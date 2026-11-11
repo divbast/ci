@@ -16,6 +16,13 @@
 # under `set allow-duplicate-variables`.
 ci_dir := ".ci"
 
+# Build ci's tools into bin/ inside ci's checkout. Run them from the
+# repository's root as .ci/bin/<tool>, so the paths they are given are the
+# repository's own. The output path is absolute because -C moves go, and
+# everything it is given, into the checkout
+ci-tools:
+    go -C '{{ ci_dir }}' build -o '{{ clean(justfile_directory() / ci_dir / "bin") }}/' ./cmd/...
+
 # Fail if any action is not pinned to a full SHA
 actions-check:
     GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --verify --check

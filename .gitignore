@@ -4,4 +4,6 @@
 .agents/
 .superpowers/
 .ci/
+# What `just ci-tools` builds, here where ci is its own checkout
+/bin/
 vendor/
