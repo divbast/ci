@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# pinact's configuration for every divbast repository. common.just's
+# actions recipes pass it from the checkout of ci; here, it is also where
+# pinact looks on its own.
+version: 3
+
+rules:
+  # A caller pins divbast/ci at a commit on main with the comment `# main`,
+  # since ci has no releases to name. pinact cannot verify a branch comment
+  # and fails every such line. divbast-pin checks those refs instead: every
+  # workflow must name the same full commit SHA.
+  - ignore: true
+    conditions:
+      - expr: ActionRepoFullName == "divbast/ci"
