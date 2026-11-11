@@ -253,6 +253,14 @@ workflow runs on:
 The calling job grants `contents: read`, `attestations: read` and
 `security-events: write`.
 
+`scan`, which can change code scanning alerts, installs only Go, just and
+Trivy from the caller's `mise.toml`, and turns mise's auto-install off. The
+caller declares each at one version: Go as `"core:go"` (mise reads the
+short `go` the same way), and just and Trivy as exactly
+`"aqua:casey/just"` and `"aqua:aquasecurity/trivy"`. mise would install a
+name that `mise.toml` does not declare at its latest version, so `scan`
+fails unless all three are there.
+
 ### `app-publish.yml`
 
 Publishes what `app-check.yml` built. The caller calls it from the daily

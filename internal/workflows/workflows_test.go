@@ -18,12 +18,14 @@ import (
 
 // guarded names the jobs that hold a write scope and install tools from
 // the caller's mise.toml. Every job of app-publish.yml holds packages,
-// attestations and id-token write. No jobs means every job in the file.
+// attestations and id-token write, and app-check.yml's scan holds
+// security-events write. No jobs means every job in the file.
 var guarded = []struct {
 	file string
 	jobs []string
 }{
 	{file: "app-publish.yml"},
+	{file: "app-check.yml", jobs: []string{"scan"}},
 }
 
 // TestWriteScopedJobsInstallOnlyWhatTheyName fails when a guarded job runs
