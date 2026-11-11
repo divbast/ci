@@ -417,7 +417,7 @@ func (c *Container) EngineHealthy(ctx context.Context, startPeriod time.Duration
 			return err
 		}
 		if res.Code != 0 {
-			return fmt.Errorf("podman healthcheck run %s: exit status %d: %s", c, res.Code, bytes.TrimSpace(append(res.Stdout, res.Stderr...)))
+			return fmt.Errorf("podman healthcheck run %s: exit status %d: %s", c, res.Code, combined(res))
 		}
 		return nil
 	}

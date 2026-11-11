@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+includes:
+    - vendor/phpstan/phpstan/conf/bleedingEdge.neon
+
+parameters:
+    level: max
+    # The PHP the images run, whichever runs the analyser
+    phpVersion: 80500
+    paths:
+        - harness/probe

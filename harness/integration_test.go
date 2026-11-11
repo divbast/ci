@@ -5,7 +5,9 @@ package harness
 
 import (
 	"errors"
+	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,14 @@ import (
 
 // These tests run real containers from the LibreSpeed fixture, under the
 // engine $ENGINE names. CI runs them on both engines and both arches.
+
+// pid1 is the fixture's server as its bootstrap hands over to it, with
+// pcntl_exec(SERVER_BIN, ['run', '--config', CADDYFILE]), and as
+// /proc/1/cmdline reads under the contract.
+var pid1 = []string{"/usr/local/bin/frankenphp", "run", "--config", "/etc/frankenphp/Caddyfile"}
+
+// healthCmd is the fixture's HEALTHCHECK, as a Podman user passes it.
+var healthCmd = []string{"/usr/local/bin/frankenphp", "php-cli", "/usr/local/bin/librespeed-health"}
 
 // integration returns the engine $ENGINE names, and skips t when it is
 // unset.
@@ -131,4 +141,174 @@ func TestWaitExitOnFixture(t *testing.T) {
 			t.Errorf("Start(entrypoint /nonexistent) error = %v, want ErrNeverStarted", err)
 		}
 	})
+}
+
+// startServed starts spec, installs the probe, and waits until both of the
+// contract's ports answer from inside the container.
+func startServed(t *testing.T, e Engine, spec *RunSpec) (*Container, *Probe) {
+	t.Helper()
+	ctx := t.Context()
+	c, err := e.Start(ctx, t, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := InstallProbe(ctx, c, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, url := range []string{"http://127.0.0.1:8080/", "http://127.0.0.1:8081/healthz"} {
+		if _, err := p.WaitHTTP(ctx, url, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return c, p
+}
+
+func TestProbeOnFixture(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+
+	network, err := e.Network(ctx, t, "", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, p := startServed(t, e, &RunSpec{
+		Image:     testfixture.LibreSpeed,
+		Network:   network,
+		Confine:   Contract("16m"),
+		HealthCmd: healthCmd,
+	})
+
+	checks := NewChecks(t)
+	for _, sub := range [][]string{
+		{"assert-caps"},
+		{"assert-no-shell"},
+		{"assert-read-only"},
+		slices.Concat([]string{"assert-pid1"}, pid1),
+		{"assert-listeners", "8080", "8081"},
+		{"probe-egress"},
+	} {
+		records, runErr := p.Run(ctx, sub[0], sub[1:]...)
+		if runErr != nil {
+			t.Error(runErr)
+			continue
+		}
+		checks.Records(records)
+	}
+
+	ins, err := c.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	Equal(checks, "the container runs as uid/gid 65532", "65532:65532", ins.Config.User)
+	checks.True("the container has an address on its internal network", ins.IP != "", ins.IP)
+
+	// Inside an internal network too: the health check is the newest thing
+	// in an image that could want a route out.
+	var startPeriod time.Duration
+	if hc := ins.Config.Healthcheck; hc != nil {
+		startPeriod = hc.StartPeriod
+	}
+	detail := "healthy"
+	if err := c.EngineHealthy(ctx, startPeriod); err != nil {
+		detail = err.Error()
+	}
+	checks.True(e.Name()+" reports the container healthy, on an internal network", detail == "healthy", detail)
+}
+
+// TestProbeNegative loosens one thing at a time, and the probe must catch
+// each: a check never seen failing proves nothing.
+func TestProbeNegative(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+
+	writable := Contract("16m")
+	writable.ReadOnly = false
+
+	tests := []struct {
+		name string
+		spec *RunSpec
+		sub  []string
+	}{
+		{
+			// It reaches CapBnd alone: exec clears CapEff and CapPrm for
+			// uid 65532 whatever the engine grants.
+			name: "a-capability-added",
+			spec: &RunSpec{Confine: Contract("16m"), Extra: []string{"--cap-add", "NET_RAW"}},
+			sub:  []string{"assert-caps"},
+		},
+		{
+			name: "an-init-as-pid-1",
+			spec: &RunSpec{Confine: Contract("16m"), Extra: []string{"--init"}},
+			sub:  slices.Concat([]string{"assert-pid1"}, pid1),
+		},
+		{
+			name: "a-writable-root",
+			spec: &RunSpec{Confine: writable},
+			sub:  []string{"assert-read-only"},
+		},
+		{
+			name: "a-listener-not-named",
+			spec: &RunSpec{Confine: Contract("16m")},
+			sub:  []string{"assert-listeners", "8080"},
+		},
+		{
+			// The engine's default network, which has a route out
+			name: "a-network-with-a-route-out",
+			spec: &RunSpec{Confine: Contract("16m")},
+			sub:  []string{"probe-egress"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.sub[0] == "probe-egress" {
+				needEgress(t)
+			}
+
+			spec := *tt.spec
+			spec.Image = testfixture.LibreSpeed
+			_, p := startServed(t, e, &spec)
+			records, err := p.Run(t.Context(), tt.sub[0], tt.sub[1:]...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(records, func(r Record) bool { return !r.OK }) {
+				t.Errorf("%s recorded %+v, want a FAIL", tt.sub[0], records)
+			}
+		})
+	}
+}
+
+// needEgress skips t on a runner that cannot reach the egress probe's
+// address itself, where no container could either.
+func needEgress(t *testing.T) {
+	t.Helper()
+	d := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.DialContext(t.Context(), "tcp", "9.9.9.9:443")
+	if err != nil {
+		t.Skipf("this runner cannot reach 9.9.9.9:443 (%v), so no container on it could", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEngineUnhealthy(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+
+	// A shell-form health check, which the engine runs as /bin/sh -c, and
+	// which no image without /bin/sh can pass.
+	c, _ := startServed(t, e, &RunSpec{
+		Image:   testfixture.LibreSpeed,
+		Confine: Contract("16m"),
+		Extra:   []string{"--health-cmd", "exit 0"},
+	})
+	err := c.EngineHealthy(t.Context(), 15*time.Second)
+	if err == nil {
+		t.Fatal("EngineHealthy() = nil, want an error for a shell-form health check in an image with no shell")
+	}
+	t.Logf("EngineHealthy() error, as it should be: %v", err)
 }

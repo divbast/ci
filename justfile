@@ -14,18 +14,22 @@ import 'just/common.just'
 default:
     @just --list
 
-# Install the pinned toolchain
+# Install the pinned toolchain, and PHPStan from composer.lock
 setup:
     #!/usr/bin/env bash
     # Not through the mise exec shell: this is what installs what it runs
     set -euo pipefail
     mise install
+    composer install
 
 # Dependencies only because common.just is always here. A repository
 # importing it from .ci calls these from a recipe's body instead.
 
 # Every lint gate
 lint: actions-check workflow-audit actionlint shell-lint go-lint reuse-lint
+    # PHP and Composer come from the host, or setup-php in CI: mise's PHP
+    # backend compiles PHP from source
+    vendor/bin/phpstan analyse --no-progress
 
 test: go-test
 

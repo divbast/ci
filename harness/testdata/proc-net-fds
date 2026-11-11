@@ -1,0 +1,17 @@
+/dev/null
+pipe:[141012585]
+pipe:[141012586]
+/sys/fs/cgroup/cpu.max
+/usr/local/bin/librespeed-bootstrap
+/memfd:opcache_lock (deleted)
+anon_inode:[eventpoll]
+anon_inode:[eventfd]
+socket:[141011426]
+socket:[141011430]
+/dev/null
+pipe:[141032107]
+pipe:[141032108]
+/sys/fs/cgroup/cpu.max
+anon_inode:[eventpoll]
+anon_inode:[eventfd]
+socket:[141099999]

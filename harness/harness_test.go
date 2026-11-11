@@ -4,12 +4,20 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -637,4 +645,588 @@ type runFunc func(argv []string) execx.Result
 
 func (f runFunc) RunStdin(_ context.Context, _ io.Reader, name string, args ...string) (execx.Result, error) {
 	return f(append([]string{name}, args...)), nil
+}
+
+func TestParseRecords(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		out     string
+		want    []Record
+		wantErr bool
+	}{
+		{
+			name: "records",
+			out:  "ok\tCapEff, every capability bit clear\t0000000000000000\t0000000000000000\nFAIL\tPID 1 comm\tfrankenphp\tdocker-init\n",
+			want: []Record{
+				{OK: true, What: "CapEff, every capability bit clear", Expected: "0000000000000000", Found: "0000000000000000"},
+				{OK: false, What: "PID 1 comm", Expected: "frankenphp", Found: "docker-init"},
+			},
+		},
+		{name: "empty-found", out: "ok\tUDP ports\tnone\t\n", want: []Record{{OK: true, What: "UDP ports", Expected: "none"}}},
+		{name: "nothing", out: "", want: nil},
+		{name: "unknown-verdict", out: "pass\twhat\texpected\tfound\n", wantErr: true},
+		{name: "too-few-fields", out: "ok\twhat\texpected\n", wantErr: true},
+		{name: "too-many-fields", out: "ok\twhat\texpected\tfound\textra\n", wantErr: true},
+		{name: "not-a-record", out: "ok\tfine\ta\ta\nPHP Warning:  something\n", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseRecords([]byte(tt.out))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseRecords(%q) = %+v, nil; want an error", tt.out, got)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(got, tt.want) {
+				t.Errorf("parseRecords(%q) = %+v, %v; want %+v, nil", tt.out, got, err, tt.want)
+			}
+		})
+	}
+}
+
+// fakeTB is a testing.TB that keeps what checks report instead of failing
+// the test running them. Only the methods Checks calls are implemented.
+type fakeTB struct {
+	testing.TB
+
+	mu         sync.Mutex
+	logs, errs []string
+}
+
+func (*fakeTB) Helper() {}
+
+func (f *fakeTB) Logf(format string, args ...any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs = append(f.logs, fmt.Sprintf(format, args...))
+}
+
+func (f *fakeTB) Errorf(format string, args ...any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs = append(f.errs, fmt.Sprintf(format, args...))
+}
+
+func TestChecks(t *testing.T) {
+	t.Parallel()
+
+	tb := &fakeTB{}
+	c := newChecks(tb, "")
+	c.Records([]Record{
+		{OK: true, What: "CapEff, every capability bit clear", Expected: "0", Found: "0"},
+		{OK: false, What: "PID 1 comm", Expected: "frankenphp", Found: "docker-init"},
+	})
+	Equal(c, "status", 401, 401)
+	Equal(c, "body", "ok\n", "fail\n")
+	c.True("healthy", true, "")
+	c.True("internal", false, "network inspect says false")
+	c.Records(nil)
+
+	wantLogs := []string{"ok   CapEff, every capability bit clear (0)", "ok   status (401)", "ok   healthy ()"}
+	wantErrs := []string{
+		`FAIL PID 1 comm: got "docker-init", want "frankenphp"`,
+		`FAIL body: got "fail\n", want "ok\n"`,
+		"FAIL internal: network inspect says false",
+		"FAIL no records",
+	}
+	if !slices.Equal(tb.logs, wantLogs) {
+		t.Errorf("logged %q, want %q", tb.logs, wantLogs)
+	}
+	if len(tb.errs) != len(wantErrs) {
+		t.Fatalf("reported %q, want %q", tb.errs, wantErrs)
+	}
+	for i, want := range wantErrs {
+		if !strings.HasPrefix(tb.errs[i], want) {
+			t.Errorf("report %d = %q, want it to start %q", i, tb.errs[i], want)
+		}
+	}
+}
+
+func TestChecksLog(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	tb := &fakeTB{}
+	c := newChecks(tb, filepath.Join(dir, "checks.log"))
+
+	// Checks from parallel subtests share one log, and every name must land
+	// whole, on a line of its own.
+	want := make([]string, 0, 66)
+	var wg sync.WaitGroup
+	for i := range 64 {
+		name := fmt.Sprintf("check %02d x%s", i, strings.Repeat("x", i*16))
+		want = append(want, name)
+		wg.Go(func() { c.True(name, true, "") })
+	}
+	wg.Wait()
+	// Failed checks are named too, and a name never spans two lines.
+	c.Records([]Record{{OK: false, What: "a record\twith a tab", Expected: "a", Found: "b"}})
+	Equal(c, "equal\nthat fails", 1, 2)
+	want = append(want, "a record with a tab", "equal that fails")
+
+	b := readLog(t, dir)
+	got := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("the log holds\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestChecksLogFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DIVBAST_CHECK_LOG", filepath.Join(dir, "checks.log"))
+
+	c := NewChecks(&fakeTB{})
+	c.True("named from the environment", true, "")
+
+	if b := readLog(t, dir); string(b) != "named from the environment\n" {
+		t.Errorf("the log holds %q, want the one name", b)
+	}
+}
+
+// readLog returns checks.log from dir.
+func readLog(t *testing.T, dir string) []byte {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := root.Close(); cerr != nil {
+			t.Error(cerr)
+		}
+	})
+	b, err := root.ReadFile("checks.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestChecksLogUnwritable(t *testing.T) {
+	t.Parallel()
+
+	tb := &fakeTB{}
+	c := newChecks(tb, filepath.Join(t.TempDir(), "no-such-dir", "checks.log"))
+	c.True("named", true, "")
+	if len(tb.errs) != 1 || !strings.Contains(tb.errs[0], "DIVBAST_CHECK_LOG") {
+		t.Errorf("reported %q, want the log's failure surfaced once", tb.errs)
+	}
+}
+
+// probeArgv is how the harness runs one probe subcommand in container abc.
+func probeArgv(args ...string) []string {
+	return slices.Concat([]string{"docker", "exec", "abc", "/usr/local/bin/frankenphp", "php-cli", "/tmp/divbast-probe/core.php"}, args)
+}
+
+func TestInstallProbe(t *testing.T) {
+	t.Parallel()
+
+	install := func(file string) []string {
+		return []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode(file)}
+	}
+	app := []byte("<?php return [];\n")
+	tests := []struct {
+		name    string
+		app     []byte
+		calls   []execx.Call
+		wantErr string
+	}{
+		{
+			name:  "core-only",
+			calls: []execx.Call{{Argv: install("/tmp/divbast-probe/core.php"), Stdin: coreProbe}},
+		},
+		{
+			name: "core-and-app",
+			app:  app,
+			calls: []execx.Call{
+				{Argv: install("/tmp/divbast-probe/core.php"), Stdin: coreProbe},
+				{Argv: install("/tmp/divbast-probe/app.php"), Stdin: app},
+			},
+		},
+		{
+			name: "write-fails",
+			calls: []execx.Call{{Argv: install("/tmp/divbast-probe/core.php"), Stdin: coreProbe, Result: execx.Result{
+				Code: 1, Stderr: []byte("cannot write /tmp/divbast-probe/core.php: No space left on device\n"),
+			}}},
+			wantErr: "No space left on device",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))}
+			p, err := InstallProbe(t.Context(), c, tt.app)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("InstallProbe() = %v, %v; want an error containing %q", p, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || p == nil {
+				t.Errorf("InstallProbe() = %v, %v; want a probe", p, err)
+			}
+		})
+	}
+}
+
+func TestInstallProbeRetries(t *testing.T) {
+	t.Parallel()
+
+	install := []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")}
+	inspect := []string{"docker", "container", "inspect", "abc"}
+	// What Docker said, once, to an exec into a container still starting
+	refused := execx.Result{Code: 128, Stderr: []byte("OCI runtime exec failed: exec failed: cannot exec in a stopped container")}
+	tests := []struct {
+		name     string
+		calls    []execx.Call
+		wantText string
+	}{
+		{
+			name: "engine-refused-while-running",
+			calls: []execx.Call{
+				{Argv: install, Stdin: coreProbe, Result: refused},
+				{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
+				{Argv: install, Stdin: coreProbe},
+			},
+		},
+		{
+			name: "engine-refused-and-stopped",
+			calls: []execx.Call{
+				{Argv: install, Stdin: coreProbe, Result: refused},
+				{Argv: inspect, Result: execx.Result{Stdout: state("exited", false, 1, startedAt, "")}},
+			},
+			wantText: "cannot exec in a stopped container",
+		},
+		{
+			name: "engine-refuses-every-time",
+			calls: slices.Concat(
+				slices.Repeat([]execx.Call{
+					{Argv: install, Stdin: coreProbe, Result: refused},
+					{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
+				}, installAttempts-1),
+				[]execx.Call{{Argv: install, Stdin: coreProbe, Result: refused}},
+			),
+			wantText: "cannot exec in a stopped container",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))}
+				p, err := InstallProbe(t.Context(), c, nil)
+				if tt.wantText == "" {
+					if err != nil || p == nil {
+						t.Errorf("InstallProbe() = %v, %v; want a probe", p, err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), tt.wantText) {
+					t.Errorf("InstallProbe() = %v, %v; want an error containing %q", p, err, tt.wantText)
+				}
+			})
+		})
+	}
+}
+
+func TestProbeRun(t *testing.T) {
+	t.Parallel()
+
+	okRecord := "ok\tCapEff, every capability bit clear\t0\t0\n"
+	failRecord := "FAIL\tCapBnd, every capability bit clear\t0\t2000\n"
+	tests := []struct {
+		name     string
+		res      execx.Result
+		want     int
+		wantText string
+	}{
+		{name: "all-ok", res: execx.Result{Stdout: []byte(okRecord + okRecord)}, want: 2},
+		// A FAIL is the caller's to report, not an error.
+		{name: "a-fail", res: execx.Result{Code: 1, Stdout: []byte(okRecord + failRecord)}, want: 2},
+		{name: "fail-but-exit-0", res: execx.Result{Stdout: []byte(failRecord)}, wantText: "disagrees"},
+		{name: "exit-1-but-all-ok", res: execx.Result{Code: 1, Stdout: []byte(okRecord)}, wantText: "disagrees"},
+		{name: "usage", res: execx.Result{Code: 2, Stderr: []byte("unknown subcommand 'assert-caps'\n")}, wantText: "unknown subcommand"},
+		{name: "no-records", res: execx.Result{Code: 1, Stderr: []byte("Error response from daemon: container abc is not running\n")}, wantText: "not running"},
+		{name: "not-records", res: execx.Result{Stdout: []byte(okRecord + "Warning: something\n")}, wantText: "not a record"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := &Probe{c: &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t,
+				execx.Call{Argv: probeArgv("assert-caps"), Result: tt.res},
+			))}}
+			got, err := p.Run(t.Context(), "assert-caps")
+			if tt.wantText != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantText) {
+					t.Errorf("Run() = %+v, %v; want an error containing %q", got, err, tt.wantText)
+				}
+				return
+			}
+			if err != nil || len(got) != tt.want {
+				t.Errorf("Run() = %+v, %v; want %d records", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseHTTP(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		out     string
+		want    HTTPResponse
+		wantErr bool
+	}{
+		{out: "200\n{\"processedString\":\"127.0.0.1\"}", want: HTTPResponse{Status: 200, Body: []byte(`{"processedString":"127.0.0.1"}`)}},
+		{out: "404\n", want: HTTPResponse{Status: 404, Body: []byte{}}},
+		{out: "200", wantErr: true},
+		{out: "ok\nbody", wantErr: true},
+		{out: "2000\nbody", wantErr: true},
+	}
+	for _, tt := range tests {
+		got, err := parseHTTP([]byte(tt.out))
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseHTTP(%q) = %+v, nil; want an error", tt.out, got)
+			}
+			continue
+		}
+		if err != nil || got.Status != tt.want.Status || !bytes.Equal(got.Body, tt.want.Body) {
+			t.Errorf("parseHTTP(%q) = %+v, %v; want %+v", tt.out, got, err, tt.want)
+		}
+	}
+}
+
+func TestWaitHTTP(t *testing.T) {
+	t.Parallel()
+
+	const url = "http://127.0.0.1:8080/"
+	request := probeArgv("http-request", "GET", url, "", "")
+	inspect := []string{"docker", "container", "inspect", "abc"}
+	refused := execx.Result{Code: 1, Stdout: []byte("FAIL\thttp-request completed\tno exception\tRuntimeException: cannot connect to 127.0.0.1:8080 (errno 111: Connection refused)\n")}
+	tests := []struct {
+		name     string
+		calls    []execx.Call
+		wantText string
+	}{
+		{
+			name: "serves-once-started",
+			calls: []execx.Call{
+				{Argv: request, Result: refused},
+				{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
+				{Argv: request, Result: execx.Result{Stdout: []byte("200\nhello")}},
+			},
+		},
+		{
+			name: "stops-instead",
+			calls: []execx.Call{
+				{Argv: request, Result: refused},
+				{Argv: inspect, Result: execx.Result{Stdout: state("exited", false, 1, startedAt, "")}},
+				{Argv: []string{"docker", "logs", "abc"}, Result: execx.Result{Stderr: []byte("refusing: TRUSTED_PROXIES holds '::/0'\n")}},
+			},
+			wantText: "TRUSTED_PROXIES",
+		},
+		{
+			name: "never-serves",
+			calls: slices.Concat(
+				slices.Repeat([]execx.Call{
+					{Argv: request, Result: refused},
+					{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
+				}, 2),
+				[]execx.Call{{Argv: []string{"docker", "logs", "abc"}, Result: execx.Result{Stdout: []byte("starting\n")}}},
+			),
+			wantText: "Connection refused",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				p := &Probe{c: &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))}}
+				got, err := p.WaitHTTP(t.Context(), url, time.Second)
+				if tt.wantText == "" {
+					if err != nil || got.Status != 200 || string(got.Body) != "hello" {
+						t.Errorf("WaitHTTP() = %+v, %v; want 200 hello", got, err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), tt.wantText) {
+					t.Errorf("WaitHTTP() error = %v, want it to contain %q", err, tt.wantText)
+				}
+			})
+		})
+	}
+}
+
+func TestHostClient(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/admin/install/", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := HostClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	// The redirect is the answer: following it would turn a 302 into a 200.
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("GET / status = %d, want 302, unfollowed", resp.StatusCode)
+	}
+}
+
+// php returns the host's php, skipping t without one: the probe runs as
+// the container's PHP in the integration tests, and here as the host's.
+func php(t *testing.T) string {
+	t.Helper()
+	bin, err := exec.LookPath("php")
+	switch {
+	case err == nil:
+	case os.Getenv("GITHUB_ACTIONS") == "true":
+		// CI sets PHP up, and a skip there would leave the probe untested.
+		t.Fatalf("no php on PATH, which CI provides: %v", err)
+	default:
+		t.Skip("no php on PATH to run the probe with")
+	}
+	return bin
+}
+
+// runPHP runs the probe script with php and arguments.
+func runPHP(t *testing.T, script string, args ...string) execx.Result {
+	t.Helper()
+	res, err := execx.OS{}.Run(t.Context(), php(t), append([]string{script}, args...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// TestListenersParser runs the probe's own socket parsing over tables
+// taken from the LibreSpeed fixture under Docker, on an internal network,
+// where Docker's resolver keeps a TCP listener and a UDP socket at
+// 127.0.0.11 that no process in the container holds. proc-net-udp adds,
+// by hand, a UDP socket that one does hold, at port 5353.
+func TestListenersParser(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		tcp, udp string
+		wantCode int
+		want     string
+	}{
+		{name: "held-udp-reported-resolver-ignored", tcp: "proc-net-tcp", udp: "proc-net-udp", want: "udp 5353\n"},
+		{name: "held-tcp-listeners", tcp: "proc-net-tcp6", udp: "proc-net-udp6", want: "tcp 8080\ntcp 8081\n"},
+		{name: "malformed-table", tcp: "proc-net-malformed", udp: "proc-net-udp6", wantCode: 1, want: "FAIL\tparse-listeners completed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			res := runPHP(t, "probe/core.php", "parse-listeners",
+				filepath.Join("testdata", tt.tcp), filepath.Join("testdata", tt.udp), filepath.Join("testdata", "proc-net-fds"))
+			if res.Code != tt.wantCode || !strings.HasPrefix(string(res.Stdout), tt.want) {
+				t.Errorf("parse-listeners = exit %d, stdout %q, stderr %q; want exit %d, stdout starting %q",
+					res.Code, res.Stdout, res.Stderr, tt.wantCode, tt.want)
+			}
+		})
+	}
+}
+
+func TestProbeDispatch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		app      string // app.php beside core.php; none when empty
+		args     []string
+		wantCode int
+		want     string // the start of stdout, or of stderr when wantCode is 2
+	}{
+		{name: "no-subcommand", wantCode: 2, want: "no subcommand given"},
+		{name: "unknown", args: []string{"assert-everything"}, wantCode: 2, want: "unknown subcommand 'assert-everything'"},
+		{name: "variadic-needs-one", args: []string{"assert-pid1"}, wantCode: 2, want: "assert-pid1 takes <argv>..., got 0"},
+		{name: "fixed-arity", args: []string{"probe-egress", "extra"}, wantCode: 2, want: "probe-egress takes no arguments, got 1"},
+		{
+			name:     "a-port-that-is-not",
+			args:     []string{"assert-listeners", "80a"},
+			wantCode: 1,
+			want:     "FAIL\tassert-listeners completed\tno exception\tInvalidArgumentException: '80a' is not a TCP port",
+		},
+		{
+			name: "app-subcommand",
+			app:  `<?php return ['app-echo' => static function (array $operands): void { Assertions::equals('app operands', 'a b', implode(' ', $operands)); }];`,
+			args: []string{"app-echo", "a", "b"},
+			want: "ok\tapp operands\ta b\ta b\n",
+		},
+		{
+			name:     "app-clashes-with-core",
+			app:      `<?php return ['assert-caps' => static function (array $operands): void {}];`,
+			args:     []string{"assert-caps"},
+			wantCode: 2,
+			want:     "cannot load the subcommands",
+		},
+		{
+			name:     "app-returns-no-commands",
+			app:      `<?php return 'nothing';`,
+			args:     []string{"assert-caps"},
+			wantCode: 2,
+			want:     "cannot load the subcommands",
+		},
+		{
+			name:     "app-does-not-parse",
+			app:      `<?php return [`,
+			args:     []string{"assert-caps"},
+			wantCode: 2,
+			want:     "cannot load the subcommands",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "core.php"), coreProbe, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tt.app != "" {
+				if err := os.WriteFile(filepath.Join(dir, "app.php"), []byte(tt.app), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res := runPHP(t, filepath.Join(dir, "core.php"), tt.args...)
+			got := res.Stdout
+			if tt.wantCode == 2 {
+				got = res.Stderr
+			}
+			if res.Code != tt.wantCode || !strings.HasPrefix(string(got), tt.want) {
+				t.Errorf("core.php %q = exit %d, stdout %q, stderr %q; want exit %d, starting %q",
+					tt.args, res.Code, res.Stdout, res.Stderr, tt.wantCode, tt.want)
+			}
+		})
+	}
 }

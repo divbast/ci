@@ -30,7 +30,7 @@ jobs:
       contents: read
 
   # Both engines on both arches, the matrix the harness and contract tests
-  # will run under.
+  # run under.
   test:
     name: test
     strategy:
@@ -52,6 +52,12 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      # The probe's own tests run it with the host's PHP, the version the
+      # images run. mise's PHP backend compiles PHP from source.
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.5'
+          coverage: none
 
       - name: Allow unprivileged user namespaces
         if: matrix.engine == 'podman'
