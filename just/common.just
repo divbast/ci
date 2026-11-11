@@ -35,15 +35,15 @@ ci-tools:
 
 # Fail if any action is not pinned to a full SHA
 actions-check:
-    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact -c '{{ ci_dir }}/.github/pinact.yaml' run --verify --check
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --verify --check
 
 # Rewrite tag references to the SHA
 actions-pin:
-    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact -c '{{ ci_dir }}/.github/pinact.yaml' run
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run
 
 # Move every action to its latest release
 actions-update:
-    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact -c '{{ ci_dir }}/.github/pinact.yaml' run --update
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --update
 
 # Audit the workflows for security problems
 workflow-audit:
