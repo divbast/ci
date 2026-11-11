@@ -29,10 +29,12 @@ linters:
     - godot
     - gosec
     - govet
+    - ineffassign
     - intrange
     - misspell
     - nilerr
     - noctx
+    - nolintlint
     - paralleltest
     - perfsprint
     - prealloc
@@ -42,6 +44,7 @@ linters:
     - tparallel
     - unconvert
     - unparam
+    - unused
     - usestdlibvars
     - wastedassign
     - whitespace
@@ -68,6 +71,13 @@ linters:
         # structs is allocated in numbers where the padding would show, and
         # field order is how a reader finds their way through one.
         - fieldalignment
+
+    # Every //nolint names the linter it silences and says why, and goes
+    # once it silences nothing.
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
 
     gocritic:
       enabled-tags:
