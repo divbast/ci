@@ -283,6 +283,11 @@ concurrency group, so the calling job needs no group of its own.
 The calling job grants `contents: read`, `packages: write`,
 `id-token: write` and `attestations: write`.
 
+Of the caller's `mise.toml` it installs Go alone, declared there as
+`"core:go"` (mise reads the short `go` the same way), and turns mise's
+auto-install off: the job can push the image and sign its attestation, so
+it runs no other tool's install code.
+
 An app's build workflow puts the two together, and keeps its own triggers
 and its `required` job, the one check its ruleset requires:
 
