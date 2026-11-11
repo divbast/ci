@@ -8,7 +8,7 @@ configuration that every divbast repository shares. A repository calls
 ci's workflows at one release, and checks ci out at that release's commit
 into a git-ignored `.ci/`. Its local `just` recipes and its CI then run
 the same code, and a ci change reaches it only through a pull request that
-moves the pin, which the repository's own CI tests.
+moves the pin.
 
 - [Using ci from a repository](#using-ci-from-a-repository)
 - [Releases](#releases)
