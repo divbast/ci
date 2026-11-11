@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:709b78c19e551d1ead82018027bd3a57ef9027757c5be89fd01204176205a6cc",
+      "size": 7020,
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:03ac22e1713e320b12732874db6379db5a32fd8d09ab4ae58df7b403274e3d85",
+      "size": 1113,
+      "annotations": {
+        "vnd.docker.reference.digest": "sha256:709b78c19e551d1ead82018027bd3a57ef9027757c5be89fd01204176205a6cc",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:3da4f3c4245a6b33459cfc523624ba2ed2e0eec50fd37f55f24c782b4db3dc39",
+      "size": 7020,
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:33cb7e35cf77cb1b30b31fe7499a73b7e0af6da90f10677e8ce612a23bae1396",
+      "size": 1113,
+      "annotations": {
+        "vnd.docker.reference.digest": "sha256:3da4f3c4245a6b33459cfc523624ba2ed2e0eec50fd37f55f24c782b4db3dc39",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    }
+  ],
+  "annotations": {
+    "org.opencontainers.image.created": "2026-11-10T22:14:47Z",
+    "org.opencontainers.image.description": "LibreSpeed speed test. Zero capabilities, read-only root, non-root, no shell",
+    "org.opencontainers.image.revision": "24e63e21ef880cd22c26964ee987fa593f5e92fc",
+    "org.opencontainers.image.version": "6.3.1"
+  }
+}
