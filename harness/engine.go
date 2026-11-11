@@ -143,6 +143,8 @@ func gone(stderr []byte) bool {
 	s := bytes.ToLower(stderr)
 	return bytes.Contains(s, []byte("no such container")) ||
 		bytes.Contains(s, []byte("no such volume")) ||
+		bytes.Contains(s, []byte("no such image")) ||
+		bytes.Contains(s, []byte("image not known")) ||
 		bytes.Contains(s, []byte("not found"))
 }
 

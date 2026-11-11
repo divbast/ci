@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The fixture, run as root when no --user is given. Only default-user can
+# see it: every other check passes --user 65532:65532.
+
+# testfixture.LibreSpeed, pinned by its index digest, which the test
+# passes in so that the fixture is named in one place only
+ARG FIXTURE
+FROM ${FIXTURE}
+
+# DL3002 asks that the last USER not be root. Root is the mutation.
+# hadolint ignore=DL3002
+USER 0:0

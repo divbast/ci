@@ -460,7 +460,25 @@ const inspectJSON = `[{
 		"Healthcheck": {"Test": ["CMD", "/usr/local/bin/frankenphp", "php-cli", "/x"],
 			"Interval": 30000000000, "Timeout": 10000000000, "StartPeriod": 60000000000, "Retries": 3}
 	},
+	"HostConfig": {
+		"CapAdd": null, "CapDrop": ["ALL"], "Privileged": false, "ReadonlyRootfs": true,
+		"SecurityOpt": null, "Init": null, "NetworkMode": "net"
+	},
 	"NetworkSettings": {"Networks": {"net": {"IPAddress": "10.89.66.3"}, "other": {"IPAddress": "10.0.0.9"}}}
+}]`
+
+// podmanHostConfig is the HostConfig of Podman's `container inspect`, as
+// rootless Podman 6.1 printed it for a container run under the contract
+// with --cap-add NET_RAW, --init and two security options on a named
+// network: the same field names as Docker's, but its own values.
+const podmanHostConfig = `[{
+	"Id": "abc",
+	"HostConfig": {
+		"CapAdd": ["CAP_NET_RAW"],
+		"CapDrop": ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL"],
+		"Privileged": false, "ReadonlyRootfs": true,
+		"SecurityOpt": ["no-new-privileges", "apparmor=unconfined"], "Init": true, "NetworkMode": "bridge"
+	}
 }]`
 
 func TestInspect(t *testing.T) {
@@ -488,6 +506,77 @@ func TestInspect(t *testing.T) {
 	// The address on the container's own network, not on any other.
 	if got.IP != "10.89.66.3" {
 		t.Errorf("Inspect().IP = %q, want 10.89.66.3", got.IP)
+	}
+	if h := got.HostConfig; len(h.CapAdd) != 0 || h.Privileged || !h.ReadonlyRootfs || len(h.SecurityOpt) != 0 ||
+		h.Init != nil || h.NetworkMode != "net" {
+		t.Errorf("Inspect().HostConfig = %+v, want Docker's null CapAdd, SecurityOpt and Init, read-only, on net", h)
+	}
+}
+
+func TestInspectPodmanHostConfig(t *testing.T) {
+	t.Parallel()
+
+	c := &Container{ID: "abc", engine: newEngine("podman", execx.NewFake(t,
+		execx.Call{Argv: []string{"podman", "container", "inspect", "abc"}, Result: execx.Result{Stdout: []byte(podmanHostConfig)}},
+	))}
+	got, err := c.Inspect(t.Context())
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	h := got.HostConfig
+	if !slices.Equal(h.CapAdd, []string{"CAP_NET_RAW"}) || h.Privileged || !h.ReadonlyRootfs ||
+		!slices.Equal(h.SecurityOpt, []string{"no-new-privileges", "apparmor=unconfined"}) ||
+		h.Init == nil || !*h.Init || h.NetworkMode != "bridge" {
+		t.Errorf("Inspect().HostConfig = %+v (Init %v), want what Podman printed", h, h.Init)
+	}
+}
+
+func TestRun(t *testing.T) {
+	t.Parallel()
+
+	spec := &RunSpec{
+		Image:      "img",
+		Name:       "ctr",
+		Network:    "none",
+		Confine:    Contract("16m"),
+		Entrypoint: []string{FrankenPHP},
+		Args:       []string{"version"},
+	}
+	// What Docker 29 printed for a binary carrying a file capability: the
+	// runtime execs it after the container has started, and exits 255.
+	refused := execx.Result{Code: 255, Stderr: []byte("exec /usr/local/bin/frankenphp: operation not permitted\n")}
+	e := newEngine("docker", nil)
+	e.run = execx.NewFake(t,
+		execx.Call{
+			Argv: []string{
+				"docker", "run", "--rm", "--label", "divbast.harness=1", "--name", "ctr",
+				"--cap-drop", "ALL", "--read-only", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m",
+				"--network", "none", "--entrypoint", FrankenPHP, "img", "version",
+			},
+			Result: refused,
+		},
+		// --rm removed it already, and a missing one is no failure.
+		execx.Call{Argv: []string{"docker", "rm", "-f", "-v", "ctr"}, Result: execx.Result{
+			Code: 1, Stderr: []byte("Error response from daemon: No such container: ctr"),
+		}},
+	)
+
+	got, err := e.Run(t.Context(), t, spec)
+	if err != nil {
+		t.Fatalf("Run() error = %v; an exit status is a Result, not an error", err)
+	}
+	if got.Code != 255 || !bytes.Equal(got.Stderr, refused.Stderr) {
+		t.Errorf("Run() = %+v, want exit status 255 and the runtime's words", got)
+	}
+}
+
+func TestRunRejects(t *testing.T) {
+	t.Parallel()
+
+	// A Fake with no calls: nothing may run.
+	e := newEngine("docker", execx.NewFake(t))
+	if _, err := e.Run(t.Context(), t, &RunSpec{}); err == nil {
+		t.Error("Run(no image) error = nil, want a refusal")
 	}
 }
 

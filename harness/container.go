@@ -119,8 +119,14 @@ func (s *RunSpec) validate() error {
 
 // Argv returns the arguments [Engine.Start] gives the engine for spec,
 // from "run" on, so a test can assert the exact flags a container gets.
+// [Engine.Run] gives the same, with --rm in place of -d.
 func (e Engine) Argv(spec *RunSpec) []string {
-	argv := []string{"run", "-d", "--label", e.label}
+	return e.argv(spec, "-d")
+}
+
+// argv is [Engine.Argv] with mode, -d or --rm, after "run".
+func (e Engine) argv(spec *RunSpec, mode string) []string {
+	argv := []string{"run", mode, "--label", e.label}
 	if spec.Name != "" {
 		argv = append(argv, "--name", spec.Name)
 	}
@@ -227,6 +233,29 @@ func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Conta
 	return c, nil
 }
 
+// Run runs spec in the foreground, as run --rm, and returns what it
+// printed and its exit status once it exits. Some failures reach nothing
+// but the foreground's stderr: crun reports an exec the kernel refused
+// there, and leaves the log of a detached container empty.
+//
+// A status of the engine's own, 125 and up, is in the Result too, as is a
+// run the engine refused: the error is for an engine that could not be run
+// at all, or a spec it would misread.
+func (e Engine) Run(ctx context.Context, tb testing.TB, spec *RunSpec) (Result, error) {
+	tb.Helper()
+	s := *spec
+	if s.Name == "" {
+		s.Name = uniqueName()
+	}
+	if err := s.validate(); err != nil {
+		return Result{}, err
+	}
+	// --rm removes it once it exits. This removes one a cancelled run
+	// left behind.
+	e.removeOnCleanup(ctx, tb, "rm", "-f", "-v", s.Name)
+	return e.run.RunStdin(ctx, nil, e.name, e.argv(&s, "--rm")...)
+}
+
 // Result is what a command left behind: its stdout, stderr and exit
 // status. A command that ran and exited non-zero is a Result, not an
 // error.
@@ -273,8 +302,9 @@ func (c *Container) Logs(ctx context.Context) (string, error) {
 // Inspect is the part of what the engine reports about a container that
 // checks read.
 type Inspect struct {
-	State  State
-	Config Config
+	State      State
+	Config     Config
+	HostConfig HostConfig
 	// IP is the container's address on the network it was started on, or
 	// on its one network if it named none. Empty when it has none, as on
 	// rootless Podman's default network.
@@ -311,21 +341,49 @@ type HealthLog struct {
 	Output     string
 }
 
-// Config is the configuration the container runs with.
+// Config is the configuration a container runs with, or the one an image
+// declares, as [Engine.ImageConfig] reads it.
 type Config struct {
 	// User is the uid:gid it runs as: --user, or else the image's own.
 	User string
-	// Healthcheck is the health check the engine runs, nil for none.
+	// Healthcheck is the health check the engine runs, or the image's
+	// HEALTHCHECK, nil for none.
 	Healthcheck *Healthcheck
 }
 
-// Healthcheck is a health check's command and timings.
+// Healthcheck is a health check's command and timings. A timing left
+// unset is zero, and the engine's default applies.
 type Healthcheck struct {
 	// Test is the command, starting "CMD" for the exec form and
 	// "CMD-SHELL" for one run through /bin/sh.
-	Test                           []string
-	Interval, Timeout, StartPeriod time.Duration
-	Retries                        int
+	Test                                          []string
+	Interval, Timeout, StartPeriod, StartInterval time.Duration
+	Retries                                       int
+}
+
+// HostConfig is how the engine set a container up, which a probe inside
+// it cannot see. Docker and Podman print the same field names here, with
+// values of their own, given with each field.
+type HostConfig struct {
+	// CapAdd is what --cap-add granted: null on Docker when nothing was,
+	// an empty list on Podman. Both name a capability CAP_<NAME>.
+	CapAdd []string
+	// Privileged is --privileged, and ReadonlyRootfs --read-only.
+	Privileged, ReadonlyRootfs bool
+	// SecurityOpt holds the --security-opt values. Docker keeps each as it
+	// was given, with = or : between key and value, and null for none.
+	// Podman rebuilds them, always with =, from what it records of the
+	// options given, and adds unmask=all when no path is masked.
+	SecurityOpt []string
+	// Init is whether the engine put an init in front of the entrypoint:
+	// null on Docker unless --init was given, a bool on Podman.
+	Init *bool
+	// NetworkMode is the network the container joined. Docker names it;
+	// Podman says bridge for any named network, or slirp4netns or pasta
+	// for its rootless default. Both say none, host for the host's, and
+	// container:<id> for another container's; Podman alone says
+	// ns:<path> for a namespace joined by its path.
+	NetworkMode string
 }
 
 // Inspect returns what the engine reports about the container now.
@@ -341,6 +399,7 @@ func (c *Container) Inspect(ctx context.Context) (Inspect, error) {
 			Healthcheck *Health
 		}
 		Config          Config
+		HostConfig      HostConfig
 		NetworkSettings struct {
 			Networks map[string]struct{ IPAddress string }
 		}
@@ -353,7 +412,7 @@ func (c *Container) Inspect(ctx context.Context) (Inspect, error) {
 	}
 	got := all[0]
 
-	ins := Inspect{State: got.State.State, Config: got.Config}
+	ins := Inspect{State: got.State.State, Config: got.Config, HostConfig: got.HostConfig}
 	if ins.State.Health == nil {
 		ins.State.Health = got.State.Healthcheck
 	}

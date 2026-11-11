@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The fixture with a shell at /bin/sh: BusyBox's musl build, which is
+# static and so runs anywhere.
+
+# testfixture.LibreSpeed, pinned by its index digest, which the test
+# passes in so that the fixture is named in one place only
+ARG FIXTURE
+
+FROM docker.io/library/busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS busybox
+
+FROM ${FIXTURE}
+# /bin is a link to usr/bin in the fixture, so this lands at /usr/bin/sh
+COPY --from=busybox /bin/busybox /bin/sh

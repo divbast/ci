@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The fixture with cap_net_bind_service=ep on its FrankenPHP binary, as
+# upstream's own builds carry it. Under --cap-drop ALL the kernel refuses
+# to exec such a binary at all. COPY --from keeps the security.capability
+# extended attribute, under BuildKit and Buildah alike.
+
+# testfixture.LibreSpeed, pinned by its index digest, which the test
+# passes in so that the fixture is named in one place only
+ARG FIXTURE
+
+FROM ${FIXTURE} AS fixture
+
+FROM docker.io/library/debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS setcap
+# DL3008 asks for apt versions to be pinned. The base is pinned by digest,
+# and setcap only marks a test binary here: nothing of this stage but that
+# binary reaches the image, and a pin would break at Debian's next point
+# release.
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=fixture /usr/local/bin/frankenphp /frankenphp
+# The build fails here, rather than the test later, if the capability did
+# not take.
+RUN setcap cap_net_bind_service=ep /frankenphp \
+    && test "$(getcap /frankenphp)" = '/frankenphp cap_net_bind_service=ep'
+
+FROM fixture
+COPY --from=setcap /frankenphp /usr/local/bin/frankenphp
