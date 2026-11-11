@@ -24,10 +24,12 @@
 # under `set allow-duplicate-variables`.
 ci_dir := ".ci"
 
-# Build ci's tools into bin/ inside ci's checkout. Run them from the
-# repository's root as .ci/bin/<tool>, so the paths they are given are the
-# repository's own. The output path is absolute because -C moves go, and
-# everything it is given, into the checkout
+# Run the tools from the repository's root as .ci/bin/<tool>, so the
+# paths they are given are the repository's own. The output path is
+# absolute because -C moves go, and everything it is given, into the
+# checkout.
+
+# Build ci's tools into bin/ inside ci's checkout
 ci-tools:
     go -C '{{ ci_dir }}' build -o '{{ clean(justfile_directory() / ci_dir / "bin") }}/' ./cmd/...
 
@@ -47,8 +49,7 @@ actions-update:
 workflow-audit:
     GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" zizmor --persona=auditor .github/workflows
 
-# Check the workflows' syntax, expressions and run: scripts, under ci's
-# configuration
+# Check the workflows' syntax, expressions and run: scripts
 actionlint:
     actionlint -config-file {{ ci_dir }}/.github/actionlint.yaml
 
@@ -57,9 +58,10 @@ shell-lint:
     git ls-files -z '*.sh' | xargs -0 -r shellcheck
     git ls-files -z '*.sh' | xargs -0 -r shfmt -d
 
-# Every Go gate but the tests: the compiler, vet, go fix and go mod tidy
-# with nothing to change, then golangci-lint's formatters and linters under
-# ci's configuration
+# The compiler, vet, go fix and go mod tidy with nothing to change, then
+# golangci-lint's formatters and linters under ci's configuration.
+
+# Every Go gate but the tests
 go-lint:
     go build ./...
     go vet ./...
@@ -68,8 +70,10 @@ go-lint:
     golangci-lint fmt -c {{ ci_dir }}/go/golangci.yml --diff ./...
     golangci-lint run -c {{ ci_dir }}/go/golangci.yml ./...
 
+# The tests, under the race detector
 go-test:
     go test -race -count=1 ./...
 
+# Licence and copyright headers on every file
 reuse-lint:
     reuse lint
