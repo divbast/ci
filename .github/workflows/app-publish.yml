@@ -1,0 +1,226 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The publish job every divbast app repository's build workflow calls from
+# its daily slot and its manual run on main, once app-check.yml and the
+# caller's required job have passed. It decides whether to publish, and
+# never moves :latest backwards. When it publishes, it pushes the two images
+# app-check built and tested, merges them into one index tagged with the
+# app's version and latest, attests that index, and checks that :latest is
+# that index to an anonymous client, as users pull it.
+#
+# The attestation is signed by this workflow, for the caller's repository
+# and ref, so it verifies with
+#
+#   gh attestation verify oci://<image>:latest --repo <caller> \
+#     --signer-workflow divbast/ci/.github/workflows/app-publish.yml \
+#     --source-ref refs/heads/main
+#
+# The caller's job grants contents: read, packages: write, id-token: write
+# and attestations: write, and runs only on schedule or workflow_dispatch
+# from main. This workflow fails on any other event or ref, so a merge never
+# publishes.
+name: app-publish
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: The image to publish, without a tag, such as ghcr.io/divbast/librespeed
+        type: string
+        required: true
+      version-arg:
+        description: The Containerfile ARG whose value is the app's version, which tags the image
+        type: string
+        required: true
+      description:
+        description: The index's description annotation, which GHCR shows on the package page
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  publish:
+    name: publish
+    # The slot and the button each read :latest and then replace it. One at a
+    # time, or each could decide against an image the other is replacing.
+    # Queued rather than the default single pending slot, so a second
+    # publish waiting never cancels the first. The group is the calling
+    # repository's, and the calling job needs none of its own.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push the image and the attestation below
+      id-token: write # Sigstore signs against the runner's OIDC identity
+      attestations: write # actions/attest writes the provenance
+    steps:
+      # The calling job's own condition says the same. This holds even when
+      # that one is wrong: divbast-publish-decision accepts a push, for
+      # repositories that publish on merge, and app repositories do not.
+      - name: Refuse anything but the daily slot or a manual run on main
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          case "${EVENT}" in
+            schedule | workflow_dispatch) ;;
+            *)
+              echo "only the daily slot and a manual run publish, not a ${EVENT} run" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${REF}" != refs/heads/main ]; then
+            echo "only main publishes, not ${REF}" >&2
+            exit 1
+          fi
+
+      # Full history, so the decision below can tell a newer commit from an
+      # older one
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # A step's `uses: ./` and a recipe's .ci/ both resolve against the
+      # caller's checkout, so this workflow's own commit goes in there.
+      - name: Check out divbast/ci at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ci
+          persist-credentials: false
+
+      # Before the pin check, which needs the caller's pinned Go.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      # `just setup` would otherwise check .ci out again at whatever commit
+      # the caller's workflows pin, and lint with that one. ci's tools build
+      # as ci's own module, since Go maps no ./.ci/ path into a caller's
+      # module, and run from the caller's root, so -dir's default is its.
+      - name: Check the caller pins this commit of divbast/ci
+        if: github.repository != 'divbast/ci'
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
+          .ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
+
+      # For `imagetools create`
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Publish, skip or fail. The slot skips when main has not moved since
+      # the published image, and :latest never moves backwards: a run that
+      # built an older commit would take back whatever the newer image fixed.
+      # GH_TOKEN tells a private package from an absent one.
+      - name: Decide whether to publish
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          IMAGE: ${{ inputs.image }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # actions/checkout points origin/main at the commit this run built,
+          # not at main's tip, so a newer published commit would read as one
+          # that is not on main. The repository is public; no credentials.
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")
+          .ci/bin/divbast-publish-decision -event "${EVENT}" -built "${GITHUB_SHA}" -published "${published}"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: steps.decide.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      # Each artifact lands in its own directory under this path
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.decide.outputs.publish == 'true'
+        with:
+          pattern: image-*
+          path: /tmp/images
+      - name: Read the version from the Containerfile
+        if: steps.decide.outputs.publish == 'true'
+        id: version
+        env:
+          VERSION_ARG: ${{ inputs.version-arg }}
+        run: |
+          if [[ ! "${VERSION_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "version-arg must name an ARG, not ${VERSION_ARG}" >&2
+            exit 1
+          fi
+          v=$(sed -n "s/^ARG ${VERSION_ARG}=//p" Containerfile)
+          if [[ ! "${v}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Containerfile has no one ARG ${VERSION_ARG}= line whose value can tag an image" >&2
+            exit 1
+          fi
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Push each tested architecture
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for arch in amd64 arm64; do
+            skopeo copy --all \
+              --digestfile "/tmp/digest-${arch}" \
+              --dest-authfile "${HOME}/.docker/config.json" \
+              "oci-archive:/tmp/images/image-${arch}/image.tar" \
+              "docker://${IMAGE}:${VERSION}-${arch}"
+          done
+      - name: Merge the architectures into one index
+        if: steps.decide.outputs.publish == 'true'
+        id: merge
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DESCRIPTION: ${{ inputs.description }}
+        run: |
+          created=$(date -u -d "@$(git log -1 --pretty=%ct)" +%Y-%m-%dT%H:%M:%SZ)
+          docker buildx imagetools create \
+            --metadata-file /tmp/index.json \
+            --annotation "index:org.opencontainers.image.version=${VERSION}" \
+            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "index:org.opencontainers.image.created=${created}" \
+            --annotation "index:org.opencontainers.image.description=${DESCRIPTION}" \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}@$(cat /tmp/digest-amd64)" \
+            "${IMAGE}@$(cat /tmp/digest-arm64)"
+          digest=$(jq -er '."containerimage.descriptor".digest' /tmp/index.json)
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+      # BuildKit's is about what went into the image. This says the image came
+      # out of the caller's main branch through this workflow, signed against
+      # the runner's OIDC identity
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: steps.decide.outputs.publish == 'true'
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.merge.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      # What users pull, as they pull it. A private package, or a :latest
+      # that is not the index just pushed, fails the run here rather than
+      # when someone first pulls.
+      - name: Check :latest is the pushed index to an anonymous client
+        if: steps.decide.outputs.publish == 'true'
+        # bash's pipefail, so a failed inspect fails the pipeline
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: |
+          if ! pulled=$(skopeo inspect --raw --no-creds "docker://${IMAGE}:latest" | shasum -a 256) ||
+            [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
+            echo "${IMAGE}:latest is not anonymously pullable as ${DIGEST}" >&2
+            exit 1
+          fi
+          echo "${IMAGE}:latest is ${DIGEST} to an anonymous client"

@@ -21,3 +21,8 @@ paths:
       # four names on the job context, whose type starts {check_run_id:, so
       # a misspelt one still fails.
       - '^property "workflow_(ref|sha|repository|file_path)" is not defined in object type \{check_run_id: '
+      # GitHub documents concurrency's queue key, whose max lets pending
+      # runs wait their turn instead of replacing one another, but
+      # actionlint 1.7.12 does not know it yet (rhysd/actionlint#657). Only
+      # that key, so any other unknown key under concurrency still fails.
+      - '^unexpected key "queue" for "concurrency" section\. '
