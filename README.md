@@ -179,13 +179,20 @@ releases both.
   instead: v2.0.0 follows v1.3.0, and the notes open with what each mark
   says, each text once. A commit marks one with a
   `Breaking-change: <what broke>` trailer, even an empty one, or with any
-  line of its message that starts with `Breaking-change:`, bulleted with
-  `* ` or `- ` or not. So a `Breaking-change:` line anywhere in a squash
+  line of its message that starts, after optional blanks and an optional
+  `*` or `-` bullet followed by blanks, with `Breaking-change`, in any
+  case, then optional blanks and `:`. So such a line anywhere in a squash
   merge's body counts, and so does one on a merge commit. The words
   mid-sentence do not.
 - A change breaks callers when it changes a reusable workflow's inputs,
   outputs or the permissions its calling job must grant, or a tool's
   flags or exit codes.
+
+Every pull request previews the release its merge would make:
+`self-ci.yml`'s `release-preview` job, which `required` needs, dry-runs
+`divbast-release` on GitHub's test merge of the pull request into main
+and writes the version, minor or major, and its notes to the run's
+summary.
 
 A repository pins ci at a release, the release's commit with its tag as
 the comment, and zizmor and pinact check that pair as they do any other

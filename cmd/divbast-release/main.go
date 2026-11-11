@@ -17,9 +17,10 @@
 // The version is the latest vX.Y.Z tag SHA descends from with its minor
 // number raised, or its major number raised when any commit since, merges
 // included, marks a breaking change: with a Breaking-change trailer, even
-// an empty one, or with any line of its message that starts with
-// Breaking-change:, after optional blanks and a "* " or "- " bullet, as a
-// squash merge lists its commits' messages. A repository with no release
+// an empty one, or with any line of its message that starts, after
+// optional blanks and an optional "*" or "-" bullet followed by blanks,
+// with Breaking-change, in any case, then optional blanks and a colon, as
+// a squash merge lists its commits' messages. A repository with no release
 // yet starts at v1.0.0. The notes list what each breaking change says,
 // once, then the subject of every commit since that tag but merges.
 //
