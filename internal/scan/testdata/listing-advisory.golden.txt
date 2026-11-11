@@ -1,0 +1,4 @@
+compared with nothing, because ghcr.io/divbast/librespeed:latest is not anonymously pullable
+1 advisory: nothing published yet:
+  CVE-2026-116587 HIGH github.com/go-jose/go-jose/v3 v3.0.5, no fix, usr/local/bin/frankenphp
+0 already published, so advisory:

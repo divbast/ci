@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The fixture's own Caddyfile with a third site, on :9090, outside the
+# contract's two ports. Built from the fixture's file, so every other
+# route stays as it was.
+
+# testfixture.LibreSpeed, pinned by its index digest, which the test
+# passes in so that the fixture is named in one place only
+ARG FIXTURE
+
+FROM ${FIXTURE} AS fixture
+
+FROM docker.io/library/busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS caddyfile
+COPY --from=fixture /etc/frankenphp/Caddyfile /Caddyfile
+RUN printf '\n:9090 {\n\trespond 404\n}\n' >>/Caddyfile
+
+FROM fixture
+COPY --from=caddyfile /Caddyfile /etc/frankenphp/Caddyfile

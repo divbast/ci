@@ -1,0 +1,1 @@
+time="2026-11-11T12:37:50+11:00" level=fatal msg="Error parsing image name \"docker://ghcr.io/divbast/no-such-package:latest\": fetching manifest latest in ghcr.io/divbast/no-such-package: Requesting bearer token: received unexpected HTTP status: 403 Forbidden"

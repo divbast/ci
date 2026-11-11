@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The fixture with its HEALTHCHECK one second slower: still exec form, the
+# same probe and every other timing the same.
+
+# testfixture.LibreSpeed, pinned by its index digest, which the test
+# passes in so that the fixture is named in one place only
+ARG FIXTURE
+FROM ${FIXTURE}
+
+HEALTHCHECK --interval=31s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/frankenphp", "php-cli", "/usr/local/bin/librespeed-health"]

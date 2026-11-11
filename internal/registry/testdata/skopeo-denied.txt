@@ -1,0 +1,1 @@
+time="2026-11-11T12:43:51+11:00" level=fatal msg="Error parsing image name \"docker://docker.io/divbast/no-such-repo-t4:latest\": reading manifest latest in docker.io/divbast/no-such-repo-t4: requested access to the resource is denied"

@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# ci's own CI. The lint job calls lint.yml from this same commit, so every
+# change to it is run here before any caller can pin it.
+name: self-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint
+    # A job-level call, which GitHub resolves from this commit before any
+    # step runs, so no checkout can stand in for it. The $/ form zizmor asks
+    # for is one actionlint 1.7.12 cannot parse yet.
+    uses: ./.github/workflows/lint.yml # zizmor: ignore[self-repository] see above
+    with:
+      php: true
+    permissions:
+      contents: read
+
+  # Both engines on both arches, the matrix the harness and contract tests
+  # run under.
+  test:
+    name: test
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        engine: [docker, podman]
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      # The probe's own tests run it with the host's PHP, the version the
+      # images run. mise's PHP backend compiles PHP from source.
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.5'
+          coverage: none
+
+      - name: Allow unprivileged user namespaces
+        if: matrix.engine == 'podman'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # Rootless podman schedules an image HEALTHCHECK through a transient
+      # systemd user timer. A runner has no user session, so podman silently
+      # falls back to the cgroupfs manager, never runs the check, and leaves
+      # State.Health a nil pointer - which reads as a broken image rather than
+      # a runner that cannot schedule anything.
+      - name: Give podman a systemd user session
+        if: matrix.engine == 'podman'
+        run: |
+          sudo loginctl enable-linger "${USER}"
+          uid=$(id -u)
+          for _ in $(seq 30); do
+            [ -S "/run/user/${uid}/bus" ] && break
+            sleep 1
+          done
+          [ -S "/run/user/${uid}/bus" ] || {
+            echo "no user bus at /run/user/${uid}/bus after 30s" >&2
+            exit 1
+          }
+          echo "XDG_RUNTIME_DIR=/run/user/${uid}" >> "${GITHUB_ENV}"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus" \
+            >> "${GITHUB_ENV}"
+
+      - name: Use slirp4netns rather than pasta
+        if: matrix.engine == 'podman'
+        run: |
+          mkdir -p ~/.config/containers
+          printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' \
+            > ~/.config/containers/containers.conf
+          podman info --format '{{.Host.RootlessNetworkCmd}}'
+          # systemd here, not cgroupfs, or the healthcheck timer never fires.
+          podman info --format '{{.Host.CgroupManager}}'
+
+      - name: Tests
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: just test
+
+  # The one check main's ruleset requires, so the job list can change without
+  # touching the ruleset. GitHub counts a skipped required check as passing,
+  # so this runs always and treats a skipped or cancelled job as a failure.
+  required:
+    name: required
+    needs: [lint, test]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail unless every needed job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in ${RESULTS}; do
+            if [ "${result}" != success ]; then
+              echo "a required job ended ${result}" >&2
+              exit 1
+            fi
+          done
+
+  # Every green merge to main is released: the next vX.Y.Z tag at that
+  # commit, as an immutable GitHub Release whose notes are the commits since
+  # the last one (cmd/divbast-release). Callers pin ci at a release's commit
+  # with its tag as the comment, which zizmor and pinact can check.
+  release:
+    name: release
+    needs: [required]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # One at a time, so each counts from the tag the one before it made.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    # For the App's key, which only main may deploy to, so no branch's
+    # workflow can mint a tag. Not a deployment, or every merge would add
+    # one to the environment's history.
+    environment:
+      name: renovate
+      deployment: false
+    # The App's token makes the tag and the release; this one only reads.
+    permissions:
+      contents: read
+    steps:
+      # Every commit and tag, which the next version is counted from
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ci's own Go, and nothing else of its toolchain
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          install_args: core:go
+
+      - name: Build ci's tools
+        run: go build -o "${GITHUB_WORKSPACE}/bin/" ./cmd/...
+
+      # Narrowed to this repository and to writing its contents, which a
+      # tag and a release need; the org App is installed on every divbast
+      # repository. Minted last, just before it is used.
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RENOVATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+          repositories: ci
+          permission-contents: write
+
+      - name: Release this commit
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bin/divbast-release -sha "${GITHUB_SHA}"

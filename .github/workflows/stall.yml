@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The stall check every divbast repository calls from a daily schedule. It
+# fails, so GitHub emails someone, when updates have stopped flowing without
+# anything failing loudly: a Renovate pull request that never goes green or
+# never finishes, Renovate itself silent, or daily slots that should have
+# published and did not. A scheduled run's failure goes to whoever last
+# edited the caller's cron line. The checks are cmd/divbast-stall's.
+#
+# The caller's job grants contents, pull-requests, actions, checks,
+# statuses and packages, all read.
+name: stall
+
+on:
+  workflow_call:
+    inputs:
+      checks:
+        description: The checks to run, a JSON array of open, stuck, renovate and slots
+        type: string
+        default: '["open","stuck","renovate","slots"]'
+      published:
+        description: The image the daily slot publishes, such as ghcr.io/divbast/librespeed:latest; slots needs it
+        type: string
+        default: ''
+      slot-workflow:
+        description: The workflow file whose scheduled runs on main are the daily slots
+        type: string
+        default: build.yml
+      renovate-workflow:
+        description: The workflow file that runs Renovate
+        type: string
+        default: renovate.yml
+      open-days:
+        description: Days a Renovate pull request may stay open
+        type: number
+        default: 14
+      stuck-hours:
+        description: Hours one may stay red since it opened, or pending since its last push
+        type: number
+        default: 24
+      run-hours:
+        description: Hours Renovate may go without a successful run
+        type: number
+        default: 24
+      lost-slots:
+        description: Lost daily slots that make a stall
+        type: number
+        default: 2
+
+permissions: {}
+
+jobs:
+  # One job per check, so a run names every stall and not only the first.
+  stall:
+    name: ${{ matrix.check }}
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(inputs.checks) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # read main, compare commits, the repository's age
+      pull-requests: read # list Renovate's pull requests
+      actions: read # list the Renovate and slot runs
+      checks: read # read each pull request's check runs
+      statuses: read # and its commit statuses
+      packages: read # tell a private image from an absent one
+    # Nothing of the caller's is checked out: every check reads the GitHub
+    # API and the registry, and nothing else.
+    steps:
+      - name: Check out divbast/ci at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ci
+          persist-credentials: false
+
+      # ci's own Go, the one its tools are built and tested with, and
+      # nothing else of its toolchain.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          working_directory: .ci
+          install_args: core:go
+
+      - name: Build ci's tools
+        run: go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
+
+      - name: Check ${{ matrix.check }}
+        env:
+          CHECK: ${{ matrix.check }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OPEN_DAYS: ${{ inputs.open-days }}
+          STUCK_HOURS: ${{ inputs.stuck-hours }}
+          RUN_HOURS: ${{ inputs.run-hours }}
+          LOST_SLOTS: ${{ inputs.lost-slots }}
+          PUBLISHED: ${{ inputs.published }}
+          SLOT_WORKFLOW: ${{ inputs.slot-workflow }}
+          RENOVATE_WORKFLOW: ${{ inputs.renovate-workflow }}
+        run: .ci/bin/divbast-stall "${CHECK}"

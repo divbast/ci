@@ -1,0 +1,1 @@
+time="2026-11-11T12:43:52+11:00" level=fatal msg="Error parsing image name \"docker://quay.io/divbast/no-such-repo-t4:latest\": reading manifest latest in quay.io/divbast/no-such-repo-t4: unauthorized: access to the requested resource is not authorized"

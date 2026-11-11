@@ -1,0 +1,373 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The checks every divbast app repository's build workflow calls, on every
+# event it runs on: lint, build the image for both architectures, then run
+# the acceptance suite against each under Docker and Podman, and scan it.
+# Every job checks divbast/ci out at this workflow's commit into .ci and
+# fails unless the caller's workflows all pin that commit, then runs the
+# caller's own recipes, which import the shared ones from .ci.
+#
+# The images it builds are the ones app-publish.yml pushes: the build job
+# uploads each as the artifact image-<arch>.
+#
+# The caller's job grants contents: read, attestations: read and
+# security-events: write.
+name: app-check
+
+on:
+  workflow_call:
+    inputs:
+      php:
+        description: Install PHP 8.5 and Composer, for a lint that runs PHPStan
+        type: boolean
+        default: true
+      no-cache-filters:
+        description: >-
+          Build stages, separated by spaces, that the daily slot and a manual
+          run build without the cache: the ones that fetch from outside the
+          repository
+        type: string
+        default: ''
+
+permissions: {}
+
+jobs:
+  # lint.yml's job, step for step. A job calling lint.yml would be a
+  # reusable workflow nested in this one, and its check would be named
+  # `<caller> / lint / lint`.
+  lint:
+    name: lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A step's `uses: ./` and a recipe's .ci/ both resolve against the
+      # caller's checkout, so this workflow's own commit goes in there.
+      - name: Check out divbast/ci at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ci
+          persist-credentials: false
+
+      # Before the pin check, which needs the caller's pinned Go.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      # `just setup` would otherwise check .ci out again at whatever commit
+      # the caller's workflows pin, and lint with that one. ci's tools build
+      # as ci's own module, since Go maps no ./.ci/ path into a caller's
+      # module, and run from the caller's root, so -dir's default is its.
+      - name: Check the caller pins this commit of divbast/ci
+        if: github.repository != 'divbast/ci'
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
+          .ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
+
+      # mise's PHP backend compiles PHP from source.
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        if: inputs.php
+        with:
+          php-version: '8.5'
+          coverage: none
+
+      - run: just setup
+      - run: just lint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  build:
+    name: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      attestations: read # verify the FrankenPHP binary's attestation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A step's `uses: ./` and a recipe's .ci/ both resolve against the
+      # caller's checkout, so this workflow's own commit goes in there.
+      - name: Check out divbast/ci at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ci
+          persist-credentials: false
+
+      # Before the pin check, which needs the caller's pinned Go.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      # `just setup` would otherwise check .ci out again at whatever commit
+      # the caller's workflows pin, and lint with that one. ci's tools build
+      # as ci's own module, since Go maps no ./.ci/ path into a caller's
+      # module, and run from the caller's root, so -dir's default is its.
+      - name: Check the caller pins this commit of divbast/ci
+        if: github.repository != 'divbast/ci'
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
+          .ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
+
+      # Before anything is built from it: the binary must come from
+      # divbast/frankenphp's own build on main, by the digest the
+      # Containerfile names. A local `just build` skips this.
+      - name: Verify the FrankenPHP binary's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .ci/bin/divbast-verify-frankenphp
+
+      # The default docker driver cannot write an image index
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Pin the build clock to the commit
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "${GITHUB_ENV}"
+      # Never for the two events that publish, which build from scratch.
+      - name: Cache the build layers
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-${{ matrix.arch }}-${{ hashFiles('Containerfile') }}-${{ github.run_id }}
+          restore-keys: |
+            buildx-${{ matrix.arch }}-${{ hashFiles('Containerfile') }}-
+            buildx-${{ matrix.arch }}-
+
+      # An OCI layout is used to enable attestations
+      - name: Build the image
+        env:
+          NO_CACHE_FILTERS: ${{ inputs.no-cache-filters }}
+        run: |
+          image=$(just --evaluate IMAGE)
+          args=(
+            --attest 'type=provenance,mode=max'
+            --attest type=sbom
+            --output 'type=oci,dest=/tmp/image.tar,rewrite-timestamp=true'
+            -f Containerfile -t "${image}"
+          )
+          if [ "${GITHUB_EVENT_NAME}" = schedule ] ||
+            [ "${GITHUB_EVENT_NAME}" = workflow_dispatch ]; then
+            # The daily slot and the button, the two runs that publish. The
+            # stages named here reach outside the repository, so a cache hit
+            # on one means the daily build tested nothing upstream, and a
+            # publish would ship whatever a push or pull request last
+            # fetched, which can be older than what :latest already carries.
+            read -ra stages <<<"${NO_CACHE_FILTERS}"
+            for stage in "${stages[@]}"; do
+              args+=(--no-cache-filter "${stage}")
+            done
+          else
+            # reset=true replaces the export rather than appending to it, which
+            # stops the directory growing every run until it is too large to
+            # restore. Needs Buildx 0.35 or later; the runner has 0.38.
+            args+=(
+              --cache-from 'type=local,src=/tmp/.buildx-cache'
+              --cache-to 'type=local,dest=/tmp/.buildx-cache,mode=max,reset=true'
+            )
+          fi
+          docker buildx build "${args[@]}" .
+
+      - name: Publish the image as an artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp/image.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  test:
+    name: test
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        engine: [docker, podman]
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A step's `uses: ./` and a recipe's .ci/ both resolve against the
+      # caller's checkout, so this workflow's own commit goes in there.
+      - name: Check out divbast/ci at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ci
+          persist-credentials: false
+
+      # Before the pin check, which needs the caller's pinned Go.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      # `just setup` would otherwise check .ci out again at whatever commit
+      # the caller's workflows pin, and lint with that one. ci's tools build
+      # as ci's own module, since Go maps no ./.ci/ path into a caller's
+      # module, and run from the caller's root, so -dir's default is its.
+      - name: Check the caller pins this commit of divbast/ci
+        if: github.repository != 'divbast/ci'
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
+          .ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp
+
+      - name: Allow unprivileged user namespaces
+        if: matrix.engine == 'podman'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # Rootless podman schedules an image HEALTHCHECK through a transient
+      # systemd user timer. A runner has no user session, so podman silently
+      # falls back to the cgroupfs manager, never runs the check, and leaves
+      # State.Health a nil pointer - which reads as a broken image rather than
+      # a runner that cannot schedule anything.
+      - name: Give podman a systemd user session
+        if: matrix.engine == 'podman'
+        run: |
+          sudo loginctl enable-linger "${USER}"
+          uid=$(id -u)
+          for _ in $(seq 30); do
+            [ -S "/run/user/${uid}/bus" ] && break
+            sleep 1
+          done
+          [ -S "/run/user/${uid}/bus" ] || {
+            echo "no user bus at /run/user/${uid}/bus after 30s" >&2
+            exit 1
+          }
+          echo "XDG_RUNTIME_DIR=/run/user/${uid}" >> "${GITHUB_ENV}"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus" \
+            >> "${GITHUB_ENV}"
+
+      - name: Use slirp4netns rather than pasta
+        if: matrix.engine == 'podman'
+        run: |
+          mkdir -p ~/.config/containers
+          printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' \
+            > ~/.config/containers/containers.conf
+          podman info --format '{{.Host.RootlessNetworkCmd}}'
+          # systemd here, not cgroupfs, or the healthcheck timer never fires.
+          podman info --format '{{.Host.CgroupManager}}'
+
+      - name: Load the image under test
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          image=$(just --evaluate IMAGE)
+          case "${ENGINE}" in
+            docker) dest="docker-daemon:${image}" ;;
+            podman) dest="containers-storage:${image}" ;;
+            *) echo "unknown engine ${ENGINE}" >&2; exit 1 ;;
+          esac
+          skopeo --version
+          skopeo copy "oci-archive:/tmp/image.tar" "${dest}"
+          "${ENGINE}" image inspect "${image}" >/dev/null
+          "${ENGINE}" --version
+
+      - name: Acceptance suite
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: just acceptance
+
+  scan:
+    name: scan
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write # upload the findings to code scanning, from main only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A step's `uses: ./` and a recipe's .ci/ both resolve against the
+      # caller's checkout, so this workflow's own commit goes in there.
+      - name: Check out divbast/ci at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ci
+          persist-credentials: false
+
+      # Before the pin check, which needs the caller's pinned Go.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      # `just setup` would otherwise check .ci out again at whatever commit
+      # the caller's workflows pin, and lint with that one. ci's tools build
+      # as ci's own module, since Go maps no ./.ci/ path into a caller's
+      # module, and run from the caller's root, so -dir's default is its.
+      - name: Check the caller pins this commit of divbast/ci
+        if: github.repository != 'divbast/ci'
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
+          .ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp
+
+      # Fails only on what the published image does not already have. Every
+      # finding, blocking or not, lands on the run's summary page.
+      - name: Vulnerability scan
+        env:
+          ARCHIVE: /tmp/image.tar
+        run: just scan
+
+      # Main's findings as code scanning alerts, which close by themselves once
+      # a later scan stops finding them. Even when the scan failed, so a finding
+      # that reached main is on record. Never from a pull request: GitHub would
+      # then add its own check comparing the PR with main, a second gate
+      # measured against something other than what is published.
+      - name: Upload the findings to code scanning
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: /tmp/image.tar.sarif
+          category: trivy-${{ matrix.arch }}

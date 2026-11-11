@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+.agents/
+.superpowers/
+.ci/
+# What `just ci-tools` builds, here where ci is its own checkout
+/bin/
+vendor/

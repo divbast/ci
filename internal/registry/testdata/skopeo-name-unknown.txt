@@ -1,0 +1,1 @@
+time="2026-11-11T12:43:53+11:00" level=fatal msg="Error parsing image name \"docker://public.ecr.aws/divbast/no-such-repo-t4:latest\": reading manifest latest in public.ecr.aws/divbast/no-such-repo-t4: name unknown: The repository with name 'no-such-repo-t4' does not exist in the registry with id 'divbast'"
