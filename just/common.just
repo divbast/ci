@@ -2,11 +2,19 @@
 # SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
 # Lint and test recipes every divbast repository shares. A repository
-# imports this file from its checkout of divbast/ci, and sets the shell
-# itself, since just refuses a setting made twice:
+# imports this file from its checkout of divbast/ci, sets the shell itself,
+# since just refuses a setting made twice, and runs these recipes from a
+# recipe's body:
 #
 #   set shell := ["mise", "exec", "--", "bash", "-euo", "pipefail", "-c"]
 #   import? '.ci/just/common.just'
+#
+#   lint:
+#       {{ just_executable() }} actions-check workflow-audit go-lint
+#
+# Never as dependencies, as in `lint: actions-check`. just resolves those
+# when it reads the justfile, so until setup has fetched .ci no recipe
+# would run at all, setup included.
 #
 # The recipes need that shell: bash, and the tools from the repository's
 # own mise.toml rather than whatever is on PATH.

@@ -21,6 +21,10 @@ setup:
     set -euo pipefail
     mise install
 
+# Dependencies only because common.just is always here. A repository
+# importing it from .ci calls these from a recipe's body instead.
+
+# Every lint gate
 lint: actions-check workflow-audit actionlint shell-lint go-lint reuse-lint
 
 test: go-test
