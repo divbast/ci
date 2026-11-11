@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
 [tools]
-"core:go" = "1.27.3"
+"core:go" = "1.27.4"
 "aqua:golangci/golangci-lint" = "2.15.0"
 
 "aqua:koalaman/shellcheck" = "0.11.0"
