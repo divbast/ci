@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"slices"
 	"strings"
@@ -57,6 +58,34 @@ func TestOS(t *testing.T) {
 			}
 			if got := string(res.Stderr); got != tt.wantStderr {
 				t.Errorf("Run(%q).Stderr = %q, want %q", tt.argv, got, tt.wantStderr)
+			}
+		})
+	}
+}
+
+func TestOSRunStdin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		stdin      io.Reader
+		wantStdout string
+	}{
+		{name: "fed", stdin: strings.NewReader("line one\nline two\n"), wantStdout: "line one\nline two\n"},
+		// nil is no stdin at all, as Run gives, not a reader to block on.
+		{name: "nil-is-none", stdin: nil, wantStdout: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := execx.OS{}.RunStdin(t.Context(), tt.stdin, "cat")
+			if err != nil {
+				t.Fatalf("RunStdin(cat) error = %v, want nil", err)
+			}
+			if res.Code != 0 || string(res.Stdout) != tt.wantStdout {
+				t.Errorf("RunStdin(cat) = code %d, stdout %q; want code 0, stdout %q", res.Code, res.Stdout, tt.wantStdout)
 			}
 		})
 	}
@@ -171,6 +200,82 @@ func TestFakeReplays(t *testing.T) {
 	rec.runCleanups()
 	if len(rec.errors) != 1 || !strings.Contains(rec.errors[0], `["gh" "api" "a" "b"]`) {
 		t.Errorf("reported %q, want exactly the one unexpected call", rec.errors)
+	}
+}
+
+func TestFakeStdin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		want  []byte
+		run   func(t *testing.T, f *execx.Fake) error
+		wantR []string
+	}{
+		{
+			name: "fed-what-was-scripted",
+			want: []byte("<?php\n"),
+			run: func(t *testing.T, f *execx.Fake) error {
+				t.Helper()
+				_, err := f.RunStdin(t.Context(), strings.NewReader("<?php\n"), "docker", "exec", "-i", "c")
+				return err
+			},
+		},
+		{
+			name: "fed-something-else",
+			want: []byte("<?php\n"),
+			run: func(t *testing.T, f *execx.Fake) error {
+				t.Helper()
+				_, err := f.RunStdin(t.Context(), strings.NewReader("other"), "docker", "exec", "-i", "c")
+				return err
+			},
+			wantR: []string{`["docker" "exec" "-i" "c"] was fed "other", want "<?php\n"`},
+		},
+		{
+			name: "run-without-the-stdin-scripted",
+			want: []byte("<?php\n"),
+			run: func(t *testing.T, f *execx.Fake) error {
+				t.Helper()
+				_, err := f.Run(t.Context(), "docker", "exec", "-i", "c")
+				return err
+			},
+			wantR: []string{`["docker" "exec" "-i" "c"] was fed "", want "<?php\n"`},
+		},
+		{
+			name: "nil-stdin-matches-none-scripted",
+			run: func(t *testing.T, f *execx.Fake) error {
+				t.Helper()
+				_, err := f.RunStdin(t.Context(), nil, "docker", "exec", "-i", "c")
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := &recorder{}
+			fake := execx.NewFake(rec, execx.Call{
+				Argv:   []string{"docker", "exec", "-i", "c"},
+				Stdin:  tt.want,
+				Result: execx.Result{Stdout: []byte("done")},
+			})
+			err := tt.run(t, fake)
+			rec.runCleanups()
+
+			if (err != nil) != (len(tt.wantR) > 0) {
+				t.Errorf("error = %v, want one only when the stdin differs", err)
+			}
+			if len(rec.errors) != len(tt.wantR) {
+				t.Fatalf("reported %q, want %q", rec.errors, tt.wantR)
+			}
+			for i, want := range tt.wantR {
+				if !strings.Contains(rec.errors[i], want) {
+					t.Errorf("report %d = %q, want it to contain %q", i, rec.errors[i], want)
+				}
+			}
+		})
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os/exec"
 	"slices"
@@ -37,12 +38,20 @@ type Runner interface {
 	Run(ctx context.Context, name string, args ...string) (Result, error)
 }
 
+// StdinRunner is [Runner]'s companion for a command that reads its stdin,
+// such as `docker exec -i`. It keeps the same contract on Result and error,
+// and a nil stdin is no stdin at all, as Run gives.
+type StdinRunner interface {
+	RunStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (Result, error)
+}
+
 // waitDelay bounds how long Run waits, once the process has exited or its
 // context is done, for anything it left holding stdout or stderr open.
 const waitDelay = 10 * time.Second
 
-// OS is the [Runner] that runs commands on the host, looked up on PATH,
-// with the caller's environment and working directory and no stdin.
+// OS is the [Runner] and [StdinRunner] that runs commands on the host,
+// looked up on PATH, with the caller's environment and working directory,
+// and no stdin unless RunStdin is given one.
 //
 // A command that exits non-zero yields a Result with that Code and a nil
 // error. Run returns an error, wrapping [exec.ErrNotFound],
@@ -51,12 +60,18 @@ const waitDelay = 10 * time.Second
 type OS struct{}
 
 // Run implements [Runner].
-func (OS) Run(ctx context.Context, name string, args ...string) (Result, error) {
+func (o OS) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	return o.RunStdin(ctx, nil, name, args...)
+}
+
+// RunStdin implements [StdinRunner].
+func (OS) RunStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (Result, error) {
 	var stdout, stderr bytes.Buffer
 	// G204 objects to a subprocess named by a variable, which is what a
 	// Runner is for. exec runs it without a shell, so no argument can
 	// smuggle in a second command.
 	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: running the caller's command is the point, with no shell
+	cmd.Stdin = stdin
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	cmd.WaitDelay = waitDelay
@@ -85,21 +100,26 @@ type TB interface {
 	Cleanup(f func())
 }
 
-// Call is one scripted invocation: the whole argv, command name first, and
-// what running it returns.
+// Call is one scripted invocation: the whole argv, command name first, the
+// stdin it must be fed, and what running it returns.
 type Call struct {
-	Argv   []string
+	Argv []string
+	// Stdin is what the invocation must be fed, all of it. An invocation
+	// through Run, or RunStdin with a nil reader, is fed nothing.
+	Stdin  []byte
 	Result Result
 	Err    error
 }
 
-// Fake is a [Runner] that replays scripted calls, for tests.
+// Fake is a [Runner] and [StdinRunner] that replays scripted calls, for
+// tests.
 //
 // Calls are keyed by their whole argv, not by their order: each scripted
 // Call answers one invocation with exactly that argv, and several Calls
 // with the same argv answer successive invocations in the order given.
 // An invocation the script has no Call left for fails the test and returns
-// an error, as does, when the test ends, a Call that never ran.
+// an error, as does one fed other than its Call's Stdin, and, when the
+// test ends, a Call that never ran.
 type Fake struct {
 	tb TB
 
@@ -120,9 +140,24 @@ func NewFake(tb TB, calls ...Call) *Fake {
 }
 
 // Run implements [Runner].
-func (f *Fake) Run(_ context.Context, name string, args ...string) (Result, error) {
+func (f *Fake) Run(ctx context.Context, name string, args ...string) (Result, error) {
+	return f.RunStdin(ctx, nil, name, args...)
+}
+
+// RunStdin implements [StdinRunner]. It reads stdin to its end before it
+// answers, as a command that consumed it would.
+func (f *Fake) RunStdin(_ context.Context, stdin io.Reader, name string, args ...string) (Result, error) {
 	argv := append([]string{name}, args...)
 	k := key(argv)
+
+	var fed []byte
+	if stdin != nil {
+		var err error
+		if fed, err = io.ReadAll(stdin); err != nil {
+			f.tb.Errorf("execx.Fake: reading the stdin of %q: %v", argv, err)
+			return Result{}, fmt.Errorf("execx.Fake: reading the stdin of %q: %w", argv, err)
+		}
+	}
 
 	f.mu.Lock()
 	queue := f.pending[k]
@@ -135,7 +170,21 @@ func (f *Fake) Run(_ context.Context, name string, args ...string) (Result, erro
 	f.pending[k] = queue[1:]
 	f.mu.Unlock()
 
+	if !bytes.Equal(fed, c.Stdin) {
+		f.tb.Errorf("execx.Fake: %q was fed %s, want %s", argv, clip(fed), clip(c.Stdin))
+		return Result{}, fmt.Errorf("execx.Fake: %q was fed other than its scripted stdin", argv)
+	}
 	return c.Result, c.Err
+}
+
+// clip quotes the start of b, enough to tell two stdins apart in a report
+// without pasting a whole file into it.
+func clip(b []byte) string {
+	const keep = 120
+	if len(b) <= keep {
+		return fmt.Sprintf("%q", b)
+	}
+	return fmt.Sprintf("%q... (%d bytes)", b[:keep], len(b))
 }
 
 func (f *Fake) checkAllRan() {
