@@ -10,11 +10,12 @@
 // that tag, merges included, marks a breaking change. A repository with
 // no such tag yet releases v1.0.0. A commit marks one with a
 // Breaking-change trailer, even an empty one, or with any line of its
-// message that starts with Breaking-change:, after optional blanks and a
-// "* " or "- " bullet. That second rule finds the trailers a squash merge
-// buries in its body, where it lists each squashed commit's message, and
-// errs towards a major release: a needless major waits for an approval,
-// where a missed one would merge a break into every caller.
+// message that starts, after optional blanks and an optional "*" or "-"
+// bullet followed by blanks, with Breaking-change, in any case, then
+// optional blanks and a colon. That second rule finds the trailers a
+// squash merge buries in its body, where it lists each squashed commit's
+// message, and errs towards a major release: a needless major waits for
+// an approval, where a missed one would merge a break into every caller.
 //
 // The notes list the text of each breaking change, once, then the subject
 // of every commit since the last release but merges, which bring changes
@@ -88,8 +89,8 @@ type Commit struct {
 	Merge bool
 	// Breaking holds what each breaking change the commit marks says, once
 	// each: a trailer's value with folded lines joined, or the rest of a
-	// line that starts with Breaking-change:. A mark that says nothing is
-	// the commit's subject.
+	// line that marks one, after its colon. A mark that says nothing is the
+	// commit's subject.
 	Breaking []string
 }
 
@@ -382,9 +383,9 @@ func (r runner) holds(ctx context.Context, tip, sha string) (bool, error) {
 
 // breakingIn returns what each breaking change a commit marks says, once
 // each, given its subject, its Breaking-change trailers as git prints them
-// and its whole message. A line that starts with Breaking-change: and is
-// the first line of a folded trailer, read whole already, is not counted
-// twice. A mark that says nothing is the subject.
+// and its whole message. A line breakingLine matches that is the first
+// line of a folded trailer, read whole already, is not counted twice. A
+// mark that says nothing is the subject.
 func breakingIn(subject, trailers, message string) []string {
 	var (
 		texts  []string
@@ -448,11 +449,12 @@ const (
 var logFormat = "--format=%H" + "%x1f" + "%P" + "%x1f" + "%s" + "%x1f" +
 	"%(trailers:key=" + Trailer + ",unfold,separator=%x1d)" + "%x1f" + "%B" + "%x1e"
 
-// breakingLine is a line of a message that starts with Breaking-change:,
-// after optional blanks and a "* " or "- " bullet, as a squash merge's
-// body lists each squashed commit's message. It captures the rest of the
-// line.
-var breakingLine = regexp.MustCompile(`(?im)^[ \t]*(?:[*-] )?` + Trailer + `:(.*)$`)
+// breakingLine is a line of a message that starts, after optional blanks
+// and an optional "*" or "-" bullet followed by blanks, with
+// Breaking-change, in any case, then optional blanks and a colon, as a
+// squash merge's body lists each squashed commit's message. It captures
+// the rest of the line.
+var breakingLine = regexp.MustCompile(`(?im)^[ \t]*(?:[*-][ \t]+)?` + Trailer + `[ \t]*:(.*)$`)
 
 // log returns the commits in the revision range, merges included, oldest
 // first.

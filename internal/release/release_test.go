@@ -206,6 +206,25 @@ func subjects(commits []release.Commit) []string {
 	return s
 }
 
+// squashSubject is the subject of the commit squash makes.
+const squashSubject = "ci: rename the input (#9)"
+
+// squash returns a setup that releases v1.0.0, then makes a squash merge
+// whose body lists two squashed commits' messages, with line in the
+// first's trailers, a paragraph git does not parse as trailers, and pushes
+// main and the tag.
+func squash(line string) func(r *repo) string {
+	return func(r *repo) string {
+		r.commit("a: one" + trailers)
+		r.git("tag", "v1.0.0")
+		sha := r.commit(squashSubject + "\n\n" +
+			"* lint: rename the input\n\nWhy.\n\n" + line + "\nDeveloped-by: X <x@x.invalid>\n\n" +
+			"* docs: say so" + trailers)
+		r.push("v1.0.0")
+		return sha
+	}
+}
+
 func TestPrepare(t *testing.T) {
 	t.Parallel()
 
@@ -521,6 +540,71 @@ func TestPrepare(t *testing.T) {
 			wantVersion:  "v2.0.0",
 			wantSubjects: []string{"ci: rework the scan (#8)"},
 			wantBreaking: []string{"divbast-scan's -layout is now -oci-layout", "divbast-scan needs -vex"},
+			wantTip:      true,
+		},
+		// git's trailer parser takes blanks between a key and its colon,
+		// and a bullet may be followed by any blanks, so a buried line
+		// counts with either, in any case. The key mid-sentence or inside a
+		// word does not.
+		{
+			name:         "squash-blank-before-the-colon",
+			setup:        squash("* Breaking-change : the input was renamed"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{squashSubject},
+			wantBreaking: []string{"the input was renamed"},
+			wantTip:      true,
+		},
+		{
+			name:         "squash-blanks-before-the-colon",
+			setup:        squash("-\tBreaking-change \t: the input was renamed"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{squashSubject},
+			wantBreaking: []string{"the input was renamed"},
+			wantTip:      true,
+		},
+		{
+			name:         "squash-tab-after-the-bullet",
+			setup:        squash("*\tBreaking-change: the input was renamed"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{squashSubject},
+			wantBreaking: []string{"the input was renamed"},
+			wantTip:      true,
+		},
+		{
+			name:         "squash-two-spaces-after-the-bullet",
+			setup:        squash("-  Breaking-change: the input was renamed"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{squashSubject},
+			wantBreaking: []string{"the input was renamed"},
+			wantTip:      true,
+		},
+		{
+			name:         "squash-lower-case",
+			setup:        squash("* breaking-change: the input was renamed"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{squashSubject},
+			wantBreaking: []string{"the input was renamed"},
+			wantTip:      true,
+		},
+		{
+			name:         "squash-key-mid-sentence",
+			setup:        squash("* see the Breaking-change: rules in README"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{squashSubject},
+			wantTip:      true,
+		},
+		{
+			name:         "squash-key-inside-a-word",
+			setup:        squash("NotBreaking-change: x"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{squashSubject},
 			wantTip:      true,
 		},
 		// A trailer that says nothing still breaks, and the notes name its
