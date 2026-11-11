@@ -24,7 +24,7 @@ on: pull_request
 permissions: {}
 jobs:
   lint:
-    uses: divbast/ci/.github/workflows/lint.yml@` + ref + ` # main
+    uses: divbast/ci/.github/workflows/lint.yml@` + ref + ` # v1.0.0
 `
 }
 

@@ -20,7 +20,7 @@ func workflows(t *testing.T, refs ...string) string {
 	t.Helper()
 	dir := t.TempDir()
 	for i, ref := range refs {
-		body := "jobs:\n  lint:\n    uses: divbast/ci/.github/workflows/lint.yml@" + ref + " # main\n"
+		body := "jobs:\n  lint:\n    uses: divbast/ci/.github/workflows/lint.yml@" + ref + " # v1.0.0\n"
 		name := filepath.Join(dir, "w"+string(rune('a'+i))+".yml")
 		if err := os.WriteFile(name, []byte(body), 0o600); err != nil {
 			t.Fatal(err)

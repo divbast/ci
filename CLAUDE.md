@@ -4,12 +4,13 @@
 # ci
 
 The reusable workflows, Go tools, acceptance harness and lint configuration
-every divbast repository shares. Callers pin it at one commit and check it
-out at that commit into `.ci/`; `README.md` says how. A change here reaches
-a caller only through the pull request that moves its pin, so anything a
-caller sees (a workflow's inputs and permissions, a recipe's name, a tool's
-flags and exit codes) is an interface: change it in a way old callers keep
-working with, or say in the commit that it breaks them.
+every divbast repository shares. Every green merge to main is released,
+callers pin a release and check out its commit into `.ci/`; `README.md`
+says how. A change here reaches a caller only through the pull request
+that moves its pin, so anything a caller sees (a workflow's inputs,
+outputs and permissions, a recipe's name, a tool's flags and exit codes)
+is an interface: change it so that old callers keep working, or mark the
+commit as breaking them (below).
 
 ## CRITICAL: Git Commit Message Format
 
@@ -31,6 +32,28 @@ E.g. `Assisted-by: <Claude:claude-4.6-opus>` for Claude Opus 4.6;
 - Sign every commit (`git commit -S`); main accepts only verified
   signatures. Renovate's merges are squashes, which GitHub signs
 - Write commit messages as if a human wrote them, and say why, not what
+
+A change that breaks a reusable workflow's inputs, outputs or permissions,
+or a tool's flags or exit codes, adds a `Breaking-change: <what>` trailer,
+in the trailer block just above those two lines:
+
+```
+Breaking-change: lint.yml no longer takes a php input
+Developed-by: Aryan Ameri <github@aryan.ameri.coffee>
+Assisted-by: <NAME_OF_LLM_MODEL>
+```
+
+It makes the next release major, and its text opens the release notes.
+Only the trailer block counts: the same words anywhere else in the body
+are not a trailer.
+
+## Releases
+
+Every merge to main that passes `required` is released by `self-ci.yml`'s
+`release` job (`cmd/divbast-release`): the next vX.Y.Z tag at the merged
+commit, as an immutable GitHub Release. Never create, move or delete a
+tag by hand. `bin/divbast-release -sha <commit> -dry-run` shows what a
+commit's release would be.
 
 ## CRITICAL: No AI Attribution in Pull Requests
 
@@ -111,7 +134,8 @@ fail.
 ## Workflows
 
 - Every action is pinned to a full SHA with its version as a comment
-  (`just actions-pin`). Refs to ci itself are `@<commit> # main`.
+  (`just actions-pin`). A caller's refs to ci name a release:
+  `@<commit> # vX.Y.Z`.
 - Actions come from GitHub, or from `docker/login-action`,
   `docker/setup-buildx-action`, `jdx/mise-action`,
   `renovatebot/github-action` and `shivammathur/setup-php`.

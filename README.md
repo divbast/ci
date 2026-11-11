@@ -5,12 +5,13 @@
 
 The reusable workflows, Go tools, acceptance harness and lint
 configuration that every divbast repository shares. A repository calls
-ci's workflows at one commit, and checks ci out at that same commit into a
-git-ignored `.ci/`. Its local `just` recipes and its CI then run the same
-code, and a ci change reaches it only through a pull request that moves
-the pin, which the repository's own CI tests.
+ci's workflows at one release, and checks ci out at that release's commit
+into a git-ignored `.ci/`. Its local `just` recipes and its CI then run
+the same code, and a ci change reaches it only through a pull request that
+moves the pin, which the repository's own CI tests.
 
 - [Using ci from a repository](#using-ci-from-a-repository)
+- [Releases](#releases)
 - [Workflows](#workflows)
 - [Attestations](#attestations)
 - [Tools](#tools)
@@ -21,17 +22,17 @@ the pin, which the repository's own CI tests.
 
 ### One pin
 
-Every `uses:` line that names ci names the same full commit on ci's main,
-with the comment `# main`, since ci has no releases:
+Every `uses:` line that names ci names the same [release](#releases) of
+it: the release's full commit SHA, with its tag as the comment.
 
 ```yaml
 jobs:
   lint:
-    uses: divbast/ci/.github/workflows/lint.yml@<commit> # main
+    uses: divbast/ci/.github/workflows/lint.yml@<commit> # vX.Y.Z
 ```
 
-Renovate moves every such line together, as one github-actions digest
-update. `lint.yml`, `app-check.yml` and `app-publish.yml`, which run the
+Renovate moves every such line together, commit and comment, in one pull
+request. `lint.yml`, `app-check.yml` and `app-publish.yml`, which run the
 repository's own recipes and code, check ci out at their own commit into
 `.ci` and run `divbast-pin -expect <that commit>`, so a repository whose
 workflows name more than one commit, or one other than the commit running,
@@ -49,7 +50,7 @@ setup:
     #!/usr/bin/env bash
     # Not through the mise exec shell: this is what installs what it runs
     set -euo pipefail
-    # The one commit every workflow calls divbast/ci at
+    # The one release commit every workflow calls divbast/ci at
     uses="^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*[\"']?divbast/ci/[^@[:space:]\"']+@[^[:space:]\"'#]+"
     sha=$(grep -hoE "${uses}" .github/workflows/*.y*ml | sed 's/.*@//' | sort -u | paste -sd ' ' - || true)
     if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -161,6 +162,38 @@ they are given are its own. Go builds them as ci's own module: it maps no
 ./.ci/cmd/<tool>` does not work. In CI, each workflow builds them in its
 pin check, before any step that needs one.
 
+## Releases
+
+Every green merge to ci's main is a release. Once `required` has passed
+on a push to main, `self-ci.yml`'s `release` job runs `divbast-release`,
+which tags the merged commit with the next version and publishes it as a
+GitHub Release, immutable once published. Its notes list the subject of
+every commit since the last release.
+
+- The version is the last release's with its minor number raised:
+  v1.4.0 follows v1.3.0. The first release is v1.0.0.
+- A commit whose trailer block carries `Breaking-change: <what broke>`
+  makes the next release major instead: v2.0.0 follows v1.3.0, and the
+  notes open with each such trailer's text. A change breaks callers when
+  it changes a reusable workflow's inputs, outputs or the permissions its
+  calling job must grant, or a tool's flags or exit codes.
+
+A repository pins ci at a release, the release's commit with its tag as
+the comment, and zizmor and pinact check that pair as they do any other
+action's:
+
+```yaml
+uses: divbast/ci/.github/workflows/lint.yml@<commit> # vX.Y.Z
+```
+
+Renovate moves every ci ref in a repository together, commit and comment,
+in one pull request. A minor release merges itself once that repository's
+checks pass; a major one waits for approval on the Dependency Dashboard.
+
+The job acts as the divbast org's `divbast-renovate` GitHub App, whose key
+is in ci's `renovate` environment, which only main can deploy to: only a
+merged commit is ever released.
+
 ## Workflows
 
 The caller grants each called job its permissions. A called job gets no
@@ -241,7 +274,7 @@ and its `required` job, the one check its ruleset requires:
 jobs:
   check:
     name: check
-    uses: divbast/ci/.github/workflows/app-check.yml@<commit> # main
+    uses: divbast/ci/.github/workflows/app-check.yml@<commit> # vX.Y.Z
     with:
       no-cache-filters: fetch
     permissions:
@@ -261,7 +294,7 @@ jobs:
     if: >-
       github.ref == 'refs/heads/main'
       && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    uses: divbast/ci/.github/workflows/app-publish.yml@<commit> # main
+    uses: divbast/ci/.github/workflows/app-publish.yml@<commit> # vX.Y.Z
     with:
       image: ghcr.io/divbast/librespeed
       version-arg: LIBRESPEED_VERSION
@@ -386,6 +419,7 @@ text, and documents its usage and exit codes in its package comment
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, or no token) |
 | `divbast-stall open\|stuck\|renovate\|slots` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-frankenphp [-containerfile FILE]` | Refuses a FrankenPHP binary frankenphp's main build did not attest | Verified | Not verified, or the Containerfile names the image other than once in full |
+| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, or the dry run printed | Refused: not a commit, not origin's main, a release tag the clone lacks, or the version's tag taken; or git or gh failed |
 
 ## Shared configuration
 
@@ -397,8 +431,6 @@ with the pin:
 - `.github/actionlint.yaml`: the ubuntu-26.04 runner labels, and an
   ignore for each name GitHub documents that actionlint 1.7.12 does not
   know yet, scoped to that name.
-- `.github/pinact.yaml`: skips `divbast/ci` refs, whose `# main` comment
-  pinact cannot verify; `divbast-pin` checks them instead.
 
 ## Working on ci
 
@@ -408,7 +440,13 @@ recipes above, PHPStan, and the tests. The tests that build and run
 containers run only when `ENGINE` is `docker` or `podman`, so
 `ENGINE=docker just ci` runs them all. `self-ci.yml` runs them on amd64 and
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
-test.
+test. A merge to main that passes them is released.
+
+To see what the next release would be, from a clone with origin's tags:
+
+```sh
+just ci-tools && bin/divbast-release -sha "$(git rev-parse HEAD)" -dry-run
+```
 
 ## Licence
 
