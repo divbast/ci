@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The lint job every divbast repository calls. It runs the caller's own
+# `just lint`, whose recipes and configurations come from this workflow's
+# commit of divbast/ci, checked out at .ci.
+name: lint
+
+on:
+  workflow_call:
+    inputs:
+      php:
+        description: Install PHP 8.5 and Composer, for a lint that runs PHPStan
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A step's `uses: ./` and a recipe's .ci/ both resolve against the
+      # caller's checkout, so this workflow's own commit goes in there.
+      - name: Check out divbast/ci at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .ci
+          persist-credentials: false
+
+      # Before the pin check, which needs the caller's pinned Go.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      # `just setup` would otherwise check .ci out again at whatever commit
+      # the caller's workflows pin, and lint with that one. Run inside .ci,
+      # as its own module: Go maps no ./.ci/ path into a caller's module,
+      # and a caller may have no go.mod at all.
+      - name: Check the caller pins this commit of divbast/ci
+        if: github.repository != 'divbast/ci'
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: >-
+          go -C .ci run ./cmd/divbast-pin
+          -dir "${GITHUB_WORKSPACE}/.github/workflows"
+          -expect "${WORKFLOW_SHA}"
+
+      # mise's PHP backend compiles PHP from source.
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        if: inputs.php
+        with:
+          php-version: '8.5'
+          coverage: none
+
+      - run: just setup
+      - run: just lint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

@@ -16,6 +16,32 @@
 # under `set allow-duplicate-variables`.
 ci_dir := ".ci"
 
+# Fail if any action is not pinned to a full SHA
+actions-check:
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --verify --check
+
+# Rewrite tag references to the SHA
+actions-pin:
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run
+
+# Move every action to its latest release
+actions-update:
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --update
+
+# Audit the workflows for security problems
+workflow-audit:
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" zizmor --persona=auditor .github/workflows
+
+# Check the workflows' syntax, expressions and run: scripts, under ci's
+# configuration
+actionlint:
+    actionlint -config-file {{ ci_dir }}/.github/actionlint.yaml
+
+# ShellCheck and shfmt over every tracked shell script
+shell-lint:
+    git ls-files -z '*.sh' | xargs -0 -r shellcheck
+    git ls-files -z '*.sh' | xargs -0 -r shfmt -d
+
 # Every Go gate but the tests: the compiler, vet, go fix and go mod tidy
 # with nothing to change, then golangci-lint's formatters and linters under
 # ci's configuration

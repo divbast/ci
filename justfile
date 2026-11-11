@@ -21,7 +21,7 @@ setup:
     set -euo pipefail
     mise install
 
-lint: go-lint reuse-lint
+lint: actions-check workflow-audit actionlint shell-lint go-lint reuse-lint
 
 test: go-test
 

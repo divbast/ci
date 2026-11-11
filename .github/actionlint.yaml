@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# actionlint's configuration for every divbast repository. common.just's
+# actionlint recipe passes it from the checkout of ci; here, it is also
+# where actionlint looks on its own.
+
+# actionlint's built-in runner list predates ubuntu-26.04, which is a
+# GitHub-hosted runner, not a self-hosted one.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
+
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      # GitHub documents job.workflow_ref, _sha, _repository and _file_path,
+      # which name a reusable workflow's own commit, but actionlint 1.7.12's
+      # job context does not have them yet (rhysd/actionlint#705). Only these
+      # four names on the job context, whose type starts {check_run_id:, so
+      # a misspelt one still fails.
+      - '^property "workflow_(ref|sha|repository|file_path)" is not defined in object type \{check_run_id: '
