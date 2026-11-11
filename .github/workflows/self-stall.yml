@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# ci's own stall check, through stall.yml from this same commit: a Renovate
+# pull request that never goes green or never finishes, or Renovate itself
+# silent. ci publishes nothing, so it has no daily slots to lose. A
+# scheduled run's failure goes to whoever last edited the cron line below.
+
+name: self-stall
+
+on:
+  schedule:
+    # Clear of the other repositories' stall checks, so none start
+    # together.
+    - cron: '41 12 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# One run at a time; a second has nothing to add to the first.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  stall:
+    name: stall
+    # A job-level call, which GitHub resolves from this commit before any
+    # step runs, so no checkout can stand in for it. The $/ form zizmor asks
+    # for is one actionlint 1.7.12 cannot parse yet.
+    uses: ./.github/workflows/stall.yml # zizmor: ignore[self-repository] see above
+    with:
+      checks: '["open","stuck","renovate"]'
+      renovate-workflow: self-renovate.yml
+    # Everything stall.yml's job asks for, since a called job gets no more
+    # than its caller grants, even what a check ci skips would need.
+    permissions:
+      contents: read # read main, compare commits, the repository's age
+      pull-requests: read # list Renovate's pull requests
+      actions: read # list the Renovate runs
+      checks: read # read each pull request's check runs
+      statuses: read # and its commit statuses
+      packages: read # tell a private image from an absent one, for slots

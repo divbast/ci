@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# Self-hosted Renovate for the calling repository and no other, which every
+# divbast repository calls from its own triggers. It authenticates as the
+# divbast org's `divbast-renovate` GitHub App, so its pull requests trigger
+# the caller's CI the way a person's would, and it can move the action pins
+# under .github/workflows, which a GITHUB_TOKEN may not write. The App's
+# private key lives in the caller's `renovate` environment, which only main
+# may deploy to. divbast/infra manages the App's wiring in each repository:
+# the environment, its client ID and key, and the kill switch the caller
+# passes as `automerge`.
+#
+# Renovate merges its own pull requests, through the API with a squash, once
+# every check on one has passed, and only while `automerge` is true. A
+# squash, because main requires signed commits and GitHub signs the commit a
+# squash makes; it cannot sign a rebase. GitHub's own auto-merge stays off,
+# so the kill switch is the one switch. One merge per run: the merge leaves
+# the other pull requests behind main, and they rebase and re-test first.
+name: renovate
+
+on:
+  workflow_call:
+    inputs:
+      automerge:
+        description: The kill switch, true only while the caller's automerge variable is `enabled`
+        type: boolean
+        required: true
+
+permissions: {}
+
+jobs:
+  renovate:
+    name: renovate
+    # Renovate rewrites the dashboard on every run, and an App's edits fire
+    # events where a GITHUB_TOKEN's would not. Without the sender check every
+    # run would schedule the next. github.event is the caller's event.
+    if: >-
+      github.event_name != 'issues'
+      || (github.event.issue.title == 'Dependency Dashboard'
+          && github.event.sender.type == 'User')
+    # On the job rather than the workflow. GitHub keeps one pending run per
+    # group and a newer one replaces it, so a run the `if` above skips (the
+    # App's own dashboard edit, every run) would otherwise take that slot and
+    # cancel a useful run waiting in it. A skipped job never joins the group:
+    # on 2026-10-29 the run a dashboard edit started was skipped while a
+    # workflow_run run waited here, and that run went ahead uncancelled.
+    concurrency:
+      group: renovate
+      cancel-in-progress: false
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    # For the App's key, not a deployment. The environment's branch policy
+    # still holds without one, and a daily run would otherwise bury the
+    # deployment history. A called job that names an environment reads the
+    # caller's: its variables and secrets are the calling repository's.
+    environment:
+      name: renovate
+      deployment: false
+    # Everything goes through the App token below; the job's own needs nothing.
+    permissions: {}
+    steps:
+      # Narrowed to the calling repository and to the permissions Renovate
+      # uses: the org App is installed on every divbast repository. A
+      # permission the App gains reaches Renovate only once it is named here.
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RENOVATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-statuses: write
+          permission-vulnerability-alerts: read
+          permission-workflows: write
+
+      # No checkout. Renovate clones the repository through the token and reads
+      # renovate.json from the default branch.
+      - uses: renovatebot/github-action@266fef21329c44765ad42f9dea1f01f5d2d91084 # v46.3.13
+        with:
+          token: ${{ steps.token.outputs.token }}
+          renovate-image: ghcr.io/renovatebot/renovate
+          # The action's own default is the floating major tag. Renovate's
+          # github-actions manager reads this input and moves the pin, so the
+          # bot updates itself through a pull request like everything else.
+          renovate-version: 44.227.4
+        env:
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          RENOVATE_ONBOARDING: 'false'
+          RENOVATE_REQUIRE_CONFIG: required
+          # Commits go through the API, which GitHub signs as the App.
+          RENOVATE_PLATFORM_COMMIT: enabled
+          # The kill switch, failing closed: Renovate merges only while
+          # `automerge` is true. False forces automerge off, over
+          # renovate.json and every packageRule. It acts from the next run
+          # and cannot recall a merge already made.
+          RENOVATE_FORCE: ${{ case(inputs.automerge, '', '{"automerge":false}') }}

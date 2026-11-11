@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# Renovate for ci itself, through renovate.yml from this same commit, so
+# every change to it runs here first. Renovate merges its own pull requests
+# only while the repository variable CI_AUTOMERGE is `enabled`, compared
+# without regard to case. Unset, empty or anything else turns automerge off
+# from the next run.
+
+name: self-renovate
+
+on:
+  # Every morning. This cron is Renovate's only clock: the preset sets no
+  # schedule of its own, so a run GitHub starts late still opens its pull
+  # requests instead of finding itself outside a window. 18:17 UTC is 05:17
+  # in Melbourne under daylight saving, 04:17 outside it.
+  schedule:
+    - cron: '17 18 * * *'
+  # A tick on the Dependency Dashboard takes effect now, not tomorrow.
+  issues:
+    types: [edited]
+  # Every merge. A merge leaves every other open PR tested against an older
+  # main, or conflicting with the new one, and GitHub re-runs nothing when a
+  # base moves. The preset's rebaseWhen has Renovate rebase each of them on
+  # its next run, so CI tests them again; this makes that run the next few
+  # minutes rather than the next morning.
+  push:
+    branches: [main]
+  # CI finishing on one of Renovate's branches, so a green pull request
+  # merges now and the next follows, instead of each waiting for a morning.
+  # The job checks out nothing and runs nothing from the run that triggered
+  # it: Renovate reads only the default branch, so a fork's branch named
+  # renovate/* gains nothing by matching.
+  workflow_run: # zizmor: ignore[dangerous-triggers] justified in the comment above
+    workflows: [self-ci]
+    types: [completed]
+    branches: ['renovate/**']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  renovate:
+    name: renovate
+    # A job-level call, which GitHub resolves from this commit before any
+    # step runs, so no checkout can stand in for it. The $/ form zizmor asks
+    # for is one actionlint 1.7.12 cannot parse yet.
+    uses: ./.github/workflows/renovate.yml # zizmor: ignore[self-repository] see above
+    with:
+      automerge: ${{ vars.CI_AUTOMERGE == 'enabled' }}
+    # Renovate works through the App's token; GITHUB_TOKEN needs nothing.
+    permissions: {}
