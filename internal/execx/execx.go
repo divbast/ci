@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -57,7 +58,12 @@ const waitDelay = 10 * time.Second
 // error. Run returns an error, wrapping [exec.ErrNotFound],
 // [context.Canceled] or [context.DeadlineExceeded] where one applies, only
 // when the command could not run or its context ended it.
-type OS struct{}
+type OS struct {
+	// Env holds NAME=value entries every command gets on top of the
+	// caller's environment. An entry overrides the caller's value for its
+	// name, and a later entry an earlier one.
+	Env []string
+}
 
 // Run implements [Runner].
 func (o OS) Run(ctx context.Context, name string, args ...string) (Result, error) {
@@ -65,12 +71,16 @@ func (o OS) Run(ctx context.Context, name string, args ...string) (Result, error
 }
 
 // RunStdin implements [StdinRunner].
-func (OS) RunStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (Result, error) {
+func (o OS) RunStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (Result, error) {
 	var stdout, stderr bytes.Buffer
 	// G204 objects to a subprocess named by a variable, which is what a
 	// Runner is for. exec runs it without a shell, so no argument can
 	// smuggle in a second command.
 	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: running the caller's command is the point, with no shell
+	if len(o.Env) > 0 {
+		// exec keeps the last value it is given for a name.
+		cmd.Env = append(os.Environ(), o.Env...)
+	}
 	cmd.Stdin = stdin
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

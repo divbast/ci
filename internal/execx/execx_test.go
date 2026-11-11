@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -58,6 +59,57 @@ func TestOS(t *testing.T) {
 			}
 			if got := string(res.Stderr); got != tt.wantStderr {
 				t.Errorf("Run(%q).Stderr = %q, want %q", tt.argv, got, tt.wantStderr)
+			}
+		})
+	}
+}
+
+func TestOSEnv(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		env  []string
+		// script prints what the command sees.
+		script string
+		want   string
+	}{
+		{
+			name:   "added",
+			env:    []string{"DIVBAST_EXECX_TEST=set"},
+			script: `printf %s "${DIVBAST_EXECX_TEST}"`,
+			want:   "set",
+		},
+		{
+			name:   "later-wins",
+			env:    []string{"DIVBAST_EXECX_TEST=first", "DIVBAST_EXECX_TEST=second"},
+			script: `printf %s "${DIVBAST_EXECX_TEST}"`,
+			want:   "second",
+		},
+		{
+			name:   "overrides-the-caller",
+			env:    []string{"HOME=/divbast-execx-home"},
+			script: `printf %s "${HOME}"`,
+			want:   "/divbast-execx-home",
+		},
+		{
+			name:   "keeps-the-caller",
+			env:    []string{"DIVBAST_EXECX_TEST=set"},
+			script: `[ "${PATH}" = "$1" ] && printf kept`,
+			want:   "kept",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := execx.OS{Env: tt.env}.Run(t.Context(), "sh", "-c", tt.script, "sh", os.Getenv("PATH"))
+			if err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			if got := string(res.Stdout); res.Code != 0 || got != tt.want {
+				t.Errorf("Run() = code %d, stdout %q; want code 0, stdout %q", res.Code, got, tt.want)
 			}
 		})
 	}
