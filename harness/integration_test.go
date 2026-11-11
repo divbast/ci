@@ -218,7 +218,9 @@ func TestProbeOnFixture(t *testing.T) {
 }
 
 // TestProbeNegative loosens one thing at a time, and the probe must catch
-// each: a check never seen failing proves nothing.
+// each: a check never seen failing proves nothing. Each case names the
+// record that must FAIL, and any that must stay ok, so a check that fails
+// for some other reason, or a subcommand that crashed, does not count.
 func TestProbeNegative(t *testing.T) {
 	t.Parallel()
 	e := integration(t)
@@ -230,6 +232,8 @@ func TestProbeNegative(t *testing.T) {
 		name string
 		spec *RunSpec
 		sub  []string
+		fail string   // the record that must FAIL
+		ok   []string // records that must stay ok
 	}{
 		{
 			// It reaches CapBnd alone: exec clears CapEff and CapPrm for
@@ -237,27 +241,43 @@ func TestProbeNegative(t *testing.T) {
 			name: "a-capability-added",
 			spec: &RunSpec{Confine: Contract("16m"), Extra: []string{"--cap-add", "NET_RAW"}},
 			sub:  []string{"assert-caps"},
+			fail: "CapBnd, every capability bit clear",
 		},
 		{
 			name: "an-init-as-pid-1",
 			spec: &RunSpec{Confine: Contract("16m"), Extra: []string{"--init"}},
 			sub:  slices.Concat([]string{"assert-pid1"}, pid1),
+			fail: "PID 1 argv",
+		},
+		{
+			// The right binary as PID 1, run with other arguments, as a
+			// bootstrap that never handed over would leave it: only the
+			// whole argv tells the two apart.
+			name: "the-server-binary-with-another-argv",
+			spec: &RunSpec{Confine: Contract("16m")},
+			sub:  []string{"assert-pid1", "/usr/local/bin/frankenphp", "run", "--config", "/etc/frankenphp/Other"},
+			fail: "PID 1 argv",
+			ok:   []string{"PID 1 comm"},
 		},
 		{
 			name: "a-writable-root",
 			spec: &RunSpec{Confine: writable},
 			sub:  []string{"assert-read-only"},
+			fail: "writing /.divbast-write-probe fails because / is read-only",
 		},
 		{
 			name: "a-listener-not-named",
 			spec: &RunSpec{Confine: Contract("16m")},
 			sub:  []string{"assert-listeners", "8080"},
+			fail: "TCP ports a process in the container listens on",
+			ok:   []string{"UDP ports a process in the container holds a socket on"},
 		},
 		{
 			// The engine's default network, which has a route out
 			name: "a-network-with-a-route-out",
 			spec: &RunSpec{Confine: Contract("16m")},
 			sub:  []string{"probe-egress"},
+			fail: "outbound TCP to 9.9.9.9:443 is refused",
 		},
 	}
 	for _, tt := range tests {
@@ -274,8 +294,22 @@ func TestProbeNegative(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !slices.ContainsFunc(records, func(r Record) bool { return !r.OK }) {
-				t.Errorf("%s recorded %+v, want a FAIL", tt.sub[0], records)
+
+			byWhat := make(map[string]Record, len(records))
+			for _, r := range records {
+				// What main records for a subcommand that threw
+				if strings.HasSuffix(r.What, " completed") {
+					t.Errorf("%s crashed rather than checked: %+v", tt.sub[0], r)
+				}
+				byWhat[r.What] = r
+			}
+			if r, found := byWhat[tt.fail]; !found || r.OK {
+				t.Errorf("%s recorded %+v, want %q among them, FAIL", tt.sub[0], records, tt.fail)
+			}
+			for _, what := range tt.ok {
+				if r, found := byWhat[what]; !found || !r.OK {
+					t.Errorf("%s recorded %+v, want %q among them, ok", tt.sub[0], records, what)
+				}
 			}
 		})
 	}
