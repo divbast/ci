@@ -9,7 +9,9 @@
 // minor number raised, or its major number raised when any commit since
 // that tag carries a Breaking-change trailer. A repository with no such
 // tag yet releases v1.0.0. The notes list each Breaking-change trailer's
-// text, then the subject of every commit since the last release.
+// text, then the subject of every commit since the last release. Merge
+// commits are left out of both: they bring changes, and say nothing of
+// their own.
 package release
 
 import (
@@ -125,6 +127,9 @@ type Plan struct {
 	// Tip is the commit origin's main points at, empty when origin has no
 	// main.
 	Tip string
+	// Superseded is whether SHA is on origin's main but no longer its tip:
+	// a later merge landed first, and the run for Tip releases SHA with it.
+	Superseded bool
 	// Released is the release tag already at SHA, when there is one, on
 	// origin or in the clone. The fields below are then empty.
 	Released string
@@ -156,9 +161,10 @@ var (
 
 // Prepare works out the release of sha in the clone git runs in, which
 // must have fetched origin's tags. It reads origin's main and release tags
-// from origin itself, and refuses nothing but a version tag already taken
-// elsewhere, or a clone missing origin's tags: [Create] decides whether
-// the plan may be carried out.
+// from origin itself, and when main has moved past sha, whether main holds
+// it, fetching main if the clone lacks it. It refuses nothing but a
+// version tag already taken elsewhere, or a clone missing origin's tags:
+// [Create], and its caller, decide whether the plan may be carried out.
 //
 // The error wraps [ErrNoCommit] when sha is not a commit there,
 // [ErrStaleTags] when origin has a release tag the clone has not fetched,
@@ -212,6 +218,12 @@ func Prepare(ctx context.Context, git execx.Runner, sha string) (Plan, error) {
 	if len(missing) > 0 {
 		slices.Sort(missing)
 		return Plan{}, fmt.Errorf("%w: %s; fetch them with git fetch --tags origin", ErrStaleTags, strings.Join(missing, ", "))
+	}
+
+	if plan.Tip != "" && plan.Tip != sha {
+		if plan.Superseded, err = g.holds(ctx, plan.Tip, sha); err != nil {
+			return Plan{}, err
+		}
 	}
 
 	reachable, err := g.versions(ctx, "--merged", sha)
@@ -322,6 +334,34 @@ func (r runner) origin(ctx context.Context) (tip string, tags map[string]string,
 	return tip, tags, nil
 }
 
+// holds reports whether tip's history holds sha. When the clone lacks
+// tip, because origin's main moved after the clone fetched, it fetches
+// origin's main first.
+func (r runner) holds(ctx context.Context, tip, sha string) (bool, error) {
+	if _, err := r.out(ctx, "cat-file", "-e", tip+"^{commit}"); err != nil {
+		if !errors.Is(err, errNoObject) {
+			return false, err
+		}
+		if _, err = r.out(ctx, "fetch", "--quiet", "--no-tags", "origin", "refs/heads/main"); err != nil {
+			return false, err
+		}
+	}
+	res, err := r.git.Run(ctx, "git", "merge-base", "--is-ancestor", sha, tip)
+	if err != nil {
+		return false, fmt.Errorf("git merge-base: %w", err)
+	}
+	// 1 is git's no. Anything else means it could not answer.
+	switch res.Code {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, fmt.Errorf("git merge-base --is-ancestor %s %s: exit status %d: %s",
+			sha, tip, res.Code, bytes.TrimSpace(res.Stderr))
+	}
+}
+
 // versions returns the release tags git tag lists, every one or those the
 // filter picks, such as --merged <sha>, ignoring every tag that is not
 // vX.Y.Z.
@@ -355,9 +395,10 @@ const (
 var logFormat = "--format=%H" + "%x1f" + "%s" + "%x1f" +
 	"%(trailers:key=" + Trailer + ",valueonly,unfold,separator=%x1d)" + "%x1e"
 
-// log returns the commits in the revision range, oldest first.
+// log returns the commits in the revision range, oldest first, leaving
+// out merges.
 func (r runner) log(ctx context.Context, revisions string) ([]Commit, error) {
-	out, err := r.out(ctx, "log", "--reverse", logFormat, revisions)
+	out, err := r.out(ctx, "log", "--reverse", "--no-merges", logFormat, revisions)
 	if err != nil {
 		return nil, err
 	}

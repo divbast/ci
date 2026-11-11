@@ -207,6 +207,8 @@ func TestPrepare(t *testing.T) {
 		wantBreaking []string
 		// wantTip is whether origin's main is the commit released.
 		wantTip bool
+		// wantSuperseded is whether a later commit on origin's main holds it.
+		wantSuperseded bool
 	}{
 		{
 			name: "first-release",
@@ -361,17 +363,91 @@ func TestPrepare(t *testing.T) {
 			wantSubjects: []string{"b: two"},
 			wantTip:      true,
 		},
-		// Prepare reports the tip; Create is what refuses.
+		// A later merge landed first: the run for main's tip releases it.
 		{
-			name: "not-the-tip",
+			name: "superseded",
 			setup: func(r *repo) string {
 				sha := r.commit("a: one" + trailers)
 				r.commit("b: two" + trailers)
 				r.push()
 				return sha
 			},
-			wantVersion:  "v1.0.0",
-			wantSubjects: []string{"a: one"},
+			wantVersion:    "v1.0.0",
+			wantSubjects:   []string{"a: one"},
+			wantSuperseded: true,
+		},
+		// Landed after this clone fetched, so the clone fetches main to
+		// see that it holds the commit.
+		{
+			name: "superseded-since-the-clone-fetched",
+			setup: func(r *repo) string {
+				sha := r.commit("a: one" + trailers)
+				r.push()
+				other := filepath.Join(filepath.Dir(r.dir), "other")
+				gitIn(r.t, filepath.Dir(r.dir), "clone", "--quiet", r.origin, other)
+				gitIn(r.t, other, "commit", "--quiet", "--allow-empty", "--message", "b: two")
+				gitIn(r.t, other, "push", "--quiet", "origin", "main")
+				return sha
+			},
+			wantVersion:    "v1.0.0",
+			wantSubjects:   []string{"a: one"},
+			wantSuperseded: true,
+		},
+		// Prepare reports a commit main does not hold; Create refuses it.
+		{
+			name: "not-on-main",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				r.commit("b: two" + trailers)
+				r.push("v1.0.0")
+				r.git("checkout", "--quiet", "-b", "side", "v1.0.0")
+				return r.commit("s: side" + trailers)
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"s: side"},
+		},
+		// Ruling R30: the notes list the changes, not the merges that
+		// brought them, and a merge's trailers count for nothing.
+		{
+			name: "merges-left-out",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				r.git("checkout", "--quiet", "-b", "feature")
+				r.commit("b: two" + trailers)
+				r.git("checkout", "--quiet", "main")
+				r.commit("c: three" + trailers)
+				r.git("merge", "--quiet", "--no-ff", "--message",
+					"Merge pull request #2 from divbast/feature\n\nBreaking-change: said only by the merge", "feature")
+				sha := r.git("rev-parse", "HEAD")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"b: two", "c: three"},
+			wantTip:      true,
+		},
+		{
+			name: "breaking-under-a-merge",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				r.git("checkout", "--quiet", "-b", "feature")
+				r.commit("b: two\n\nWhy.\n\nBreaking-change: lint.yml drops its php input\nDeveloped-by: X <x@x.invalid>")
+				r.git("checkout", "--quiet", "main")
+				r.git("merge", "--quiet", "--no-ff", "--message", "Merge pull request #2 from divbast/feature", "feature")
+				sha := r.git("rev-parse", "HEAD")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{"b: two"},
+			wantBreaking: []string{"lint.yml drops its php input"},
+			wantTip:      true,
 		},
 		{
 			name: "next-tag-taken-here",
@@ -479,6 +555,9 @@ func TestPrepare(t *testing.T) {
 			}
 			if got := plan.Tip == sha; got != tt.wantTip {
 				t.Errorf("Prepare().Tip = %s; is the commit: %t, want %t", plan.Tip, got, tt.wantTip)
+			}
+			if plan.Superseded != tt.wantSuperseded {
+				t.Errorf("Prepare().Superseded = %t, want %t", plan.Superseded, tt.wantSuperseded)
 			}
 			if tt.wantReleased != "" {
 				return

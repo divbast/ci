@@ -168,7 +168,10 @@ Every green merge to ci's main is a release. Once `required` has passed
 on a push to main, `self-ci.yml`'s `release` job runs `divbast-release`,
 which tags the merged commit with the next version and publishes it as a
 GitHub Release, immutable once published. Its notes list the subject of
-every commit since the last release.
+every commit since the last release, leaving out merge commits. When two
+merges land close together, the run for the earlier one finds main has
+moved on and leaves the release to the run for the later one, which
+releases both.
 
 - The version is the last release's with its minor number raised:
   v1.4.0 follows v1.3.0. The first release is v1.0.0.
@@ -419,7 +422,7 @@ text, and documents its usage and exit codes in its package comment
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, or no token) |
 | `divbast-stall open\|stuck\|renovate\|slots` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-frankenphp [-containerfile FILE]` | Refuses a FrankenPHP binary frankenphp's main build did not attest | Verified | Not verified, or the Containerfile names the image other than once in full |
-| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, or the dry run printed | Refused: not a commit, not origin's main, a release tag the clone lacks, or the version's tag taken; or git or gh failed |
+| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; or git or gh failed |
 
 ## Shared configuration
 

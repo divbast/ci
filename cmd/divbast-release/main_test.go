@@ -34,9 +34,9 @@ func gitIn(t *testing.T, dir string, args ...string) string {
 }
 
 // history is a clone with an origin: a, tagged v1.0.0, then b, which
-// breaks something, then c, all pushed. It returns the clone and the
-// commits.
-func history(t *testing.T) (dir, a, b, c string) {
+// breaks something, then c, all pushed, and side, a commit on a branch
+// from a that main does not hold. It returns the clone and the commits.
+func history(t *testing.T) (dir string, h commits) {
 	t.Helper()
 	base := t.TempDir()
 	dir, origin := filepath.Join(base, "work"), filepath.Join(base, "origin.git")
@@ -47,72 +47,103 @@ func history(t *testing.T) (dir, a, b, c string) {
 		gitIn(t, dir, "commit", "--quiet", "--allow-empty", "--message", msg)
 		return gitIn(t, dir, "rev-parse", "HEAD")
 	}
-	a = commit("lint: share the recipes\n\nWhy.\n\nDeveloped-by: X <x@x.invalid>")
+	h.a = commit("lint: share the recipes\n\nWhy.\n\nDeveloped-by: X <x@x.invalid>")
 	gitIn(t, dir, "tag", "v1.0.0")
-	b = commit("scan: rename -layout\n\nWhy.\n\nBreaking-change: divbast-scan's -layout is now -oci-layout\nDeveloped-by: X <x@x.invalid>")
-	c = commit("docs: say so\n\nWhy.\n\nDeveloped-by: X <x@x.invalid>")
+	h.b = commit("scan: rename -layout\n\nWhy.\n\nBreaking-change: divbast-scan's -layout is now -oci-layout\nDeveloped-by: X <x@x.invalid>")
+	h.c = commit("docs: say so\n\nWhy.\n\nDeveloped-by: X <x@x.invalid>")
 	gitIn(t, dir, "push", "--quiet", "origin", "main", "v1.0.0")
-	return dir, a, b, c
+	gitIn(t, dir, "checkout", "--quiet", "-b", "side", h.a)
+	h.side = commit("side: not on main\n\nDeveloped-by: X <x@x.invalid>")
+	gitIn(t, dir, "checkout", "--quiet", "main")
+	return dir, h
 }
 
-const notes = "## Breaking changes\n\n- divbast-scan's -layout is now -oci-layout\n\n## Changes\n\n- scan: rename -layout\n- docs: say so\n"
+// commits are history's.
+type commits struct{ a, b, c, side string }
+
+const (
+	notes  = "## Breaking changes\n\n- divbast-scan's -layout is now -oci-layout\n\n## Changes\n\n- scan: rename -layout\n- docs: say so\n"
+	notesB = "## Breaking changes\n\n- divbast-scan's -layout is now -oci-layout\n\n## Changes\n\n- scan: rename -layout\n"
+)
+
+func create(c string) []string {
+	return []string{"gh", "release", "create", "v2.0.0", "--target", c, "--title", "v2.0.0", "--notes-file", "-"}
+}
 
 func TestRun(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name string
-		// args builds the command line from the commits.
-		args func(a, b, c string) []string
+		args func(h commits) []string
 		// gh is what gh is scripted to be asked; anything else fails.
-		gh         func(c string) []execx.Call
-		wantCode   int
-		wantStdout string
+		gh       func(h commits) []execx.Call
+		wantCode int
+		stdout   func(h commits) string
 		// wantStderr lists what stderr must contain.
 		wantStderr []string
 	}{
 		{
-			name:       "dry-run",
-			args:       func(_, _, c string) []string { return []string{"-sha", c, "-dry-run"} },
-			wantStdout: "v2.0.0\n\n" + notes,
+			name:   "dry-run",
+			args:   func(h commits) []string { return []string{"-sha", h.c, "-dry-run"} },
+			stdout: func(commits) string { return "v2.0.0\n\n" + notes },
 		},
-		// A dry run says what a real one would refuse, and still shows
-		// the release.
+		// A dry run says what a real one would do, and still shows the
+		// release.
 		{
-			name:       "dry-run-not-the-tip",
-			args:       func(_, b, _ string) []string { return []string{"-sha", b, "-dry-run"} },
-			wantStdout: "v2.0.0\n\n## Breaking changes\n\n- divbast-scan's -layout is now -oci-layout\n\n## Changes\n\n- scan: rename -layout\n",
-			wantStderr: []string{"not the tip of origin's main", "would refuse"},
+			name:       "dry-run-superseded",
+			args:       func(h commits) []string { return []string{"-sha", h.b, "-dry-run"} },
+			stdout:     func(commits) string { return "v2.0.0\n\n" + notesB },
+			wantStderr: []string{"no longer main's tip", "would skip it"},
+		},
+		{
+			name:       "dry-run-not-on-main",
+			args:       func(h commits) []string { return []string{"-sha", h.side, "-dry-run"} },
+			stdout:     func(commits) string { return "v1.1.0\n\n## Changes\n\n- side: not on main\n" },
+			wantStderr: []string{"not on origin's main", "would refuse it"},
 		},
 		{
 			name: "releases",
-			args: func(_, _, c string) []string { return []string{"-sha", c} },
-			gh: func(c string) []execx.Call {
+			args: func(h commits) []string { return []string{"-sha", h.c} },
+			gh: func(h commits) []execx.Call {
 				return []execx.Call{{
-					Argv:   []string{"gh", "release", "create", "v2.0.0", "--target", c, "--title", "v2.0.0", "--notes-file", "-"},
+					Argv:   create(h.c),
 					Stdin:  []byte(notes),
 					Result: execx.Result{Stdout: []byte("https://github.com/divbast/ci/releases/tag/v2.0.0\n")},
 				}}
 			},
-			wantStdout: "https://github.com/divbast/ci/releases/tag/v2.0.0\nreleased v2.0.0 at ",
+			stdout: func(h commits) string {
+				return "https://github.com/divbast/ci/releases/tag/v2.0.0\nreleased v2.0.0 at " + h.c + "\n"
+			},
 		},
 		{
-			name:       "already-released",
-			args:       func(a, _, _ string) []string { return []string{"-sha", a} },
-			wantStdout: " is already released as v1.0.0: nothing to do\n",
+			name: "already-released",
+			args: func(h commits) []string { return []string{"-sha", h.a} },
+			stdout: func(h commits) string {
+				return h.a + " is already released as v1.0.0: nothing to do\n"
+			},
+		},
+		// Ruling R29: a later merge landed first, and its run releases
+		// this commit with it.
+		{
+			name: "superseded",
+			args: func(h commits) []string { return []string{"-sha", h.b} },
+			stdout: func(h commits) string {
+				return h.b + " is no longer main's tip (" + h.c + "); the run for " + h.c + " releases it\n"
+			},
 		},
 		{
-			name:       "not-the-tip",
-			args:       func(_, b, _ string) []string { return []string{"-sha", b} },
+			name:       "not-on-main",
+			args:       func(h commits) []string { return []string{"-sha", h.side} },
 			wantCode:   1,
-			wantStderr: []string{"not the tip of origin's main"},
+			wantStderr: []string{"is not on origin's main"},
 		},
 		{
 			name: "gh-fails",
-			args: func(_, _, c string) []string { return []string{"-sha", c} },
-			gh: func(c string) []execx.Call {
+			args: func(h commits) []string { return []string{"-sha", h.c} },
+			gh: func(h commits) []execx.Call {
 				return []execx.Call{{
-					Argv:   []string{"gh", "release", "create", "v2.0.0", "--target", c, "--title", "v2.0.0", "--notes-file", "-"},
+					Argv:   create(h.c),
 					Stdin:  []byte(notes),
 					Result: execx.Result{Code: 1, Stderr: []byte("HTTP 403: Resource not accessible by integration\n")},
 				}}
@@ -122,7 +153,7 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name: "not-a-commit",
-			args: func(_, _, _ string) []string {
+			args: func(commits) []string {
 				return []string{"-sha", "0000000000000000000000000000000000000000", "-dry-run"}
 			},
 			wantCode:   1,
@@ -130,25 +161,25 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:       "no-sha",
-			args:       func(_, _, _ string) []string { return []string{"-dry-run"} },
+			args:       func(commits) []string { return []string{"-dry-run"} },
 			wantCode:   2,
 			wantStderr: []string{"-sha is required"},
 		},
 		{
 			name:       "short-sha",
-			args:       func(_, _, c string) []string { return []string{"-sha", c[:7]} },
+			args:       func(h commits) []string { return []string{"-sha", h.c[:7]} },
 			wantCode:   2,
 			wantStderr: []string{"full 40-character commit SHA"},
 		},
 		{
 			name:       "stray-argument",
-			args:       func(_, _, c string) []string { return []string{"-sha", c, "now"} },
+			args:       func(h commits) []string { return []string{"-sha", h.c, "now"} },
 			wantCode:   2,
 			wantStderr: []string{`unexpected argument "now"`},
 		},
 		{
 			name:       "help",
-			args:       func(_, _, _ string) []string { return []string{"-h"} },
+			args:       func(commits) []string { return []string{"-h"} },
 			wantStderr: []string{"-dry-run"},
 		},
 	}
@@ -157,29 +188,24 @@ func TestRun(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			dir, a, b, c := history(t)
+			dir, h := history(t)
 			var calls []execx.Call
 			if tt.gh != nil {
-				calls = tt.gh(c)
+				calls = tt.gh(h)
 			}
-			args := tt.args(a, b, c)
+			args := tt.args(h)
 			var stdout, stderr bytes.Buffer
 			code := run(t.Context(), args, inDir{dir}, execx.NewFake(t, calls...), &stdout, &stderr)
 
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d; stderr:\n%s", args, code, tt.wantCode, stderr.String())
 			}
-			// A SHA in the output varies with the repository; the rest of
-			// a line is checked by prefix or suffix.
-			switch got := stdout.String(); {
-			case tt.wantStdout == "" && got != "":
-				t.Errorf("run(%q) stdout = %q, want nothing", args, got)
-			case strings.HasPrefix(tt.wantStdout, " ") && !strings.HasSuffix(got, tt.wantStdout):
-				t.Errorf("run(%q) stdout = %q, want it to end %q", args, got, tt.wantStdout)
-			case strings.HasSuffix(tt.wantStdout, " ") && !strings.HasPrefix(got, tt.wantStdout):
-				t.Errorf("run(%q) stdout = %q, want it to start %q", args, got, tt.wantStdout)
-			case !strings.HasPrefix(tt.wantStdout, " ") && !strings.HasSuffix(tt.wantStdout, " ") && got != tt.wantStdout:
-				t.Errorf("run(%q) stdout = %q, want %q", args, got, tt.wantStdout)
+			want := ""
+			if tt.stdout != nil {
+				want = tt.stdout(h)
+			}
+			if got := stdout.String(); got != want {
+				t.Errorf("run(%q) stdout = %q, want %q", args, got, want)
 			}
 			for _, s := range tt.wantStderr {
 				if !strings.Contains(stderr.String(), s) {
