@@ -48,5 +48,9 @@ jobs:
     uses: ./.github/workflows/renovate.yml # zizmor: ignore[self-repository] see above
     with:
       automerge: ${{ vars.CI_AUTOMERGE == 'enabled' }}
+    # By name, never `inherit`: the called workflow gets this one secret
+    # and no other. An environment secret reaches it only when passed.
+    secrets:
+      RENOVATE_APP_PRIVATE_KEY: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
     # Renovate works through the App's token; GITHUB_TOKEN needs nothing.
     permissions: {}

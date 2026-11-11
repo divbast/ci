@@ -26,6 +26,10 @@ on:
         description: The kill switch, true only while the caller's automerge variable is `enabled`
         type: boolean
         required: true
+    secrets:
+      RENOVATE_APP_PRIVATE_KEY:
+        description: The divbast-renovate App's private key, the caller's `renovate` environment secret
+        required: true
 
 permissions: {}
 
@@ -53,7 +57,9 @@ jobs:
     # For the App's key, not a deployment. The environment's branch policy
     # still holds without one, and a daily run would otherwise bury the
     # deployment history. A called job that names an environment reads the
-    # caller's: its variables and secrets are the calling repository's.
+    # caller's: its variables are the calling repository's. Its secrets are
+    # not handed over on their own: the caller must pass the key by name, or
+    # it arrives as an empty string.
     environment:
       name: renovate
       deployment: false

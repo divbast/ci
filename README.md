@@ -334,6 +334,29 @@ the App's token. The App's client ID and private key are the caller's
 `renovate` environment's `RENOVATE_APP_CLIENT_ID` variable and
 `RENOVATE_APP_PRIVATE_KEY` secret, which divbast/infra manages.
 
+| Secret | Required | What |
+|---|---|---|
+| `RENOVATE_APP_PRIVATE_KEY` | yes | The App's private key |
+
+The called job reads the caller's `renovate` environment, but an
+environment secret is not handed to a called workflow on its own: the
+caller must pass it explicitly, or it arrives as an empty string. A caller
+passes it by name:
+
+```yaml
+jobs:
+  renovate:
+    uses: divbast/ci/.github/workflows/renovate.yml@<commit> # vX.Y.Z
+    with:
+      automerge: ${{ vars.AUTOMERGE == 'enabled' }}
+    secrets:
+      RENOVATE_APP_PRIVATE_KEY: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+    permissions: {}
+```
+
+Do not use `secrets: inherit`: it hands the called workflow every secret
+the caller can see, where one is all it needs.
+
 ### `stall.yml`
 
 The daily stall check: fails, so GitHub emails someone, when updates have
