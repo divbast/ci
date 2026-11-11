@@ -138,6 +138,37 @@ pinact, zizmor, actionlint, ShellCheck, shfmt, Go, golangci-lint, reuse and
 just, and for an app hadolint and trivy as well. `ci/mise.toml` holds the
 versions ci itself is tested with.
 
+### Local GitHub token
+
+The shared recipes in `common.just` that call GitHub, pinact's
+`actions-check`, `actions-pin` and `actions-update` and zizmor's
+`workflow-audit`, read `GITHUB_TOKEN`, and take only a fine-grained
+personal access token (`github_pat_`) or the job token CI passes
+(`ghs_`). Without a token, or with any other kind, gh's own (`gho_`) or a
+classic one (`ghp_`) among them, they refuse with one line that names the
+kind, never the token. An app built through `app.just` needs no token at
+all.
+
+The recipes can tell a token's kind, not what it may reach, so that is
+yours to choose: a fine-grained personal access token with Repository
+access set to Public repositories, and no permissions beyond the default
+metadata read. It reads only what anyone can read anonymously, so a leak
+costs at most your API rate limit, and an expiry of up to a year is
+reasonable. GitHub allows up to 366 days or none, emails before the token
+expires, and its "Regenerate token" keeps the token's settings.
+
+Keep it in a password manager or the OS keychain, and pass it per command:
+
+```sh
+GITHUB_TOKEN="$(<your password manager's get command>)" just lint
+```
+
+Do not export it from a shell profile or a `mise.toml`'s `[env]`: gh
+prefers `GITHUB_TOKEN` over its own stored login (`gh help environment`),
+so your own gh commands would start using the read-only token.
+
+CI passes the job's own token.
+
 ### Go
 
 A repository with Go code reaches ci's packages, the `harness` and the
@@ -488,7 +519,8 @@ with the pin:
 
 `just setup` installs the toolchain from `mise.toml`, and PHPStan from
 `composer.lock` for the probe's PHP. `just ci` runs every gate: the lint
-recipes above, PHPStan, and the tests. The tests that build and run
+recipes above, PHPStan, and the tests. It needs `GITHUB_TOKEN` set (see
+[Local GitHub token](#local-github-token)). The tests that build and run
 containers run only when `ENGINE` is `docker` or `podman`, so
 `ENGINE=docker just ci` runs them all. `self-ci.yml` runs them on amd64 and
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
