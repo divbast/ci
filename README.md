@@ -188,6 +188,12 @@ releases both.
   outputs or the permissions its calling job must grant, or a tool's
   flags or exit codes.
 
+Every pull request previews the release its merge would make:
+`self-ci.yml`'s `release-preview` job, which `required` needs, dry-runs
+`divbast-release` on GitHub's test merge of the pull request into main
+and writes the version, minor or major, and its notes to the run's
+summary.
+
 A repository pins ci at a release, the release's commit with its tag as
 the comment, and zizmor and pinact check that pair as they do any other
 action's:

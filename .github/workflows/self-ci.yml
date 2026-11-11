@@ -100,12 +100,74 @@ jobs:
           ENGINE: ${{ matrix.engine }}
         run: just test
 
+  # On a pull request, the release its merge would make, in the run's
+  # summary, from divbast-release's dry run of GitHub's test merge into
+  # main. required needs it, so a release that would fail stops the merge.
+  # On any other event, a push to main among them, every step is skipped
+  # and the job succeeds: the release job's own log says what main
+  # releases, and a preview there could race an earlier merge's release
+  # minting its tag.
+  release-preview:
+    name: release-preview
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Every commit and tag, which the next version is counted from
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ci's own Go, and nothing else of its toolchain
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        if: github.event_name == 'pull_request'
+        with:
+          install_args: core:go
+
+      - name: Build ci's tools
+        if: github.event_name == 'pull_request'
+        run: go build -o "${GITHUB_WORKSPACE}/bin/" ./cmd/...
+
+      - name: Preview this pull request's release
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          # A tag minted since checkout, which the tool refuses a clone to lack
+          git fetch --quiet --tags origin
+          out=$(bin/divbast-release -sha "${GITHUB_SHA}" -dry-run)
+          version=${out%%$'\n'*}
+          {
+            echo '## Release preview'
+            echo
+            # Anything but a version says a release tag is already here
+            if [[ ! ${version} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "${out}"
+              exit 0
+            fi
+            kind=minor
+            if [[ ${version} =~ ^v[0-9]+\.0\.0$ ]]; then
+              kind=major
+            fi
+            echo "Merging this pull request would release **${version}**, a ${kind} release."
+            echo
+            echo "This is a prediction from GitHub's test merge into main: the" \
+              "commit GitHub makes when it merges can carry the pull" \
+              "request's title, which this preview cannot see."
+            echo
+            echo '```markdown'
+            echo "${out#*$'\n\n'}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   # The one check main's ruleset requires, so the job list can change without
   # touching the ruleset. GitHub counts a skipped required check as passing,
   # so this runs always and treats a skipped or cancelled job as a failure.
   required:
     name: required
-    needs: [lint, test]
+    needs: [lint, test, release-preview]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 5
