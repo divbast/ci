@@ -83,6 +83,15 @@ type Config struct {
 	ProbeApp []byte
 	// HealthOnly404 holds the paths that must answer 404 on HealthPort.
 	HealthOnly404 []string
+	// Scenario, when set, names the configuration the container under the
+	// contract runs in, such as "telemetry off", for a suite that runs the
+	// contract once for each configuration it supports. Each check's name
+	// gains the prefix "<Scenario>: ", and so do the records of the two
+	// checks that judge the app's health in that configuration,
+	// health-probe and engine-healthy, as LibreSpeed's bash suite named
+	// them. The records of the confinement checks hold whatever the
+	// configuration, and keep their names.
+	Scenario string
 }
 
 // validate refuses a Config that cannot be checked, or whose checks
@@ -102,6 +111,9 @@ func (c *Config) validate() error {
 	}
 	if c.AppPort == c.HealthPort {
 		errs = append(errs, fmt.Errorf("Config.AppPort and Config.HealthPort are the same port, %d", c.AppPort))
+	}
+	if strings.ContainsAny(c.Scenario, "\t\n\r") {
+		errs = append(errs, fmt.Errorf("Config.Scenario is %q: a record's name is one line", c.Scenario))
 	}
 	if c.TmpfsSize == "" {
 		errs = append(errs, errors.New("Config.TmpfsSize is empty: the contract's one tmpfs, /tmp, needs its size"))
@@ -149,6 +161,10 @@ const (
 	checkHostConfig        = "host-config"
 )
 
+// scenarioChecks are the checks whose records a Scenario names: those
+// that judge the app's health in the configuration it runs in.
+var scenarioChecks = map[string]bool{checkHealthProbe: true, checkEngineHealthy: true}
+
 // allChecks is every check, in the order Check runs and returns them.
 var allChecks = []string{
 	checkDefaultUser, checkFileCapability, checkCaps, checkReadOnly, checkPID1, checkNoShell, checkListeners,
@@ -180,7 +196,7 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 	if err != nil {
 		results := make([]Result, len(allChecks))
 		for i, name := range allChecks {
-			results[i] = resultOf(name, nil, fmt.Errorf("the contract cannot be checked: %w", err))
+			results[i] = resultFor(cfg.Scenario, name, nil, fmt.Errorf("the contract cannot be checked: %w", err))
 		}
 		return results
 	}
@@ -207,9 +223,29 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 	results := make([]Result, 0, len(allChecks))
 	for _, name := range allChecks {
 		records, err := run[name](ctx, tb)
-		results = append(results, resultOf(name, records, err))
+		results = append(results, resultFor(cfg.Scenario, name, records, err))
 	}
 	return results
+}
+
+// resultFor is the Result of the check name in scenario, which made
+// records and then stopped with err, if err is not nil. A scenario prefixes
+// the check's name, and the names of its records if it judges the app's
+// health.
+func resultFor(scenario, name string, records []harness.Record, err error) Result {
+	if scenario == "" {
+		return resultOf(name, records, err)
+	}
+	prefix := scenario + ": "
+	if scenarioChecks[name] {
+		named := make([]harness.Record, len(records))
+		for i, rec := range records {
+			rec.What = prefix + rec.What
+			named[i] = rec
+		}
+		records = named
+	}
+	return resultOf(prefix+name, records, err)
 }
 
 // resultOf is the Result of the check name, which made records and then
@@ -242,7 +278,14 @@ func resultOf(name string, records []harness.Record, err error) Result {
 // subtest, and every record's name goes to $DIVBAST_CHECK_LOG.
 func Run(t *testing.T, cfg *Config) {
 	t.Helper()
-	for _, r := range Check(t.Context(), t, cfg) {
+	reportAll(t, Check(t.Context(), t, cfg))
+}
+
+// reportAll reports each of results as a subtest of t named for its
+// check.
+func reportAll(t *testing.T, results []Result) {
+	t.Helper()
+	for _, r := range results {
 		t.Run(r.Check, func(t *testing.T) {
 			t.Helper()
 			report(t, r)

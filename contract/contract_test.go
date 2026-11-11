@@ -80,15 +80,21 @@ func checkNames(results []Result) []string {
 }
 
 // TestContractOnFixture runs the whole contract against the published
-// LibreSpeed image, which keeps it.
+// LibreSpeed image, which keeps it, as LibreSpeed's suite will: in the
+// scenario its bash suite named "telemetry off".
 func TestContractOnFixture(t *testing.T) {
 	t.Parallel()
 	e := integration(t)
 
 	cfg := libreSpeed(testfixture.LibreSpeed)
+	cfg.Scenario = "telemetry off"
 	results := Check(t.Context(), t, &cfg)
-	if got := checkNames(results); !slices.Equal(got, allChecks) {
-		t.Fatalf("Check() ran %q, want %q", got, allChecks)
+	want := make([]string, len(allChecks))
+	for i, name := range allChecks {
+		want[i] = "telemetry off: " + name
+	}
+	if got := checkNames(results); !slices.Equal(got, want) {
+		t.Fatalf("Check() ran %q, want %q", got, want)
 	}
 
 	made := make(map[string]bool)
@@ -106,10 +112,11 @@ func TestContractOnFixture(t *testing.T) {
 	}
 
 	// The names LibreSpeed's bash suite gave these checks in its sections
-	// 2, 3, 17 and 19, which its Go suite must keep making.
-	engineHealthy := "docker reports it healthy within the 60 s start period"
+	// 2, 3, 17 and 19, which its Go suite must keep making: section 17
+	// named its health checks for the scenario, and nothing else.
+	engineHealthy := "telemetry off: docker reports it healthy within the 60 s start period"
 	if e.Name() == "podman" {
-		engineHealthy = "podman healthcheck run"
+		engineHealthy = "telemetry off: podman healthcheck run"
 	}
 	for _, what := range []string{
 		"the image runs as uid/gid 65532 by default",
@@ -124,8 +131,8 @@ func TestContractOnFixture(t *testing.T) {
 		"test network really is internal",
 		"outbound TCP to 9.9.9.9:443 is refused",
 		"the image's HEALTHCHECK: the probe in exec form, with no shell, at Baikal's timings",
-		"/usr/local/bin/librespeed-health exits 0",
-		"/usr/local/bin/librespeed-health prints nothing",
+		"telemetry off: /usr/local/bin/librespeed-health exits 0",
+		"telemetry off: /usr/local/bin/librespeed-health prints nothing",
 		engineHealthy,
 		"GET :8081/",
 		"GET :8081/backend/getIP.php",
@@ -154,6 +161,13 @@ func TestValidate(t *testing.T) {
 		{name: "no-tmpfs-size", change: func(c *Config) { c.TmpfsSize = "" }, want: "TmpfsSize"},
 		{name: "no-pid1", change: func(c *Config) { c.PID1 = nil }, want: "PID1"},
 		{name: "no-health-cmd", change: func(c *Config) { c.HealthCmd = nil }, want: "HealthCmd"},
+		{name: "scenario", change: func(c *Config) { c.Scenario = "telemetry off" }},
+		{
+			// A record is one line; a scenario that broke one would split it.
+			name:   "scenario-on-two-lines",
+			change: func(c *Config) { c.Scenario = "telemetry\noff" },
+			want:   "Scenario",
+		},
 		{
 			// The shell form needs /bin/sh, which no divbast image has.
 			name:   "shell-form",
@@ -462,5 +476,77 @@ func TestReport(t *testing.T) {
 	}
 	if want := "PID 1 comm\nPID 1 comm\nPID 1 argv\nPID 1 comm\n"; string(got) != want {
 		t.Errorf("the check log holds %q, want %q", got, want)
+	}
+}
+
+// TestScenarioPrefix shows a Config's Scenario reaching every name a
+// suite sees: each Result's check, the subtests Run makes, and the records
+// of the health checks, in the check log too. The confinement checks'
+// records keep their names, as LibreSpeed's bash suite gave them. It sets
+// the check log in the environment, so it runs alone.
+func TestScenarioPrefix(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(harness.CheckLogEnv, filepath.Join(dir, "checks.log"))
+
+	// One ok record per check, named for it, as a check makes them.
+	results := make([]Result, len(allChecks))
+	for i, name := range allChecks {
+		results[i] = resultFor("telemetry off", name, []harness.Record{{OK: true, What: "of " + name, Found: "x", Expected: "x"}}, nil)
+	}
+
+	var wantLog strings.Builder
+	for i, name := range allChecks {
+		r := results[i]
+		if want := "telemetry off: " + name; r.Check != want {
+			t.Errorf("Result.Check = %q, want %q", r.Check, want)
+		}
+		wantWhat := "of " + name
+		if name == checkHealthProbe || name == checkEngineHealthy {
+			wantWhat = "telemetry off: of " + name
+		}
+		if got := r.Records[0].What; got != wantWhat {
+			t.Errorf("%s: record named %q, want %q", r.Check, got, wantWhat)
+		}
+		if !r.OK {
+			t.Errorf("%s: OK = false: %s", r.Check, r.Detail)
+		}
+		wantLog.WriteString(wantWhat + "\n")
+	}
+
+	reportAll(t, results)
+
+	// A subtest named as one before it gets a #01 suffix, which shows the
+	// name reportAll gave it.
+	t.Run("telemetry off: health-probe", sawSubtest)
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := root.Close(); cerr != nil {
+			t.Error(cerr)
+		}
+	})
+	got, err := root.ReadFile("checks.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != wantLog.String() {
+		t.Errorf("the check log holds\n%s\nwant\n%s", got, wantLog.String())
+	}
+
+	// No scenario, no prefix anywhere.
+	plain := resultFor("", checkHealthProbe, []harness.Record{{OK: true, What: "of health-probe"}}, nil)
+	if plain.Check != checkHealthProbe || plain.Records[0].What != "of health-probe" {
+		t.Errorf("resultFor(no scenario) = %q with record %q, want both unchanged", plain.Check, plain.Records[0].What)
+	}
+}
+
+// sawSubtest fails t unless a subtest of its name ran before it, which
+// testing marks by adding #01 to the second's name.
+func sawSubtest(t *testing.T) {
+	if !strings.HasSuffix(t.Name(), "#01") {
+		t.Errorf("subtest %q is the first of its name: reportAll made no subtest of that name", t.Name())
 	}
 }
