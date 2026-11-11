@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The one golangci-lint configuration for every divbast Go module. Callers
+# reach it at .ci/go/golangci.yml through common.just's go-lint recipe.
+version: "2"
+
+run:
+  # The default, cfg, resolves paths against this file, which in a caller
+  # sits two directories down inside .ci. Their own go.mod is the root that
+  # means something to them.
+  relative-path-mode: gomod
+
+issues:
+  # Every finding, not the first 50 per linter or 3 of a kind
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - exhaustive
+    - gocritic
+    - godot
+    - gosec
+    - govet
+    - intrange
+    - misspell
+    - nilerr
+    - noctx
+    - paralleltest
+    - perfsprint
+    - prealloc
+    - revive
+    - staticcheck
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+
+  settings:
+    staticcheck:
+      checks: ["all"]
+
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+        - name: error-return
+        - name: error-strings
+        - name: unused-parameter
+        - name: early-return
+        - name: indent-error-flow
+
+    govet:
+      enable-all: true
+      disable:
+        # Orders struct fields by size rather than by meaning. None of these
+        # structs is allocated in numbers where the padding would show, and
+        # field order is how a reader finds their way through one.
+        - fieldalignment
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - experimental
+        - opinionated
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      # Formatter-side fixes for what gocritic's paramTypeCombine and a
+      # reader would otherwise ask for by hand
+      extra:
+        group-params: true
+        clothe-returns: true
+        balance-calls: true
+    goimports:
+      local-prefixes:
+        - github.com/divbast

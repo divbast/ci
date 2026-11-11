@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+[tools]
+"core:go" = "1.27.3"
+"aqua:golangci/golangci-lint" = "2.15.0"
+
+"aqua:koalaman/shellcheck" = "0.11.0"
+"aqua:mvdan/sh" = "3.14.1"
+"aqua:rhysd/actionlint" = "1.7.12"
+"aqua:zizmorcore/zizmor" = "1.32.0"
+"aqua:suzuki-shunsuke/pinact" = "5.0.2"
+
+"pipx:reuse" = "6.3.0"
+"aqua:casey/just" = "1.59.0"
+"aqua:aquasecurity/trivy" = "0.76.2"
+
+[env]
+# The toolchain is the one pinned above, never one go.mod's toolchain line
+# would download
+GOTOOLCHAIN = "local"
