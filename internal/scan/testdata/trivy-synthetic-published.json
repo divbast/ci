@@ -1,0 +1,9 @@
+{
+  "Results": [
+    {"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian",
+     "Packages": [{"ID": "libssl3t64@3.5.0-1"}],
+     "Vulnerabilities": [
+       {"VulnerabilityID": "CVE-2026-0001", "PkgName": "libssl3t64", "InstalledVersion": "3.5.0-1", "Severity": "CRITICAL"}
+     ]}
+  ]
+}
