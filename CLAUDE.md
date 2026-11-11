@@ -44,8 +44,12 @@ Assisted-by: <NAME_OF_LLM_MODEL>
 ```
 
 It makes the next release major, and its text opens the release notes.
-Only the trailer block counts: the same words anywhere else in the body
-are not a trailer.
+Any line of a commit message that starts with `Breaking-change:`, bulleted
+or not, counts wherever it stands, so a squash merge's body, which lists
+each squashed commit's message, keeps the mark. The words mid-sentence
+do not count, so when wrapping a body that mentions them, never let a
+line of prose begin with them. When unsure whether a change breaks
+callers, mark it: a needless major only waits for an approval.
 
 ## Releases
 

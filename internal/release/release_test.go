@@ -96,6 +96,17 @@ func TestNotes(t *testing.T) {
 			commits: []release.Commit{{Subject: "lint: share the recipes"}, {Subject: "go: start the module"}},
 			want:    "## Changes\n\n- lint: share the recipes\n- go: start the module\n",
 		},
+		// Merges' subjects are left out, their breaking changes are not,
+		// and the same text is listed once.
+		{
+			name: "merges-and-duplicates",
+			commits: []release.Commit{
+				{Subject: "lint: drop the php input", Breaking: []string{"lint.yml has no php input"}},
+				{Subject: "Merge pull request #2 from divbast/lint", Merge: true, Breaking: []string{"lint.yml has no php input", "said by the merge"}},
+				{Subject: "docs: say so"},
+			},
+			want: "## Breaking changes\n\n- lint.yml has no php input\n- said by the merge\n\n## Changes\n\n- lint: drop the php input\n- docs: say so\n",
+		},
 		{
 			name: "breaking",
 			commits: []release.Commit{
@@ -184,10 +195,13 @@ const (
 	missing  = "0000000000000000000000000000000000000000"
 )
 
+// subjects are the subjects the notes list: every commit's but merges'.
 func subjects(commits []release.Commit) []string {
 	s := make([]string, 0, len(commits))
 	for _, c := range commits {
-		s = append(s, c.Subject)
+		if !c.Merge {
+			s = append(s, c.Subject)
+		}
 	}
 	return s
 }
@@ -254,13 +268,13 @@ func TestPrepare(t *testing.T) {
 			wantBreaking: []string{"lint.yml drops its php input"},
 			wantTip:      true,
 		},
-		// Only the trailer block counts: the same words in the body do not.
+		// The words mid-line, which no line starts with, do not count.
 		{
 			name: "mention-in-the-body",
 			setup: func(r *repo) string {
 				r.commit("a: one" + trailers)
 				r.git("tag", "v1.0.0")
-				sha := r.commit("b: two\n\nBreaking-change: not a trailer, said mid-body.\n\nMore prose." + trailers)
+				sha := r.commit("b: two\n\nThis only says Breaking-change: mid-line, which no line starts with.\n\nMore prose." + trailers)
 				r.push("v1.0.0")
 				return sha
 			},
@@ -409,9 +423,29 @@ func TestPrepare(t *testing.T) {
 			wantSubjects: []string{"s: side"},
 		},
 		// Ruling R30: the notes list the changes, not the merges that
-		// brought them, and a merge's trailers count for nothing.
+		// brought them.
 		{
-			name: "merges-left-out",
+			name: "merge-subject-left-out",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				r.git("checkout", "--quiet", "-b", "feature")
+				r.commit("b: two" + trailers)
+				r.git("checkout", "--quiet", "main")
+				r.commit("c: three" + trailers)
+				r.git("merge", "--quiet", "--no-ff", "--message", "Merge pull request #2 from divbast/feature", "feature")
+				sha := r.git("rev-parse", "HEAD")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"b: two", "c: three"},
+			wantTip:      true,
+		},
+		// Ruling R32: a merge's own Breaking-change trailer still counts.
+		{
+			name: "merge-trailer-counts",
 			setup: func(r *repo) string {
 				r.commit("a: one" + trailers)
 				r.git("tag", "v1.0.0")
@@ -426,8 +460,84 @@ func TestPrepare(t *testing.T) {
 				return sha
 			},
 			wantPrevious: "v1.0.0",
-			wantVersion:  "v1.1.0",
+			wantVersion:  "v2.0.0",
 			wantSubjects: []string{"b: two", "c: three"},
+			wantBreaking: []string{"said only by the merge"},
+			wantTip:      true,
+		},
+		// A squash merge lists each squashed commit's message in its body,
+		// so their trailers sit in paragraphs git does not parse as
+		// trailers. A line that starts with one counts, bulleted or not,
+		// and the same text twice is listed once.
+		{
+			name: "squash-buried-trailer",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("ci: rework the lint job (#7)\n\n" +
+					"* lint: drop the php input\n\nWhy.\n\nBreaking-change: lint.yml drops its php input\nDeveloped-by: X <x@x.invalid>\n\n" +
+					"* docs: say so\n\nDeveloped-by: X <x@x.invalid>\n\n" +
+					"Co-authored-by: Y <y@y.invalid>")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{"ci: rework the lint job (#7)"},
+			wantBreaking: []string{"lint.yml drops its php input"},
+			wantTip:      true,
+		},
+		{
+			name: "squash-repeats-its-trailer",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("ci: rework the lint job (#7)\n\n" +
+					"* lint: drop the php input\n\nWhy.\n\nBreaking-change: lint.yml drops its php input\nDeveloped-by: X <x@x.invalid>\n\n" +
+					"* docs: say so\n\nDeveloped-by: X <x@x.invalid>\n\n" +
+					"Breaking-change: lint.yml drops its php input\nCo-authored-by: Y <y@y.invalid>")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{"ci: rework the lint job (#7)"},
+			wantBreaking: []string{"lint.yml drops its php input"},
+			wantTip:      true,
+		},
+		{
+			name: "squash-bullets",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("ci: rework the scan (#8)\n\n" +
+					"* Breaking-change: divbast-scan's -layout is now -oci-layout\n" +
+					"  - Breaking-change: divbast-scan needs -vex\n\n" +
+					"* docs: say so" + trailers)
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{"ci: rework the scan (#8)"},
+			wantBreaking: []string{"divbast-scan's -layout is now -oci-layout", "divbast-scan needs -vex"},
+			wantTip:      true,
+		},
+		// A trailer that says nothing still breaks, and the notes name its
+		// commit.
+		{
+			name: "bare-trailer",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("b: two\n\nWhy.\n\nBreaking-change:\nDeveloped-by: X <x@x.invalid>")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{"b: two"},
+			wantBreaking: []string{"b: two"},
 			wantTip:      true,
 		},
 		{

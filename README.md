@@ -175,11 +175,17 @@ releases both.
 
 - The version is the last release's with its minor number raised:
   v1.4.0 follows v1.3.0. The first release is v1.0.0.
-- A commit whose trailer block carries `Breaking-change: <what broke>`
-  makes the next release major instead: v2.0.0 follows v1.3.0, and the
-  notes open with each such trailer's text. A change breaks callers when
-  it changes a reusable workflow's inputs, outputs or the permissions its
-  calling job must grant, or a tool's flags or exit codes.
+- A commit that marks a breaking change makes the next release major
+  instead: v2.0.0 follows v1.3.0, and the notes open with what each mark
+  says, each text once. A commit marks one with a
+  `Breaking-change: <what broke>` trailer, even an empty one, or with any
+  line of its message that starts with `Breaking-change:`, bulleted with
+  `* ` or `- ` or not. So a `Breaking-change:` line anywhere in a squash
+  merge's body counts, and so does one on a merge commit. The words
+  mid-sentence do not.
+- A change breaks callers when it changes a reusable workflow's inputs,
+  outputs or the permissions its calling job must grant, or a tool's
+  flags or exit codes.
 
 A repository pins ci at a release, the release's commit with its tag as
 the comment, and zizmor and pinact check that pair as they do any other

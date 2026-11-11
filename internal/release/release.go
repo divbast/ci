@@ -7,11 +7,18 @@
 //
 // The version is the latest vX.Y.Z tag the commit descends from with its
 // minor number raised, or its major number raised when any commit since
-// that tag carries a Breaking-change trailer. A repository with no such
-// tag yet releases v1.0.0. The notes list each Breaking-change trailer's
-// text, then the subject of every commit since the last release. Merge
-// commits are left out of both: they bring changes, and say nothing of
-// their own.
+// that tag, merges included, marks a breaking change. A repository with
+// no such tag yet releases v1.0.0. A commit marks one with a
+// Breaking-change trailer, even an empty one, or with any line of its
+// message that starts with Breaking-change:, after optional blanks and a
+// "* " or "- " bullet. That second rule finds the trailers a squash merge
+// buries in its body, where it lists each squashed commit's message, and
+// errs towards a major release: a needless major waits for an approval,
+// where a missed one would merge a break into every caller.
+//
+// The notes list the text of each breaking change, once, then the subject
+// of every commit since the last release but merges, which bring changes
+// and say nothing of their own.
 package release
 
 import (
@@ -76,15 +83,20 @@ func (v Version) Compare(w Version) int {
 type Commit struct {
 	SHA     string
 	Subject string
-	// Breaking holds the value of each Breaking-change trailer, with
-	// folded lines joined.
+	// Merge is whether the commit is a merge, whose subject the notes
+	// leave out.
+	Merge bool
+	// Breaking holds what each breaking change the commit marks says, once
+	// each: a trailer's value with folded lines joined, or the rest of a
+	// line that starts with Breaking-change:. A mark that says nothing is
+	// the commit's subject.
 	Breaking []string
 }
 
 // Next returns the version that follows previous, given the commits since
 // it: previous with its minor number raised, or with its major number
-// raised when any commit carries a Breaking-change trailer. With no
-// previous release, released false, it is [First].
+// raised when any commit, a merge or not, marks a breaking change. With
+// no previous release, released false, it is [First].
 func Next(previous Version, released bool, commits []Commit) Version {
 	if !released {
 		return First
@@ -97,14 +109,18 @@ func Next(previous Version, released bool, commits []Commit) Version {
 	return Version{Major: previous.Major, Minor: previous.Minor + 1}
 }
 
-// Notes returns a release's notes, in Markdown: the text of each
-// Breaking-change trailer, when there is one, then the subject of each
-// commit, in the order given.
+// Notes returns a release's notes, in Markdown: what each breaking change
+// says, when there is one, each text once, then the subject of each commit
+// but merges, in the order given.
 func Notes(commits []Commit) string {
 	var b strings.Builder
 	var breaking []string
 	for _, c := range commits {
-		breaking = append(breaking, c.Breaking...)
+		for _, text := range c.Breaking {
+			if !slices.Contains(breaking, text) {
+				breaking = append(breaking, text)
+			}
+		}
 	}
 	if len(breaking) > 0 {
 		b.WriteString("## Breaking changes\n\n")
@@ -115,7 +131,9 @@ func Notes(commits []Commit) string {
 	}
 	b.WriteString("## Changes\n\n")
 	for _, c := range commits {
-		b.WriteString("- " + c.Subject + "\n")
+		if !c.Merge {
+			b.WriteString("- " + c.Subject + "\n")
+		}
 	}
 	return b.String()
 }
@@ -139,7 +157,7 @@ type Plan struct {
 	// Version is the release to make.
 	Version Version
 	// Commits are those since Previous, or all of SHA's history when there
-	// is none, oldest first.
+	// is none, merges included, oldest first.
 	Commits []Commit
 }
 
@@ -362,6 +380,40 @@ func (r runner) holds(ctx context.Context, tip, sha string) (bool, error) {
 	}
 }
 
+// breakingIn returns what each breaking change a commit marks says, once
+// each, given its subject, its Breaking-change trailers as git prints them
+// and its whole message. A line that starts with Breaking-change: and is
+// the first line of a folded trailer, read whole already, is not counted
+// twice. A mark that says nothing is the subject.
+func breakingIn(subject, trailers, message string) []string {
+	var (
+		texts  []string
+		marked bool
+	)
+	for trailer := range strings.SplitSeq(trailers, trailerSep) {
+		if strings.TrimSpace(trailer) == "" {
+			continue
+		}
+		marked = true
+		_, value, _ := strings.Cut(trailer, ":")
+		if value = strings.TrimSpace(value); value != "" && !slices.Contains(texts, value) {
+			texts = append(texts, value)
+		}
+	}
+	for _, m := range breakingLine.FindAllStringSubmatch(message, -1) {
+		marked = true
+		text := strings.TrimSpace(m[1])
+		if text == "" || slices.ContainsFunc(texts, func(t string) bool { return strings.HasPrefix(t, text) }) {
+			continue
+		}
+		texts = append(texts, text)
+	}
+	if marked && len(texts) == 0 {
+		texts = []string{subject}
+	}
+	return texts
+}
+
 // versions returns the release tags git tag lists, every one or those the
 // filter picks, such as --merged <sha>, ignoring every tag that is not
 // vX.Y.Z.
@@ -388,17 +440,24 @@ const (
 	trailerSep = "\x1d"
 )
 
-// logFormat has git print each commit's SHA, subject and Breaking-change
-// trailer values. git parses the trailers as git interpret-trailers does,
-// from the message's last paragraph alone, matching the key without regard
-// to case and joining folded lines.
-var logFormat = "--format=%H" + "%x1f" + "%s" + "%x1f" +
-	"%(trailers:key=" + Trailer + ",valueonly,unfold,separator=%x1d)" + "%x1e"
+// logFormat has git print each commit's SHA, parents, subject,
+// Breaking-change trailers and whole message. git parses the trailers as
+// git interpret-trailers does, from the message's last paragraph alone,
+// matching the key without regard to case and joining folded lines. It
+// prints each as "Key: value", so one with no value still shows.
+var logFormat = "--format=%H" + "%x1f" + "%P" + "%x1f" + "%s" + "%x1f" +
+	"%(trailers:key=" + Trailer + ",unfold,separator=%x1d)" + "%x1f" + "%B" + "%x1e"
 
-// log returns the commits in the revision range, oldest first, leaving
-// out merges.
+// breakingLine is a line of a message that starts with Breaking-change:,
+// after optional blanks and a "* " or "- " bullet, as a squash merge's
+// body lists each squashed commit's message. It captures the rest of the
+// line.
+var breakingLine = regexp.MustCompile(`(?im)^[ \t]*(?:[*-] )?` + Trailer + `:(.*)$`)
+
+// log returns the commits in the revision range, merges included, oldest
+// first.
 func (r runner) log(ctx context.Context, revisions string) ([]Commit, error) {
-	out, err := r.out(ctx, "log", "--reverse", "--no-merges", logFormat, revisions)
+	out, err := r.out(ctx, "log", "--reverse", logFormat, revisions)
 	if err != nil {
 		return nil, err
 	}
@@ -408,16 +467,12 @@ func (r runner) log(ctx context.Context, revisions string) ([]Commit, error) {
 		if record == "" {
 			continue
 		}
-		fields := strings.Split(record, fieldSep)
-		if len(fields) != 3 {
-			return nil, fmt.Errorf("git log printed a commit as %q, not SHA, subject and trailers", record)
+		fields := strings.SplitN(record, fieldSep, 5)
+		if len(fields) != 5 {
+			return nil, fmt.Errorf("git log printed a commit as %q, not SHA, parents, subject, trailers and message", record)
 		}
-		c := Commit{SHA: fields[0], Subject: fields[1]}
-		for value := range strings.SplitSeq(fields[2], trailerSep) {
-			if value = strings.TrimSpace(value); value != "" {
-				c.Breaking = append(c.Breaking, value)
-			}
-		}
+		c := Commit{SHA: fields[0], Merge: len(strings.Fields(fields[1])) > 1, Subject: fields[2]}
+		c.Breaking = breakingIn(c.Subject, fields[3], fields[4])
 		commits = append(commits, c)
 	}
 	return commits, nil
