@@ -234,6 +234,9 @@ func TestProbeNegative(t *testing.T) {
 		sub  []string
 		fail string   // the record that must FAIL
 		ok   []string // records that must stay ok
+		// tries is how many runs of sub may be needed to see fail FAIL,
+		// for a check whose one try can be inconclusive. Zero is one.
+		tries int
 	}{
 		{
 			// It reaches CapBnd alone: exec clears CapEff and CapPrm for
@@ -273,11 +276,17 @@ func TestProbeNegative(t *testing.T) {
 			ok:   []string{"UDP ports a process in the container holds a socket on"},
 		},
 		{
-			// The engine's default network, which has a route out
-			name: "a-network-with-a-route-out",
-			spec: &RunSpec{Confine: Contract("16m")},
-			sub:  []string{"probe-egress"},
-			fail: "outbound TCP to 9.9.9.9:443 is refused",
+			// The engine's default network, which has a route out. One
+			// connect there can time out, through rootless slirp4netns
+			// under load, which shows nothing either way: the case passes
+			// once a try connects, and fails only if none of five does.
+			// TestProbeOnFixture's check stays one try, since a refusal
+			// and a timeout are both the success there.
+			name:  "a-network-with-a-route-out",
+			spec:  &RunSpec{Confine: Contract("16m")},
+			sub:   []string{"probe-egress"},
+			fail:  "outbound TCP to 9.9.9.9:443 is refused",
+			tries: 5,
 		},
 	}
 	for _, tt := range tests {
@@ -290,9 +299,21 @@ func TestProbeNegative(t *testing.T) {
 			spec := *tt.spec
 			spec.Image = testfixture.LibreSpeed
 			_, p := startServed(t, e, &spec)
-			records, err := p.Run(t.Context(), tt.sub[0], tt.sub[1:]...)
-			if err != nil {
-				t.Fatal(err)
+			tries := max(tt.tries, 1)
+			var records []Record
+			for try := 1; ; try++ {
+				var err error
+				records, err = p.Run(t.Context(), tt.sub[0], tt.sub[1:]...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if failed(records, tt.fail) || try == tries {
+					break
+				}
+				t.Logf("try %d of %d: %s recorded %+v, which shows nothing; trying again", try, tries, tt.sub[0], records)
+				if err := sleep(t.Context(), time.Second); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			byWhat := make(map[string]Record, len(records))
@@ -313,6 +334,11 @@ func TestProbeNegative(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failed reports whether records hold what, and it FAILed.
+func failed(records []Record, what string) bool {
+	return slices.ContainsFunc(records, func(r Record) bool { return r.What == what && !r.OK })
 }
 
 // needEgress skips t on a runner that cannot reach the egress probe's
