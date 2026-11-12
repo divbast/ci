@@ -92,7 +92,7 @@ jobs:
           # The action's own default is the floating major tag. Renovate's
           # github-actions manager reads this input and moves the pin, so the
           # bot updates itself through a pull request like everything else.
-          renovate-version: 44.234.1
+          renovate-version: 44.235.0
         env:
           RENOVATE_REPOSITORIES: ${{ github.repository }}
           RENOVATE_ONBOARDING: 'false'
