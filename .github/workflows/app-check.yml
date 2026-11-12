@@ -12,7 +12,10 @@
 # uploads each as the artifact image-<arch>.
 #
 # The caller's job grants contents: read, attestations: read and
-# security-events: write.
+# security-events: write. Of the caller's mise.toml, the scan job installs
+# only Go, just and Trivy, each declared at one version: Go as "core:go"
+# (mise reads the short "go" the same way), and just and Trivy as exactly
+# "aqua:casey/just" and "aqua:aquasecurity/trivy".
 name: app-check
 
 on:
@@ -318,6 +321,11 @@ jobs:
     permissions:
       contents: read
       security-events: write # upload the findings to code scanning, from main only
+    # mise exec, which is a recipe's shell, installs every tool missing from
+    # the caller's mise.toml. Off, so nothing installs what the mise step
+    # below leaves out.
+    env:
+      MISE_AUTO_INSTALL: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -333,8 +341,29 @@ jobs:
           path: .ci
           persist-credentials: false
 
-      # Before the pin check, which needs the caller's pinned Go.
+      # Before the pin check, which needs the caller's pinned Go, and only
+      # what the scan runs: Go for the pin check and ci's tools, just for
+      # the recipe, and Trivy. An install runs code from outside the
+      # repository, and this job can dismiss code scanning alerts.
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy
+
+      # mise installs a name that mise.toml does not declare, or declares
+      # under another name, at its latest version, and succeeds. So that a
+      # scan never runs a Trivy the caller did not pin, each must be the
+      # caller's, at the one version it names.
+      - name: Check the caller's mise.toml pins each tool installed above
+        run: |
+          current=$(mise ls --current --json)
+          for tool in go aqua:casey/just aqua:aquasecurity/trivy; do
+            if ! jq -e --arg tool "${tool}" \
+              '.[$tool] // [] | any(.installed and .version == .requested_version)' \
+              <<<"${current}" >/dev/null; then
+              echo "mise.toml must pin ${tool} to one version, under exactly that name" >&2
+              exit 1
+            fi
+          done
 
       # `just setup` would otherwise check .ci out again at whatever commit
       # the caller's workflows pin, and lint with that one. ci's tools build

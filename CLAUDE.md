@@ -74,7 +74,8 @@ this project's one record of LLM involvement.
 - `just setup` installs the toolchain from `mise.toml`, and PHPStan from
   `composer.lock`
 - `just ci` runs every gate. Run it before committing; `just lint` is
-  enough for a commit that changes only documentation
+  enough for a commit that changes only documentation. Both need
+  `GITHUB_TOKEN` set (README.md, "Local GitHub token")
 - `just ci-tools` builds the commands into `bin/`
 
 The tests that build and run containers run only when `ENGINE` is

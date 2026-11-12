@@ -33,21 +33,43 @@ ci_dir := ".ci"
 ci-tools:
     go -C '{{ ci_dir }}' build -o '{{ clean(justfile_directory() / ci_dir / "bin") }}/' ./cmd/...
 
+# The four recipes below call GitHub. Each takes its token from
+# GITHUB_TOKEN and nowhere else, and first runs this, which refuses one that
+# is neither a fine-grained personal access token nor the job token CI
+# passes, naming the token's kind and never the token. README.md's "Local
+# GitHub token" says which token to give them. They name it as a
+# dependency, which is safe within this file: it resolves whenever the file
+# is imported, unlike a caller's dependency on a shared recipe.
+_github-token:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "${GITHUB_TOKEN:-}" in
+        github_pat_* | ghs_*) exit 0 ;;
+        "") kind="unset or empty" ;;
+        gho_*) kind="a gh/OAuth token (gho_)" ;;
+        ghp_*) kind="a classic personal access token (ghp_)" ;;
+        ghu_*) kind="a GitHub App user token (ghu_)" ;;
+        ghr_*) kind="a GitHub App refresh token (ghr_)" ;;
+        *) kind="not a GitHub token of any known kind" ;;
+    esac
+    echo "GITHUB_TOKEN is ${kind}; these recipes take a fine-grained personal access token (github_pat_) or CI's job token (ghs_): see https://github.com/divbast/ci#local-github-token" >&2
+    exit 1
+
 # Fail if any action is not pinned to a full SHA
-actions-check:
-    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --verify --check
+actions-check: _github-token
+    pinact run --verify --check
 
 # Rewrite tag references to the SHA
-actions-pin:
-    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run
+actions-pin: _github-token
+    pinact run
 
 # Move every action to its latest release
-actions-update:
-    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" pinact run --update
+actions-update: _github-token
+    pinact run --update
 
 # Audit the workflows for security problems
-workflow-audit:
-    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" zizmor --persona=auditor .github/workflows
+workflow-audit: _github-token
+    zizmor --persona=auditor .github/workflows
 
 # Check the workflows' syntax, expressions and run: scripts
 actionlint:
