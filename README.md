@@ -343,6 +343,32 @@ module, so `Engine.Sweep` in one repository's suite removes what a dead
 run of that suite left behind, and nothing another repository's suite
 on the same host made.
 
+Before that, every suite labelled what it made `divbast.harness=1`.
+Suites on this version no longer remove anything carrying that label.
+An interrupted run under an older pin can leave containers and networks
+behind on a developer's machine, holding the host ports and subnets a
+suite fixes, and then the first run after the pin moves fails on a
+conflict. Remove them once, with the engine that made them, after
+stopping any suite still on an older pin, since this removes what a
+running one made too:
+
+```sh
+docker ps -aq --filter label=divbast.harness=1 | xargs -r docker rm -f -v
+docker image ls -q --filter label=divbast.harness=1 | sort -u | xargs -r docker image rm -f
+docker network ls -q --filter label=divbast.harness=1 | xargs -r docker network rm
+docker volume ls -q --filter label=divbast.harness=1 | xargs -r docker volume rm
+```
+
+```sh
+podman ps -aq --filter label=divbast.harness=1 | xargs -r podman rm -f -v
+podman image ls -q --filter label=divbast.harness=1 | sort -u | xargs -r podman image rm -f
+podman network ls -q --filter label=divbast.harness=1 | xargs -r podman network rm
+podman volume ls -q --filter label=divbast.harness=1 | xargs -r podman volume rm
+```
+
+Containers go first, since an image, network or volume one still uses
+cannot. CI runners start empty, and need none of this.
+
 ### ci's tools in `.ci/bin`
 
 `just ci-tools` builds every command under `cmd/` into `.ci/bin/`. A
