@@ -454,14 +454,6 @@ func layerCapabilities(r io.Reader) (caps []string, err error) {
 // of the Containerfile's own. On Podman, a build shares the image store
 // with other builds, in this process and others, and no image is removed
 // while it runs, its cleanup's removal among them: see storeLock.
-//
-// A build that failed only in Buildah's look for a cached step is built
-// again, up to three times in all, a second apart. That look reads the
-// layer of every image in the store, and the Buildah in the Podman on
-// ci's runners fails the build when an image goes while it looks, as one
-// does when a parallel test's cleanup removes it: newer Buildah passes
-// that image over. Any other failure is the builder's own, and is
-// returned at once.
 func (e Engine) Build(ctx context.Context, tb testing.TB, containerfile string, args map[string]string) (string, error) {
 	tb.Helper()
 	tag := "localhost/" + uniqueName() + ":latest"
@@ -486,32 +478,12 @@ func (e Engine) Build(ctx context.Context, tb testing.TB, containerfile string, 
 		return "", fmt.Errorf("%s build: waiting for an image's removal to end: %w", e.name, err)
 	}
 	defer release()
-	for attempt := 1; ; attempt++ {
-		res, err := e.run.RunStdin(ctx, nil, e.name, argv...)
-		if err != nil {
-			return "", err
-		}
-		if res.Code == 0 {
-			return tag, nil
-		}
-		failed := fmt.Errorf("%s %s: exit status %d: %s", e.name, strings.Join(argv, " "), res.Code, bytes.TrimSpace(res.Stderr))
-		if !bytes.Contains(res.Stderr, []byte(cacheLookupFailed)) {
-			return "", failed
-		}
-		if attempt == buildAttempts {
-			return "", fmt.Errorf("attempt %d of %d: %w", attempt, buildAttempts, failed)
-		}
-		if err := Pause(ctx, execRetry); err != nil {
-			return "", fmt.Errorf("%w; and then, waiting to build again: %w", failed, err)
-		}
+	res, err := e.run.RunStdin(ctx, nil, e.name, argv...)
+	if err != nil {
+		return "", err
 	}
+	if res.Code != 0 {
+		return "", fmt.Errorf("%s %s: exit status %d: %s", e.name, strings.Join(argv, " "), res.Code, bytes.TrimSpace(res.Stderr))
+	}
+	return tag, nil
 }
-
-// cacheLookupFailed opens what Buildah says when its look through the
-// store for a cached step failed, which reads and writes nothing of the
-// build's own: [Engine.Build] builds again, up to buildAttempts times in
-// all.
-const (
-	cacheLookupFailed = "checking if cached image exists from a previous build"
-	buildAttempts     = 3
-)
