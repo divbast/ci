@@ -2529,6 +2529,103 @@ func installsGoAlone(workflow string) error {
 	return nil
 }
 
+// publishActions is every action app-publish.yml's publish job uses, in
+// the order its steps use them. The job can push the image and sign its
+// attestation, so an action it gains is a change to review here, not one
+// that arrives with a line no golden pins (backlog CI-11).
+var publishActions = []string{
+	"actions/checkout",
+	"actions/checkout",
+	"jdx/mise-action",
+	"docker/setup-buildx-action",
+	"docker/login-action",
+	"actions/download-artifact",
+	"actions/attest",
+}
+
+// TestPublishUsesOnlyItsActions checks that the publish job's uses: steps
+// call exactly publishActions, in order, each pinned to a full commit SHA
+// with its version as a comment, the form Renovate and pinact keep
+// current; which commit is theirs to move. Against app-publish.yml as it
+// is, then with each change below, which the check must refuse.
+func TestPublishUsesOnlyItsActions(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := usesOnlyItsActions(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const (
+		attest = "      - uses: actions/attest@"
+		cache  = "      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n        with:\n          path: /tmp/x\n          key: x\n"
+	)
+	for name, mutant := range map[string]string{
+		"one more action":               strings.Replace(publish, attest, cache+attest, 1),
+		"one more action, quoted":       strings.Replace(publish, attest, strings.Replace(cache, "uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830", `uses: "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830"`, 1)+attest, 1),
+		"an action the job had renamed": strings.Replace(publish, "uses: docker/login-action@", "uses: docker/login-actions@", 1),
+		"an action by tag":              regexp.MustCompile(`actions/attest@[0-9a-f]{40} # (v[0-9.]+)`).ReplaceAllString(publish, "actions/attest@$1"),
+		"an action by a short SHA":      regexp.MustCompile(`(actions/attest@[0-9a-f]{12})[0-9a-f]{28}`).ReplaceAllString(publish, "$1"),
+		"a pin with no version":         regexp.MustCompile(`(actions/attest@[0-9a-f]{40}) # v[0-9.]+`).ReplaceAllString(publish, "$1"),
+		"a local action":                strings.Replace(publish, attest, "      - uses: ./.ci/.github/actions/sign\n"+attest, 1),
+		"a container action":            strings.Replace(publish, attest, "      - uses: docker://alpine:3\n"+attest, 1),
+		"an action left out":            regexp.MustCompile(`(?m)^ {6}- uses: docker/login-action@.*\n(?: {8}.*\n)*`).ReplaceAllString(publish, ""),
+		"an action, written mixed-case": strings.Replace(publish, "uses: actions/download-artifact@", "uses: Actions/Download-Artifact@", 1),
+		"two actions in another order":  moveStep(publish, "      - uses: docker/login-action@", "      - uses: docker/setup-buildx-action@"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if usesOnlyItsActions(mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+	// What Renovate and pinact do to a pin: another commit, another version
+	t.Run("a pin Renovate moves", func(t *testing.T) {
+		t.Parallel()
+		bumped := regexp.MustCompile(`actions/attest@[0-9a-f]{40} # v[0-9.]+`).ReplaceAllString(publish, "actions/attest@"+strings.Repeat("a", 40)+" # v9.0.0")
+		if bumped == publish {
+			t.Fatal("the change changed nothing")
+		}
+		if err := usesOnlyItsActions(bumped); err != nil {
+			t.Errorf("refuses app-publish.yml with actions/attest moved: %v", err)
+		}
+	})
+}
+
+// actionPin is a uses: value as ci pins an action: owner/repo at a full
+// commit SHA, with the version as a comment.
+var actionPin = regexp.MustCompile(`^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@[0-9a-f]{40} # v[0-9][0-9A-Za-z.+-]*$`)
+
+// usesOnlyItsActions returns an error unless the publish job's uses:
+// steps, read at each step's key column, call publishActions in order,
+// each pinned as actionPin reads it.
+func usesOnlyItsActions(workflow string) error {
+	var used []string
+	for _, s := range publishSteps(workflow) {
+		i := stepKey(s, "uses")
+		if i < 0 {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(s[i].text), "- "), "uses:"))
+		// A quoted value keeps its comment after the closing quote
+		if q := v[:min(1, len(v))]; q == `"` || q == "'" {
+			value, comment, _ := strings.Cut(v[1:], q)
+			v = value + comment
+		}
+		m := actionPin.FindStringSubmatch(v)
+		if m == nil {
+			return fmt.Errorf("line %d uses %q, not an action pinned to a full commit SHA with its version as a comment", s[i].n, v)
+		}
+		used = append(used, m[1])
+	}
+	if !slices.Equal(used, publishActions) {
+		return fmt.Errorf("the publish job uses %q, want exactly %q, in that order", used, publishActions)
+	}
+	return nil
+}
+
 // publishSteps returns the steps of a workflow's publish job.
 func publishSteps(workflow string) [][]line {
 	return steps(jobsOf(linesOf(workflow))["publish"])
