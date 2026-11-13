@@ -777,6 +777,27 @@ with the pin:
   ignore for each name GitHub documents that actionlint 1.7.12 does not
   know yet, scoped to that name.
 
+## Pinned build tools
+
+Four tools the workflows run are not actions, so nothing pins them by
+default. Each is fixed, and Renovate moves it through the org preset's
+managers (`divbast/renovate-config`), which read these exact shapes:
+
+- BuildKit: `driver-opts: image=moby/buildkit:vX.Y.Z@sha256:<digest>` on
+  every `docker/setup-buildx-action` step, not the `buildx-stable-1` tag.
+- The SBOM scanner: `--attest 'type=sbom,generator=docker/buildkit-syft-scanner:X.Y.Z@sha256:<digest>'`
+  in `app-check.yml`, not the scanner buildx picks.
+- mise: `MISE_VERSION` in each workflow's `env:`, under a
+  `# renovate: datasource=github-releases depName=jdx/mise` line, and
+  `version: ${{ env.MISE_VERSION }}` on every `jdx/mise-action` step.
+- Renovate: `renovate-image: ghcr.io/renovatebot/renovate:X.Y.Z@sha256:<digest>`
+  in `renovate.yml`. The input is `renovate-image` and not
+  `renovate-version`, because the github-actions manager reads a digest
+  from the first and takes the whole of the second, digest included, as the
+  version. The action ignores `renovate-version` once the image has a tag.
+
+`go test ./internal/workflows` fails when any of them floats.
+
 ## Working on ci
 
 `just setup` installs the toolchain from `mise.toml`, and PHPStan from

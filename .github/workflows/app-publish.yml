@@ -54,6 +54,11 @@ on:
 
 permissions: {}
 
+env:
+  # The mise release jdx/mise-action installs. Renovate moves it.
+  # renovate: datasource=github-releases depName=jdx/mise
+  MISE_VERSION: 2026.11.7
+
 jobs:
   publish:
     name: publish
@@ -135,6 +140,7 @@ jobs:
       # can push the image and sign its attestation.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
+          version: ${{ env.MISE_VERSION }}
           install_args: core:go
 
       # `just setup` would otherwise check .ci out again at whatever commit
@@ -151,6 +157,8 @@ jobs:
 
       # For `imagetools create`
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
       # Publish, skip or fail. The slot skips when main has not moved since
       # the published image, and :latest never moves backwards: a run that
