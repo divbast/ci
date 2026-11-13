@@ -310,30 +310,50 @@ func (hang) Run(ctx context.Context, name string, _ ...string) (execx.Result, er
 
 // TestTimeout checks that a gh that hangs is given up on after a minute,
 // or after the Client's own Timeout, rather than holding the job until the
-// job's timeout ends it. The bubble's clock moves only when everything in
-// it waits, so no test waits a minute.
+// job's timeout ends it, and that the error names the call and the limit.
+// A caller's own deadline, reached first, is the caller's to report. The
+// bubble's clock moves only when everything in it waits, so no test waits
+// a minute.
 func TestTimeout(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct {
 		name    string
 		timeout time.Duration
-		want    time.Duration
+		// caller is a deadline the caller's context sets; zero for none.
+		caller time.Duration
+		want   time.Duration
+		// wantErr is what the error must say; empty means it must not
+		// say the call gave up.
+		wantErr string
 	}{
-		{name: "default", want: time.Minute},
-		{name: "set", timeout: 3 * time.Second, want: 3 * time.Second},
+		{name: "default", want: time.Minute, wantErr: "gh api users/divbast gave up after 1m0s: "},
+		{name: "set", timeout: 3 * time.Second, want: 3 * time.Second, wantErr: "gh api users/divbast gave up after 3s: "},
+		{name: "caller-first", caller: 2 * time.Second, want: 2 * time.Second},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				if tt.caller != 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tt.caller)
+					defer cancel()
+				}
 				start := time.Now()
 				c := ghapi.Client{Run: hang{}, Timeout: tt.timeout}
-				status, err := c.API(t.Context(), "users/divbast", nil)
+				status, err := c.API(ctx, "users/divbast", nil)
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("API() = %d, %v; want an error wrapping %v", status, err, context.DeadlineExceeded)
 				}
 				if waited := time.Since(start); waited != tt.want {
 					t.Errorf("API() gave up after %v, want %v", waited, tt.want)
+				}
+				if tt.wantErr == "" && strings.Contains(err.Error(), "gave up") {
+					t.Errorf("API() error = %q, want it not to say the call gave up on a deadline of the caller's", err)
+				}
+				if tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("API() error = %q, want it to contain %q", err, tt.wantErr)
 				}
 			})
 		})

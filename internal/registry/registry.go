@@ -125,8 +125,14 @@ func (l Lookup) Revision(ctx context.Context, image string) (string, State, erro
 	}
 	inspectCtx, cancel := context.WithTimeout(ctx, limit)
 	res, err := l.Run.Run(inspectCtx, "skopeo", "inspect", "--raw", "--no-creds", "docker://"+image)
+	timedOut := ctx.Err() == nil && errors.Is(inspectCtx.Err(), context.DeadlineExceeded)
 	cancel()
 	if err != nil {
+		// Only the Lookup's own limit is the Lookup's to name: a deadline
+		// of the caller's, reached first, is the caller's to report.
+		if timedOut {
+			err = fmt.Errorf("skopeo inspect docker://%s gave up after %v: %w", image, limit, err)
+		}
 		return "", 0, unreadable(image, err)
 	}
 	if res.Code != 0 {

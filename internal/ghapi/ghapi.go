@@ -59,7 +59,8 @@ type Response struct {
 // response at all (gh missing, a network failure, ctx done), for output
 // that does not parse, and for a 2xx that gh failed on or whose body is
 // not the JSON v expects. A call that runs past the Client's Timeout gets
-// no response, and wraps [context.DeadlineExceeded].
+// no response, and an error that says so and wraps
+// [context.DeadlineExceeded].
 func (c Client) API(ctx context.Context, path string, v any) (status int, err error) {
 	resp, err := c.Get(ctx, path, v)
 	return resp.Status, err
@@ -78,14 +79,19 @@ func (c Client) Get(ctx context.Context, path string, v any) (Response, error) {
 	if limit == 0 {
 		limit = timeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, limit)
+	callCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 
 	// gh exits 1 on a 4xx or 5xx but, with -i, still prints the status
 	// line, the headers and the body, so the response is read from stdout
 	// whatever the exit status.
-	res, err := c.Run.Run(ctx, "gh", "api", "-i", path)
+	res, err := c.Run.Run(callCtx, "gh", "api", "-i", path)
 	if err != nil {
+		// Only the Client's own limit is the Client's to name: a deadline
+		// of the caller's, reached first, is the caller's to report.
+		if ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return Response{}, fmt.Errorf("gh api %s gave up after %v: %w", path, limit, err)
+		}
 		return Response{}, fmt.Errorf("gh api %s: %w", path, err)
 	}
 	status, body, err := parse(res.Stdout)

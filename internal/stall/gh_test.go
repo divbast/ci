@@ -720,23 +720,34 @@ func (hang) Run(ctx context.Context, name string, _ ...string) (execx.Result, er
 }
 
 // TestGHTimeout checks that a gh that hangs is given up on after a minute,
-// or after GH's own Timeout, whether GH runs it to list or to call the API.
+// or after GH's own Timeout, whether GH runs it to list or to call the API,
+// with an error that names the call and the limit.
 // The bubble's clock moves only when everything in it waits, so no test
 // waits a minute.
 func TestGHTimeout(t *testing.T) {
 	t.Parallel()
 
-	calls := map[string]func(ctx context.Context, gh stall.GH) error{
-		"list": func(ctx context.Context, gh stall.GH) error {
-			_, err := gh.SlotRuns(ctx, "build.yml")
-			return err
+	// Each call, and what its error names it.
+	calls := map[string]struct {
+		call func(ctx context.Context, gh stall.GH) error
+		says string
+	}{
+		"list": {
+			call: func(ctx context.Context, gh stall.GH) error {
+				_, err := gh.SlotRuns(ctx, "build.yml")
+				return err
+			},
+			says: "gh run list",
 		},
-		"api": func(ctx context.Context, gh stall.GH) error {
-			_, err := gh.MainSHA(ctx)
-			return err
+		"api": {
+			call: func(ctx context.Context, gh stall.GH) error {
+				_, err := gh.MainSHA(ctx)
+				return err
+			},
+			says: "gh api repos/divbast/baikal-oci-image/commits/main",
 		},
 	}
-	for name, call := range calls {
+	for name, c := range calls {
 		for _, tt := range []struct {
 			name    string
 			timeout time.Duration
@@ -749,12 +760,15 @@ func TestGHTimeout(t *testing.T) {
 				t.Parallel()
 				synctest.Test(t, func(t *testing.T) {
 					start := time.Now()
-					err := call(t.Context(), stall.GH{Run: hang{}, Repo: baikal, Timeout: tt.timeout})
+					err := c.call(t.Context(), stall.GH{Run: hang{}, Repo: baikal, Timeout: tt.timeout})
 					if !errors.Is(err, context.DeadlineExceeded) {
 						t.Fatalf("got %v, want an error wrapping %v", err, context.DeadlineExceeded)
 					}
 					if waited := time.Since(start); waited != tt.want {
 						t.Errorf("gave up after %v, want %v", waited, tt.want)
+					}
+					if want := fmt.Sprintf("%s gave up after %v: ", c.says, tt.want); !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %q, want it to contain %q", err, want)
 					}
 				})
 			})

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -301,10 +302,15 @@ func (g GH) list(ctx context.Context, v any, args ...string) error {
 	if limit == 0 {
 		limit = timeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, limit)
+	callCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	res, err := g.Run.Run(ctx, "gh", args...)
+	res, err := g.Run.Run(callCtx, "gh", args...)
 	if err != nil {
+		// Only GH's own limit is GH's to name: a deadline of the caller's,
+		// reached first, is the caller's to report.
+		if ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("gh %s %s gave up after %v: %w", args[0], args[1], limit, err)
+		}
 		return fmt.Errorf("gh %s %s: %w", args[0], args[1], err)
 	}
 	if res.Code != 0 {

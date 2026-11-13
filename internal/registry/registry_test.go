@@ -497,7 +497,8 @@ func hangs(t *testing.T, name string) execx.Runner {
 
 // TestRevisionTimeout checks that a skopeo or a gh that hangs is given up
 // on after a minute each, or after the timeout the Lookup or its Client
-// sets, and is an error rather than an answer. The bubble's clock moves
+// sets, and is an error rather than an answer, one that names the call and
+// its limit. The bubble's clock moves
 // only when everything in it waits, so no test waits a minute.
 func TestRevisionTimeout(t *testing.T) {
 	t.Parallel()
@@ -508,11 +509,25 @@ func TestRevisionTimeout(t *testing.T) {
 		// skopeo and gh are the Lookup's and its Client's timeouts.
 		skopeo, gh time.Duration
 		want       time.Duration
+		// wantErr is what the error must say: the call and its limit.
+		wantErr string
 	}{
-		{name: "skopeo", hung: "skopeo", want: time.Minute},
-		{name: "skopeo-set", hung: "skopeo", skopeo: 2 * time.Second, gh: 5 * time.Second, want: 2 * time.Second},
-		{name: "gh", hung: "gh", want: time.Minute},
-		{name: "gh-set", hung: "gh", skopeo: 2 * time.Second, gh: 5 * time.Second, want: 5 * time.Second},
+		{
+			name: "skopeo", hung: "skopeo", want: time.Minute,
+			wantErr: "skopeo inspect docker://" + noPackage + " gave up after 1m0s: ",
+		},
+		{
+			name: "skopeo-set", hung: "skopeo", skopeo: 2 * time.Second, gh: 5 * time.Second, want: 2 * time.Second,
+			wantErr: "skopeo inspect docker://" + noPackage + " gave up after 2s: ",
+		},
+		{
+			name: "gh", hung: "gh", want: time.Minute,
+			wantErr: "gh api " + noPackageAPI + " gave up after 1m0s: ",
+		},
+		{
+			name: "gh-set", hung: "gh", skopeo: 2 * time.Second, gh: 5 * time.Second, want: 5 * time.Second,
+			wantErr: "gh api " + noPackageAPI + " gave up after 5s: ",
+		},
 	}
 
 	for _, tt := range tests {
@@ -531,6 +546,9 @@ func TestRevisionTimeout(t *testing.T) {
 				}
 				if waited := time.Since(start); waited != tt.want {
 					t.Errorf("Revision() gave up after %v, want %v", waited, tt.want)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("Revision() error = %q, want it to contain %q", err, tt.wantErr)
 				}
 			})
 		})
