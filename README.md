@@ -480,8 +480,9 @@ the mark, above, that makes the next release major:
   needs the `posix` extension, with which `no-shell` tells a path that is
   absent from one it may not look up. An image without it fails
   `no-shell`.
-- **Shared configuration:** `go/golangci.yml` or `.github/actionlint.yaml`
-  changed so that a caller's unchanged code or workflows fail.
+- **Shared configuration:** `go/golangci.yml`, `.github/actionlint.yaml`
+  or `.github/pinact.yaml` changed so that a caller's unchanged code or
+  workflows fail.
 
 When unsure whether a change breaks callers, mark it: a major release only
 waits for approval on each caller's Dependency Dashboard.
@@ -828,6 +829,10 @@ with the pin:
 - `.github/actionlint.yaml`: the ubuntu-26.04 runner labels, and an
   ignore for each name GitHub documents that actionlint 1.7.12 does not
   know yet, scoped to that name.
+- `.github/pinact.yaml`: pinact's, with no rule that leaves an action
+  unchecked, which the actions recipes pass as both the project's and the
+  global configuration, so that neither a repository's own `.pinact.yaml`
+  nor a user's is read.
 
 ## Pinned build tools
 

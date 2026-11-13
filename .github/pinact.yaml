@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# pinact's configuration for every divbast repository: pinact's defaults,
+# and no rule that leaves an action unchecked. common.just's actions
+# recipes pass it as both the project's and the global configuration, so
+# that no .pinact.yaml of a repository's, nor one of a user's, is read.
+version: 3
