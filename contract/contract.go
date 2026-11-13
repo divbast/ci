@@ -41,8 +41,9 @@
 //     systemd timer its --health-cmd sets up, and reports the container
 //     healthy within the image's start period and three of the intervals
 //     it runs the check at;
-//   - health-port-only: each path in Config.HealthOnly404 answers 404 on
-//     the health port, and /healthz answers 404 on the app port;
+//   - health-port-only: each path in Config.HealthOnly404, which may not
+//     be empty, answers 404 on the health port, and /healthz answers 404
+//     on the app port;
 //   - host-config: the engine reports adding no capability, no
 //     --privileged, a read-only root, no security option that loosens
 //     seccomp, AppArmor or SELinux, no init before the entrypoint, and a
@@ -116,7 +117,8 @@ type Config struct {
 	// ProbeApp is the app's own probe subcommands, installed beside the
 	// core probe as app.php. Empty installs none.
 	ProbeApp []byte
-	// HealthOnly404 holds the paths that must answer 404 on HealthPort.
+	// HealthOnly404 holds the paths that must answer 404 on HealthPort,
+	// such as the app's own pages: one at least.
 	HealthOnly404 []string
 	// Scenario, when set, names the configuration the container under the
 	// contract runs in, such as "telemetry off", for a suite that runs the
@@ -152,6 +154,10 @@ func (c *Config) validate() error {
 	}
 	if c.TmpfsSize == "" {
 		errs = append(errs, errors.New("Config.TmpfsSize is empty: the contract's one tmpfs, /tmp, needs its size"))
+	}
+	if len(c.HealthOnly404) == 0 {
+		errs = append(errs, errors.New("Config.HealthOnly404 is empty: health-port-only would check the app port alone, "+
+			"and nothing of what the health port refuses"))
 	}
 	if c.Ready != nil && c.ReadyProbe != nil {
 		errs = append(errs, errors.New("Config.Ready and Config.ReadyProbe are both set: set one"))

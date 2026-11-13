@@ -226,6 +226,21 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestValidateRefusesEmptyHealthOnly404 shows a Config naming no path for
+// the health port to refuse is refused: health-port-only would then check
+// only the app port, and prove nothing of the health port at all.
+func TestValidateRefusesEmptyHealthOnly404(t *testing.T) {
+	t.Parallel()
+
+	for _, paths := range [][]string{nil, {}} {
+		cfg := libreSpeed("img")
+		cfg.HealthOnly404 = paths
+		if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "Config.HealthOnly404 is empty") {
+			t.Errorf("validate() with HealthOnly404 %#v: error = %v, want one saying Config.HealthOnly404 is empty", paths, err)
+		}
+	}
+}
+
 // TestRecordNames pins the names of the records this package renamed, or
 // added, since LibreSpeed's bash suite named the rest. An app's suite logs
 // each name to $DIVBAST_CHECK_LOG, so a name that moves reads there as a

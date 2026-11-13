@@ -82,6 +82,28 @@ func TestContractMinimal(t *testing.T) {
 			name: "runtime-user", loosen: []string{"--user", "65532:0"},
 			fails: []failure{{checkRuntimeUser, runtimeGIDRecord, []string{"0 0 0 0"}}},
 		},
+		{
+			// The health port serves the page at /, which HealthOnly404 lists
+			name: "health-port", dir: "health-port",
+			fails: []failure{{checkHealthPortOnly, "GET :8081/", []string{"200"}}},
+		},
+		{
+			// A probe that passes and says so, on every check
+			name: "health-probe-prints", dir: "health-probe-prints",
+			fails: []failure{{checkHealthProbe, "/usr/local/bin/minimal-health prints nothing", []string{"all is well"}}},
+		},
+		{
+			// A probe that fails once the server is up. The engine runs it
+			// on its own schedule, and once the start period is past, and
+			// it has failed as often as the HEALTHCHECK retries, it calls
+			// the container unhealthy: on Docker some two minutes after it
+			// started, within the start period and three intervals.
+			name: "unhealthy", dir: "unhealthy",
+			fails: []failure{
+				{checkHealthProbe, "/usr/local/bin/minimal-health exits 0", []string{"1"}},
+				{checkEngineHealthy, engineHealthyRecord, []string{"reports container", "unhealthy"}},
+			},
+		},
 	} {
 		t.Run(m.name, func(t *testing.T) {
 			t.Parallel()
