@@ -16,9 +16,14 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/divbast/ci/internal/execx"
 )
+
+// timeout is how long one call to gh may take when a Client sets no
+// Timeout of its own.
+const timeout = time.Minute
 
 // Client calls the GitHub API through gh.
 type Client struct {
@@ -28,6 +33,20 @@ type Client struct {
 	// path. Left empty, they are gh's to fill, from GH_REPO or the current
 	// directory's repository.
 	Repo string
+	// Timeout bounds each call to gh, so that a gh that hangs fails the
+	// call rather than holding the job until the job's own timeout. Zero
+	// means a minute.
+	Timeout time.Duration
+}
+
+// Response is what GitHub answered a request with.
+type Response struct {
+	// Status is the HTTP status.
+	Status int
+	// Message is GitHub's own word on a status outside 2xx, the message
+	// field of its error body, such as "Package not found.", and "" when
+	// the body has none.
+	Message string
 }
 
 // API sends a GET for path, such as "orgs/divbast/packages/container/x",
@@ -39,40 +58,65 @@ type Client struct {
 // error rather than the resource. The error is for a request that got no
 // response at all (gh missing, a network failure, ctx done), for output
 // that does not parse, and for a 2xx that gh failed on or whose body is
-// not the JSON v expects.
+// not the JSON v expects. A call that runs past the Client's Timeout gets
+// no response, and wraps [context.DeadlineExceeded].
 func (c Client) API(ctx context.Context, path string, v any) (status int, err error) {
-	path, err = c.expand(path)
+	resp, err := c.Get(ctx, path, v)
+	return resp.Status, err
+}
+
+// Get is [Client.API], and also returns GitHub's message for a status
+// outside 2xx. That is what tells one 404 from another: a package that
+// does not exist from a path that names nothing at all.
+func (c Client) Get(ctx context.Context, path string, v any) (Response, error) {
+	path, err := c.expand(path)
 	if err != nil {
-		return 0, err
+		return Response{}, err
 	}
+
+	limit := c.Timeout
+	if limit == 0 {
+		limit = timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
 
 	// gh exits 1 on a 4xx or 5xx but, with -i, still prints the status
 	// line, the headers and the body, so the response is read from stdout
 	// whatever the exit status.
 	res, err := c.Run.Run(ctx, "gh", "api", "-i", path)
 	if err != nil {
-		return 0, fmt.Errorf("gh api %s: %w", path, err)
+		return Response{}, fmt.Errorf("gh api %s: %w", path, err)
 	}
 	status, body, err := parse(res.Stdout)
 	if err != nil {
 		if res.Code != 0 {
-			return 0, fmt.Errorf("gh api %s: no response, exit status %d: %s", path, res.Code, bytes.TrimSpace(res.Stderr))
+			return Response{}, fmt.Errorf("gh api %s: no response, exit status %d: %s", path, res.Code, bytes.TrimSpace(res.Stderr))
 		}
-		return 0, fmt.Errorf("gh api %s: %w", path, err)
+		return Response{}, fmt.Errorf("gh api %s: %w", path, err)
 	}
+	resp := Response{Status: status}
 	if status < 200 || status > 299 {
-		return status, nil
+		var e struct {
+			Message string `json:"message"`
+		}
+		// A body that is not GitHub's JSON, such as a proxy's HTML error
+		// page, carries no message, and the status says all there is.
+		if json.Unmarshal(body, &e) == nil {
+			resp.Message = e.Message
+		}
+		return resp, nil
 	}
 	if res.Code != 0 {
-		return status, fmt.Errorf("gh api %s: exit status %d after HTTP %d: %s", path, res.Code, status, bytes.TrimSpace(res.Stderr))
+		return resp, fmt.Errorf("gh api %s: exit status %d after HTTP %d: %s", path, res.Code, status, bytes.TrimSpace(res.Stderr))
 	}
 	if v == nil || len(bytes.TrimSpace(body)) == 0 {
-		return status, nil
+		return resp, nil
 	}
 	if err = json.Unmarshal(body, v); err != nil {
-		return status, fmt.Errorf("gh api %s: decode the HTTP %d response: %w", path, status, err)
+		return resp, fmt.Errorf("gh api %s: decode the HTTP %d response: %w", path, status, err)
 	}
-	return status, nil
+	return resp, nil
 }
 
 // expand fills path's {owner} and {repo} placeholders from c.Repo.

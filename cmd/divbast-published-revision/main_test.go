@@ -53,7 +53,7 @@ func TestRun(t *testing.T) {
 			args: []string{image},
 			calls: []execx.Call{
 				{Argv: inspect, Result: refused},
-				{Argv: api, Result: execx.Result{Stdout: []byte("HTTP/2.0 404 Not Found\n\r\n{}"), Code: 1}},
+				{Argv: api, Result: execx.Result{Stdout: []byte("HTTP/2.0 404 Not Found\n\r\n" + `{"message":"Package not found.","status":"404"}`), Code: 1}},
 			},
 			wantStderr: []string{"nothing is published as " + image + " yet"},
 		},

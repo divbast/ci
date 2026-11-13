@@ -4,11 +4,15 @@
 package ghapi_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/divbast/ci/internal/execx"
 	"github.com/divbast/ci/internal/ghapi"
@@ -235,5 +239,103 @@ func TestAPILeavesVAloneOnError(t *testing.T) {
 	}
 	if len(got) != 1 || got["kept"] != true {
 		t.Errorf("API() changed v to %v on a 404, want it left alone", got)
+	}
+}
+
+// TestGet checks that Get returns GitHub's own message for a status outside
+// 2xx, which is what tells a missing package's 404 from any other, and no
+// message where GitHub gave none.
+func TestGet(t *testing.T) {
+	t.Parallel()
+
+	const path = "orgs/divbast/packages/container/no-such-package"
+	tests := []struct {
+		name   string
+		result execx.Result
+		want   ghapi.Response
+	}{
+		{
+			name:   "404-package-not-found",
+			result: execx.Result{Stdout: recorded(t, "gh-api-404.txt"), Code: 1},
+			want:   ghapi.Response{Status: 404, Message: "Package not found."},
+		},
+		{
+			name:   "403-scope",
+			result: execx.Result{Stdout: recorded(t, "gh-api-403.txt"), Code: 1},
+			want:   ghapi.Response{Status: 403, Message: "You need at least read:packages scope to get a package."},
+		},
+		{
+			name:   "404-generic",
+			result: execx.Result{Stdout: []byte("HTTP/2.0 404 Not Found\r\n\r\n" + `{"message":"Not Found","status":"404"}`), Code: 1},
+			want:   ghapi.Response{Status: 404, Message: "Not Found"},
+		},
+		{
+			// A proxy's error page is not GitHub's JSON, and has no message.
+			name:   "502-html",
+			result: execx.Result{Stdout: []byte("HTTP/2.0 502 Bad Gateway\r\n\r\n<html>502</html>"), Code: 1},
+			want:   ghapi.Response{Status: 502},
+		},
+		{
+			// A 2xx body is the resource, never a message, even one with a
+			// message field of its own.
+			name:   "200-message-field",
+			result: execx.Result{Stdout: []byte("HTTP/2.0 200 OK\r\n\r\n" + `{"message":"a commit message"}`)},
+			want:   ghapi.Response{Status: 200},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := ghapi.Client{Run: execx.NewFake(t, execx.Call{Argv: []string{"gh", "api", "-i", path}, Result: tt.result})}
+			got, err := c.Get(t.Context(), path, nil)
+			if err != nil {
+				t.Fatalf("Get(%q) error = %v, want nil", path, err)
+			}
+			if got != tt.want {
+				t.Errorf("Get(%q) = %+v, want %+v", path, got, tt.want)
+			}
+		})
+	}
+}
+
+// hang is a Runner whose every command runs until its context ends, as a
+// gh that hangs would, and then fails as execx.OS does.
+type hang struct{}
+
+func (hang) Run(ctx context.Context, name string, _ ...string) (execx.Result, error) {
+	<-ctx.Done()
+	return execx.Result{}, fmt.Errorf("run %s: %w", name, ctx.Err())
+}
+
+// TestTimeout checks that a gh that hangs is given up on after a minute,
+// or after the Client's own Timeout, rather than holding the job until the
+// job's timeout ends it. The bubble's clock moves only when everything in
+// it waits, so no test waits a minute.
+func TestTimeout(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{name: "default", want: time.Minute},
+		{name: "set", timeout: 3 * time.Second, want: 3 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				c := ghapi.Client{Run: hang{}, Timeout: tt.timeout}
+				status, err := c.API(t.Context(), "users/divbast", nil)
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("API() = %d, %v; want an error wrapping %v", status, err, context.DeadlineExceeded)
+				}
+				if waited := time.Since(start); waited != tt.want {
+					t.Errorf("API() gave up after %v, want %v", waited, tt.want)
+				}
+			})
+		})
 	}
 }

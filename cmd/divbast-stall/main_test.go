@@ -143,7 +143,7 @@ func TestRun(t *testing.T) {
 			env:  map[string]string{"SLOT_WORKFLOW": "publish.yml"},
 			calls: []execx.Call{
 				{Argv: inspect, Result: refused},
-				{Argv: pkgAPI, Result: execx.Result{Stdout: []byte("HTTP/2.0 404 Not Found\n\r\n{}"), Code: 1}},
+				{Argv: pkgAPI, Result: execx.Result{Stdout: []byte("HTTP/2.0 404 Not Found\n\r\n" + `{"message":"Package not found.","status":"404"}`), Code: 1}},
 				{Argv: mainAPI, Result: apiOK(`{"sha":"` + revision + `"}`)},
 				{Argv: slotRuns("publish.yml"), Result: ok("[]")},
 				{Argv: repoAPI, Result: apiOK(`{"created_at":"1999-12-31T21:00:00Z"}`)},
