@@ -53,7 +53,8 @@ type Config struct {
 	RenovateWorkflow string
 	// ContentGated says the slot workflow publishes only when the image's
 	// content moved, as divbast-publish-decision's -content-gated does, so
-	// that a slot run can succeed and leave an older commit published.
+	// that once the image is published, a slot run can succeed and leave
+	// an older commit published.
 	ContentGated bool
 }
 
@@ -242,9 +243,11 @@ func Renovate(ctx context.Context, s Source, c *Config) (Result, error) {
 // A finished slot run that built a commit ahead of the published one would
 // have published it, so each such run is a lost slot, whether it failed,
 // was cancelled or skipped; with nothing published, every finished run is.
-// Content-gated, a run that succeeded is never lost: it published, or
-// decided that nothing in the image had moved. One that failed, was
-// cancelled or ended any other way is lost all the same.
+// Content-gated, once the image is published, a run that succeeded is
+// never lost: it published, or decided that nothing in the image had
+// moved. One that failed, was cancelled or ended any other way is lost all
+// the same, and so is any run with nothing published yet, since then every
+// run publishes, gated or not.
 //
 // So is each day with no slot run at all, after 12 hours' grace, since
 // GitHub starts them hours late. Those days count from the newest slot
@@ -375,15 +378,16 @@ func against(status string) string {
 }
 
 // isLost says whether a finished slot run should have published and did
-// not. Content-gated, a run that succeeded never is. Otherwise, with
-// nothing published, any run since the slot could first run is; with a
-// commit published, a run that built a commit ahead of it.
+// not. With nothing published, any run since the slot could first run is,
+// content-gated or not: every such run publishes. With a commit published,
+// a run that built a commit ahead of it is, unless content-gated and the
+// run succeeded.
 func isLost(ctx context.Context, s Source, c *Config, run *Run, state registry.State, revision string, since time.Time) (bool, error) {
-	if c.ContentGated && run.Conclusion == "success" {
-		return false, nil
-	}
 	if state == registry.Absent {
 		return run.Created.After(since), nil
+	}
+	if c.ContentGated && run.Conclusion == "success" {
+		return false, nil
 	}
 	status, _, err := s.Compare(ctx, revision, run.HeadSHA)
 	if err != nil {

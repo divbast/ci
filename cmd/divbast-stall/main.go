@@ -24,8 +24,10 @@
 //
 // slots -content-gated is for a slot workflow that publishes only when the
 // image's content moved, as divbast-publish-decision -content-gated does:
-// a slot run that succeeded is never lost, since it may have decided that
-// nothing in the image had moved.
+// once the image is published, a slot run that succeeded is never lost,
+// since it may have decided that nothing in the image had moved. With
+// nothing published, every slot run publishes, so one that succeeded and
+// left nothing published is lost all the same.
 //
 // It reads the repository's pull requests, runs and commits through gh,
 // and PUBLISHED as an anonymous client through skopeo. The environment:
@@ -103,10 +105,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, r execx
 	check := flags.Arg(0)
 	checkFlags := flag.NewFlagSet(name+" "+check, flag.ContinueOnError)
 	checkFlags.SetOutput(stderr)
-	checkFlags.Usage = usage
+	// The usage, then the check's own flags, which only slots has.
+	checkFlags.Usage = func() {
+		usage()
+		checkFlags.PrintDefaults()
+	}
 	var gated *bool
 	if check == "slots" {
-		gated = checkFlags.Bool("content-gated", false, "never count a slot run that succeeded as lost")
+		gated = checkFlags.Bool("content-gated", false, "once the image is published, never count a slot run that succeeded as lost")
 	}
 	if err := checkFlags.Parse(flags.Args()[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

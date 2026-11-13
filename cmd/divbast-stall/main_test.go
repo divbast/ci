@@ -217,9 +217,13 @@ func TestRun(t *testing.T) {
 			wantStderr: []string{"want one check, not 2 arguments"},
 		},
 		{
-			name:       "slots-help",
-			args:       []string{"slots", "-h"},
-			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots", "slots -content-gated"},
+			// The usage, then what the check's own flags do.
+			name: "slots-help",
+			args: []string{"slots", "-h"},
+			wantStderr: []string{
+				"usage: divbast-stall open|stuck|renovate|slots", "slots -content-gated",
+				"  -content-gated\n", "once the image is published, never count a slot run that succeeded as lost",
+			},
 		},
 		{
 			name: "slots-private",

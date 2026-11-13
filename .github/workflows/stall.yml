@@ -48,7 +48,7 @@ on:
         type: number
         default: 2
       content-gated:
-        description: The slot workflow publishes only when the image's content moved, so a slot run that succeeded is never lost
+        description: The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost
         type: boolean
         default: false
 
