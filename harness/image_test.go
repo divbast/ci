@@ -381,6 +381,41 @@ func TestSaveMemoized(t *testing.T) {
 	})
 }
 
+// TestImageConfigReturnsACopy changes the configuration ImageConfig
+// returned, its volumes and its healthcheck's command, then reads the
+// image's again (backlog CI-20). What the save cache holds is the image's
+// own, so no check's change to what it was given reaches the next check
+// that asks.
+func TestImageConfigReturnsACopy(t *testing.T) {
+	t.Parallel()
+
+	const blob = `{"config":{"User":"65532:65532","Volumes":{"/data":{}},"Healthcheck":{"Test":["CMD","/probe"]}}}`
+	sum := sha256.Sum256([]byte(blob))
+	id := hex.EncodeToString(sum[:])
+	archive := tarball(t, file{"l1.tar", "a layer"}, file{id + ".json", blob},
+		file{"manifest.json", `[{"Config":"` + id + `.json","RepoTags":[],"Layers":["l1.tar"]}]`})
+	e := newEngine("podman", podmanSaving(t, id, archive))
+	want := Config{User: "65532:65532", Volumes: map[string]struct{}{"/data": {}}, Healthcheck: &Healthcheck{Test: []string{"CMD", "/probe"}}}
+
+	got, err := e.ImageConfig(t.Context(), t, "img")
+	if err != nil || !sameConfig(got, want) {
+		t.Fatalf("ImageConfig() = %+v, %v; want %+v", got, err, want)
+	}
+	got.Volumes["/elsewhere"] = struct{}{}
+	delete(got.Volumes, "/data")
+	got.Healthcheck.Test[1] = "/another"
+	got.Healthcheck.Retries = 9
+
+	again, err := e.ImageConfig(t.Context(), t, "img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameConfig(again, want) {
+		t.Errorf("ImageConfig() after a change to what it returned = %+v, healthcheck %+v; want %+v, healthcheck %+v",
+			again, again.Healthcheck, want, want.Healthcheck)
+	}
+}
+
 func TestBuild(t *testing.T) {
 	t.Parallel()
 
