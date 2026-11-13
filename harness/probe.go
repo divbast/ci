@@ -11,7 +11,6 @@ import (
 	"path"
 	"slices"
 	"strings"
-	"time"
 )
 
 // FrankenPHP is the PHP every divbast image runs, and so the probe's.
@@ -50,56 +49,18 @@ func InstallProbe(ctx context.Context, c *Container, app []byte) (*Probe, error)
 	return &Probe{c: c}, nil
 }
 
-// An engine can refuse an exec while a container is starting: Docker once
-// answered "cannot exec in a stopped container" here, with exit status
-// 128, to one whose server was still coming up. So an exec the engine
-// itself failed, rather than the PHP it ran, is tried again while the
-// container runs, up to installAttempts times, installRetry apart.
-const (
-	installAttempts = 5
-	installRetry    = 500 * time.Millisecond
-)
-
-// engineFailed reports whether an exec that exited as res did failed in
-// the engine rather than in the PHP it ran: 125 for the engine, 126 and
-// 127 for a command it could not run, and 128 where Docker's runtime
-// refused. Podman also exits 255 when its runtime fails the exec, as crun
-// once did with "setns `mnt`: Bad file descriptor" into a running
-// container, and then opens stderr with podmanRuntimeError, which no PHP
-// prints. Any other exit is the PHP's, which exits 0 or 1 for the install,
-// or 255 for a fatal error, and would only do the same again.
-func engineFailed(res Result) bool {
-	return res.Code >= 125 && res.Code <= 128 ||
-		res.Code == 255 && bytes.HasPrefix(res.Stderr, []byte(podmanRuntimeError))
-}
-
-// podmanRuntimeError opens what Podman prints when its OCI runtime fails.
-const podmanRuntimeError = "Error: OCI runtime error:"
-
+// install writes body to file in c. An exec the engine refuses is tried
+// again by [Container.Exec], so a container still starting gets the file
+// all the same.
 func install(ctx context.Context, c *Container, file string, body []byte) error {
-	for attempt := 1; ; attempt++ {
-		res, err := c.Exec(ctx, bytes.NewReader(body), FrankenPHP, "php-cli", "-r", installCode(file))
-		if err != nil {
-			return err
-		}
-		if res.Code == 0 {
-			return nil
-		}
-		failed := fmt.Errorf("installing %s in container %s: exit status %d: %s", file, c, res.Code, combined(res))
-		if !engineFailed(res) || attempt == installAttempts {
-			return failed
-		}
-		ins, err := c.Inspect(ctx)
-		if err != nil {
-			return fmt.Errorf("%w; and then: %w", failed, err)
-		}
-		if !ins.State.Running {
-			return failed
-		}
-		if err := sleep(ctx, installRetry); err != nil {
-			return err
-		}
+	res, err := c.Exec(ctx, bytes.NewReader(body), FrankenPHP, "php-cli", "-r", installCode(file))
+	if err != nil {
+		return fmt.Errorf("installing %s: %w", file, err)
 	}
+	if res.Code != 0 {
+		return fmt.Errorf("installing %s in container %s: exit status %d: %s", file, c, res.Code, combined(res))
+	}
+	return nil
 }
 
 // installCode is PHP that writes its stdin to file, making the directory

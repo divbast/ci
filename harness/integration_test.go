@@ -281,6 +281,120 @@ func TestInspectPortsOnFixture(t *testing.T) {
 	}
 }
 
+// TestRestartSameContainer restarts a serving container in place, as a
+// suite does to see an app come back up on the state it left: the same
+// container, running again, with what it wrote to its volume. What the
+// restart does to the tmpfs at /tmp and to a host port the engine picked
+// is asserted exactly for each engine, as Restart's doc comment states it.
+func TestRestartSameContainer(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+
+	// The fixture's home directory is 65532's, and a new volume mounted on
+	// it takes that owner, so the contract's user can write to it.
+	volume, err := e.Volume(ctx, t, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := startServed(t, e, &RunSpec{
+		Image:   testfixture.LibreSpeed,
+		Confine: Contract("16m"),
+		Mounts:  []Mount{{Source: volume, Target: "/home/nonroot", Volume: true}},
+		Publish: []string{"127.0.0.1::8080"},
+	})
+	php := func(code string) string {
+		t.Helper()
+		res, execErr := c.Exec(ctx, nil, FrankenPHP, "php-cli", "-r", code)
+		if execErr != nil {
+			t.Fatal(execErr)
+		}
+		if res.Code != 0 {
+			t.Fatalf("php-cli -r %q in container %s: exit status %d: %s", code, c, res.Code, combined(res))
+		}
+		return string(res.Stdout)
+	}
+	php(`foreach (["/home/nonroot/kept" => "volume", "/tmp/kept" => "tmpfs"] as $f => $s) {
+    if (file_put_contents($f, $s) !== strlen($s)) { fwrite(STDERR, "cannot write $f\n"); exit(1); }
+}`)
+	before, err := c.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := c.ID
+
+	if err = c.Restart(ctx); err != nil {
+		t.Fatalf("Restart() error = %v", err)
+	}
+
+	out, err := e.output(ctx, "container", "inspect", "--format", "{{.Id}}", c.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(out)); got != id || c.ID != id {
+		t.Errorf("after Restart(), %s names container %s and the harness %s; want the one restarted, %s", c.Name, got, c.ID, id)
+	}
+	after, err := c.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.State.Running {
+		t.Fatalf("after Restart(), container %s is %s, exit status %d, want it running", c, after.State.Status, after.State.ExitCode)
+	}
+	if got := php(`echo file_get_contents("/home/nonroot/kept");`); got != "volume" {
+		t.Errorf("after Restart(), the volume holds %q, want what was written to it, volume", got)
+	}
+	// A new, empty tmpfs on both engines: what was on /tmp, the probe
+	// among it, is gone.
+	if got := php(`var_export(file_exists("/tmp/kept"));`); got != "false" {
+		t.Errorf("after Restart() on %s, /tmp/kept exists: %s; want false, the tmpfs a new one", e.Name(), got)
+	}
+
+	// Docker picks the host port again, and binds another; Podman picked
+	// it once, when it made the container, and keeps it.
+	was, now := before.Ports["8080/tcp"], after.Ports["8080/tcp"]
+	host, port, err := net.SplitHostPort(now)
+	if err != nil || host != "127.0.0.1" || port == "" || port == "0" {
+		t.Fatalf("after Restart(), Inspect().Ports = %q, want 8080/tcp at 127.0.0.1 and a port the engine picked", after.Ports)
+	}
+	switch e.Name() {
+	case "docker":
+		if now == was {
+			t.Errorf("after Restart() on docker, 8080/tcp is still at %s, want another port: Docker picks one again", was)
+		}
+	case "podman":
+		if now != was {
+			t.Errorf("after Restart() on podman, 8080/tcp moved from %s to %s, want it kept: Podman picked it when it made the container", was, now)
+		}
+	}
+
+	// As a caller does after a restart: the probe installed again answers
+	// on both ports, and the address Inspect now gives reaches the app.
+	p, err := InstallProbe(ctx, c, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, url := range []string{"http://127.0.0.1:8080/", "http://127.0.0.1:8081/healthz"} {
+		if _, err = p.WaitHTTP(ctx, url, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+now+"/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := HostClient().Do(req)
+	if err != nil {
+		t.Fatalf("GET / at %s, from the host, after Restart(): %v", now, err)
+	}
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Error(cerr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET / at %s, from the host, after Restart(): status %d, want 200", now, resp.StatusCode)
+	}
+}
+
 // startServed starts spec, installs the probe, and waits until both of the
 // contract's ports answer from inside the container.
 func startServed(t *testing.T, e Engine, spec *RunSpec) (*Container, *Probe) {

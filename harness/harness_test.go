@@ -711,6 +711,254 @@ func TestExec(t *testing.T) {
 	}
 }
 
+// What engines and their runtimes print when they, and not the command,
+// fail an exec, and what a command that ran prints when it fails.
+var (
+	// Podman, when crun failed an exec into a running container on an
+	// arm64 runner.
+	runtimeError = execx.Result{Code: 255, Stderr: []byte("Error: OCI runtime error: crun: setns `mnt`: Bad file descriptor\nfail startup\n")}
+	// Docker, once, to an exec into a container still starting.
+	stoppedRefusal = execx.Result{Code: 128, Stderr: []byte("OCI runtime exec failed: exec failed: cannot exec in a stopped container")}
+	// Podman's own error, as for an exec into a container not running.
+	engineError = execx.Result{Code: 125, Stderr: []byte("Error: can only create exec sessions on running containers: container state improper\n")}
+	// Docker 29, for /bin/sh in an image without one.
+	notFound = execx.Result{Code: 127, Stderr: []byte(`OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/sh": stat /bin/sh: no such file or directory` + "\n")}
+	// FrankenPHP's PHP, for a fatal error, which exits 255 too.
+	phpFatal = execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Uncaught Error: Call to undefined function f() in Command line code:1\n")}
+)
+
+// TestExecRetriesEngineFailure runs Exec into each way an exec can fail.
+// One the engine failed, rather than the command it ran, is run again, a
+// second apart, three times in all, each fed the whole of stdin; one whose
+// command ran and failed is not. Three engine failures in a row are an
+// error naming the last attempt, except for a command the runtime could
+// not execute or find, 126 or 127, which stays a Result: a check that an
+// image has no /bin/sh asserts exactly that.
+func TestExecRetriesEngineFailure(t *testing.T) {
+	t.Parallel()
+
+	argv := []string{FrankenPHP, "php-cli", "-r", "echo 1;"}
+	tests := []struct {
+		name   string
+		engine string
+		stdin  []byte
+		// what each attempt returns, in order: the test fails on an
+		// attempt more or fewer
+		attempts []execx.Result
+		wantCode int
+		// wantErr is in the error; empty for none
+		wantErr  string
+		wantWait time.Duration
+	}{
+		{
+			name:     "runtime-error-then-0",
+			engine:   "podman",
+			attempts: []execx.Result{runtimeError, {Stdout: []byte("1")}},
+			wantWait: time.Second,
+		},
+		{
+			name:     "255-without-the-prefix",
+			engine:   "podman",
+			attempts: []execx.Result{phpFatal},
+			wantCode: 255,
+		},
+		{
+			// The prefix must open stderr: PHP may print the words
+			// anywhere else in what it was given to say.
+			name:     "the-prefix-later",
+			engine:   "podman",
+			attempts: []execx.Result{{Code: 255, Stderr: []byte("PHP Fatal error:  Error: OCI runtime error: in Command line code:1\n")}},
+			wantCode: 255,
+		},
+		{
+			name:     "exit-1",
+			engine:   "docker",
+			attempts: []execx.Result{{Code: 1, Stderr: []byte("no\n")}},
+			wantCode: 1,
+		},
+		{
+			name:     "125-three-times",
+			engine:   "podman",
+			attempts: []execx.Result{engineError, engineError, engineError},
+			wantCode: 125,
+			wantErr:  "attempt 3 of 3",
+			wantWait: 2 * time.Second,
+		},
+		{
+			name:     "128-then-0-fed-again",
+			engine:   "docker",
+			stdin:    []byte("<?php return [];\n"),
+			attempts: []execx.Result{stoppedRefusal, {}},
+			wantWait: time.Second,
+		},
+		{
+			name:     "128-three-times",
+			engine:   "docker",
+			attempts: []execx.Result{stoppedRefusal, stoppedRefusal, stoppedRefusal},
+			wantCode: 128,
+			wantErr:  "cannot exec in a stopped container",
+			wantWait: 2 * time.Second,
+		},
+		{
+			name:     "127-three-times-is-a-result",
+			engine:   "docker",
+			attempts: []execx.Result{notFound, notFound, notFound},
+			wantCode: 127,
+			wantWait: 2 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				run := slices.Concat([]string{tt.engine, "exec", "abc"}, argv)
+				var stdin io.Reader
+				if tt.stdin != nil {
+					run = slices.Concat([]string{tt.engine, "exec", "-i", "abc"}, argv)
+					stdin = bytes.NewReader(tt.stdin)
+				}
+				calls := make([]execx.Call, 0, len(tt.attempts))
+				for _, res := range tt.attempts {
+					calls = append(calls, execx.Call{Argv: run, Stdin: tt.stdin, Result: res})
+				}
+				c := &Container{ID: "abc", engine: newEngine(tt.engine, execx.NewFake(t, calls...))}
+
+				start := time.Now()
+				res, err := c.Exec(t.Context(), stdin, argv...)
+				switch {
+				case tt.wantErr == "" && err != nil:
+					t.Errorf("Exec() error = %v, want nil", err)
+				case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+					t.Errorf("Exec() error = %v, want one containing %q", err, tt.wantErr)
+				}
+				if res.Code != tt.wantCode {
+					t.Errorf("Exec() exit status = %d, want %d", res.Code, tt.wantCode)
+				}
+				if waited := time.Since(start); waited != tt.wantWait {
+					t.Errorf("Exec() took %s, want %s between its attempts", waited, tt.wantWait)
+				}
+			})
+		})
+	}
+}
+
+// TestExecRetryCodes runs Exec into each exit status once, then 0. Only
+// the engine's own, 125 to 128, are tried again: any other is the
+// command's, which another try would only repeat.
+func TestExecRetryCodes(t *testing.T) {
+	t.Parallel()
+
+	run := []string{"docker", "exec", "abc", "true"}
+	for _, code := range []int{1, 2, 124, 125, 126, 127, 128, 129, 137, 255} {
+		retried := code >= 125 && code <= 128
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				calls := []execx.Call{{Argv: run, Result: execx.Result{Code: code, Stderr: []byte("exit " + strconv.Itoa(code))}}}
+				if retried {
+					calls = append(calls, execx.Call{Argv: run})
+				}
+				c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, calls...))}
+
+				res, err := c.Exec(t.Context(), nil, "true")
+				switch {
+				case err != nil:
+					t.Errorf("Exec() after exit status %d: error = %v, want nil", code, err)
+				case retried && res.Code != 0:
+					t.Errorf("Exec() after exit status %d, then 0 = exit status %d, want it tried again and 0", code, res.Code)
+				case !retried && res.Code != code:
+					t.Errorf("Exec() after exit status %d = exit status %d, want that status, not tried again", code, res.Code)
+				}
+			})
+		})
+	}
+}
+
+// TestExecRetryHonoursContext ends the context while Exec waits to try an
+// exec the engine failed again: it stops waiting, runs nothing more, and
+// says why.
+func TestExecRetryHonoursContext(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		run := []string{"docker", "exec", "abc", "true"}
+		c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, execx.Call{Argv: run, Result: stoppedRefusal}))}
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		_, err := c.Exec(ctx, nil, "true")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Exec() error = %v, want the context's deadline", err)
+		}
+		if waited := time.Since(start); waited != 300*time.Millisecond {
+			t.Errorf("Exec() returned after %s, want at the deadline, 300ms", waited)
+		}
+	})
+}
+
+// TestRestart restarts a container by its name, and reads back from the
+// engine that it runs again. A restart the engine refuses is an error in
+// its words, and so is a container that is not running once it is done.
+// Docker's health check counts its start period from the restart, so
+// EngineHealthy's does too.
+func TestRestart(t *testing.T) {
+	t.Parallel()
+
+	restart := []string{"docker", "restart", "ctr"}
+	inspect := []string{"docker", "container", "inspect", "abc"}
+	tests := []struct {
+		name    string
+		calls   []execx.Call
+		wantErr string
+	}{
+		{
+			name: "running-again",
+			calls: []execx.Call{
+				{Argv: restart, Result: execx.Result{Stdout: []byte("ctr\n")}},
+				{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
+			},
+		},
+		{
+			name: "refused",
+			calls: []execx.Call{{Argv: restart, Result: execx.Result{
+				Code: 1, Stderr: []byte("Error response from daemon: Cannot restart container ctr: tried to kill container, but did not receive an exit event\n"),
+			}}},
+			wantErr: "did not receive an exit event",
+		},
+		{
+			name: "exited-again",
+			calls: []execx.Call{
+				{Argv: restart, Result: execx.Result{Stdout: []byte("ctr\n")}},
+				{Argv: inspect, Result: execx.Result{Stdout: state("exited", false, 3, startedAt, "")}},
+			},
+			wantErr: "exit status 3",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				c := &Container{ID: "abc", Name: "ctr", engine: newEngine("docker", execx.NewFake(t, tt.calls...)), started: time.Now()}
+				time.Sleep(time.Hour)
+
+				err := c.Restart(t.Context())
+				if tt.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+						t.Errorf("Restart() error = %v, want one containing %q", err, tt.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("Restart() error = %v", err)
+				}
+				if !c.started.Equal(time.Now()) {
+					t.Errorf("after Restart(), the container started at %s, want the restart's time, %s", c.started, time.Now())
+				}
+			})
+		})
+	}
+}
+
 func TestLogs(t *testing.T) {
 	t.Parallel()
 
@@ -1319,44 +1567,32 @@ func TestInstallProbe(t *testing.T) {
 	}
 }
 
+// TestInstallProbeRetries installs the probe through an engine that
+// refuses the exec, as Docker once did to a container still starting: the
+// install rides on Exec's retry, which feeds the file again, and once the
+// third attempt is refused too, the error says what was being installed.
 func TestInstallProbeRetries(t *testing.T) {
 	t.Parallel()
 
-	install := []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")}
-	inspect := []string{"docker", "container", "inspect", "abc"}
-	// What Docker said, once, to an exec into a container still starting
-	refused := execx.Result{Code: 128, Stderr: []byte("OCI runtime exec failed: exec failed: cannot exec in a stopped container")}
+	install := execx.Call{
+		Argv:  []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")},
+		Stdin: coreProbe,
+	}
+	refused := install
+	refused.Result = stoppedRefusal
 	tests := []struct {
 		name     string
 		calls    []execx.Call
-		wantText string
+		wantText []string
 	}{
 		{
-			name: "engine-refused-while-running",
-			calls: []execx.Call{
-				{Argv: install, Stdin: coreProbe, Result: refused},
-				{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
-				{Argv: install, Stdin: coreProbe},
-			},
+			name:  "engine-refused-then-installed",
+			calls: []execx.Call{refused, install},
 		},
 		{
-			name: "engine-refused-and-stopped",
-			calls: []execx.Call{
-				{Argv: install, Stdin: coreProbe, Result: refused},
-				{Argv: inspect, Result: execx.Result{Stdout: state("exited", false, 1, startedAt, "")}},
-			},
-			wantText: "cannot exec in a stopped container",
-		},
-		{
-			name: "engine-refuses-every-time",
-			calls: slices.Concat(
-				slices.Repeat([]execx.Call{
-					{Argv: install, Stdin: coreProbe, Result: refused},
-					{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
-				}, installAttempts-1),
-				[]execx.Call{{Argv: install, Stdin: coreProbe, Result: refused}},
-			),
-			wantText: "cannot exec in a stopped container",
+			name:     "engine-refuses-every-time",
+			calls:    []execx.Call{refused, refused, refused},
+			wantText: []string{"installing /tmp/divbast-probe/core.php", "attempt 3 of 3", "cannot exec in a stopped container"},
 		},
 	}
 	for _, tt := range tests {
@@ -1365,113 +1601,16 @@ func TestInstallProbeRetries(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))}
 				p, err := InstallProbe(t.Context(), c, nil)
-				if tt.wantText == "" {
+				if len(tt.wantText) == 0 {
 					if err != nil || p == nil {
 						t.Errorf("InstallProbe() = %v, %v; want a probe", p, err)
 					}
 					return
 				}
-				if err == nil || !strings.Contains(err.Error(), tt.wantText) {
-					t.Errorf("InstallProbe() = %v, %v; want an error containing %q", p, err, tt.wantText)
-				}
-			})
-		})
-	}
-}
-
-// TestProbeRetryCodes runs the install into each exit status once. Only
-// the engine's own, 125 to 128, are tried again: any other is the PHP the
-// exec ran, a fatal error's 255 among them, which another try would only
-// repeat.
-func TestProbeRetryCodes(t *testing.T) {
-	t.Parallel()
-
-	install := []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")}
-	inspect := []string{"docker", "container", "inspect", "abc"}
-	for _, code := range []int{1, 2, 124, 125, 126, 127, 128, 129, 137, 255} {
-		retried := code >= 125 && code <= 128
-		t.Run(strconv.Itoa(code), func(t *testing.T) {
-			t.Parallel()
-			synctest.Test(t, func(t *testing.T) {
-				failed := execx.Result{Code: code, Stderr: []byte("exit " + strconv.Itoa(code))}
-				calls := []execx.Call{{Argv: install, Stdin: coreProbe, Result: failed}}
-				if retried {
-					calls = append(calls,
-						execx.Call{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
-						execx.Call{Argv: install, Stdin: coreProbe},
-					)
-				}
-				c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, calls...))}
-
-				_, err := InstallProbe(t.Context(), c, nil)
-				switch {
-				case retried && err != nil:
-					t.Errorf("InstallProbe() after exit status %d, then 0: error = %v, want it tried again and installed", code, err)
-				case !retried && (err == nil || !strings.Contains(err.Error(), fmt.Sprintf("exit status %d", code))):
-					t.Errorf("InstallProbe() after exit status %d: error = %v, want that status, not tried again", code, err)
-				}
-			})
-		})
-	}
-}
-
-// TestProbeRetryRuntimeError runs the install once into each failure on
-// Podman. Podman exits 255 itself when its runtime fails an exec, as crun
-// did on an arm64 runner with "setns `mnt`: Bad file descriptor" into a
-// running container, and says so with a prefix of its own on stderr,
-// which no PHP prints: that 255 is tried again, and a PHP fatal error's is
-// not.
-func TestProbeRetryRuntimeError(t *testing.T) {
-	t.Parallel()
-
-	install := []string{"podman", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")}
-	inspect := []string{"podman", "container", "inspect", "abc"}
-	tests := []struct {
-		name    string
-		failed  execx.Result
-		retried bool
-	}{
-		{
-			name: "runtime-error-255",
-			failed: execx.Result{Code: 255, Stderr: []byte("Error: OCI runtime error: crun: setns `mnt`: Bad file descriptor\n" +
-				"fail startup\n")},
-			retried: true,
-		},
-		{
-			name:   "php-fatal-255",
-			failed: execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Uncaught Error: Call to undefined function f() in Command line code:1\n")},
-		},
-		{
-			// The prefix must open stderr: PHP may print the words anywhere
-			// else in what it was given to say.
-			name:   "the-words-later-255",
-			failed: execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Error: OCI runtime error: in Command line code:1\n")},
-		},
-		{
-			name:    "cannot-execute-126",
-			failed:  execx.Result{Code: 126, Stderr: []byte("Error: crun: open executable: Operation not permitted: OCI permission denied\n")},
-			retried: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			synctest.Test(t, func(t *testing.T) {
-				calls := []execx.Call{{Argv: install, Stdin: coreProbe, Result: tt.failed}}
-				if tt.retried {
-					calls = append(calls,
-						execx.Call{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
-						execx.Call{Argv: install, Stdin: coreProbe},
-					)
-				}
-				c := &Container{ID: "abc", engine: newEngine("podman", execx.NewFake(t, calls...))}
-
-				_, err := InstallProbe(t.Context(), c, nil)
-				switch {
-				case tt.retried && err != nil:
-					t.Errorf("InstallProbe() after %q, then 0: error = %v, want it tried again and installed", tt.failed.Stderr, err)
-				case !tt.retried && (err == nil || !strings.Contains(err.Error(), "exit status 255")):
-					t.Errorf("InstallProbe() after %q: error = %v, want that failure, not tried again", tt.failed.Stderr, err)
+				for _, want := range tt.wantText {
+					if err == nil || !strings.Contains(err.Error(), want) {
+						t.Errorf("InstallProbe() = %v, %v; want an error containing %q", p, err, want)
+					}
 				}
 			})
 		})

@@ -358,13 +358,109 @@ func (c *Container) String() string { return cmp.Or(c.Name, c.ID) }
 // Exec runs argv in the container, as the container's own user, feeding it
 // stdin when that is not nil. A non-zero exit status is in the Result;
 // the error is for an exec the engine could not run at all.
+//
+// An exec the engine failed, rather than the command it ran, is run
+// again, up to three times in all, a second apart, for as long as ctx
+// allows: an engine can refuse an exec into a container that is starting
+// or has just restarted, and its runtime can fail one into a container
+// that runs. Each attempt is fed the whole of stdin, which Exec reads to
+// its end before the first. When the third attempt fails in the engine
+// too, the error names it, with the engine's words, and the Result is the
+// third's. A command the runtime could not execute or find, exit status
+// 126 or 127, is the one exception: it stays a Result, since a check that
+// an image has no /bin/sh asserts exactly that. A command's own non-zero
+// exit, a PHP fatal error's 255 among them, is never run again.
 func (c *Container) Exec(ctx context.Context, stdin io.Reader, argv ...string) (Result, error) {
 	args := []string{"exec"}
+	var in []byte
 	if stdin != nil {
 		args = append(args, "-i")
+		var err error
+		if in, err = io.ReadAll(stdin); err != nil {
+			return Result{}, fmt.Errorf("reading what to feed an exec in container %s: %w", c, err)
+		}
 	}
-	args = append(args, c.ID)
-	return c.engine.run.RunStdin(ctx, stdin, c.engine.name, append(args, argv...)...)
+	args = slices.Concat(args, []string{c.ID}, argv)
+	for attempt := 1; ; attempt++ {
+		var fed io.Reader
+		if stdin != nil {
+			fed = bytes.NewReader(in)
+		}
+		res, err := c.engine.run.RunStdin(ctx, fed, c.engine.name, args...)
+		if err != nil || !engineFailed(res) {
+			return res, err
+		}
+		if attempt == execAttempts {
+			if res.Code == 126 || res.Code == 127 {
+				return res, nil
+			}
+			return res, fmt.Errorf("%s exec in container %s: attempt %d of %d failed in the engine, as each before it did: exit status %d: %s",
+				c.engine.name, c, attempt, execAttempts, res.Code, combined(res))
+		}
+		if err := sleep(ctx, execRetry); err != nil {
+			return res, fmt.Errorf("%s exec in container %s: waiting to try again after attempt %d failed in the engine, exit status %d: %w",
+				c.engine.name, c, attempt, res.Code, err)
+		}
+	}
+}
+
+// An engine can refuse an exec while a container is starting: Docker once
+// answered "cannot exec in a stopped container" here, with exit status
+// 128, to one whose server was still coming up. So [Container.Exec] runs
+// an exec the engine itself failed again, up to execAttempts times in
+// all, execRetry apart.
+const (
+	execAttempts = 3
+	execRetry    = time.Second
+)
+
+// engineFailed reports whether an exec that exited as res did failed in
+// the engine rather than in the command it ran: 125 for the engine, 126
+// and 127 for a command it could not run, and 128 where Docker's runtime
+// refused. Podman also exits 255 when its runtime fails the exec, as crun
+// once did with "setns `mnt`: Bad file descriptor" into a running
+// container, and then opens stderr with podmanRuntimeError, which no PHP
+// prints. Any other exit is the command's own, as PHP exits 255 for a
+// fatal error, and would only do the same again.
+func engineFailed(res Result) bool {
+	return res.Code >= 125 && res.Code <= 128 ||
+		res.Code == 255 && bytes.HasPrefix(res.Stderr, []byte(podmanRuntimeError))
+}
+
+// podmanRuntimeError opens what Podman prints when its OCI runtime fails.
+const podmanRuntimeError = "Error: OCI runtime error:"
+
+// Restart restarts the container in place, as <engine> restart does: the
+// engine stops its process, as a stop would, and starts it again in the
+// same container, with the same ID, name, run flags and volumes. It
+// returns once the engine reports that container running again, not once
+// the server in it is serving. [Container.EngineHealthy] counts Docker's
+// start period from the restart.
+//
+// What a restart keeps, as measured on Docker 29 and Podman 5.7, and as
+// ci's TestRestartSameContainer asserts on each:
+//
+//   - A volume keeps what was written to it.
+//   - The tmpfs at /tmp is a new, empty one on both engines. A probe
+//     [InstallProbe] put there is gone: install it again.
+//   - A host port the engine picked, as -p 127.0.0.1::8080 asks it to, is
+//     picked again by Docker, which binds another port, and kept by
+//     Podman, which picked it once, when it made the container. Read
+//     [Container.Inspect] again for where a published port is now.
+func (c *Container) Restart(ctx context.Context) error {
+	if _, err := c.engine.output(ctx, "restart", c.String()); err != nil {
+		return err
+	}
+	c.started = time.Now()
+	ins, err := c.Inspect(ctx)
+	if err != nil {
+		return err
+	}
+	if !ins.State.Running {
+		return fmt.Errorf("container %s is %s after %s restart, exit status %d, not running: %s",
+			c, ins.State.Status, c.engine.name, ins.State.ExitCode, ins.State.Error)
+	}
+	return nil
 }
 
 // Logs returns what the container has written: its stdout, then its
