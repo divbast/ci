@@ -16,7 +16,7 @@ permissions: {}
 env:
   # The mise release jdx/mise-action installs. Renovate moves it.
   # renovate: datasource=github-releases depName=jdx/mise
-  MISE_VERSION: 2026.11.7
+  MISE_VERSION: 2026.11.8
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}

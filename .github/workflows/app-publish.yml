@@ -57,7 +57,7 @@ permissions: {}
 env:
   # The mise release jdx/mise-action installs. Renovate moves it.
   # renovate: datasource=github-releases depName=jdx/mise
-  MISE_VERSION: 2026.11.7
+  MISE_VERSION: 2026.11.8
 
 # bash with -e and pipefail, so a command that fails fails its step, in a
 # pipeline too, such as the last check's skopeo into shasum. A step that
