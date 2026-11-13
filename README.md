@@ -558,6 +558,44 @@ the mark, above, that makes the next release major:
 When unsure whether a change breaks callers, mark it: a major release only
 waits for approval on each caller's Dependency Dashboard.
 
+v2.0.0 is such a release: it added a permission a calling job must grant,
+and made a run that passed fail. [Moving to v2](#moving-to-v2) says what
+a caller changes.
+
+### Moving to v2
+
+v2.0.0 breaks two things a v1 caller relies on.
+
+- **`app-check.yml` needs `packages: read`.** Its `scan` job asks GitHub
+  whether a published image the registry refuses is absent, private, or
+  public and failing, where v1 read Trivy's error text and took any
+  refusal for nothing published. So a registry refusing a public image
+  now fails the scan, where v1 made it advisory. A called job gets no
+  more than its caller grants, so a caller's `check` job that does not
+  grant it fails before any job starts. The `check` job's permissions
+  become:
+
+  ```yaml
+      permissions:
+        contents: read
+        attestations: read # verify the FrankenPHP binary
+        packages: read # the scan asks GitHub whether the published image is absent or private
+        security-events: write # code scanning, from main
+  ```
+
+  `divbast-scan`'s `-published` must name a ghcr.io image, as every
+  caller's does.
+- **`app-publish.yml` rehearses only in `divbast/oci-image-template`.**
+  Anywhere else, `rehearse: true` fails the publish job, where v1 warned
+  and went on. A repository made from the template sets `image` to its own
+  and removes `rehearse` before it moves to v2; the
+  [Rehearsal](#rehearsal) section says how.
+
+Nothing else changed for a caller. `lint.yml`, `renovate.yml` and
+`stall.yml` take the same inputs and permissions as in v1, so a repository
+that calls only those moves its pin and nothing more. An app may add an
+`openvex.json` ([VEX](#vex)); without one, `scan` runs as before.
+
 ## Workflows
 
 The caller grants each called job its permissions. A called job gets no
