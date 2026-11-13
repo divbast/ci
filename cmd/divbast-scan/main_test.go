@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -120,11 +121,13 @@ func TestRun(t *testing.T) {
 	const before = "earlier\n"
 
 	// The registry showing the published image, or refusing to
-	index := &execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}
-	refused := &execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}
+	index := &execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}
+	refused := &execx.Result{Stderr: skopeoRecording(t, "skopeo-no-such-package.txt"), Code: 1}
 
 	tests := []struct {
 		name string
+		// image is the -published flag's value, when not published.
+		image string
 		// vex is the -vex flag's value, if any.
 		vex string
 		// skopeo is how the registry answers the read of the published
@@ -222,6 +225,21 @@ func TestRun(t *testing.T) {
 			wantBaseline: "{}\n",
 		},
 		{
+			// Only ghcr.io images can be told absent from private, so any
+			// other image fails before the registry is asked anything
+			name:         "not-ghcr",
+			image:        "docker.io/divbast/librespeed:latest",
+			candidate:    report(t, "amd64", "", 3, "CVE-1"),
+			layoutResult: &execx.Result{},
+			sarifResult:  &execx.Result{},
+			wantCode:     1,
+			wantStderr: []string{
+				"could not tell whether docker.io/divbast/librespeed:latest is published",
+				`"docker.io/divbast/librespeed:latest" is not a ghcr.io image`,
+			},
+			notInStdout: []string{"compared with"},
+		},
+		{
 			name:         "nothing-to-scan",
 			candidate:    report(t, "amd64", "", 0),
 			layoutResult: &execx.Result{},
@@ -296,8 +314,9 @@ func TestRun(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			image := cmp.Or(tt.image, published)
 			args := []string{
-				"-layout", paths["layout"], "-report", paths["report.json"], "-published", published,
+				"-layout", paths["layout"], "-report", paths["report.json"], "-published", image,
 				"-baseline", paths["baseline.json"], "-sarif", paths["report.sarif"],
 			}
 			scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
@@ -399,10 +418,11 @@ func TestRun(t *testing.T) {
 	}
 }
 
-// skopeoStderr returns a recording of skopeo's stderr from
+// skopeoRecording returns a recording of what skopeo printed, the index
+// it wrote to stdout or the refusal or failure it wrote to stderr, from
 // internal/registry's testdata, where registry_test.go says how each was
 // made.
-func skopeoStderr(t *testing.T, name string) []byte {
+func skopeoRecording(t *testing.T, name string) []byte {
 	t.Helper()
 	root, err := os.OpenRoot(filepath.Join("..", "..", "internal", "registry", "testdata"))
 	if err != nil {
@@ -451,8 +471,8 @@ func status(code int, text string) execx.Result {
 func TestPublishedPresenceFromRegistry(t *testing.T) {
 	t.Parallel()
 
-	refused := execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}
-	index := execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}
+	refused := execx.Result{Stderr: skopeoRecording(t, "skopeo-no-such-package.txt"), Code: 1}
+	index := execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}
 	tests := []struct {
 		name string
 		// actions is whether GITHUB_ACTIONS is true.
@@ -520,7 +540,7 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 		{
 			name:       "registry-unreachable",
 			actions:    true,
-			skopeo:     execx.Result{Stderr: skopeoStderr(t, "skopeo-manifest-503.txt"), Code: 1},
+			skopeo:     execx.Result{Stderr: skopeoRecording(t, "skopeo-manifest-503.txt"), Code: 1},
 			wantCode:   1,
 			wantStderr: []string{"503 Service Unavailable", "could not tell whether " + published + " is published"},
 		},
@@ -566,7 +586,7 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 		},
 		{
 			name:       "outside-actions-unreachable",
-			skopeo:     execx.Result{Stderr: skopeoStderr(t, "skopeo-manifest-503.txt"), Code: 1},
+			skopeo:     execx.Result{Stderr: skopeoRecording(t, "skopeo-manifest-503.txt"), Code: 1},
 			wantCode:   1,
 			wantStderr: []string{"503 Service Unavailable"},
 		},
@@ -729,7 +749,7 @@ func TestRunOutsideActions(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
-			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
 			}, scanArgs...), "--output", base, published)},
@@ -769,7 +789,7 @@ func TestRunUnwritableSummary(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
-			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
 			}, scanArgs...), "--output", base, published)},
@@ -814,7 +834,7 @@ func TestRunBaselineStaysInItsDirectory(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
-			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stderr: skopeoRecording(t, "skopeo-no-such-package.txt"), Code: 1}},
 		),
 		reports: map[string]string{rep: report(t, "amd64", "", 1)},
 	}
