@@ -10,7 +10,7 @@
 #   import? '.ci/just/common.just'
 #
 #   lint:
-#       {{ just_executable() }} actions-check workflow-audit go-lint
+#       {{ just_executable() }} ci-fresh actions-check workflow-audit go-lint
 #
 # Never as dependencies, as in `lint: actions-check`. just resolves those
 # when it reads the justfile, so until setup has fetched .ci no recipe
@@ -32,6 +32,28 @@ ci_dir := ".ci"
 # Build ci's tools into bin/ inside ci's checkout
 ci-tools:
     go -C '{{ ci_dir }}' build -o '{{ clean(justfile_directory() / ci_dir / "bin") }}/' ./cmd/...
+
+# A git pull that moves the workflows' pin leaves .ci where it was until
+# `just setup` moves it, and every shared recipe would go on running the
+# old commit's recipes, tools and configuration. A repository's lint runs
+# this first. It builds divbast-pin from its own body when .ci/bin lacks
+# it, since a shared recipe is never named as a dependency. ci, its own
+# checkout, has no pin to check.
+
+# Fail unless .ci holds the commit the workflows pin
+ci-fresh:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ '{{ ci_dir }}' == . ]]; then
+        echo "ci-fresh: ci is its own checkout, with no pin to check"
+        exit 0
+    fi
+    [[ -x '{{ ci_dir }}/bin/divbast-pin' ]] || {{ just_executable() }} ci-tools
+    have=$(git -C '{{ ci_dir }}' rev-parse HEAD)
+    if ! '{{ ci_dir }}/bin/divbast-pin' -expect "${have}"; then
+        echo "ci-fresh: {{ ci_dir }} holds ${have}, not the commit the workflows pin; just setup moves it there" >&2
+        exit 1
+    fi
 
 # The four recipes below call GitHub. Each takes its token from
 # GITHUB_TOKEN and nowhere else, and first runs this, which refuses one that

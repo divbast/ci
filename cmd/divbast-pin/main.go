@@ -10,10 +10,10 @@
 //
 // With -expect, it also fails unless that commit is SHA. A reusable
 // workflow passes its own job.workflow_sha there, so a caller whose other
-// workflows pin a different commit fails its own CI. An empty SHA is a
-// wrong command line, not a missing -expect: it comes from an expression
-// or a command that produced nothing, and taken as no -expect it would
-// check nothing.
+// workflows pin a different commit fails its own CI, and common.just's
+// ci-fresh passes the commit .ci holds. An empty SHA is a wrong command
+// line, not a missing -expect: it comes from an expression or a command
+// that produced nothing, and taken as no -expect it would check nothing.
 //
 // Exit codes:
 //
