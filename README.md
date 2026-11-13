@@ -389,6 +389,38 @@ new, empty tmpfs on both engines, and the probe goes with it, so
 install it again. A host port the engine picked moves on Docker and
 stays on Podman, so read `Inspect` again for it.
 
+The harness also carries the helpers an app's suite needs to serve its
+image and check what it answers, so no suite carries its own copy:
+
+- `Engine.Serve` starts a container from a `ServeSpec` and waits until
+  it serves. The caller sets the `RunSpec`'s image, confinement,
+  environment, mounts, network and health command; `Serve` publishes
+  `AppPort`, and `HealthPort` unless it is 0, each on `127.0.0.1` at a
+  host port the engine picks, and reads it back from `Inspect`, so no
+  two suites on one host collide. A spec with no network gets one of
+  its own. `Serve` then asks for `ReadyPath`, `/` by default, from the
+  host until any status comes back, for up to `ServeWithin`, a minute,
+  and installs the probe, with the app's `ProbeApp` beside it. A
+  container that stops first, or never answers, is an error carrying
+  its log. `Engine.StartServing` starts one without waiting.
+- `Serving` is the container, its `Probe`, and `Base` and `HealthBase`,
+  where its ports are from the host. `Serving.Wait` waits for a path of
+  its own, as `Serve` does. `Serving.Restart` restarts the container in
+  place, reads its ports again, waits, and installs the probe again.
+- `Serving.Get` and `Serving.Do` send a request from the host to `Base`
+  exactly as it is written, as `curl --path-as-is` sends it, with each
+  header name in the case it was given, and return a `Response`. A copy
+  of the `Serving` with `Base` set to `HealthBase` sends to the health
+  port.
+- Each assertion is a named check, through `Checks`: `StatusIs` and
+  `Answers` for an exact status, `Contains` and `Lacks` for text,
+  `LogContains` and `LogLacks` for a container's log, `IsFile` for a
+  path present or absent, `RunRecords` for a probe subcommand's
+  records, and `Refuses` for a container that must exit non-zero within
+  `ServeWithin` and say why in its log.
+- `PHPIn` runs PHP in a container, `WithLog` adds a container's log to
+  an error, and `Pause` waits, or stops when the context ends.
+
 ### ci's tools in `.ci/bin`
 
 `just ci-tools` builds every command under `cmd/` into `.ci/bin/`. A

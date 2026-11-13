@@ -71,23 +71,14 @@ func (p *Probe) WaitHTTP(ctx context.Context, url string, within time.Duration) 
 		case ierr != nil:
 			return HTTPResponse{}, fmt.Errorf("%w; and then: %w", err, ierr)
 		case !ins.State.Running:
-			return HTTPResponse{}, p.withLogs(ctx, fmt.Errorf("container %s stopped, exit status %d, before %s answered", p.c, ins.State.ExitCode, url))
+			return HTTPResponse{}, WithLog(ctx, p.c, fmt.Errorf("container %s stopped, exit status %d, before %s answered", p.c, ins.State.ExitCode, url))
 		case !time.Now().Before(deadline):
-			return HTTPResponse{}, p.withLogs(ctx, fmt.Errorf("%s did not answer within %s: %w", url, within, err))
+			return HTTPResponse{}, WithLog(ctx, p.c, fmt.Errorf("%s did not answer within %s: %w", url, within, err))
 		}
-		if err := sleep(ctx, time.Second); err != nil {
+		if err := Pause(ctx, time.Second); err != nil {
 			return HTTPResponse{}, err
 		}
 	}
-}
-
-// withLogs adds the container's log to err.
-func (p *Probe) withLogs(ctx context.Context, err error) error {
-	logs, lerr := p.c.Logs(ctx)
-	if lerr != nil {
-		return fmt.Errorf("%w; its log could not be read: %w", err, lerr)
-	}
-	return fmt.Errorf("%w; its log:\n%s", err, logs)
 }
 
 // hostTimeout bounds one request from the host.

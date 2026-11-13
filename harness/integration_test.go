@@ -4,7 +4,9 @@
 package harness
 
 import (
+	"encoding/json"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -20,8 +22,9 @@ import (
 	"github.com/divbast/ci/internal/testfixture"
 )
 
-// These tests run real containers from the LibreSpeed fixture, under the
-// engine $ENGINE names. CI runs them on both engines and both arches.
+// These tests run real containers from the LibreSpeed fixture, and the
+// Serving tests from the contract suite's minimal one, under the engine
+// $ENGINE names. CI runs them on both engines and both arches.
 
 // pid1 is the fixture's server as its bootstrap hands over to it, with
 // pcntl_exec(SERVER_BIN, ['run', '--config', CADDYFILE]), and as
@@ -625,7 +628,7 @@ func TestProbeNegative(t *testing.T) {
 					break
 				}
 				t.Logf("try %d of %d: %s recorded %+v, which shows nothing; trying again", try, tries, tt.sub[0], records)
-				if err := sleep(t.Context(), time.Second); err != nil {
+				if err := Pause(t.Context(), time.Second); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -723,4 +726,254 @@ func TestEngineUnhealthy(t *testing.T) {
 			t.Fatalf("EngineHealthy() error = %v, want podman healthcheck run's exit status 1 and its word unhealthy", unhealthy)
 		}
 	}
+}
+
+// minimalHealthCmd is the minimal fixture's health probe, as its
+// HEALTHCHECK runs it and a Podman user passes it.
+var minimalHealthCmd = []string{FrankenPHP, "php-cli", "/usr/local/bin/minimal-health"}
+
+// minimalPage is exactly what the minimal fixture's GET / answers.
+const minimalPage = "Hello from frankenphp\n"
+
+// exitsSays is what the exits mutant writes to its log before it stops.
+const exitsSays = "exits: stopping before it serves"
+
+// minimalFixture builds the contract suite's minimal fixture for t, an
+// image with nothing in it but a server and its health probe, and, when
+// exits is set, the exits mutant FROM it, whose entrypoint stops before
+// it ever serves, exit status 3, saying exitsSays.
+func minimalFixture(t *testing.T, e Engine, exits bool) string {
+	t.Helper()
+	image, err := e.Build(t.Context(), t, filepath.Join("..", "contract", "testdata", "minimal", "Containerfile"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exits {
+		image, err = e.Build(t.Context(), t, filepath.Join("testdata", "exits", "Containerfile"), map[string]string{"FIXTURE": image})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return image
+}
+
+// minimalServe is image served as the minimal fixture is: under the
+// contract, on both its ports.
+func minimalServe(image string) ServeSpec {
+	return ServeSpec{
+		Run:        RunSpec{Image: image, Confine: Contract("16m"), HealthCmd: minimalHealthCmd},
+		AppPort:    8080,
+		HealthPort: 8081,
+	}
+}
+
+// loopbackPort returns the port of base, failing t unless base is
+// http://127.0.0.1:<port>, at a port the engine picked.
+func loopbackPort(t *testing.T, what, base string) string {
+	t.Helper()
+	host, port, err := net.SplitHostPort(strings.TrimPrefix(base, "http://"))
+	if err != nil || !strings.HasPrefix(base, "http://") || host != "127.0.0.1" || port == "" || port == "0" {
+		t.Fatalf("%s = %q, want http://127.0.0.1:<the port the engine picked>", what, base)
+	}
+	return port
+}
+
+// TestServeEnginePickedPort serves the minimal fixture twice at once, on
+// the same container ports, as two suites on one host would: each port
+// is published on the host's loopback at a port the engine picked, so
+// neither collides with the other, each container is on a network Serve
+// made for it alone, and each answers from the host where Serve says, on
+// its app port and its health port alike, with the probe installed. A
+// spec with no HealthPort leaves the health port unpublished.
+func TestServeEnginePickedPort(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+	sp := minimalServe(minimalFixture(t, e, false))
+
+	var served [2]*Serving
+	for i := range served {
+		s, err := e.Serve(ctx, t, &sp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		served[i] = s
+	}
+	ports, networks := make(map[string]bool), make(map[string]bool)
+	for _, s := range served {
+		for _, base := range []string{s.Base, s.HealthBase} {
+			port := loopbackPort(t, "Serve()'s Base or HealthBase", base)
+			if ports[port] {
+				t.Errorf("host port %s is published twice: two containers served at once collide", port)
+			}
+			ports[port] = true
+		}
+
+		out, err := e.output(ctx, "container", "inspect", "--format", "{{json .NetworkSettings.Networks}}", s.C.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var on map[string]json.RawMessage
+		if err = json.Unmarshal(out, &on); err != nil {
+			t.Fatalf("container %s's networks, %s: %v", s.C, out, err)
+		}
+		names := slices.Sorted(maps.Keys(on))
+		if len(names) != 1 || !strings.HasPrefix(names[0], "divbast-") || networks[names[0]] {
+			t.Errorf("container %s is on networks %q, want one network Serve made for it alone", s.C, names)
+		}
+		for _, n := range names {
+			networks[n] = true
+		}
+
+		resp, err := s.Get(ctx, "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != http.StatusOK || string(resp.Body) != minimalPage {
+			t.Errorf("GET / at %s, from the host = %d %q, want 200 %q", s.Base, resp.Status, resp.Body, minimalPage)
+		}
+		health := *s
+		health.Base = s.HealthBase
+		StatusIs(t, &health, "GET /healthz on the health port, from the host", http.StatusOK, "/healthz")
+		StatusIs(t, s, "GET /healthz on the app port, from the host", http.StatusNotFound, "/healthz")
+		RunRecords(t, s.Probe, "assert-listeners", "8080", "8081")
+	}
+
+	// The container's own PHP, and a path PHP would read otherwise if it
+	// interpolated: IsFile must look for the path exactly as written.
+	c := served[0].C
+	if out, err := PHPIn(ctx, c, `echo PHP_SAPI; file_put_contents("/tmp/it's \$HOME", "");`); err != nil || out != "cli" {
+		t.Errorf("PHPIn() = %q, %v; want cli", out, err)
+	}
+	IsFile(t, c, "a path holding a quote and a dollar sign is present", "present", `/tmp/it's $HOME`)
+	IsFile(t, c, "the image has no /bin/sh", "absent", "/bin/sh")
+
+	unpublished := sp
+	unpublished.HealthPort = 0
+	s, err := e.Serve(ctx, t, &unpublished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopbackPort(t, "Serve()'s Base", s.Base)
+	ins, err := s.C.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, published := ins.Ports["8081/tcp"]; published || s.HealthBase != "" {
+		t.Errorf("with HealthPort 0, HealthBase = %q and 8081/tcp is at %q; want it unpublished", s.HealthBase, got)
+	}
+}
+
+// TestServeStoppedContainerCarriesLog serves the exits mutant, whose
+// entrypoint stops before it serves: once at once, before Serve has read
+// its ports, and once after a while, as Serve waits. Either way Serve
+// fails as soon as it sees the container stopped, not after ServeWithin,
+// with an error carrying the container's log, which says why.
+func TestServeStoppedContainerCarriesLog(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	image := minimalFixture(t, e, true)
+
+	for _, tt := range []struct{ name, afterMS string }{{"at-once", "0"}, {"while-waiting", "3000"}} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sp := minimalServe(image)
+			sp.Run.Env = map[string]string{"EXITS_AFTER_MS": tt.afterMS}
+
+			start := time.Now()
+			s, err := e.Serve(t.Context(), t, &sp)
+			if err == nil {
+				t.Fatalf("Serve() = %+v, nil; want an error, the container having stopped", s)
+			}
+			t.Logf("Serve() error, as it should be: %v", err)
+			for _, want := range []string{"stopped, exit status 3", exitsSays} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Serve() error = %v, want it to hold %q", err, want)
+				}
+			}
+			if waited := time.Since(start); waited >= ServeWithin {
+				t.Errorf("Serve() took %s, want it to stop waiting once the container stopped", waited)
+			}
+		})
+	}
+}
+
+// TestServingRestart restarts a serving container in place, as a suite
+// does to see an app come back up on the state it left: the same
+// container comes back, at the host ports the engine reports now, which
+// Docker moves and Podman keeps, and serves there, with the probe, which
+// went with the old tmpfs, installed again.
+func TestServingRestart(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+
+	sp := minimalServe(minimalFixture(t, e, false))
+	s, err := e.Serve(ctx, t, &sp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, base, probe := s.C.ID, s.Base, s.Probe
+
+	if err = s.Restart(ctx); err != nil {
+		t.Fatalf("Restart() error = %v", err)
+	}
+	if s.C.ID != id {
+		t.Errorf("after Restart(), the container is %s, want the one restarted, %s", s.C.ID, id)
+	}
+	ins, err := s.C.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Base != "http://"+ins.Ports["8080/tcp"] || s.HealthBase != "http://"+ins.Ports["8081/tcp"] {
+		t.Errorf("after Restart(), Base, HealthBase = %q, %q; want where the engine has the ports now, %q", s.Base, s.HealthBase, ins.Ports)
+	}
+	switch e.Name() {
+	case "docker":
+		if s.Base == base {
+			t.Errorf("after Restart() on docker, Base is still %s, want another port: Docker picks one again", base)
+		}
+	case "podman":
+		if s.Base != base {
+			t.Errorf("after Restart() on podman, Base moved from %s to %s, want it kept", base, s.Base)
+		}
+	}
+	StatusIs(t, s, "GET / after the restart, where the engine has the port now", http.StatusOK, "/")
+	if s.Probe == nil || s.Probe == probe {
+		t.Errorf("after Restart(), the probe is %p (was %p), want one installed again", s.Probe, probe)
+	}
+	RunRecords(t, s.Probe, "assert-read-only")
+}
+
+// TestRefuses runs the exits mutant, which stops before it serves, as a
+// refusal: Refuses passes it, and fails a container that exits 0, and one
+// whose log does not say what it was asked for, each on the half it
+// breaks, with why.
+func TestRefuses(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	spec := RunSpec{Image: minimalFixture(t, e, true), Network: "none", Confine: Contract("16m")}
+
+	t.Run("refuses", func(t *testing.T) {
+		t.Parallel()
+		Refuses(t, e, &spec, "the exits mutant", exitsSays)
+	})
+	t.Run("exits-0", func(t *testing.T) {
+		t.Parallel()
+		zero := spec
+		zero.Entrypoint = []string{FrankenPHP, "php-cli", "-r", "fwrite(STDERR, '" + exitsSays + "' . PHP_EOL); exit(0);"}
+		tb := &recTB{t: t}
+		Refuses(tb, e, &zero, "exits 0", exitsSays)
+		recorded(t, tb,
+			[]string{"ok   exits 0: the log says '" + exitsSays + `' (holds "` + exitsSays + `")`},
+			[]string{"FAIL exits 0: the container exits: exit status 0"})
+	})
+	t.Run("says-something-else", func(t *testing.T) {
+		t.Parallel()
+		tb := &recTB{t: t}
+		Refuses(tb, e, &spec, "something else", "TRUSTED_PROXIES")
+		recorded(t, tb,
+			[]string{"ok   something else: the container exits (exit status 3)"},
+			[]string{`FAIL something else: the log says 'TRUSTED_PROXIES': "TRUSTED_PROXIES" is not in "` + exitsSays + `\n"`})
+	})
 }
