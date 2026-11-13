@@ -141,6 +141,46 @@ func TestFromWorkflows(t *testing.T) {
 			},
 			wantErr: pin.ErrNoPin,
 		},
+		{
+			// GitHub resolves a uses: line's owner and repository in any
+			// case, so this calls ci as surely as the lower-case spelling.
+			name: "case_variant",
+			files: map[string]string{
+				"build.yml":    caller(sha1),
+				"renovate.yml": "jobs:\n  renovate:\n    uses: DivBast/CI/.github/workflows/renovate.yml@" + sha2 + " # v1.0.0\n",
+			},
+			wantErr: pin.ErrMixedPins,
+			wantMsg: "workflows pin more than one divbast/ci commit: " +
+				sha2 + " in renovate.yml; " + sha1 + " in build.yml",
+		},
+		{
+			// YAML's flow style: a job, and two steps on one line, with
+			// uses: first, later and last in its mapping.
+			name: "flow_style",
+			files: map[string]string{
+				"build.yml": "jobs:\n  lint: {uses: divbast/ci/.github/workflows/lint.yml@" + sha1 + "}\n",
+				"steps.yml": "jobs:\n  s:\n    steps: [{name: a, uses: divbast/ci/actions/a@" + sha1 + ", with: {x: y}}," +
+					" {uses: 'divbast/ci/actions/b@" + sha2 + "'}]\n",
+			},
+			wantErr: pin.ErrMixedPins,
+			wantMsg: "workflows pin more than one divbast/ci commit: " +
+				sha2 + " in steps.yml; " + sha1 + " in build.yml, steps.yml",
+		},
+		{
+			name: "flow_style_alone",
+			files: map[string]string{
+				"build.yml": "jobs:\n  lint: {uses: divbast/ci/.github/workflows/lint.yml@" + sha1 + ", permissions: {contents: read}}\n",
+			},
+			want: sha1,
+		},
+		{
+			name: "flow_style_in_a_comment",
+			files: map[string]string{
+				"build.yml": caller(sha1),
+				"old.yml":   "jobs:\n  # lint: {uses: divbast/ci/.github/workflows/lint.yml@" + sha2 + "}\n  lint:\n    uses: ./x.yml\n",
+			},
+			want: sha1,
+		},
 	}
 
 	for _, tt := range tests {

@@ -30,17 +30,20 @@ var (
 )
 
 var (
-	// usesRef matches a uses: line that calls something in divbast/ci, and
-	// captures the ref after the @ whatever it is, so that a branch or a
-	// short SHA is reported rather than skipped.
-	usesRef = regexp.MustCompile(`^\s*(?:-\s+)?uses:\s*["']?divbast/ci/[^@\s"']+@([^\s"'#]+)`)
+	// usesRef matches a uses: key that calls something in divbast/ci,
+	// whether it starts a line in block style or follows a { or , in a
+	// flow mapping, and captures the ref after the @ whatever it is, so
+	// that a branch or a short SHA is reported rather than skipped. GitHub
+	// reads the owner and repository in any case, and so does this.
+	usesRef = regexp.MustCompile(`(?:^\s*(?:-\s+)?|[{,]\s*)uses:\s*["']?(?i:divbast/ci)/[^@\s"',}]+@([^\s"'#,}]+)`)
 	// commit is the only ref that counts as a pin.
 	commit = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
 
 // FromWorkflows returns the commit every workflow in dir that calls
 // divbast/ci calls it at. It reads the *.yml and *.yaml files directly in
-// dir, and only their uses: lines.
+// dir, and only their uses: keys, in block or flow style, on lines that
+// are not comments.
 //
 // It returns an error wrapping [ErrNoPin] when no workflow calls divbast/ci
 // or the one ref they use is not a full commit SHA, and one wrapping
@@ -63,13 +66,14 @@ func FromWorkflows(dir *os.Root) (string, error) {
 			return "", fmt.Errorf("read workflow %s: %w", e.Name(), err)
 		}
 		for line := range bytes.Lines(data) {
-			m := usesRef.FindSubmatch(line)
-			if m == nil {
+			if bytes.HasPrefix(bytes.TrimSpace(line), []byte("#")) {
 				continue
 			}
-			ref := string(m[1])
-			if !slices.Contains(used[ref], e.Name()) {
-				used[ref] = append(used[ref], e.Name())
+			for _, m := range usesRef.FindAllSubmatch(line, -1) {
+				ref := string(m[1])
+				if !slices.Contains(used[ref], e.Name()) {
+					used[ref] = append(used[ref], e.Name())
+				}
 			}
 		}
 	}

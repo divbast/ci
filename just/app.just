@@ -16,8 +16,10 @@
 #   import? '.ci/just/app.just'
 #
 # ENGINE is docker or podman. IMAGE is the local tag the build writes and
-# the acceptance suite runs. ARCHIVE is where archive writes the image and
-# scan reads it, and PUBLISHED is the image scan compares it with. As with
+# the acceptance suite runs; written as a plain value, as above, it takes
+# nothing from the environment, so `just IMAGE=<image> acceptance` tests
+# another image. ARCHIVE is where archive writes the image and scan reads
+# it, and PUBLISHED is the image scan compares it with. As with
 # common.just, the app runs these from a recipe's body, never as a
 # dependency.
 

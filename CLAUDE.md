@@ -7,10 +7,10 @@ The reusable workflows, Go tools, acceptance harness and lint configuration
 every divbast repository shares. Every green merge to main is released,
 callers pin a release and check out its commit into `.ci/`; `README.md`
 says how. A change here reaches a caller only through the pull request
-that moves its pin, so anything a caller sees (a workflow's inputs,
-outputs and permissions, a recipe's name, a tool's flags and exit codes)
-is an interface: change it so that old callers keep working, or mark the
-commit as breaking them (below).
+that moves its pin, so anything a caller sees is an interface, and
+README.md's "What breaks a caller" is the one list of what that covers:
+change it so that old callers keep working, or mark the commit as
+breaking them (below).
 
 ## CRITICAL: Git Commit Message Format
 
@@ -33,9 +33,9 @@ E.g. `Assisted-by: <Claude:claude-4.6-opus>` for Claude Opus 4.6;
   signatures. Renovate's merges are squashes, which GitHub signs
 - Write commit messages as if a human wrote them, and say why, not what
 
-A change that breaks a reusable workflow's inputs, outputs or permissions,
-or a tool's flags or exit codes, adds a `Breaking-change: <what>` trailer,
-in the trailer block just above those two lines:
+A change that breaks callers, by README.md's "What breaks a caller", adds
+a `Breaking-change: <what>` trailer, in the trailer block just above those
+two lines:
 
 ```
 Breaking-change: lint.yml no longer takes a php input

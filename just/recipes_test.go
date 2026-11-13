@@ -3,7 +3,8 @@
 
 // Package just_test runs the shared recipes in common.just through ci's own
 // justfile, which imports them as a caller's does, and reads app.just's
-// through a justfile set up as an app's.
+// through a justfile set up as an app's. Each test needs just and mise on
+// PATH, as `just ci` has them, and skips, saying so, where they are not.
 package just_test
 
 import (
@@ -29,12 +30,26 @@ func refusal(kind string) string {
 		" or CI's job token (ghs_): see https://github.com/divbast/ci#local-github-token"
 }
 
+// needJustAndMise skips the test unless just and mise are both on PATH:
+// just runs the recipes, and ci's justfile runs them through mise's shell.
+// `just ci` runs the tests under mise, which puts both there; a bare go
+// test from a shell without them would otherwise fail on every recipe.
+func needJustAndMise(t *testing.T) {
+	t.Helper()
+	for _, program := range []string{"just", "mise"} {
+		if _, err := exec.LookPath(program); err != nil {
+			t.Skipf("%s is not on PATH: run these tests through `just ci`, which runs them with ci's toolchain", program)
+		}
+	}
+}
+
 // TestGitHubTokenGuard runs the guard every recipe that calls GitHub runs
 // first, with each kind of GITHUB_TOKEN. It must pass a fine-grained
 // personal access token or a job token in silence, and refuse anything
 // else with one line naming its kind, never the token.
 func TestGitHubTokenGuard(t *testing.T) {
 	t.Parallel()
+	needJustAndMise(t)
 	tests := []struct {
 		name string
 		env  []string
@@ -80,6 +95,7 @@ func TestGitHubTokenGuard(t *testing.T) {
 // where to read about the token, and never run gh.
 func TestGitHubRecipesRefuseWithoutAGuardedToken(t *testing.T) {
 	t.Parallel()
+	needJustAndMise(t)
 	for _, recipe := range []string{"actions-check", "actions-pin", "actions-update", "workflow-audit"} {
 		for _, token := range []struct {
 			name, kind string
@@ -119,6 +135,7 @@ func TestGitHubRecipesRefuseWithoutAGuardedToken(t *testing.T) {
 // under a caller's shell that sets no pipefail.
 func TestAcceptancePipesThroughTestcount(t *testing.T) {
 	t.Parallel()
+	needJustAndMise(t)
 	ci, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
@@ -197,6 +214,168 @@ func TestAcceptancePipesThroughTestcount(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestCIFresh runs common.just's ci-fresh in a repository set up as a
+// caller's, whose workflows pin one commit while .ci holds another, as
+// after a git pull that moved the pin without a `just setup`, or the same
+// one. It must fail naming both commits and saying that just setup moves
+// .ci, or pass. Workflows that pin more than one commit, or none, must
+// fail it too, without that hint, since setup refuses them as well. A
+// shared recipe is run from a recipe's body, never named as a dependency,
+// so it builds divbast-pin from its own body when .ci/bin lacks it, and
+// only then. In ci itself, its own checkout, there is no pin to check.
+func TestCIFresh(t *testing.T) {
+	t.Parallel()
+	needJustAndMise(t)
+	ci, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := filepath.Join(t.TempDir(), "divbast-pin")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", tool, "./cmd/divbast-pin") //nolint:gosec // G204: the arguments are this test's own
+	build.Dir = ci
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	// A commit no fixture's .ci holds
+	const other = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+	// What the fixture's workflows pin, against the commit .ci holds
+	const (
+		fresh = "fresh" // that commit
+		stale = "stale" // another one
+		mixed = "mixed" // that commit and another
+		none  = "none"  // no commit at all
+	)
+	for _, tt := range []struct {
+		name, pins string
+		built      bool
+		want       string // what the output must say, beside the commits
+	}{
+		{name: "stale", pins: stale, built: true},
+		{name: "fresh", pins: fresh, built: true},
+		{name: "stale, divbast-pin not built", pins: stale},
+		{name: "fresh, divbast-pin not built", pins: fresh},
+		{name: "mixed", pins: mixed, built: true, want: "workflows pin more than one divbast/ci commit"},
+		{name: "none", pins: none, built: true, want: "no workflow pins divbast/ci to a commit"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			git(t, dir, "init", "--quiet", ".ci")
+			git(t, filepath.Join(dir, ".ci"), "commit", "--quiet", "--allow-empty", "--message", "ci")
+			have := git(t, filepath.Join(dir, ".ci"), "rev-parse", "HEAD")
+			calls := func(sha string) string {
+				return "jobs:\n  lint:\n    uses: divbast/ci/.github/workflows/lint.yml@" + sha + " # v1.0.0\n"
+			}
+			workflows := filepath.Join(dir, ".github", "workflows")
+			if err := os.MkdirAll(workflows, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{
+				filepath.Join(dir, "justfile"): `set shell := ["bash", "-euo", "pipefail", "-c"]
+
+import '` + filepath.Join(ci, "just", "common.just") + `'
+`,
+			}
+			pinned := have
+			switch tt.pins {
+			case fresh:
+				files[filepath.Join(workflows, "build.yml")] = calls(have)
+			case stale:
+				pinned = other
+				files[filepath.Join(workflows, "build.yml")] = calls(other)
+			case mixed:
+				files[filepath.Join(workflows, "build.yml")] = calls(have)
+				files[filepath.Join(workflows, "stall.yml")] = calls(other)
+			case none:
+				files[filepath.Join(workflows, "build.yml")] = "jobs:\n  lint:\n    uses: ./.github/workflows/lint.yml\n"
+			}
+			for name, body := range files {
+				if err := os.WriteFile(name, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.built {
+				if err := os.MkdirAll(filepath.Join(dir, ".ci", "bin"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(tool, filepath.Join(dir, ".ci", "bin", "divbast-pin")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A go that notes it ran and builds divbast-pin by copying the
+			// real one into the directory -o names
+			stub := t.TempDir()
+			goScript := "#!/bin/sh\necho \"go $*\" >>'" + filepath.Join(stub, "ran") + "'\n" +
+				"while [ $# -gt 0 ]; do\n  if [ \"$1\" = -o ]; then out=$2; fi\n  shift\ndone\n" +
+				"mkdir -p \"${out}\" && cp '" + tool + "' \"${out}divbast-pin\"\n"
+			if err := os.WriteFile(filepath.Join(stub, "go"), []byte(goScript), 0o700); err != nil { //nolint:gosec // G306: the stub must be executable, and only by its owner
+				t.Fatal(err)
+			}
+
+			cmd := exec.CommandContext(t.Context(), "just", "--justfile", filepath.Join(dir, "justfile"), "ci-fresh") //nolint:gosec // G204: the arguments are this test's own
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"))
+			out, err := cmd.CombinedOutput()
+			_, failed := errors.AsType[*exec.ExitError](err)
+			if err != nil && !failed {
+				t.Fatalf("just ci-fresh: %v\n%s", err, out)
+			}
+			hint := strings.Contains(string(out), "just setup")
+			switch {
+			case tt.pins == fresh && failed:
+				t.Errorf("just ci-fresh failed, though the workflows pin %s, which .ci holds:\n%s", have, out)
+			case tt.pins == fresh:
+			case !failed:
+				t.Errorf("just ci-fresh passed, though the workflows pin %s and .ci holds %s:\n%s", tt.pins, have, out)
+			case tt.pins == stale && (!strings.Contains(string(out), pinned) || !strings.Contains(string(out), have)):
+				t.Errorf("just ci-fresh failed without naming both %s, the pin, and %s, .ci's:\n%s", pinned, have, out)
+			case tt.pins == stale && !hint:
+				t.Errorf("just ci-fresh failed without saying `just setup` moves .ci:\n%s", out)
+			case tt.pins != stale && hint:
+				t.Errorf("just ci-fresh says `just setup` would help, which refuses workflows that pin %s:\n%s", tt.pins, out)
+			case !strings.Contains(string(out), tt.want):
+				t.Errorf("just ci-fresh failed without saying %q:\n%s", tt.want, out)
+			}
+			root, err := os.OpenRoot(stub)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			ran, err := root.ReadFile("ran")
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if got := len(ran) > 0; got != !tt.built {
+				t.Errorf("built divbast-pin: %t, want %t\ngo ran: %s\n%s", got, !tt.built, ran, out)
+			}
+		})
+	}
+
+	t.Run("in ci", func(t *testing.T) {
+		t.Parallel()
+		out, code := just(t, "ci-fresh", nil)
+		if code != 0 || !strings.Contains(out, "ci-fresh: ci is its own checkout") {
+			t.Errorf("just ci-fresh in ci: exit %d, printed\n%s\nwant 0, and a line saying there is nothing to check", code, out)
+		}
+	})
+}
+
+// git runs a git command in dir that must succeed, as no one's in
+// particular and unsigned, and returns its stdout.
+func git(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	argv := append([]string{
+		"-C", dir, "-c", "user.name=divbast test", "-c", "user.email=test@divbast.invalid",
+		"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+	}, args...)
+	out, err := exec.CommandContext(t.Context(), "git", argv...).Output() //nolint:gosec // G204: the arguments are this test's own
+	if err != nil {
+		t.Fatalf("git %q: %v", args, err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // appJustfile writes a justfile set up as an app's, with shell as its

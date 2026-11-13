@@ -4,13 +4,16 @@
 // Package workflows_test reads ci's workflows as text, so that no job
 // holding a write scope runs install code from the caller's toolchain that
 // it does not need. Every job whose permissions, its own or else its
-// workflow's, grant a write scope must give each jdx/mise-action step
-// install_args that name a tool, set MISE_AUTO_INSTALL to false in the
-// job's env if it has such a step, and set it to nothing else in any step.
-// A permissions value the test cannot read fails as well.
+// workflow's, grant a write scope, and every job that mints a GitHub App
+// token in a step, whose scopes its permissions do not bound, must give
+// each jdx/mise-action step install_args that name a tool, set
+// MISE_AUTO_INSTALL to false in the job's env if it has such a step, and
+// set it to nothing else in any step. A permissions value the test cannot
+// read fails as well.
 package workflows_test
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
@@ -22,9 +25,10 @@ import (
 	"testing"
 )
 
-// mustGuard are jobs the derived set must hold, the two that hold write
-// scopes today, so that a parser regression cannot empty it unnoticed.
-var mustGuard = []string{"app-check.yml/scan", "app-publish.yml/publish"}
+// mustGuard are jobs the derived set must hold, so that a parser
+// regression cannot empty it unnoticed: the two whose permissions hold a
+// write scope today, and the two that mint a GitHub App token in a step.
+var mustGuard = []string{"app-check.yml/scan", "app-publish.yml/publish", "renovate.yml/renovate", "self-ci.yml/release"}
 
 // TestWriteScopedJobsInstallOnlyWhatTheyName runs check over every
 // workflow in .github/workflows, and fails on each problem it finds, or
@@ -49,6 +53,7 @@ func TestCheck(t *testing.T) {
 	t.Parallel()
 	const bare = "    steps:\n      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7\n"
 	const scope = "      attestations: read # verify the FrankenPHP binary's attestation\n"
+	const mint = "      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0\n"
 	tests := []struct {
 		name    string
 		change  func(workflows map[string]string)
@@ -152,12 +157,30 @@ func TestCheck(t *testing.T) {
 			want:    "release.yml: line 1: permissions: write is none of {}, read-all, write-all or a { } map",
 		},
 		{
-			name: "read-all, and write only in a step's inputs",
+			name: "read-all, and an App token with write minted in a step",
 			change: func(w map[string]string) {
-				w["release.yml"] = "permissions: {}\n\njobs:\n  tag:\n    runs-on: ubuntu-26.04\n    permissions: read-all\n" + bare +
-					"      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0\n        with:\n          permission-contents: write\n"
+				w["release.yml"] = "permissions: {}\n\njobs:\n  tag:\n    runs-on: ubuntu-26.04\n    permissions: read-all\n" + bare + mint +
+					"        with:\n          permission-contents: write\n"
 			},
-			job: "release.yml/tag",
+			job:     "release.yml/tag",
+			guarded: true,
+		},
+		{
+			name: "no permissions at all, and an App token minted in a step",
+			change: func(w map[string]string) {
+				w["release.yml"] = "permissions: {}\n\njobs:\n  tag:\n    runs-on: ubuntu-26.04\n    permissions: {}\n" + bare +
+					"      - id: token\n" + strings.Replace(mint, "- uses:", "  uses:", 1)
+			},
+			job:     "release.yml/tag",
+			guarded: true,
+		},
+		{
+			name: "renovate gains a mise step",
+			change: func(w map[string]string) {
+				w["renovate.yml"] = strings.Replace(w["renovate.yml"], "    steps:\n", bare, 1)
+			},
+			job:     "renovate.yml/renovate",
+			guarded: true,
 		},
 	}
 	base := readWorkflows(t)
@@ -277,6 +300,67 @@ func TestProblems(t *testing.T) {
 	}
 }
 
+// TestRenovateTokenReadsDependabotAlerts checks that renovate.yml's App
+// token asks to read Dependabot alerts. Renovate reads a repository's
+// alerts to raise its security updates, and given a token that cannot, it
+// warns in its log and raises none: nothing would fail to say so. Against
+// renovate.yml as it is, then with the permission taken out, which the
+// check must refuse.
+func TestRenovateTokenReadsDependabotAlerts(t *testing.T) {
+	t.Parallel()
+	renovate := readWorkflows(t)["renovate.yml"]
+	if err := readsDependabotAlerts(renovate); err != nil {
+		t.Errorf("renovate.yml: %v", err)
+	}
+	const perm = "          permission-vulnerability-alerts: read\n"
+	for name, mutant := range map[string]string{
+		"taken out":     strings.Replace(renovate, perm, "", 1),
+		"commented out": strings.Replace(renovate, perm, "          # permission-vulnerability-alerts: read\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == renovate {
+				t.Fatal("the change changed nothing")
+			}
+			if readsDependabotAlerts(mutant) == nil {
+				t.Error("passes renovate.yml with permission-vulnerability-alerts " + name)
+			}
+		})
+	}
+}
+
+// readsDependabotAlerts returns an error unless the workflow has a step
+// that mints a GitHub App token, and each such step asks for
+// permission-vulnerability-alerts: read.
+func readsDependabotAlerts(workflow string) error {
+	minted := false
+	for _, job := range jobsOf(linesOf(workflow)) {
+		for _, step := range steps(job) {
+			if !slices.ContainsFunc(step, mintsAppToken) {
+				continue
+			}
+			minted = true
+			if !slices.ContainsFunc(step, func(l line) bool {
+				v, ok := strings.CutPrefix(strings.TrimSpace(l.text), "permission-vulnerability-alerts:")
+				return ok && unquote(v) == "read"
+			}) {
+				return fmt.Errorf("line %d mints a token without permission-vulnerability-alerts: read,"+
+					" so Renovate cannot read the Dependabot alerts it raises security updates for", step[0].n)
+			}
+		}
+	}
+	if !minted {
+		return errors.New("no step mints a GitHub App token")
+	}
+	return nil
+}
+
+// mintsAppToken reports whether l is a step's uses: line for
+// actions/create-github-app-token.
+func mintsAppToken(l line) bool {
+	return strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), "uses: actions/create-github-app-token@")
+}
+
 // line is one line of a workflow and its 1-based number in the file.
 type line struct {
 	n    int
@@ -315,9 +399,11 @@ func readWorkflows(t *testing.T) map[string]string {
 
 // check guards every job, in every workflow given by file name, whose
 // permissions grant a write scope, as grantsWrite reads them: its own
-// permissions key or, when it has none, the workflow's. A permissions value
-// grantsWrite cannot read is a problem, and the job it covers is guarded.
-// check returns the guarded jobs, as file/job, and each problem it finds.
+// permissions key or, when it has none, the workflow's. It guards every
+// job with a step that mints a GitHub App token as well, whatever its
+// permissions say. A permissions value grantsWrite cannot read is a
+// problem, and the job it covers is guarded. check returns the guarded
+// jobs, as file/job, and each problem it finds.
 func check(workflows map[string]string) (guarded, found []string) {
 	for _, file := range slices.Sorted(maps.Keys(workflows)) {
 		lines := linesOf(workflows[file])
@@ -336,7 +422,7 @@ func check(workflows map[string]string) (guarded, found []string) {
 			if !declared {
 				write = inherited
 			}
-			if !write {
+			if !write && !slices.ContainsFunc(jobs[name], mintsAppToken) {
 				continue
 			}
 			guarded = append(guarded, file+"/"+name)

@@ -207,6 +207,11 @@ jobs:
     # The App's token makes the tag and the release; this one only reads.
     permissions:
       contents: read
+    # The App's token can write ci's contents, so nothing but the Go the
+    # mise step below names installs: mise exec would otherwise install
+    # the rest of mise.toml.
+    env:
+      MISE_AUTO_INSTALL: "false"
     steps:
       # Every commit and tag, which the next version is counted from
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
