@@ -468,11 +468,9 @@ func (e Engine) Build(ctx context.Context, tb testing.TB, containerfile string, 
 
 	// Registered before the build, which may leave the tag behind although
 	// it failed.
-	tb.Cleanup(func() {
-		rmCtx, cancel := cleanupContext(ctx)
-		defer cancel()
-		e.removeImage(rmCtx, tb, tag)
-	})
+	// Its wait for the builds beside it has no deadline but theirs, and
+	// the removal its own once it can run.
+	tb.Cleanup(func() { e.removeImage(context.WithoutCancel(ctx), tb, tag) })
 	release, err := e.hold(ctx, false)
 	if err != nil {
 		return "", fmt.Errorf("%s build: waiting for an image's removal to end: %w", e.name, err)

@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
@@ -283,4 +285,79 @@ func TestRemovalGivesUp(t *testing.T) {
 	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Errorf("the removal returned before its context ended: %v", ctx.Err())
 	}
+}
+
+// contextRun is a runner that, unlike runFunc, sees each command's
+// context.
+type contextRun func(ctx context.Context, argv []string) execx.Result
+
+func (f contextRun) RunStdin(ctx context.Context, _ io.Reader, name string, args ...string) (execx.Result, error) {
+	return f(ctx, append([]string{name}, args...)), nil
+}
+
+// TestRemovalHasItsTimeOnceItCanRun has a Build's cleanup wait, on Podman,
+// for a build in another process that outlasts the cleanup's budget of
+// cleanupTimeout. The wait is as long as the builds beside it take, and
+// the removal's own budget, all of cleanupTimeout, starts only once it can
+// run, rather than being used up by the wait, or never set at all.
+func TestRemovalHasItsTimeOnceItCanRun(t *testing.T) {
+	t.Parallel()
+	if !fileLocks {
+		t.Skip("this platform has no lock on a file that other processes see")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		lock := filepath.Join(t.TempDir(), "store.lock")
+		b := newBlockingBuilds(t)
+		defer b.finish()
+		other := newEngine("podman", runFunc(b.run))
+		other.store = newStoreLock(lock)
+		go func() {
+			if _, err := other.Build(t.Context(), t, "testdata/mutant/Containerfile", nil); err != nil {
+				t.Errorf("the other build: %v", err)
+			}
+		}()
+		<-b.building
+
+		// What each image rm had left of its context: none at all for one
+		// with no deadline
+		var mu sync.Mutex
+		var removals []time.Duration
+		e := newEngine("podman", contextRun(func(ctx context.Context, argv []string) execx.Result {
+			if slices.Equal(argv[1:4], []string{"image", "rm", "-f"}) {
+				left := time.Duration(0)
+				if deadline, ok := ctx.Deadline(); ok {
+					left = time.Until(deadline)
+				}
+				mu.Lock()
+				removals = append(removals, left)
+				mu.Unlock()
+			}
+			return execx.Result{}
+		}))
+		e.store = newStoreLock(lock)
+		scope := &cleanups{TB: t}
+		if _, err := e.Build(t.Context(), scope, "testdata/mutant/Containerfile", nil); err != nil {
+			t.Fatal(err)
+		}
+		long := cleanupTimeout + time.Minute
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			defer b.finish()
+			select {
+			case <-time.After(long):
+			case <-stop:
+			}
+		}()
+		start := time.Now()
+		scope.run()
+		if waited := time.Since(start); waited < long {
+			t.Errorf("the removal ran after %v, while the other build held the store for %v", waited, long)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(removals) != 1 || removals[0] != cleanupTimeout {
+			t.Errorf("image rm ran %d times, with %v of their contexts left; want once, with all %v of its own", len(removals), removals, cleanupTimeout)
+		}
+	})
 }

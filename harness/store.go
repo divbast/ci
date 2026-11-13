@@ -99,7 +99,10 @@ func (s *storeLock) hold(ctx context.Context, exclusive bool) (func(), error) {
 }
 
 // removeImage removes the image ref, for a cleanup, once no build holds
-// the store, and fails tb if it cannot, as [Engine.remove] does.
+// the store, and fails tb if it cannot, as [Engine.remove] does. ctx
+// bounds the wait for the builds; the removal itself then has
+// cleanupTimeout, counted from when it can run, so that a long wait never
+// leaves it a context already used up.
 func (e Engine) removeImage(ctx context.Context, tb testing.TB, ref string) {
 	tb.Helper()
 	release, err := e.hold(ctx, true)
@@ -108,5 +111,7 @@ func (e Engine) removeImage(ctx context.Context, tb testing.TB, ref string) {
 		return
 	}
 	defer release()
-	e.remove(ctx, tb, "image", "rm", "-f", ref)
+	rmCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	e.remove(rmCtx, tb, "image", "rm", "-f", ref)
 }
