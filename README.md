@@ -76,7 +76,7 @@ ci-checkout:
     fi
     git init -q .ci
     git -C .ci fetch -q --depth 1 https://github.com/divbast/ci "${sha}"
-    git -C .ci checkout -q FETCH_HEAD
+    git -C .ci checkout -q FETCH_HEAD && rm -rf .ci/bin
 ```
 
 `ci-checkout` refuses workflows that call ci at more than one ref, or at
@@ -84,13 +84,16 @@ anything but a full commit, and names every ref it found. It reads ci's
 name in any case, as GitHub does, so `DivBast/CI/...@<other>` beside
 `divbast/ci/...@<commit>` is two refs. It reads block-style `uses:` lines
 only, the form Renovate writes; `ci-fresh` and CI's pin check read flow
-style as well. It does nothing to `.ci` when `.ci`
-is already at the pinned commit, which is how it finds a checkout that one
-of ci's workflows made, so that CI runs the workflow's own commit of the
-recipes. It refuses to move a `.ci` that holds changes of its own, edited
-or untracked files, and names each: a checkout would carry them across to
+style as well. It does nothing to `.ci` when `.ci` is already at the
+pinned commit, which is how it finds a checkout that one of ci's
+workflows made, so that CI runs the workflow's own commit of the recipes.
+It refuses to move a `.ci` that holds changes of its own, edited or
+untracked files, and names each: a checkout would carry them across to
 the new commit, or stop halfway on one. The tools `ci-tools` builds into
-`.ci/bin` are not changes, since ci's own `.gitignore` leaves them out.
+`.ci/bin` are not changes, since ci's own `.gitignore` leaves them out,
+and for that reason a checkout leaves them in place too. So once `.ci`
+has moved, `ci-checkout` deletes `.ci/bin`, and each shared recipe that
+runs a tool builds it again, from the new commit.
 
 `setup` runs `ci-checkout`, then `mise install`. A repository that needs
 more, such as `composer install`, adds it after `mise install`.
@@ -133,7 +136,9 @@ dependencies when it reads the justfile, so until `setup` has fetched
 moves it, and every shared recipe would go on running the old commit's
 recipes, tools and configuration. It runs `divbast-pin -expect` with the
 commit `.ci` holds, so a failure names both commits, and builds
-`.ci/bin/divbast-pin` first when it is missing. In CI it passes, since each
+`.ci/bin/divbast-pin` first when it is missing. It says that `just setup`
+moves `.ci` only when the workflows pin one commit, since `ci-checkout`
+refuses workflows that pin several or none. In CI it passes, since each
 workflow checks `.ci` out at the commit it checks the pin against. Inside
 ci, its own checkout, it checks nothing.
 
