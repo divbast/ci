@@ -309,11 +309,15 @@ func TestDecisionString(t *testing.T) {
 }
 
 // inDir runs every command with git's -C dir, so ExecGit's commands run
-// against the repository in dir rather than the test's working directory.
-type inDir struct{ dir string }
+// against the repository in dir rather than the test's working directory,
+// and with env on top of the test's environment.
+type inDir struct {
+	dir string
+	env []string
+}
 
 func (r inDir) Run(ctx context.Context, name string, args ...string) (execx.Result, error) {
-	return execx.OS{}.Run(ctx, name, append([]string{"-C", r.dir}, args...)...)
+	return execx.OS{Env: r.env}.Run(ctx, name, append([]string{"-C", r.dir}, args...)...)
 }
 
 // git runs a git command in dir that must succeed, and returns its stdout.
@@ -323,7 +327,7 @@ func git(t *testing.T, dir string, args ...string) string {
 		"-c", "user.name=divbast test", "-c", "user.email=test@divbast.invalid",
 		"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
 	}, args...)
-	res, err := inDir{dir}.Run(t.Context(), "git", argv...)
+	res, err := inDir{dir: dir}.Run(t.Context(), "git", argv...)
 	if err != nil || res.Code != 0 {
 		t.Fatalf("git %q: %v, exit %d: %s", args, err, res.Code, res.Stderr)
 	}
@@ -345,7 +349,7 @@ func TestExecGit(t *testing.T) {
 	git(t, dir, "update-ref", "refs/remotes/origin/main", cb)
 	tree := git(t, dir, "rev-parse", "HEAD^{tree}")
 
-	g := publish.ExecGit(inDir{dir})
+	g := publish.ExecGit(inDir{dir: dir})
 
 	exists := []struct {
 		name string
@@ -389,8 +393,11 @@ func TestExecGit(t *testing.T) {
 		t.Errorf("IsAncestor(%s, missing ref) = %t, nil; want an error", ca, got)
 	}
 
-	// Where git cannot look at all, a missing commit is not the answer.
-	nowhere := publish.ExecGit(inDir{filepath.Join(dir, "absent")})
+	// Where there is no repository to look in, as in a job that never
+	// checked one out, a missing commit is not the answer. The ceiling
+	// keeps git from finding one above the directory.
+	empty := t.TempDir()
+	nowhere := publish.ExecGit(inDir{dir: empty, env: []string{"GIT_CEILING_DIRECTORIES=" + filepath.Dir(empty)}})
 	if got, err := nowhere.CommitExists(t.Context(), ca); err == nil {
 		t.Errorf("CommitExists with no repository = %t, nil; want an error", got)
 	}
