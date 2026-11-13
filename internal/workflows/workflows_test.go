@@ -2310,7 +2310,10 @@ func refusesTheTemplatesImage(t *testing.T, workflow string) error {
 
 // registryManager is the matchStrings of the regex manager in
 // divbast/renovate-config's default.json that moves the rehearsal's
-// registry image, as Renovate reads it.
+// registry image, as Renovate reads it. It is a copy, and default.json is
+// its source: a change there comes here with it, and renovate-config's
+// CLAUDE.md ("Tests that copy these regexes") lists every copy (backlog
+// CI-16).
 var registryManager = regexp.MustCompile(`# renovate: registry\n[^\n]*docker run [^\n]* (?<depName>registry):(?<currentValue>[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})`)
 
 // registryRun is a line that runs the registry image, pinned or not.
@@ -3240,11 +3243,18 @@ func indent(s string) int {
 }
 
 // The shapes the org's Renovate preset reads (divbast/renovate-config,
-// default.json). A pin written any other way is not kept current.
+// default.json). A pin written any other way is not kept current. The
+// three managers are copies of its regex managers' matchStrings, and
+// default.json is their source: a change there comes here with it, and
+// renovate-config's CLAUDE.md ("Tests that copy these regexes") lists
+// every copy (backlog CI-16).
 var (
+	// A copy of default.json's moby/buildkit manager.
 	buildkitManager = regexp.MustCompile(`image=(?<depName>moby/buildkit):(?<currentValue>v[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})`)
-	sbomManager     = regexp.MustCompile(`generator=(?<depName>docker/buildkit-syft-scanner):(?<currentValue>[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})`)
-	miseManager     = regexp.MustCompile(`# renovate: datasource=(?<datasource>github-releases) depName=(?<depName>jdx/mise)\n\s*MISE_VERSION: ["']?(?<currentValue>[0-9.]+)["']?`)
+	// A copy of default.json's docker/buildkit-syft-scanner manager.
+	sbomManager = regexp.MustCompile(`generator=(?<depName>docker/buildkit-syft-scanner):(?<currentValue>[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})`)
+	// A copy of default.json's jdx/mise manager.
+	miseManager = regexp.MustCompile(`# renovate: datasource=(?<datasource>github-releases) depName=(?<depName>jdx/mise)\n\s*MISE_VERSION: ["']?(?<currentValue>[0-9.]+)["']?`)
 	// renovateImage is renovate.yml's image with tag and digest. The
 	// github-actions manager reads a digest from renovate-image, and
 	// takes all of renovate-version, digest included, as the version.
