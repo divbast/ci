@@ -48,8 +48,23 @@ func newStoreLock(path string) *storeLock {
 // one file for every process of this user on the host, as rootless
 // Podman keeps one store for each user.
 var sharedStore = sync.OnceValue(func() *storeLock {
-	return newStoreLock(filepath.Join(os.TempDir(), fmt.Sprintf("divbast-harness-podman-store-%d.lock", os.Getuid())))
+	return newStoreLock(storeFile(os.Getenv))
 })
+
+// storeFile returns the path of the file sharedStore locks, reading the
+// environment through getenv: in $XDG_RUNTIME_DIR when it is set, the
+// user's own directory, where rootless Podman keeps its runtime state and
+// no other user can enter, or else in the temporary directory. There,
+// on a /tmp every user shares, another user could make the file first
+// and keep it from opening, which fails each build and removal rather
+// than letting them overlap.
+func storeFile(getenv func(string) string) string {
+	dir := getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, fmt.Sprintf("divbast-harness-podman-store-%d.lock", os.Getuid()))
+}
 
 // storePoll is how often a wait for another process's hold on the store
 // looks again.

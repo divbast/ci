@@ -354,9 +354,10 @@ image's cache would lose its container and fail. `Engine.Build` holds
 the image store shared, as other builds may, and the removal of an image,
 by a `Build`'s cleanup or by `Engine.Sweep`, holds it alone. Across the
 test binaries running at once, such as two packages', the hold is a
-`flock` of `divbast-harness-podman-store-<uid>.lock` in the temporary
-directory, which every process of the user's shares, as rootless Podman
-keeps one store for each user. Docker is never held: its builder keeps
+`flock` of `divbast-harness-podman-store-<uid>.lock`, which every process
+of the user's shares, as rootless Podman keeps one store for each user.
+It is in `$XDG_RUNTIME_DIR` when that is set, the user's own directory,
+and otherwise in the temporary directory. Docker is never held: its builder keeps
 what a build uses out of `image rm`'s reach.
 
 Before that, every suite labelled what it made `divbast.harness=1`.

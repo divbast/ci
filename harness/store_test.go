@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -360,4 +361,32 @@ func TestRemovalHasItsTimeOnceItCanRun(t *testing.T) {
 			t.Errorf("image rm ran %d times, with %v of their contexts left; want once, with all %v of its own", len(removals), removals, cleanupTimeout)
 		}
 	})
+}
+
+// TestStoreFile checks where the lock every process of the user's shares
+// lives: in $XDG_RUNTIME_DIR, the user's own directory, which no other
+// user can enter, when it is set, as it is wherever rootless Podman runs
+// under systemd; otherwise in the temporary directory, by the user's uid.
+func TestStoreFile(t *testing.T) {
+	t.Parallel()
+	name := fmt.Sprintf("divbast-harness-podman-store-%d.lock", os.Getuid())
+	for _, tt := range []struct {
+		name, runtime, want string
+	}{
+		{name: "runtime-dir", runtime: "/run/user/1001", want: "/run/user/1001/" + name},
+		{name: "no-runtime-dir", want: filepath.Join(os.TempDir(), name)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			getenv := func(key string) string {
+				if key == "XDG_RUNTIME_DIR" {
+					return tt.runtime
+				}
+				return ""
+			}
+			if got := storeFile(getenv); got != tt.want {
+				t.Errorf("storeFile() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
