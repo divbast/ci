@@ -17,19 +17,20 @@
 // exporter writes it. The token is read from GITHUB_TOKEN in the
 // environment, so it stays off every command line, and is never printed.
 //
-// Every regular file in ARCHIVE is read without unpacking it, gzip and
-// zstd layers decompressed, so the config, its history and any
-// attestation are read too. The build should get the token only through a
-// secret mount, which never reaches a layer. An ARG or ENV carrying it
-// would, and the provenance records each build argument. zstd layers need
-// the zstd command on PATH.
+// Every file in ARCHIVE is read without unpacking it, gzip and zstd
+// layers decompressed as they are read, so the config, its history and
+// any attestation are read too. The build should get the token only
+// through a secret mount, which never reaches a layer. An ARG or ENV
+// carrying it would, and the provenance records each build argument. zstd
+// layers need the zstd command on PATH.
 //
 // Exit codes:
 //
 //	0  no file in ARCHIVE holds the token
 //	1  a file holds it; stderr names each one
 //	2  a file could not be read, ARCHIVE holds no files or cannot be read
-//	   as a tar, or the command line or GITHUB_TOKEN is wrong
+//	   as a tar, the command line or GITHUB_TOKEN is wrong, or the verdict
+//	   that no file holds the token could not be written
 package main
 
 import (
@@ -55,7 +56,7 @@ func main() {
 	os.Exit(code)
 }
 
-func run(ctx context.Context, args []string, getenv func(string) string, zstd execx.Runner, stdout, stderr io.Writer) int {
+func run(ctx context.Context, args []string, getenv func(string) string, zstd execx.StreamRunner, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
@@ -93,8 +94,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, zstd ex
 		return 1
 	}
 	if _, err = fmt.Fprintf(stdout, "no trace of the token in any of the %d files in %s\n", scanned, archive); err != nil {
+		// Not 1, which says the token was found
 		complain(stderr, "write the verdict: %v", err)
-		return 1
+		return 2
 	}
 	return 0
 }

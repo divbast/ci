@@ -10,10 +10,12 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/divbast/ci/internal/execx"
@@ -50,11 +52,15 @@ func writeTar(t *testing.T, entries ...entry) string {
 	tw := tar.NewWriter(&buf)
 	for _, e := range entries {
 		hdr := &tar.Header{Name: e.name, Typeflag: e.typeflag, Linkname: e.linkname, Mode: 0o644}
-		if e.typeflag == tar.TypeReg {
+		if e.typeflag == tar.TypeReg || len(e.body) > 0 {
 			hdr.Size = int64(len(e.body))
 		}
-		if e.typeflag == tar.TypeDir {
+		switch e.typeflag {
+		case tar.TypeDir:
 			hdr.Mode = 0o755
+		case tar.TypeXGlobalHeader:
+			// Records alone, as the writer insists
+			hdr = &tar.Header{Typeflag: e.typeflag, PAXRecords: map[string]string{"comment": "divbast"}}
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatal(err)
@@ -153,10 +159,10 @@ func at(n, off int, token []byte) []byte {
 	return b
 }
 
-// failing is a Runner whose every command could not run.
+// failing is a StreamRunner whose every command could not run.
 type failing struct{}
 
-func (failing) Run(context.Context, string, ...string) (execx.Result, error) {
+func (failing) RunStream(context.Context, io.Reader, io.Writer, string, ...string) (execx.Result, error) {
 	return execx.Result{}, exec.ErrNotFound
 }
 
@@ -174,12 +180,17 @@ func TestScan(t *testing.T) {
 	badChecksum := gz(t, withToken)
 	badChecksum[len(badChecksum)-8] ^= 0xff
 	corruptZstd := append([]byte{0x28, 0xb5, 0x2f, 0xfd}, filler(100)...)
+	// What a Fake zstd is fed: the magic, then anything
+	zstdBlob := append([]byte{0x28, 0xb5, 0x2f, 0xfd}, noise(64)...)
 	index := file("index.json", []byte(`{"schemaVersion":2}`))
 
 	tests := []struct {
-		name        string
-		archive     string
-		zstd        execx.Runner
+		name    string
+		archive string
+		// zstd is what runs zstd: the command itself when nil, or a Fake
+		// made from these calls when not.
+		zstd        execx.StreamRunner
+		zstdCalls   []execx.Call
 		wantScanned int
 		wantHits    []string
 		wantErr     bool
@@ -256,6 +267,39 @@ func TestScan(t *testing.T) {
 			name:        "token-split-between-files",
 			archive:     writeTar(t, file("a", token[:len(token)/2]), file("b", token[len(token)/2:])),
 			wantScanned: 2,
+		},
+		{
+			// CI-20: entries are chosen by their type. A PAX global header
+			// holds records the tar reader has already taken, not a file
+			name:        "pax-global-header-not-a-file",
+			archive:     writeTar(t, entry{name: "pax_global_header", typeflag: tar.TypeXGlobalHeader}, file("blobs/sha256/aa", clean)),
+			wantScanned: 1,
+		},
+		{
+			// A type the check does not know, or a contiguous file, is read
+			// as a file: a type it skipped could carry the token past it
+			name: "unknown-and-contiguous-types-read",
+			archive: writeTar(t,
+				entry{name: "blobs/sha256/aa", typeflag: 'Z', body: withToken},
+				entry{name: "blobs/sha256/bb", typeflag: tar.TypeCont, body: withToken}),
+			wantScanned: 2,
+			wantHits:    []string{"blobs/sha256/aa", "blobs/sha256/bb"},
+		},
+		{
+			// CI-22: zstd reads the blob on its stdin, and its output is
+			// searched as it streams, never held whole
+			name:        "zstd-streamed",
+			archive:     writeTar(t, file("blobs/sha256/aa", zstdBlob)),
+			zstdCalls:   []execx.Call{{Argv: []string{"zstd", "-dcq"}, Stdin: zstdBlob, Result: execx.Result{Stdout: withToken}}},
+			wantScanned: 1,
+			wantHits:    []string{"blobs/sha256/aa"},
+		},
+		{
+			// What zstd wrote before it failed is no clean bill
+			name:      "zstd-token-then-failure",
+			archive:   writeTar(t, file("blobs/sha256/aa", zstdBlob)),
+			zstdCalls: []execx.Call{{Argv: []string{"zstd", "-dcq"}, Stdin: zstdBlob, Result: execx.Result{Stdout: withToken, Stderr: []byte("zstd: corrupted block"), Code: 1}}},
+			wantErr:   true,
 		},
 		{
 			name:    "corrupt-gzip",
@@ -340,7 +384,10 @@ func TestScan(t *testing.T) {
 			t.Parallel()
 
 			zstd := tt.zstd
-			if zstd == nil {
+			switch {
+			case tt.zstdCalls != nil:
+				zstd = execx.NewFake(t, tt.zstdCalls...)
+			case zstd == nil:
 				zstd = execx.OS{}
 			}
 			scanned, hits, err := tokenleak.Scan(t.Context(), tt.archive, token, zstd)
@@ -400,6 +447,51 @@ func TestScanEmptyToken(t *testing.T) {
 	archive := writeTar(t, file("blob", filler(10)))
 	if _, _, err := tokenleak.Scan(t.Context(), archive, nil, failing{}); err == nil {
 		t.Error("Scan() with no token: error = nil, want one")
+	}
+}
+
+// cancelsOnFirstCheck is a context that cancels itself once it has been
+// asked whether it is done, after answering that first time that it is
+// not: it lets a scan start an entry and then be cancelled inside it.
+type cancelsOnFirstCheck struct {
+	context.Context
+
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancelsOnFirstCheck) Err() error {
+	first := false
+	c.once.Do(func() { first = true })
+	if first {
+		defer c.cancel()
+	}
+	return c.Context.Err()
+}
+
+// TestScanCancelledInsideAnEntry (CI-23) checks that a scan cancelled
+// while it reads an entry stops inside that entry, rather than reading it
+// to its end first: the token, past the first read, is never reached.
+func TestScanCancelledInsideAnEntry(t *testing.T) {
+	t.Parallel()
+
+	token := syntheticToken()
+	big := at(3*chunk, 2*chunk, token)
+	for name, blob := range map[string][]byte{"plain": big, "gzip": hidden(t, gz(t, big), token)} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			archive := writeTar(t, file("blobs/sha256/aa", blob))
+			_, hits, err := tokenleak.Scan(&cancelsOnFirstCheck{Context: ctx, cancel: cancel}, archive, token, failing{})
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Scan() error = %v, want context.Canceled", err)
+			}
+			if len(hits) != 0 {
+				t.Errorf("hits = %q, want none: the entry was read to its end after the scan was cancelled", hits)
+			}
+		})
 	}
 }
 
