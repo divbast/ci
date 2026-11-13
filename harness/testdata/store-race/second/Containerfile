@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# Built second by TestBuildBesideImageRemoval: its first step comes from
+# store-race/first's cache, and its second is slow, so that store-race/
+# first's image is removed while this build is still at it.
+
+FROM docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+
+# The step both builds share, which this one takes from the cache
+RUN echo shared > /shared
+# DL3059 would fold this into the step above, which both builds share:
+# this one is apart on purpose, the slow one the removal lands in
+# hadolint ignore=DL3059
+RUN sleep 20 && echo second > /second
