@@ -206,9 +206,10 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-26.04
     timeout-minutes: 10
-    # For the App's key, which only main may deploy to, so no branch's
-    # workflow can mint a tag. Not a deployment, or every merge would add
-    # one to the environment's history.
+    # The App's key is this repository's `renovate` environment secret, and
+    # only main may deploy to that environment, so no branch's workflow can
+    # mint a tag. Not a deployment, or every merge would add one to the
+    # environment's history.
     environment:
       name: renovate
       deployment: false
@@ -237,8 +238,7 @@ jobs:
         run: go build -o "${GITHUB_WORKSPACE}/bin/" ./cmd/...
 
       # Narrowed to this repository and to writing its contents, which a
-      # tag and a release need; the org App is installed on every divbast
-      # repository. Minted last, just before it is used.
+      # tag and a release need. Minted last, just before it is used.
       - id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:

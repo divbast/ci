@@ -5,11 +5,11 @@
 # divbast repository calls from its own triggers. It authenticates as the
 # divbast org's `divbast-renovate` GitHub App, so its pull requests trigger
 # the caller's CI the way a person's would, and it can move the action pins
-# under .github/workflows, which a GITHUB_TOKEN may not write. The App's
-# private key lives in the caller's `renovate` environment, which only main
-# may deploy to. divbast/infra manages the App's wiring in each repository:
-# the environment, its client ID and key, and the kill switch the caller
-# passes as `automerge`.
+# under .github/workflows, which a GITHUB_TOKEN may not write. The job reads
+# the App's private key from the caller's `renovate` environment, which
+# only main may deploy to, so it runs from main alone. divbast/infra
+# manages that environment, its client ID and key, and the kill switch the
+# caller passes as `automerge`.
 #
 # Renovate merges its own pull requests, through the API with a squash, once
 # every check on one has passed, and only while `automerge` is true. A
@@ -67,8 +67,7 @@ jobs:
     permissions: {}
     steps:
       # Narrowed to the calling repository and to the permissions Renovate
-      # uses: the org App is installed on every divbast repository. A
-      # permission the App gains reaches Renovate only once it is named here.
+      # uses, each named below.
       - id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
