@@ -185,8 +185,10 @@ var (
 	// fetched, so the version cannot be counted from the clone's.
 	ErrStaleTags = errors.New("origin has release tags this clone has not fetched")
 	// ErrTagMismatch means gh made the release, but origin's tag of its
-	// version does not point at the commit: a tag of that name was
-	// already there, and the release took it.
+	// version is not at the commit. Either it points at another commit,
+	// since a tag of that name was already there and the release took
+	// it, or origin shows no such tag even after Create has read it
+	// again.
 	ErrTagMismatch = errors.New("the release's tag is not at the commit released")
 )
 
