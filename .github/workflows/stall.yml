@@ -54,6 +54,11 @@ on:
 
 permissions: {}
 
+env:
+  # The mise release jdx/mise-action installs. Renovate moves it.
+  # renovate: datasource=github-releases depName=jdx/mise
+  MISE_VERSION: 2026.11.7
+
 jobs:
   # One job per check, so a run names every stall and not only the first.
   stall:
@@ -86,6 +91,7 @@ jobs:
       # nothing else of its toolchain.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
+          version: ${{ env.MISE_VERSION }}
           working_directory: .ci
           install_args: core:go
 

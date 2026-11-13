@@ -36,6 +36,11 @@ on:
 
 permissions: {}
 
+env:
+  # The mise release jdx/mise-action installs. Renovate moves it.
+  # renovate: datasource=github-releases depName=jdx/mise
+  MISE_VERSION: 2026.11.7
+
 jobs:
   # lint.yml's steps, but for the pin check's skip, which names divbast/ci:
   # ci never calls this workflow, so a caller's pin is always checked. A
@@ -64,6 +69,8 @@ jobs:
 
       # Before the pin check, which needs the caller's pinned Go.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: ${{ env.MISE_VERSION }}
 
       # `just setup` would otherwise check .ci out again at whatever commit
       # the caller's workflows pin, and lint with that one. ci's tools build
@@ -121,6 +128,8 @@ jobs:
 
       # Before the pin check, which needs the caller's pinned Go.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: ${{ env.MISE_VERSION }}
 
       # `just setup` would otherwise check .ci out again at whatever commit
       # the caller's workflows pin, and lint with that one. ci's tools build
@@ -144,6 +153,8 @@ jobs:
 
       # The default docker driver cannot write an image index
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - name: Pin the build clock to the commit
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "${GITHUB_ENV}"
       # Never for the two events that publish, which build from scratch.
@@ -165,7 +176,7 @@ jobs:
           image=$(just --evaluate IMAGE)
           args=(
             --attest 'type=provenance,mode=max'
-            --attest type=sbom
+            --attest 'type=sbom,generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315'
             --output 'type=oci,dest=/tmp/image.tar,rewrite-timestamp=true'
             -f Containerfile -t "${image}"
           )
@@ -235,6 +246,8 @@ jobs:
 
       # Before the pin check, which needs the caller's pinned Go.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: ${{ env.MISE_VERSION }}
 
       # `just setup` would otherwise check .ci out again at whatever commit
       # the caller's workflows pin, and lint with that one. ci's tools build
@@ -351,6 +364,7 @@ jobs:
       # repository, and this job can dismiss code scanning alerts.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
+          version: ${{ env.MISE_VERSION }}
           install_args: core:go aqua:casey/just aqua:aquasecurity/trivy
 
       # mise installs a name that mise.toml does not declare, or declares

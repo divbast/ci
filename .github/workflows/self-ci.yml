@@ -13,6 +13,11 @@ on:
 
 permissions: {}
 
+env:
+  # The mise release jdx/mise-action installs. Renovate moves it.
+  # renovate: datasource=github-releases depName=jdx/mise
+  MISE_VERSION: 2026.11.7
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -52,6 +57,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: ${{ env.MISE_VERSION }}
       # The probe's own tests run it with the host's PHP, the version the
       # images run. mise's PHP backend compiles PHP from source.
       - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
@@ -125,6 +132,7 @@ jobs:
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         if: github.event_name == 'pull_request'
         with:
+          version: ${{ env.MISE_VERSION }}
           install_args: core:go
 
       - name: Build ci's tools
@@ -222,6 +230,7 @@ jobs:
       # ci's own Go, and nothing else of its toolchain
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
+          version: ${{ env.MISE_VERSION }}
           install_args: core:go
 
       - name: Build ci's tools

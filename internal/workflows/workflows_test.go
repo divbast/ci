@@ -2168,3 +2168,114 @@ func unquote(v string) string {
 func indent(s string) int {
 	return len(s) - len(strings.TrimLeft(s, " "))
 }
+
+// The shapes the org's Renovate preset reads (divbast/renovate-config,
+// default.json). A pin written any other way is not kept current.
+var (
+	buildkitManager = regexp.MustCompile(`image=(?<depName>moby/buildkit):(?<currentValue>v[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})`)
+	sbomManager     = regexp.MustCompile(`generator=(?<depName>docker/buildkit-syft-scanner):(?<currentValue>[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})`)
+	miseManager     = regexp.MustCompile(`# renovate: datasource=(?<datasource>github-releases) depName=(?<depName>jdx/mise)\n\s*MISE_VERSION: ["']?(?<currentValue>[0-9.]+)["']?`)
+	// renovateImage is renovate.yml's image with tag and digest. The
+	// github-actions manager reads a digest from renovate-image, and
+	// takes all of renovate-version, digest included, as the version.
+	renovateImage = regexp.MustCompile(`renovate-image: ghcr\.io/renovatebot/renovate:[0-9.]+@sha256:[a-f0-9]{64}\n`)
+)
+
+// TestBuildToolsPinned checks that BuildKit, the SBOM scanner, mise and
+// the Renovate image are each pinned in the form Renovate keeps current,
+// against ci's workflows as they are, then with each pin undone, which
+// the check must refuse.
+func TestBuildToolsPinned(t *testing.T) {
+	t.Parallel()
+	workflows := readWorkflows(t)
+	if found := buildToolsPinned(workflows); len(found) > 0 {
+		t.Errorf("workflows: %s", strings.Join(found, "\n"))
+	}
+	mutate := func(file, old, replacement string) map[string]string {
+		w := maps.Clone(workflows)
+		w[file] = strings.Replace(w[file], old, replacement, 1)
+		if w[file] == workflows[file] {
+			t.Fatalf("the change to %s changed nothing", file)
+		}
+		return w
+	}
+	digest := regexp.MustCompile(`@sha256:[a-f0-9]{64}`)
+	bk := buildkitManager.FindString(workflows["app-check.yml"])
+	sbom := sbomManager.FindString(workflows["app-check.yml"])
+	for name, mutant := range map[string]map[string]string{
+		"buildkit without a digest":    mutate("app-check.yml", bk, digest.ReplaceAllString(bk, "")),
+		"buildkit left floating":       mutate("app-publish.yml", "driver-opts: ", "ignored: "),
+		"sbom generator left floating": mutate("app-check.yml", sbom, "generator=docker/buildkit-syft-scanner:stable-1"),
+		"sbom without a digest":        mutate("app-check.yml", sbom, digest.ReplaceAllString(sbom, "")),
+		"mise unversioned":             mutate("lint.yml", "version: ${{ env.MISE_VERSION }}", "install_args: core:go"),
+		"mise marker removed":          mutate("stall.yml", "# renovate: datasource=github-releases depName=jdx/mise\n", ""),
+		"renovate image floating":      mutate("renovate.yml", digest.FindString(workflows["renovate.yml"]), ""),
+		"renovate version beside it":   mutate("renovate.yml", "          renovate-image:", "          renovate-version: 44.237.3@sha256:"+strings.Repeat("0", 64)+"\n          renovate-image:"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if len(buildToolsPinned(mutant)) == 0 {
+				t.Error("passes the workflows with " + name)
+			}
+		})
+	}
+}
+
+// buildToolsPinned returns each way the workflows leave a build tool
+// floating: a setup-buildx-action step without driver-opts that name a
+// digest-pinned BuildKit, an SBOM attest without a digest-pinned
+// generator, a mise-action step without version: set to env.MISE_VERSION,
+// a workflow with such a step and no Renovate-marked MISE_VERSION, and
+// renovate.yml without a digest-pinned image, or with a renovate-version.
+// It finds one of each, or says so, so that a parser that reads no step
+// cannot pass.
+func buildToolsPinned(workflows map[string]string) []string {
+	var out []string
+	var buildx, sboms, mises int
+	for _, file := range slices.Sorted(maps.Keys(workflows)) {
+		text := workflows[file]
+		miseHere := 0
+		for name, job := range jobsOf(linesOf(text)) {
+			for _, step := range steps(job) {
+				at := file + "/" + name + " line " + strconv.Itoa(step[0].n)
+				switch {
+				case slices.ContainsFunc(step, isUses("docker/setup-buildx-action")):
+					buildx++
+					if !slices.ContainsFunc(step, func(l line) bool {
+						return strings.Contains(l.text, "driver-opts:") && buildkitManager.MatchString(l.text)
+					}) {
+						out = append(out, at+": setup-buildx-action has no driver-opts: image=moby/buildkit:<tag>@sha256:<digest>")
+					}
+				case slices.ContainsFunc(step, isUses("jdx/mise-action")):
+					mises++
+					miseHere++
+					if value(step, "version") != "${{ env.MISE_VERSION }}" {
+						out = append(out, at+": mise-action does not set version: ${{ env.MISE_VERSION }}")
+					}
+				}
+			}
+		}
+		for l := range strings.Lines(text) {
+			if strings.Contains(l, "type=sbom") && !strings.HasPrefix(strings.TrimSpace(l), "#") {
+				sboms++
+				if !sbomManager.MatchString(l) {
+					out = append(out, file+": the SBOM attest names no digest-pinned generator=docker/buildkit-syft-scanner:<version>@sha256:<digest>: "+strings.TrimSpace(l))
+				}
+			}
+		}
+		if miseHere > 0 && len(miseManager.FindAllString(text, -1)) != 1 {
+			out = append(out, file+": runs mise-action but has not exactly one '# renovate: datasource=github-releases depName=jdx/mise' MISE_VERSION")
+		}
+	}
+	if buildx == 0 || sboms == 0 || mises == 0 {
+		out = append(out, fmt.Sprintf("read %d setup-buildx steps, %d SBOM attests and %d mise steps; want at least one of each", buildx, sboms, mises))
+	}
+	renovate := workflows["renovate.yml"]
+	if !renovateImage.MatchString(renovate) {
+		out = append(out, "renovate.yml: no renovate-image: ghcr.io/renovatebot/renovate:<version>@sha256:<digest>")
+	}
+	if strings.Contains(renovate, "renovate-version:") {
+		out = append(out, "renovate.yml: renovate-version beside renovate-image, which the action ignores once the image has a tag")
+	}
+	return out
+}
