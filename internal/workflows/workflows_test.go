@@ -478,6 +478,20 @@ func declaration(lines []line, input string) []string {
 	return decl
 }
 
+// sneak is a step, written run: first, that tags latest through env
+// values before the attestation, as review wrote it; sneakOnGate is the
+// same on the decision's if:, and sneakNamed the same with a name.
+const (
+	sneak = "      - run: docker buildx imagetools create \"-t\" \"${D}:${T}\" \"${D}@${S}\"\n" +
+		"        env:\n          T: latest\n"
+	sneakOnGate = "      - run: docker buildx imagetools create \"-t\" \"${D}:${T}\" \"${D}@${S}\"\n" +
+		"        if: steps.decide.outputs.publish == 'true'\n        env:\n          T: latest\n"
+	sneakNamed = "      - name: Tag it early\n" +
+		"        if: steps.decide.outputs.publish == 'true'\n" +
+		"        run: docker buildx imagetools create \"-t\" \"${D}:${T}\" \"${D}@${S}\"\n" +
+		"        env:\n          T: latest\n"
+)
+
 // The publish job's step names that the mutants below move or change, and
 // the if: every step from the first push to the promotion runs on.
 const (
@@ -533,9 +547,15 @@ func TestPublishAttestsBeforePromote(t *testing.T) {
 		"latest pushed unquoted":                               replaceAfter(publish, pushName, "          done\n", "          done\n          skopeo copy --all docker://${IMAGE}@$(cat /tmp/digest-amd64) docker://${IMAGE}:latest\n"),
 		"the version pushed unbraced":                          replaceAfter(publish, pushName, "          done\n", "          done\n          "+from+` "docker://${IMAGE}:$VERSION"`+"\n"),
 		"latest pushed to ghcr.io by name":                     replaceAfter(publish, pushName, "          done\n", "          done\n          "+from+` "docker://ghcr.io/divbast/librespeed:latest"`+"\n"),
-		"a write appended to the decision's read":              strings.Replace(publish, notReferences["decide"]+"\n", notReferences["decide"]+"; "+from+` "docker://${IMAGE}:latest"`+"\n", 1),
-		"another tool's write appended to the decision's read": strings.Replace(publish, notReferences["decide"]+"\n", notReferences["decide"]+`; crane copy "${IMAGE}@${published}" "${IMAGE}:latest"`+"\n", 1),
-		"a write appended to the choice of image":              strings.Replace(publish, notReferences["target"]+"\n", notReferences["target"]+"; "+from+` "docker://${IMAGE}:latest"`+"\n", 1),
+		"a write appended to the decision's read":              strings.Replace(publish, notReferences["decide"][0]+"\n", notReferences["decide"][0]+"; "+from+` "docker://${IMAGE}:latest"`+"\n", 1),
+		"another tool's write appended to the decision's read": strings.Replace(publish, notReferences["decide"][0]+"\n", notReferences["decide"][0]+`; crane copy "${IMAGE}@${published}" "${IMAGE}:latest"`+"\n", 1),
+		"a run-first step tagging latest early":                strings.Replace(publish, attestStep, sneak+attestStep, 1),
+		"a run-first step on the gate tagging early":           strings.Replace(publish, attestStep, sneakOnGate+attestStep, 1),
+		"latest staged by a quoted -t":                         strings.Replace(publish, staging, staging+`            "-t" "${IMAGE}:latest" \`+"\n", 1),
+		"latest staged by a quoted --tag=":                     strings.Replace(publish, staging, staging+`            "--tag=${IMAGE}:latest" \`+"\n", 1),
+		"a tag behind an @ in an expansion":                    replaceAfter(publish, pushName, "          done\n", "          done\n          "+from+` "docker://${IMAGE//@/}:${T}"`+"\n"),
+		"a tag behind an @ in a reference":                     replaceAfter(publish, pushName, "          done\n", "          done\n          "+from+` "docker://${IMAGE}@x:latest"`+"\n"),
+		"a write appended to the choice of image":              strings.Replace(publish, notReferences["target"][1]+"\n", notReferences["target"][1]+"; "+from+` "docker://${IMAGE}:latest"`+"\n", 1),
 		"the decision's read moved past a push":                replaceAfter(publish, verifyName, "        run: |\n", "        run: |\n          published=$(.ci/bin/divbast-published-revision \"${IMAGE}:latest\")\n"),
 		"promoted before verifying":                            moveStep(publish, promoteName, verifyName),
 		"promoted before attesting":                            moveStep(publish, promoteName, attestStep),
@@ -569,42 +589,44 @@ func TestPublishAttestsBeforePromote(t *testing.T) {
 }
 
 var (
-	// tagArg is a -t or --tag argument and the reference it names.
-	tagArg = regexp.MustCompile(`(?:^|\s)(?:-t|--tag)[ =]"?([^"\s]+)`)
+	// tagArg is a -t or --tag argument and the reference it names, either
+	// quoted or not, given as the next word or after an =.
+	tagArg = regexp.MustCompile(`(?:^|[\s(])['"]?(?:-t|--tag)(?:['"]?\s+['"]?|=['"]?)([^"'\s]+)`)
 	// publicTag is the version's tag or latest, however the version is
 	// written, with the suffix, if any, that makes it the staging tag or
 	// an architecture's.
 	publicTag = regexp.MustCompile(`:(?:latest|\$\{VERSION\}|\$VERSION|\$\{\{ *steps\.version\.outputs\.version *\}\})(-staging|-\$\{arch\})?`)
 )
 
-// imageRef is a reference skopeo reads or writes, or one built on
-// ${IMAGE}, to the quote or blank that ends it.
-var imageRef = regexp.MustCompile(`docker://[^"\s]*|\$\{IMAGE\}[^"\s]*|\$IMAGE\b[^"\s]*`)
+// imageRef is a reference skopeo reads or writes, or one built on IMAGE
+// in any expansion, to the quote or blank that ends it, a $( ) whole.
+var imageRef = regexp.MustCompile(`(?:docker://|\$\{IMAGE[^}]*\}|\$IMAGE\b)(?:\$\([^)]*\)|[^"\s])*`)
+
+// unmovedRef is the whole of a reference that leaves the version's tag
+// and latest where they are: ${IMAGE} by a digest, sha256: or the
+// DIGEST or per-arch digest file the job writes, or tagged
+// ${VERSION}-staging or ${VERSION}-${arch}.
+var unmovedRef = regexp.MustCompile(`^(?:docker://)?(?:\$\{IMAGE\}|\$IMAGE)` +
+	`(?:@(?:sha256:[0-9a-f]{64}|\$\{DIGEST\}|\$\(cat /tmp/digest-(?:amd64|arm64)\))|:\$\{VERSION\}-(?:staging|\$\{arch\}))$`)
 
 // notReferences are the lines before the promotion that may name the image
-// otherwise than by digest, staging tag or architecture's tag, each
-// matched as the whole line, in the step with that id alone: the
-// decision's read of the commit latest was built from, and the choice of
-// where to publish, which names the image but no tag of it.
-var notReferences = map[string]string{
-	"decide": `published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")`,
-	"target": `echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"`,
+// otherwise than unmovedRef allows, each matched as the whole line, in the
+// step with that id alone: the decision's read of the commit latest was
+// built from, and the choice of where to publish, which names the image
+// but no tag of it.
+var notReferences = map[string][]string{
+	"decide": {`published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")`},
+	"target": {
+		`echo "image=localhost:5000/${IMAGE#*/}" >> "${GITHUB_OUTPUT}"`,
+		`echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"`,
+	},
 }
 
 // unmoved reports whether ref, a docker:// reference or one built on
-// ${IMAGE}, names a digest or a tag that ends -staging or -${arch}: one
-// that leaves the version's tag and latest where they are. A reference
-// with no tag at all is latest's.
+// IMAGE, is one unmovedRef allows. A reference with no tag at all is
+// latest's.
 func unmoved(ref string) bool {
-	ref = strings.TrimPrefix(ref, "docker://")
-	if _, digest, ok := strings.Cut(ref, "@"); ok {
-		return digest != ""
-	}
-	i := strings.LastIndex(ref, ":")
-	if i < 0 || strings.Contains(ref[i:], "/") {
-		return false
-	}
-	return strings.HasSuffix(ref, "-staging") || strings.HasSuffix(ref, "-${arch}")
+	return unmovedRef.MatchString(ref)
 }
 
 // attestsBeforePromote returns an error unless the publish job has one
@@ -672,14 +694,14 @@ func attestsBeforePromote(workflow string) error {
 	}
 
 	for _, s := range st[:promote] {
-		exempt, isExempt := notReferences[value(s, "id")]
+		exempt := notReferences[value(s, "id")]
 		for _, l := range s {
 			for _, tag := range tags(l) {
 				if !strings.HasSuffix(tag, "-staging") {
 					return fmt.Errorf("line %d tags %s before the attestation verifies", l.n, tag)
 				}
 			}
-			if isExempt && strings.TrimSpace(l.text) == exempt {
+			if slices.Contains(exempt, strings.TrimSpace(l.text)) {
 				continue
 			}
 			for _, ref := range imageRef.FindAllString(l.text, -1) {
@@ -1100,12 +1122,16 @@ func TestPublishShellPinned(t *testing.T) {
 			"          done\n          "+from+" \"docker://${IMAGE}:$VERSION\"\n"),
 		"latest written to ghcr.io by name": replaceAfter(publish, pushName, "          done\n",
 			"          done\n          "+from+" \"docker://ghcr.io/divbast/librespeed:latest\"\n"),
-		"a write appended to the decision's read": strings.Replace(publish, notReferences["decide"]+"\n",
-			notReferences["decide"]+"; "+from+" \"docker://${IMAGE}:latest\"\n", 1),
-		"a write appended to the choice of image": strings.Replace(publish, notReferences["target"]+"\n",
-			notReferences["target"]+"; "+from+" \"docker://${IMAGE}:latest\"\n", 1),
-		"another version tag staged":  strings.Replace(publish, `-t "${IMAGE}:${VERSION}-staging"`, `-t "${IMAGE}:${VERSION}-stage"`, 1),
-		"the registry's wait changed": strings.Replace(publish, "--retry 10 --retry-delay 1", "--retry 3 --retry-delay 1", 1),
+		"a write appended to the decision's read": strings.Replace(publish, notReferences["decide"][0]+"\n",
+			notReferences["decide"][0]+"; "+from+" \"docker://${IMAGE}:latest\"\n", 1),
+		"a write appended to the choice of image": strings.Replace(publish, notReferences["target"][1]+"\n",
+			notReferences["target"][1]+"; "+from+" \"docker://${IMAGE}:latest\"\n", 1),
+		"another version tag staged":                 strings.Replace(publish, `-t "${IMAGE}:${VERSION}-staging"`, `-t "${IMAGE}:${VERSION}-stage"`, 1),
+		"the registry's wait changed":                strings.Replace(publish, "--retry 10 --retry-delay 1", "--retry 3 --retry-delay 1", 1),
+		"a run-first step tagging latest early":      strings.Replace(publish, attestStep, sneak+attestStep, 1),
+		"a run-first step on the gate tagging early": strings.Replace(publish, attestStep, sneakOnGate+attestStep, 1),
+		"a named step tagging latest early":          strings.Replace(publish, attestStep, sneakNamed+attestStep, 1),
+		"a step that neither runs nor uses":          strings.Replace(publish, attestStep, "      - name: Nothing at all\n        if: steps.decide.outputs.publish == 'true'\n"+attestStep, 1),
 	}
 	exits := 0
 	for i, l := range strings.SplitAfter(publish, "\n") {
@@ -1130,18 +1156,86 @@ func TestPublishShellPinned(t *testing.T) {
 			}
 		})
 	}
-	t.Run("a pin Renovate moves", func(t *testing.T) {
-		t.Parallel()
-		moved := registryManager.ReplaceAllStringFunc(publish, func(m string) string {
-			return m[:strings.LastIndex(m, ":")+1] + strings.Repeat("0", 64)
+	// What Renovate does to the registry's pin: a new digest for the same
+	// version, and a new version with its digest. Each new value is made
+	// from the old one, so it differs whatever the workflow pins.
+	pin := registryManager.FindStringSubmatch(publish)
+	if pin == nil {
+		t.Fatal("app-publish.yml pins no registry image Renovate reads")
+	}
+	version, digest := pin[registryManager.SubexpIndex("currentValue")], pin[registryManager.SubexpIndex("currentDigest")]
+	moved := sha256.Sum256([]byte(digest))
+	newDigest := "sha256:" + hex.EncodeToString(moved[:])
+	for name, bump := range map[string]string{
+		"a digest Renovate moves":             "registry:" + version + "@" + newDigest,
+		"a version and digest Renovate moves": "registry:" + version + "1@" + newDigest,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			bumped := strings.Replace(publish, "registry:"+version+"@"+digest, bump, 1)
+			if bumped == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if registryManager.FindString(bumped) == "" {
+				t.Fatalf("Renovate would not read %s", bump)
+			}
+			if err := shellPinned(bumped, string(golden)); err != nil {
+				t.Errorf("refuses app-publish.yml with the registry at %s: %v", bump, err)
+			}
 		})
-		if moved == publish {
-			t.Fatal("the change changed nothing")
-		}
-		if err := shellPinned(moved, string(golden)); err != nil {
-			t.Errorf("refuses app-publish.yml with the registry's digest moved: %v", err)
-		}
-	})
+	}
+}
+
+// TestPublishShellReadsEveryForm checks publishShell on a small publish
+// job: it reads a script whether run: comes first in its step or not,
+// inline or as a block, and stops a block at the step's next key; and it
+// refuses, rather than skips, a step it cannot read in the pinned range.
+func TestPublishShellReadsEveryForm(t *testing.T) {
+	t.Parallel()
+	const (
+		head = "jobs:\n  publish:\n    steps:\n" +
+			"      - name: Gate\n        run: |\n          case \"${EVENT}\" in\n            schedule | workflow_dispatch) ;;\n          esac\n" +
+			"      - name: Decide\n        id: decide\n        run: echo decide\n"
+		gate = "== Gate ==\ncase \"${EVENT}\" in\n  schedule | workflow_dispatch) ;;\nesac\n== Decide ==\necho decide\n"
+	)
+	tests := []struct {
+		name, steps, want string
+	}{
+		{
+			name:  "a block written run: first, keys after it",
+			steps: "      - run: |\n          echo one\n\n            echo indented\n        name: Block first\n        env:\n          T: latest\n",
+			want:  gate + "== Block first ==\necho one\n\n  echo indented\n",
+		},
+		{
+			name:  "an inline script written run: first",
+			steps: "      - run: echo two\n        name: Inline first\n",
+			want:  gate + "== Inline first ==\necho two\n",
+		},
+		{
+			name:  "an action between scripts",
+			steps: "      - uses: actions/attest@x\n        with:\n          push-to-registry: true\n      - name: After\n        run: echo after\n",
+			want:  gate + "== After ==\necho after\n",
+		},
+		{name: "a script with no name", steps: "      - run: echo nameless\n"},
+		{name: "a step that neither runs nor uses", steps: "      - name: Nothing\n        if: always()\n"},
+		{name: "a step that both runs and uses", steps: "      - name: Both\n        uses: actions/attest@x\n        run: echo both\n"},
+		{name: "a folded script", steps: "      - name: Folded\n        run: >\n          echo folded\n"},
+		{name: "a stripped block", steps: "      - name: Stripped\n        run: |-\n          echo stripped\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := publishShell(head + tt.steps)
+			switch {
+			case tt.want == "" && err == nil:
+				t.Errorf("publishShell() = %q, want an error", got)
+			case tt.want != "" && err != nil:
+				t.Errorf("publishShell() error: %v", err)
+			case got != tt.want:
+				t.Errorf("publishShell() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 // shellPinned returns an error, with a diff, unless publishShell of the
@@ -1166,7 +1260,9 @@ const pinnedRegistry = "registry:<version>@<digest>"
 // publishShell returns the run: scripts of the publish job's gate step and
 // of every step from the decision on, each under its name, as written, its
 // indent taken off. The registry image's version and digest are replaced
-// by pinnedRegistry.
+// by pinnedRegistry. A step in that range that neither runs a script nor
+// uses an action, a script in a step with no name, and a block scalar
+// other than | are errors, never skipped.
 func publishShell(workflow string) (string, error) {
 	raw := strings.Split(workflow, "\n")
 	st := publishSteps(workflow)
@@ -1175,28 +1271,43 @@ func publishShell(workflow string) (string, error) {
 	if len(decide) != 1 || len(gate) != 1 {
 		return "", fmt.Errorf("%d decide steps and %d gate steps, want one of each", len(decide), len(gate))
 	}
+	key := func(l line) string { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") }
 	var b strings.Builder
 	for i, s := range st {
 		if i != gate[0] && i < decide[0] {
 			continue
 		}
-		at := slices.IndexFunc(s, func(l line) bool { return strings.HasPrefix(strings.TrimSpace(l.text), "run:") })
-		if at < 0 {
+		at := slices.IndexFunc(s, func(l line) bool { return strings.HasPrefix(key(l), "run:") })
+		uses := slices.ContainsFunc(s, func(l line) bool { return strings.HasPrefix(key(l), "uses:") })
+		switch {
+		case at < 0 && uses:
 			continue
+		case at < 0 || uses:
+			return "", fmt.Errorf("line %d: a step must run a script or use an action, one and not both", s[0].n)
 		}
+		run := s[at]
 		name := value(s, "name")
 		if name == "" {
-			return "", fmt.Errorf("line %d runs a script in a step with no name", s[at].n)
+			return "", fmt.Errorf("line %d runs a script in a step with no name", run.n)
 		}
 		b.WriteString("== " + name + " ==\n")
-		run := s[at]
-		if v := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(run.text), "run:")); v != "|" {
+		v := strings.TrimSpace(strings.TrimPrefix(key(run), "run:"))
+		if v == "" || strings.HasPrefix(v, ">") || (strings.HasPrefix(v, "|") && v != "|") {
+			return "", fmt.Errorf("line %d: run: %s is no script this test reads; write it inline or as a | block", run.n, v)
+		}
+		if v != "|" {
 			b.WriteString(v + "\n")
 			continue
 		}
+		// The block ends at the first line no deeper than the run: key,
+		// which sits past the "- " when it is the step's first.
+		at = indent(run.text)
+		if strings.HasPrefix(strings.TrimSpace(run.text), "- ") {
+			at += 2
+		}
 		var block []string
 		for _, r := range raw[run.n:] {
-			if strings.TrimSpace(r) != "" && indent(r) <= indent(run.text) {
+			if strings.TrimSpace(r) != "" && indent(r) <= at {
 				break
 			}
 			block = append(block, r)
@@ -1204,7 +1315,11 @@ func publishShell(workflow string) (string, error) {
 		for len(block) > 0 && strings.TrimSpace(block[len(block)-1]) == "" {
 			block = block[:len(block)-1]
 		}
-		in := indent(run.text) + 2
+		first := slices.IndexFunc(block, func(r string) bool { return strings.TrimSpace(r) != "" })
+		if first < 0 {
+			return "", fmt.Errorf("line %d: an empty run: block", run.n)
+		}
+		in := indent(block[first])
 		for _, r := range block {
 			if len(r) >= in {
 				r = r[in:]
@@ -1744,7 +1859,7 @@ func moveStep(workflow, what, before string) string {
 // value. Blank lines and comments are already gone.
 func runScript(step []line) (string, error) {
 	for i, l := range step {
-		v, ok := strings.CutPrefix(strings.TrimSpace(l.text), "run:")
+		v, ok := strings.CutPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), "run:")
 		if !ok {
 			continue
 		}
