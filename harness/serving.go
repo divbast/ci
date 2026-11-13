@@ -50,8 +50,9 @@ type ServeSpec struct {
 
 // Serving is a container serving, as [Engine.Serve] or
 // [Engine.StartServing] started it, with its ports published on the
-// host's loopback. Get and Do send to Base: to send one to the health
-// port, use a copy of the Serving with Base set to HealthBase.
+// host's loopback. Get and Do send to Base, the app port, and so do the
+// assertions that take a Serving; [Serving.Health] returns one that sends
+// to the health port instead.
 type Serving struct {
 	C *Container
 	// Probe is the probe in C, installed once the container serves, and
@@ -66,6 +67,9 @@ type Serving struct {
 	appPort, healthPort int
 	readyPath           string
 	probeApp            []byte
+	// health marks a copy Health made, whose Base is the health port's,
+	// empty when that is unpublished.
+	health bool
 	// transport, when set, sends Get's requests in place of the default
 	// transport, so a test can answer them without a connection.
 	transport http.RoundTripper
@@ -247,6 +251,19 @@ func (s *Serving) Restart(ctx context.Context) error {
 	return s.Wait(ctx, s.readyPath)
 }
 
+// Health returns a copy of s that sends to the health port: its Base is
+// s's HealthBase, so Get, Do and StatusIs reach the health port through
+// it as they reach the app port through s. With the health port
+// unpublished, every request the copy would send is an error saying so,
+// and none goes to the app port in its place. The copy holds the ports s
+// had when it was taken: after [Serving.Restart], take another.
+func (s *Serving) Health() *Serving {
+	h := *s
+	h.Base = s.HealthBase
+	h.health = true
+	return &h
+}
+
 // Response is the answer to one request from the host.
 type Response struct {
 	Status int
@@ -274,6 +291,12 @@ func (s *Serving) Get(ctx context.Context, path string, header http.Header) (Res
 // never sent. Each header name keeps the case it was given, as a server
 // that tells them apart sees it; a Host header sets the request's host.
 func (s *Serving) Do(ctx context.Context, client *http.Client, method, path string, header http.Header, body []byte) (Response, error) {
+	switch {
+	case s.Base == "" && s.health:
+		return Response{}, fmt.Errorf("%s %s %w: the health port is unpublished, its ServeSpec's HealthPort being 0", method, path, errUnsendable)
+	case s.Base == "":
+		return Response{}, fmt.Errorf("%s %s %w: the Serving has no Base, as only Engine.Serve and Engine.StartServing set one", method, path, errUnsendable)
+	}
 	var r io.Reader
 	if body != nil {
 		r = bytes.NewReader(body)

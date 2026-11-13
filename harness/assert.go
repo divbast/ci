@@ -144,12 +144,14 @@ func RunRecords(tb testing.TB, p *Probe, sub string, args ...string) {
 }
 
 // Refuses runs spec and checks that the container refuses to start: that
-// it exits with a status other than 0 within ServeWithin, and that its
-// log holds needle. Each is a record of its own, named
+// it exits with exactly wantExit within ServeWithin, and that its log
+// holds needle. Each is a record of its own, named
 // "<what>: the container exits" and "<what>: the log says '<needle>'".
-// spec runs as it is given: a refusal comes before there is a server to
-// reach, so a Network of "none" suits most.
-func Refuses(tb testing.TB, e Engine, spec *RunSpec, what, needle string) {
+// One that exits with any other status, 0 or not, fails, with the status
+// it found and the container's log. spec runs as it is given: a refusal
+// comes before there is a server to reach, so a Network of "none" suits
+// most.
+func Refuses(tb testing.TB, e Engine, spec *RunSpec, wantExit int, what, needle string) {
 	tb.Helper()
 	ctx := tb.Context()
 	checks := NewChecks(tb)
@@ -161,14 +163,25 @@ func Refuses(tb testing.TB, e Engine, spec *RunSpec, what, needle string) {
 		checks.True(says, false, err.Error())
 		return
 	}
-	if code, werr := c.WaitExit(ctx, ServeWithin); werr != nil {
-		checks.True(exits, false, werr.Error())
-	} else {
-		checks.True(exits, code != 0, fmt.Sprintf("exit status %d", code))
+	code, werr := c.WaitExit(ctx, ServeWithin)
+	logs, lerr := c.Logs(ctx)
+	logged := "its log: " + clip(logs)
+	if lerr != nil {
+		logged = "its log could not be read: " + lerr.Error()
 	}
-	if logs, ok := logOf(tb, c, says); ok {
-		Contains(tb, says, needle, logs)
+	switch {
+	case werr != nil:
+		checks.True(exits, false, werr.Error()+"; "+logged)
+	case code != wantExit:
+		checks.True(exits, false, fmt.Sprintf("exit status %d, want %d; %s", code, wantExit, logged))
+	default:
+		checks.True(exits, true, fmt.Sprintf("exit status %d", code))
 	}
+	if lerr != nil {
+		checks.True(says, false, lerr.Error())
+		return
+	}
+	Contains(tb, says, needle, logs)
 }
 
 // clipAt is as much of a text as a failing check quotes.

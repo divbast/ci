@@ -409,15 +409,17 @@ image and check what it answers, so no suite carries its own copy:
   place, reads its ports again, waits, and installs the probe again.
 - `Serving.Get` and `Serving.Do` send a request from the host to `Base`
   exactly as it is written, as `curl --path-as-is` sends it, with each
-  header name in the case it was given, and return a `Response`. A copy
-  of the `Serving` with `Base` set to `HealthBase` sends to the health
-  port.
+  header name in the case it was given, and return a `Response`.
+  `Serving.Health` returns a copy whose `Base` is `HealthBase`, so the
+  same calls, and `StatusIs`, reach the health port. With the health
+  port unpublished, its every request is an error saying so, and never
+  goes to the app port instead.
 - Each assertion is a named check, through `Checks`: `StatusIs` and
   `Answers` for an exact status, `Contains` and `Lacks` for text,
   `LogContains` and `LogLacks` for a container's log, `IsFile` for a
   path present or absent, `RunRecords` for a probe subcommand's
-  records, and `Refuses` for a container that must exit non-zero within
-  `ServeWithin` and say why in its log.
+  records, and `Refuses` for a container that must exit with exactly
+  the status given within `ServeWithin`, and say why in its log.
 - `PHPIn` runs PHP in a container, `WithLog` adds a container's log to
   an error, and `Pause` waits, or stops when the context ends.
 

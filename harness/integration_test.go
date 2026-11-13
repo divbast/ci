@@ -832,9 +832,7 @@ func TestServeEnginePickedPort(t *testing.T) {
 		if resp.Status != http.StatusOK || string(resp.Body) != minimalPage {
 			t.Errorf("GET / at %s, from the host = %d %q, want 200 %q", s.Base, resp.Status, resp.Body, minimalPage)
 		}
-		health := *s
-		health.Base = s.HealthBase
-		StatusIs(t, &health, "GET /healthz on the health port, from the host", http.StatusOK, "/healthz")
+		StatusIs(t, s.Health(), "GET /healthz on the health port, from the host", http.StatusOK, "/healthz")
 		StatusIs(t, s, "GET /healthz on the app port, from the host", http.StatusNotFound, "/healthz")
 		RunRecords(t, s.Probe, "assert-listeners", "8080", "8081")
 	}
@@ -861,6 +859,9 @@ func TestServeEnginePickedPort(t *testing.T) {
 	}
 	if got, published := ins.Ports["8081/tcp"]; published || s.HealthBase != "" {
 		t.Errorf("with HealthPort 0, HealthBase = %q and 8081/tcp is at %q; want it unpublished", s.HealthBase, got)
+	}
+	if resp, err := s.Health().Get(ctx, "/healthz", nil); err == nil || !strings.Contains(err.Error(), "the health port is unpublished") {
+		t.Errorf("with HealthPort 0, Health().Get(/healthz) = %+v, %v; want an error saying the health port is unpublished", resp, err)
 	}
 }
 
@@ -945,33 +946,43 @@ func TestServingRestart(t *testing.T) {
 	RunRecords(t, s.Probe, "assert-read-only")
 }
 
-// TestRefuses runs the exits mutant, which stops before it serves, as a
-// refusal: Refuses passes it, and fails a container that exits 0, and one
-// whose log does not say what it was asked for, each on the half it
+// TestRefuses runs the exits mutant, which stops before it serves, exit
+// status 3, as a refusal: Refuses passes it when told to want 3, and
+// fails a container that exits 0, one told to want another status, and
+// one whose log does not say what it was asked for, each on the half it
 // breaks, with why.
 func TestRefuses(t *testing.T) {
 	t.Parallel()
 	e := integration(t)
 	spec := RunSpec{Image: minimalFixture(t, e, true), Network: "none", Confine: Contract("16m")}
+	logged := `its log: "` + exitsSays + `\n"`
 
 	t.Run("refuses", func(t *testing.T) {
 		t.Parallel()
-		Refuses(t, e, &spec, "the exits mutant", exitsSays)
+		Refuses(t, e, &spec, 3, "the exits mutant", exitsSays)
 	})
 	t.Run("exits-0", func(t *testing.T) {
 		t.Parallel()
 		zero := spec
 		zero.Entrypoint = []string{FrankenPHP, "php-cli", "-r", "fwrite(STDERR, '" + exitsSays + "' . PHP_EOL); exit(0);"}
 		tb := &recTB{t: t}
-		Refuses(tb, e, &zero, "exits 0", exitsSays)
+		Refuses(tb, e, &zero, 3, "exits 0", exitsSays)
 		recorded(t, tb,
 			[]string{"ok   exits 0: the log says '" + exitsSays + `' (holds "` + exitsSays + `")`},
-			[]string{"FAIL exits 0: the container exits: exit status 0"})
+			[]string{"FAIL exits 0: the container exits: exit status 0, want 3; " + logged})
+	})
+	t.Run("another-exit", func(t *testing.T) {
+		t.Parallel()
+		tb := &recTB{t: t}
+		Refuses(tb, e, &spec, 1, "wants 1", exitsSays)
+		recorded(t, tb,
+			[]string{"ok   wants 1: the log says '" + exitsSays + `' (holds "` + exitsSays + `")`},
+			[]string{"FAIL wants 1: the container exits: exit status 3, want 1; " + logged})
 	})
 	t.Run("says-something-else", func(t *testing.T) {
 		t.Parallel()
 		tb := &recTB{t: t}
-		Refuses(tb, e, &spec, "something else", "TRUSTED_PROXIES")
+		Refuses(tb, e, &spec, 3, "something else", "TRUSTED_PROXIES")
 		recorded(t, tb,
 			[]string{"ok   something else: the container exits (exit status 3)"},
 			[]string{`FAIL something else: the log says 'TRUSTED_PROXIES': "TRUSTED_PROXIES" is not in "` + exitsSays + `\n"`})

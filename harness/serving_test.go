@@ -669,6 +669,80 @@ func TestServingDo(t *testing.T) {
 	}
 }
 
+// TestServingHealth sends through Health to the health port, with Get,
+// Do and StatusIs alike, and leaves the Serving it was taken from on the
+// app port. With the health port unpublished, every request the copy
+// would send fails, saying so, Wait among them, and none reaches the app
+// port in its place.
+func TestServingHealth(t *testing.T) {
+	t.Parallel()
+
+	t.Run("published", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		app, toApp := rawServer(t)
+		health, toHealth := rawServer(t)
+		s := &Serving{Base: app, HealthBase: health}
+
+		h := s.Health()
+		if h.Base != health || h.HealthBase != health || s.Base != app {
+			t.Errorf("Health() Base, HealthBase = %q, %q, and the Serving's Base is then %q; want %q, %q, and %q kept",
+				h.Base, h.HealthBase, s.Base, health, health, app)
+		}
+		if resp, err := h.Get(ctx, "/healthz", nil); err != nil || resp.Status != http.StatusOK {
+			t.Errorf("Health().Get(/healthz) = %+v, %v; want 200", resp, err)
+		}
+		if resp, err := h.Do(ctx, nil, http.MethodHead, "/healthz", nil, nil); err != nil || resp.Status != http.StatusOK {
+			t.Errorf("Health().Do(HEAD /healthz) = %+v, %v; want 200", resp, err)
+		}
+		tb := &recTB{t: t}
+		StatusIs(tb, h, "health", http.StatusOK, "/healthz")
+		recorded(t, tb, []string{"ok   health (200)"})
+
+		if got := toHealth(); len(got) != 3 || !strings.HasPrefix(got[0], "GET /healthz ") || !strings.HasPrefix(got[1], "HEAD /healthz ") {
+			t.Errorf("the health port got %q, want GET, HEAD and GET /healthz", got)
+		}
+		if got := toApp(); len(got) != 0 {
+			t.Errorf("the app port got %q, want nothing", got)
+		}
+	})
+
+	t.Run("unpublished", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		app, toApp := rawServer(t)
+		h := (&Serving{Base: app}).Health()
+
+		const why = "GET /healthz was not sent: the health port is unpublished"
+		if resp, err := h.Get(ctx, "/healthz", nil); err == nil || !strings.Contains(err.Error(), why) || !errors.Is(err, errUnsendable) {
+			t.Errorf("Health().Get(/healthz) = %+v, %v; want an error wrapping errUnsendable and holding %q", resp, err, why)
+		}
+		if resp, err := h.Do(ctx, nil, http.MethodPost, "/healthz", nil, []byte("x")); err == nil || !strings.Contains(err.Error(), "the health port is unpublished") {
+			t.Errorf("Health().Do(POST /healthz) = %+v, %v; want an error saying the health port is unpublished", resp, err)
+		}
+		// At once: there is no port to wait for
+		if err := h.Wait(ctx, "/healthz"); err == nil || !strings.Contains(err.Error(), why) {
+			t.Errorf("Health().Wait(/healthz) = %v, want an error holding %q", err, why)
+		}
+		tb := &recTB{t: t}
+		StatusIs(tb, h, "health", http.StatusOK, "/healthz")
+		recorded(t, tb, nil, []string{"FAIL health: " + why})
+
+		if got := toApp(); len(got) != 0 {
+			t.Errorf("the app port got %q, want nothing: a request for the health port must never reach it", got)
+		}
+	})
+
+	// Not a copy Health made: a Serving no Serve or StartServing set up
+	t.Run("no-base", func(t *testing.T) {
+		t.Parallel()
+		const why = "GET / was not sent: the Serving has no Base"
+		if resp, err := (&Serving{}).Get(t.Context(), "/", nil); err == nil || !strings.Contains(err.Error(), why) || !errors.Is(err, errUnsendable) {
+			t.Errorf("Get(/) with no Base = %+v, %v; want an error wrapping errUnsendable and holding %q", resp, err, why)
+		}
+	})
+}
+
 // TestServingGetUnfollowed answers GET from the host with a redirect,
 // which Get returns as it is, as HostClient does: a 302 to an install
 // wizard is a failure, not a hop on the way to a 200.

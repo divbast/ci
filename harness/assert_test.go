@@ -303,11 +303,13 @@ func TestRunRecords(t *testing.T) {
 	}
 }
 
-// TestRefusesRecords runs a container that must refuse to start: it passes only
-// for one that exits non-zero within ServeWithin, with the needle in its
-// log, and each half is a record of its own. One that exits 0, one still
-// running at the deadline, one whose log says something else and one the
-// engine never ran each fail the half they break, with why.
+// TestRefusesRecords runs a container that must refuse to start: it
+// passes only for one that exits with exactly the status it was told to
+// within ServeWithin, with the needle in its log, and each half is a
+// record of its own. One that exits with any other status, 0 or not, one
+// still running at the deadline, one whose log says something else and
+// one the engine never ran each fail the half they break, with why: the
+// status found and the log.
 func TestRefusesRecords(t *testing.T) {
 	t.Parallel()
 
@@ -331,17 +333,28 @@ func TestRefusesRecords(t *testing.T) {
 			wantWait: pollInterval,
 		},
 		{
+			// Non-zero, and still not the status a refusal exits with
+			name:     "another-exit",
+			states:   [][]byte{state("exited", false, 2, startedAt, "")},
+			logs:     refusing,
+			wantLogs: []string{"ok   " + says + ` (holds "` + needle + `")`},
+			wantErrs: [][]string{{"FAIL " + exits + `: exit status 2, want 1; its log: "refusing: TRUSTED_PROXIES holds '::/0'\n"`}},
+		},
+		{
 			name:     "exits-0",
 			states:   [][]byte{state("exited", false, 0, startedAt, "")},
 			logs:     refusing,
 			wantLogs: []string{"ok   " + says + ` (holds "` + needle + `")`},
-			wantErrs: [][]string{{"FAIL " + exits + ": exit status 0"}},
+			wantErrs: [][]string{{"FAIL " + exits + `: exit status 0, want 1; its log: "refusing: TRUSTED_PROXIES holds '::/0'\n"`}},
 		},
 		{
-			name:     "still-running",
-			states:   [][]byte{state("running", true, 0, startedAt, "")},
-			logs:     "serving\n",
-			wantErrs: [][]string{{"FAIL " + exits + ": ", "still running after 1m0s"}, {"FAIL " + says + `: "` + needle + `" is not in "serving\n"`}},
+			name:   "still-running",
+			states: [][]byte{state("running", true, 0, startedAt, "")},
+			logs:   "serving\n",
+			wantErrs: [][]string{
+				{"FAIL " + exits + ": ", "still running after 1m0s", `; its log: "serving\n"`},
+				{"FAIL " + says + `: "` + needle + `" is not in "serving\n"`},
+			},
 			wantWait: ServeWithin,
 		},
 		{
@@ -387,7 +400,7 @@ func TestRefusesRecords(t *testing.T) {
 				tb := &recTB{t: t}
 
 				start := time.Now()
-				Refuses(tb, e, &RunSpec{Image: "img", Name: "ctr", Network: "none", Confine: Contract("16m")}, what, needle)
+				Refuses(tb, e, &RunSpec{Image: "img", Name: "ctr", Network: "none", Confine: Contract("16m")}, 1, what, needle)
 				if waited := time.Since(start); waited != tt.wantWait {
 					t.Errorf("Refuses() took %s, want %s", waited, tt.wantWait)
 				}
@@ -420,7 +433,7 @@ func TestAssertionsLogNames(t *testing.T) {
 	Answers(tb, "answers", http.StatusOK, Response{Status: http.StatusOK}, nil)
 	Contains(tb, "contains", "x", "x")
 	Lacks(tb, "lacks", "y", "x")
-	Refuses(tb, e, &RunSpec{Image: "img", Network: "none", Confine: Contract("16m")}, "refuses", "x")
+	Refuses(tb, e, &RunSpec{Image: "img", Network: "none", Confine: Contract("16m")}, 1, "refuses", "x")
 
 	want := "answers\ncontains\nlacks\nrefuses: the container exits\nrefuses: the log says 'x'\n"
 	if got := readLog(t, dir); string(got) != want {
