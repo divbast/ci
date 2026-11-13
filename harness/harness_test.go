@@ -723,6 +723,8 @@ var (
 	engineError = execx.Result{Code: 125, Stderr: []byte("Error: can only create exec sessions on running containers: container state improper\n")}
 	// Docker 29, for /bin/sh in an image without one.
 	notFound = execx.Result{Code: 127, Stderr: []byte(`OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/sh": stat /bin/sh: no such file or directory` + "\n")}
+	// Docker 29, for a file that is not executable.
+	notExecutable = execx.Result{Code: 126, Stderr: []byte(`OCI runtime exec failed: exec failed: unable to start container process: exec: "/etc/passwd": permission denied` + "\n")}
 	// FrankenPHP's PHP, for a fatal error, which exits 255 too.
 	phpFatal = execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Uncaught Error: Call to undefined function f() in Command line code:1\n")}
 )
@@ -806,6 +808,23 @@ func TestExecRetriesEngineFailure(t *testing.T) {
 			wantCode: 127,
 			wantWait: 2 * time.Second,
 		},
+		{
+			name:     "126-three-times-is-a-result",
+			engine:   "docker",
+			attempts: []execx.Result{notExecutable, notExecutable, notExecutable},
+			wantCode: 126,
+			wantWait: 2 * time.Second,
+		},
+		{
+			// A runtime error that lasts is an error, as 125 and 128 are,
+			// never a Result of 255 a caller could take for PHP's
+			name:     "runtime-error-three-times",
+			engine:   "podman",
+			attempts: []execx.Result{runtimeError, runtimeError, runtimeError},
+			wantCode: 255,
+			wantErr:  "attempt 3 of 3 failed in the engine, as each before it did: exit status 255: Error: OCI runtime error: crun: setns",
+			wantWait: 2 * time.Second,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -876,7 +895,7 @@ func TestExecRetryCodes(t *testing.T) {
 
 // TestExecRetryHonoursContext ends the context while Exec waits to try an
 // exec the engine failed again: it stops waiting, runs nothing more, and
-// says why.
+// says why, with the engine's words for the attempt that failed.
 func TestExecRetryHonoursContext(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
@@ -889,6 +908,9 @@ func TestExecRetryHonoursContext(t *testing.T) {
 		_, err := c.Exec(ctx, nil, "true")
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Exec() error = %v, want the context's deadline", err)
+		}
+		if want := "exit status 128: " + string(stoppedRefusal.Stderr); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Exec() error = %v, want it to carry the engine's words, %q", err, want)
 		}
 		if waited := time.Since(start); waited != 300*time.Millisecond {
 			t.Errorf("Exec() returned after %s, want at the deadline, 300ms", waited)
@@ -1293,12 +1315,16 @@ func TestWaitExitStates(t *testing.T) {
 func TestEngineHealthy(t *testing.T) {
 	t.Parallel()
 
+	// Why each engine may report no health check
+	noCheck := map[string]string{"docker": "its image declares no HEALTHCHECK", "podman": "it was started with no --health-cmd"}
 	for _, engine := range []string{"docker", "podman"} {
 		inspect := []string{engine, "container", "inspect", "abc"}
 		tests := []struct {
 			name     string
 			states   [][]byte
 			wantText string
+			// notText is what the error must not say.
+			notText string
 		}{
 			{
 				name: "healthy-once-the-engine-says-so",
@@ -1316,9 +1342,13 @@ func TestEngineHealthy(t *testing.T) {
 				wantText: engine + " reports container abc unhealthy; its checks:\n  exit 1: probe said no",
 			},
 			{
+				// Only a missing --health-cmd leaves Podman reporting none: a
+				// missing systemd session fails the run, or leaves the check
+				// starting with none run.
 				name:     "no-health-check",
 				states:   [][]byte{state("running", true, 0, startedAt, "")},
-				wantText: engine + " reports no health check for container abc",
+				wantText: engine + " reports no health check for container abc: " + noCheck[engine],
+				notText:  "systemd",
 			},
 			{
 				// A container that stopped can never turn healthy.
@@ -1347,6 +1377,9 @@ func TestEngineHealthy(t *testing.T) {
 					if err == nil || !strings.Contains(err.Error(), tt.wantText) {
 						t.Errorf("EngineHealthy() error = %v, want it to contain %q", err, tt.wantText)
 					}
+					if tt.notText != "" && err != nil && strings.Contains(err.Error(), tt.notText) {
+						t.Errorf("EngineHealthy() error = %v, want it not to contain %q", err, tt.notText)
+					}
 				})
 			})
 		}
@@ -1356,13 +1389,18 @@ func TestEngineHealthy(t *testing.T) {
 // healthState is `container inspect` output for a running container whose
 // health check is status, run every interval as the engine says, or at
 // the engine's default when interval is zero and the field is left out.
-func healthState(status string, interval time.Duration) []byte {
+// Its log holds one failed check when checked is set, and none otherwise.
+func healthState(status string, interval time.Duration, checked bool) []byte {
 	hc := ""
 	if interval > 0 {
 		hc = `, "Config": {"Healthcheck": {"Test": ["CMD", "/x"], "Interval": ` + strconv.FormatInt(int64(interval), 10) + `}}`
 	}
+	log := "[]"
+	if checked {
+		log = `[{"ExitCode": 1, "Output": "probe said no"}]`
+	}
 	return []byte(`[{"State": {"Status": "running", "Running": true, "StartedAt": "` + startedAt +
-		`", "Health": {"Status": "` + status + `", "Log": []}}` + hc + `}]`)
+		`", "Health": {"Status": "` + status + `", "Log": ` + log + `}}` + hc + `}]`)
 }
 
 // TestEngineHealthyWindow shows how long EngineHealthy waits for a
@@ -1371,24 +1409,31 @@ func healthState(status string, interval time.Duration) []byte {
 // intervals the engine runs the check at, as the container's inspection
 // gives them, or 30 s, both engines' default, when it gives none. By then
 // a check that had passed would have been seen, and one that kept failing
-// would have been retried as often as Docker's default and Podman's.
+// would have been retried as often as Docker's default and Podman's. A
+// Podman container with no check run by then says that Podman's timer
+// needs a systemd user session; one with a check run, or Docker's, does
+// not.
 func TestEngineHealthyWindow(t *testing.T) {
 	t.Parallel()
 
+	const session = "Podman runs its checks only from a transient systemd timer, which needs a systemd user session"
 	tests := []struct {
 		engine      string
 		startPeriod time.Duration
 		interval    time.Duration // as inspect gives it; zero for none
-		want        time.Duration
+		// checked is whether the engine logged a check by then.
+		checked bool
+		want    time.Duration
 	}{
 		{engine: "docker", startPeriod: time.Minute, interval: 30 * time.Second, want: 150 * time.Second},
 		{engine: "docker", startPeriod: 10 * time.Second, interval: 2 * time.Second, want: 16 * time.Second},
 		{engine: "podman", startPeriod: time.Minute, interval: 30 * time.Second, want: 150 * time.Second},
 		{engine: "podman", startPeriod: 0, interval: 5 * time.Second, want: 15 * time.Second},
 		{engine: "podman", startPeriod: 0, want: 90 * time.Second},
+		{engine: "podman", startPeriod: 0, interval: 5 * time.Second, checked: true, want: 15 * time.Second},
 	}
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%s/%s+3x%s", tt.engine, tt.startPeriod, tt.interval), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/%s+3x%s/checked=%t", tt.engine, tt.startPeriod, tt.interval, tt.checked), func(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				inspect := []string{tt.engine, "container", "inspect", "abc"}
@@ -1398,7 +1443,7 @@ func TestEngineHealthyWindow(t *testing.T) {
 						others = append(others, strings.Join(argv, " "))
 						return execx.Result{Code: 125, Stderr: []byte("not scripted")}
 					}
-					return execx.Result{Stdout: healthState("starting", tt.interval)}
+					return execx.Result{Stdout: healthState("starting", tt.interval, tt.checked)}
 				}))
 				// Started a little before EngineHealthy is called, as a container
 				// is, and the window is counted from then.
@@ -1410,7 +1455,11 @@ func TestEngineHealthyWindow(t *testing.T) {
 					t.Errorf("EngineHealthy() gave up %s after the container started, want %s", waited, tt.want)
 				}
 				if err == nil || !strings.Contains(err.Error(), "still starting") {
-					t.Errorf("EngineHealthy() error = %v, want one saying it is still starting", err)
+					t.Fatalf("EngineHealthy() error = %v, want one saying it is still starting", err)
+				}
+				wantSession := tt.engine == "podman" && !tt.checked
+				if got := strings.Contains(err.Error(), session); got != wantSession {
+					t.Errorf("EngineHealthy() error = %v; saying %q is %t, want %t", err, session, got, wantSession)
 				}
 				if len(others) > 0 {
 					t.Errorf("EngineHealthy() ran %q, want nothing but %q", others, inspect)

@@ -5,9 +5,11 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"maps"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/registry"
 )
 
 const (
@@ -118,11 +121,13 @@ func TestRun(t *testing.T) {
 	const before = "earlier\n"
 
 	// The registry showing the published image, or refusing to
-	index := &execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}
-	refused := &execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}
+	index := &execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}
+	refused := &execx.Result{Stderr: skopeoRecording(t, "skopeo-no-such-package.txt"), Code: 1}
 
 	tests := []struct {
 		name string
+		// image is the -published flag's value, when not published.
+		image string
 		// vex is the -vex flag's value, if any.
 		vex string
 		// skopeo is how the registry answers the read of the published
@@ -220,6 +225,21 @@ func TestRun(t *testing.T) {
 			wantBaseline: "{}\n",
 		},
 		{
+			// Only ghcr.io images can be told absent from private, so any
+			// other image fails before the registry is asked anything
+			name:         "not-ghcr",
+			image:        "docker.io/divbast/librespeed:latest",
+			candidate:    report(t, "amd64", "", 3, "CVE-1"),
+			layoutResult: &execx.Result{},
+			sarifResult:  &execx.Result{},
+			wantCode:     1,
+			wantStderr: []string{
+				"could not tell whether docker.io/divbast/librespeed:latest is published",
+				`"docker.io/divbast/librespeed:latest" is not a ghcr.io image`,
+			},
+			notInStdout: []string{"compared with"},
+		},
+		{
 			name:         "nothing-to-scan",
 			candidate:    report(t, "amd64", "", 0),
 			layoutResult: &execx.Result{},
@@ -294,8 +314,9 @@ func TestRun(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			image := cmp.Or(tt.image, published)
 			args := []string{
-				"-layout", paths["layout"], "-report", paths["report.json"], "-published", published,
+				"-layout", paths["layout"], "-report", paths["report.json"], "-published", image,
 				"-baseline", paths["baseline.json"], "-sarif", paths["report.sarif"],
 			}
 			scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
@@ -397,10 +418,11 @@ func TestRun(t *testing.T) {
 	}
 }
 
-// skopeoStderr returns a recording of skopeo's stderr from
+// skopeoRecording returns a recording of what skopeo printed, the index
+// it wrote to stdout or the refusal or failure it wrote to stderr, from
 // internal/registry's testdata, where registry_test.go says how each was
 // made.
-func skopeoStderr(t *testing.T, name string) []byte {
+func skopeoRecording(t *testing.T, name string) []byte {
 	t.Helper()
 	root, err := os.OpenRoot(filepath.Join("..", "..", "internal", "registry", "testdata"))
 	if err != nil {
@@ -444,13 +466,14 @@ func status(code int, text string) execx.Result {
 // which; present compares with what Trivy finds in it, and any failure of
 // that scan fails, whatever Trivy said; a registry or a GitHub that does
 // not answer fails, as does a public package the registry refuses to
-// show. Outside GitHub Actions no token may read packages, so nothing
-// asks GitHub: a refusal is an advisory there, saying CI decides.
+// show for any reason but a missing tag. Outside GitHub Actions no token
+// may read packages, so nothing asks GitHub: a refusal is an advisory
+// there, saying CI decides.
 func TestPublishedPresenceFromRegistry(t *testing.T) {
 	t.Parallel()
 
-	refused := execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}
-	index := execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}
+	refused := execx.Result{Stderr: skopeoRecording(t, "skopeo-no-such-package.txt"), Code: 1}
+	index := execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}
 	tests := []struct {
 		name string
 		// actions is whether GITHUB_ACTIONS is true.
@@ -518,7 +541,7 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 		{
 			name:       "registry-unreachable",
 			actions:    true,
-			skopeo:     execx.Result{Stderr: skopeoStderr(t, "skopeo-manifest-503.txt"), Code: 1},
+			skopeo:     execx.Result{Stderr: skopeoRecording(t, "skopeo-manifest-503.txt"), Code: 1},
 			wantCode:   1,
 			wantStderr: []string{"503 Service Unavailable", "could not tell whether " + published + " is published"},
 		},
@@ -564,7 +587,7 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 		},
 		{
 			name:       "outside-actions-unreachable",
-			skopeo:     execx.Result{Stderr: skopeoStderr(t, "skopeo-manifest-503.txt"), Code: 1},
+			skopeo:     execx.Result{Stderr: skopeoRecording(t, "skopeo-manifest-503.txt"), Code: 1},
 			wantCode:   1,
 			wantStderr: []string{"503 Service Unavailable"},
 		},
@@ -629,6 +652,61 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 	}
 }
 
+// TestUnshippedFor checks each answer the registry lookup can give, in
+// GitHub Actions and outside it. A refusal nothing asked GitHub about is
+// advisory only outside Actions, where nothing does ask: in Actions it is
+// an error, which run exits 1 on, whoever made the lookup that gave it.
+func TestUnshippedFor(t *testing.T) {
+	t.Parallel()
+
+	refused := fmt.Errorf("%w: ghcr.io refused to show %s: denied", registry.ErrRefused, published)
+	private := fmt.Errorf("%w: GitHub gives it the visibility \"private\"", registry.ErrPrivate)
+	unreadable := errors.New("could not read " + published + ": skopeo exit status 1")
+	tests := []struct {
+		name      string
+		state     registry.State
+		err       error
+		inActions bool
+		// wantReason is the advisory's reason, empty for none; wantErr
+		// the error it returns, nil for none.
+		wantReason string
+		wantErr    error
+	}{
+		{name: "published", state: registry.Published, inActions: true},
+		{name: "absent", state: registry.Absent, inActions: true, wantReason: "is not published yet"},
+		{name: "private", err: private, inActions: true, wantReason: "is private"},
+		{name: "refused-outside-actions", err: refused, wantReason: "was refused by ghcr.io"},
+		{name: "refused-in-actions", err: refused, inActions: true, wantErr: registry.ErrRefused},
+		{name: "unreadable", err: unreadable, inActions: true, wantErr: unreadable},
+		{name: "unreadable-outside-actions", err: unreadable, wantErr: unreadable},
+		{name: "no-state-and-no-error", inActions: true, wantErr: errors.New("the lookup answered State(0), and no error")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := unshippedFor(tt.state, tt.err, tt.inActions, published)
+			if tt.wantErr != nil {
+				if err == nil || (!errors.Is(err, tt.wantErr) && err.Error() != tt.wantErr.Error()) {
+					t.Errorf("unshippedFor() = %+v, %v; want the error %v", got, err, tt.wantErr)
+				}
+				if got != nil {
+					t.Errorf("unshippedFor() = %+v with error %v, want no advisory", got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unshippedFor() error = %v, want nil", err)
+			}
+			switch {
+			case tt.wantReason == "" && got != nil:
+				t.Errorf("unshippedFor() = %+v, want no advisory", got)
+			case tt.wantReason != "" && (got == nil || got.reason != tt.wantReason):
+				t.Errorf("unshippedFor() = %+v, want an advisory because %s %s", got, published, tt.wantReason)
+			}
+		})
+	}
+}
+
 // TestOnlyGHGetsTheToken checks the runner the command runs with: gh gets
 // the token in GH_TOKEN and GITHUB_TOKEN, as the job gives it, and trivy
 // and skopeo get both empty, from stand-ins on PATH that print what they
@@ -672,7 +750,7 @@ func TestRunOutsideActions(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
-			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
 			}, scanArgs...), "--output", base, published)},
@@ -712,7 +790,7 @@ func TestRunUnwritableSummary(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
-			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
 			}, scanArgs...), "--output", base, published)},
@@ -757,7 +835,7 @@ func TestRunBaselineStaysInItsDirectory(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
-			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stderr: skopeoRecording(t, "skopeo-no-such-package.txt"), Code: 1}},
 		),
 		reports: map[string]string{rep: report(t, "amd64", "", 1)},
 	}

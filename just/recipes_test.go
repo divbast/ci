@@ -391,10 +391,9 @@ func TestActionsRecipesUseCIsPinactConfig(t *testing.T) {
 // after a git pull that moved the pin without a `just setup`, or the same
 // one. It must fail naming both commits and saying that just setup moves
 // .ci, or pass. Workflows that pin more than one commit, or none, must
-// fail it too, without that hint, since setup refuses them as well. A
-// shared recipe is run from a recipe's body, never named as a dependency,
-// so it builds divbast-pin from its own body when .ci/bin lacks it, and
-// only then. In ci itself, its own checkout, there is no pin to check.
+// fail it too, without that hint, since setup refuses them as well.
+// ci-fresh builds divbast-pin from its own body when .ci/bin lacks it,
+// and only then. In ci itself, its own checkout, there is no pin to check.
 func TestCIFresh(t *testing.T) {
 	t.Parallel()
 	needJustAndMise(t)

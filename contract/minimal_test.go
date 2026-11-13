@@ -93,11 +93,12 @@ func TestContractMinimal(t *testing.T) {
 			fails: []failure{{checkHealthProbe, "/usr/local/bin/minimal-health prints nothing", []string{"all is well"}}},
 		},
 		{
-			// A probe that fails once the server is up. The engine runs it
-			// on its own schedule, and once the start period is past, and
-			// it has failed as often as the HEALTHCHECK retries, it calls
-			// the container unhealthy: on Docker some two minutes after it
-			// started, within the start period and three intervals.
+			// A probe that always fails. The engine runs it on its own
+			// schedule and, once it has failed as often as the engine
+			// retries, counted on Docker past the start period and on
+			// Podman from its first check, calls the container unhealthy:
+			// on Docker some two minutes after it started, within the
+			// start period and three intervals.
 			name: "unhealthy", dir: "unhealthy",
 			fails: []failure{
 				{checkHealthProbe, "/usr/local/bin/minimal-health exits 0", []string{"1"}},

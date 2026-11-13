@@ -30,8 +30,8 @@
 # from main. This workflow fails on any other event or ref, so a merge never
 # publishes. Of the caller's mise.toml it installs only Go, declared there
 # as "core:go" (mise reads the short "go" the same way), and hands none of
-# its [env] to the steps: Go runs through mise exec, which gives it the
-# caller's toolchain and [env] for that one command.
+# its [env] to the steps' own shells: Go runs through mise exec, which
+# gives it the caller's toolchain and [env] for that one command.
 name: app-publish
 
 on:
@@ -167,12 +167,12 @@ jobs:
 
       # Before the pin check, which needs the caller's pinned Go, and only
       # Go: an install runs code from outside the repository, and this job
-      # can push the image and sign its attestation. Neither the caller's
-      # [env], nor the PATH mise makes, nor mise's shims reach the steps
-      # below, where a BASH_ENV or a PATH there would change what the
-      # pinned scripts run; the step that needs Go runs it through mise
-      # exec, which needs no shim. mise itself is on PATH whatever these
-      # say.
+      # can push the image and sign its attestation. The steps' own shells
+      # below get none of the caller's [env], nor the PATH mise makes, nor
+      # mise's shims, where a BASH_ENV or a PATH would change what the
+      # pinned scripts run. Only a command run through mise exec -- gets
+      # the [env]: the pin check runs Go that way, which needs no shim.
+      # mise itself is on PATH whatever these say.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           version: ${{ env.MISE_VERSION }}

@@ -244,9 +244,11 @@ func said(message string) string {
 	return message
 }
 
-// unreadable is the error for an image whose revision nothing can read.
+// unreadable is the error for an image nothing could read, whatever was
+// asked of it: which commit it was built from, or only whether it is
+// published.
 func unreadable(image string, err error) error {
-	return fmt.Errorf("could not read %s, so nothing says which commit it was built from: %w", image, err)
+	return fmt.Errorf("could not read %s: %w", image, err)
 }
 
 // parse returns the owner and package name of a ghcr.io reference, which

@@ -357,8 +357,8 @@ test binaries running at once, such as two packages', the hold is a
 `flock` of `divbast-harness-podman-store-<uid>.lock`, which every process
 of the user's shares, as rootless Podman keeps one store for each user.
 It is in `$XDG_RUNTIME_DIR` when that is set, the user's own directory,
-and otherwise in the temporary directory. Docker is never held: its builder keeps
-what a build uses out of `image rm`'s reach.
+and otherwise in the temporary directory. Docker is never held: its
+builder keeps what a build uses out of `image rm`'s reach.
 
 Before that, every suite labelled what it made `divbast.harness=1`.
 Suites on this version no longer remove anything carrying that label.
@@ -387,15 +387,18 @@ Containers go first, since an image, network or volume one still uses
 cannot. CI runners start empty, and need none of this.
 
 `Container.Exec` runs an exec again when the engine, not the command,
-failed it: exit status 125 to 128, or Podman's 255 with stderr opening
-`Error: OCI runtime error:`. It makes three attempts in all, a second
-apart, and feeds each the same stdin, so `InstallProbe`, the probe's
-subcommands, the contract's health exec and a suite's own execs ride
-out an engine that refuses an exec into a container still starting. A
-command's own exit status is never retried. A third failure in the
-engine is an error naming that attempt, except for 126 and 127, a
-command the runtime could not execute or find, which stay a `Result`,
-as a check that an image has no `/bin/sh` needs.
+failed it, which it tells by exit status alone: 125 to 128, or Podman's
+255 with stderr opening `Error: OCI runtime error:`. It makes three
+attempts in all, a second apart, and feeds each the same stdin, so
+`InstallProbe`, the probe's subcommands, the contract's health exec and
+a suite's own execs ride out an engine that refuses an exec into a
+container still starting. A command that itself exits 125 to 128 is
+taken for the engine's, and so run again, so a command run through
+`Exec` should not exit that way. Any other exit status is the command's
+own, and is never retried. A third failure in the engine is an error
+naming that attempt, except for 126 and 127, a command the runtime could
+not execute or find, which stay a `Result`, as a check that an image has
+no `/bin/sh` needs.
 
 `Container.Restart` restarts a container in place, as `<engine> restart`
 does, and returns once the engine reports it running again. The
@@ -408,16 +411,21 @@ stays on Podman, so read `Inspect` again for it.
 the engine's own schedule, as a user's engine would reach it, and never
 runs a check itself. Docker runs the image's `HEALTHCHECK`. Podman runs
 the `--health-cmd` that a `RunSpec`'s `HealthCmd` gives it, from a
-transient systemd timer, which runs only in a systemd user session, such
-as the one `app-check.yml`'s Podman legs set up: without one, Podman
-schedules nothing, and the wait ends in an error. It waits for the start
-period it is given, the image's own, from when the container started or
-last restarted, then for three of the intervals the engine runs the
-check at, or 30 s each when the engine reports none. A check that keeps
-failing past the start period has by then failed as often as either
-engine retries by default, so the engine calls the container unhealthy,
-and `EngineHealthy` returns that at once, as it does a container that
-stopped.
+transient systemd timer, which needs a systemd user session, such as the
+one `app-check.yml`'s Podman legs set up: without one, Podman fails to
+start the container, or runs no check, and the wait ends in an error
+saying none has run. It waits for the start period it is given, the
+image's own, from when the container started or last restarted, then
+for three of the intervals the engine runs the check at, or 30 s each
+when the engine reports none. Docker counts a failed check only once the
+start period is past; Podman, which is not told the start period, counts
+each from its first check, one interval in. Either way, a check that
+keeps failing has failed as often as the engine retries by default by
+the end of the wait, and the engine calls the container unhealthy.
+`EngineHealthy` returns that as soon as the engine reports it, as it does
+a container that stopped. A last failure that lands just as the wait
+ends, as Podman's third does with a start period of 0, can end it as
+still starting instead, which fails too.
 
 The harness also carries the helpers an app's suite needs to serve its
 image and check what it answers, so no suite carries its own copy:
@@ -519,8 +527,8 @@ in one pull request. A minor release merges itself once that repository's
 checks pass; a major one waits for approval on the Dependency Dashboard.
 
 The job acts as the divbast org's `divbast-renovate` GitHub App, whose key
-is in ci's `renovate` environment, which only main can deploy to: only a
-merged commit is ever released.
+is in ci's `renovate` environment, which only main can deploy to, so the
+job runs from main alone.
 
 ### What breaks a caller
 
@@ -579,16 +587,18 @@ a caller changes.
 
 ### Moving to v2
 
-v2.0.0 breaks two things a v1 caller relies on.
+v2.0.0 breaks three things a v1 caller relies on.
 
 - **`app-check.yml` needs `packages: read`.** Its `scan` job asks GitHub
   whether a published image the registry refuses is absent, private, or
   public and failing, where v1 read Trivy's error text and took any
   refusal for nothing published. So a registry refusing a public image
-  now fails the scan, where v1 made it advisory. A called job gets no
-  more than its caller grants, so a caller's `check` job that does not
-  grant it fails before any job starts. The `check` job's permissions
-  become:
+  for any reason but a missing tag now fails the scan, where v1 made it
+  advisory. And for an image the registry refuses, even one never
+  published, such as the template's, the scan now fails when GitHub's
+  packages API does not answer. A called job gets no more than its
+  caller grants, so a caller's `check` job that does not grant it fails
+  before any job starts. The `check` job's permissions become:
 
   ```yaml
       permissions:
@@ -600,16 +610,21 @@ v2.0.0 breaks two things a v1 caller relies on.
 
   `divbast-scan`'s `-published` must name a ghcr.io image, as every
   caller's does.
+- **`divbast-scan` needs skopeo.** It runs `skopeo inspect` on
+  `PUBLISHED` before it scans, where v1 ran only Trivy, and no caller's
+  `mise.toml` installs skopeo. CI's runners carry it, so CI needs
+  nothing more, but a local `just scan`, and so `just ci`, fails until
+  `skopeo` is on the host's `PATH`.
 - **`app-publish.yml` rehearses only in `divbast/oci-image-template`.**
   Anywhere else, `rehearse: true` fails the publish job, where v1 warned
   and went on. A repository made from the template sets `image` to its own
   and removes `rehearse` before it moves to v2; the
   [Rehearsal](#rehearsal) section says how.
 
-Nothing else changed for a caller. `lint.yml`, `renovate.yml` and
-`stall.yml` take the same inputs and permissions as in v1, so a repository
-that calls only those moves its pin and nothing more. An app may add an
-`openvex.json` ([VEX](#vex)); without one, `scan` runs as before.
+`lint.yml`, `renovate.yml` and `stall.yml` take the same inputs and
+permissions as in v1, so a repository that calls only those moves its pin
+and nothing more. An app may add an `openvex.json` ([VEX](#vex)); without
+one, `scan` passes Trivy no VEX document.
 
 ## Workflows
 
@@ -676,14 +691,16 @@ something already shipped is reported, not blocked. Whether anything is
 published is the registry's to say, never Trivy's: the tool first reads
 `PUBLISHED` as an anonymous client, as users pull it, and when ghcr.io
 refuses, asks the GitHub API why, through gh and the job's token, which
-is what `packages: read` is for.
+is what `packages: read` is for. It reads `PUBLISHED` with `skopeo`, from
+`PATH`, which no `mise.toml` lists: CI's runners carry it, and a local
+`just scan` needs it installed on the host.
 
 | `PUBLISHED` is | The scan |
 |---|---|
 | readable | Compares with what Trivy finds in it, from the same vulnerability database. Any failure of that scan fails, whatever Trivy says about why |
-| not published yet | Advisory, with a warning: nothing is shipped to compare with |
+| not published yet: no such package, or no such tag in a public one | Advisory, with a warning: nothing is shipped to compare with |
 | private | Advisory, with a warning that it stays advisory until the package is public |
-| public, but refused | Fails: a registry failing to serve the image is not nothing published |
+| public, but refused for any other reason | Fails: a registry failing to serve the image is not nothing published |
 | unreadable, or GitHub does not answer | Fails |
 
 Each warning is a GitHub Actions warning and a callout on the run's
@@ -761,13 +778,14 @@ The calling job grants `contents: read`, `packages: write`,
 Of the caller's `mise.toml` it installs Go alone, declared there as
 `"core:go"` (mise reads the short `go` the same way), and turns mise's
 auto-install off: the job can push the image and sign its attestation, so
-it runs no other tool's install code. Nor does the `mise.toml`'s `[env]`,
-the `PATH` mise makes, or mise's shims, reach the job's steps, where a
-`BASH_ENV` or a `PATH` there would change what the publish scripts run.
-mise itself stays on `PATH`, and the one step that needs Go, the build of
-ci's tools, runs it through `mise exec`, which needs no shim and gives Go
-the caller's toolchain and its `[env]`, such as `GOTOOLCHAIN` and
-`GOFLAGS`, for that command alone.
+it runs no other tool's install code. The steps' own shells get none of
+the `mise.toml`'s `[env]`, the `PATH` mise makes, or mise's shims, where a
+`BASH_ENV` or a `PATH` would change what the publish scripts run; only a
+command run through `mise exec --` gets the `[env]`. mise itself stays on
+`PATH`, and the one step that needs Go, the build of ci's tools, runs it
+through `mise exec`, which needs no shim and gives Go the caller's
+toolchain and its `[env]`, such as `GOTOOLCHAIN` and `GOFLAGS`, for that
+command alone.
 
 An app's build workflow puts the two together, and keeps its own triggers
 and its `required` job, the one check its ruleset requires:
@@ -917,10 +935,13 @@ named `publish (${{ matrix.app }})`, only that job's conclusion counts.
 GitHub decides a job's `if:` before it expands the job's matrix, so a run
 in which it skipped or cancelled the matrix, its lint red say, lists the
 job once, by its unexpanded name, which stands for every name it expands
-to: that job did not succeed. A run that never started, and so has no
-jobs, counts as the run ended. Only a run of a commit ahead of the
-published one has its jobs read, and one whose jobs include neither the
-name nor an unexpanded name standing for it fails the check, as does
+to: that job did not succeed. So give a matrix publish job a `name:`
+that holds its matrix expression, as that one does: a matrix job with
+no `name:` is listed by its bare id when skipped that way, as `publish`
+alone, which stands for no other name. A run that never started, and so
+has no jobs, counts as the run ended. Only a run of a commit ahead of
+the published one has its jobs read, and one whose jobs include neither
+the name nor an unexpanded name standing for it fails the check, as does
 `slot-job` without `content-gated`, the one slot check that reads a
 conclusion.
 
@@ -1006,7 +1027,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

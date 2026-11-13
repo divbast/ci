@@ -54,6 +54,7 @@ type ServeSpec struct {
 // assertions that take a Serving; [Serving.Health] returns one that sends
 // to the health port instead.
 type Serving struct {
+	// C is the container serving.
 	C *Container
 	// Probe is the probe in C, installed once the container serves, and
 	// again after each [Serving.Restart], since a restart empties /tmp.
@@ -295,9 +296,13 @@ func (s *Serving) base() string {
 
 // Response is the answer to one request from the host.
 type Response struct {
+	// Status is the answer's status code, such as 200.
 	Status int
+	// Header is the answer's header, each name in Go's canonical case, so
+	// that Header.Get finds it.
 	Header http.Header
-	Body   []byte
+	// Body is the whole of the answer's body.
+	Body []byte
 }
 
 // errUnsendable marks a request that would not go out as written, and so

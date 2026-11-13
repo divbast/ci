@@ -596,6 +596,9 @@ func TestServingDo(t *testing.T) {
 		// wantErr what the error must say instead
 		wantSent []string
 		wantErr  string
+		// wantOne is a header the request must carry exactly once, its
+		// name in any case
+		wantOne string
 	}{
 		{
 			name:   "path-as-is",
@@ -629,6 +632,7 @@ func TestServingDo(t *testing.T) {
 			path:     "/",
 			header:   http.Header{"host": {"dav.example"}},
 			wantSent: []string{"\r\nHost: dav.example\r\n"},
+			wantOne:  "Host",
 		},
 		{name: "a-space", method: http.MethodGet, path: "/a b", wantErr: "GET /a b would go out as /a%20b"},
 		{name: "a-bad-escape", method: http.MethodGet, path: "/%zz", wantErr: "invalid URL escape"},
@@ -663,6 +667,18 @@ func TestServingDo(t *testing.T) {
 			for _, want := range tt.wantSent {
 				if !strings.Contains(sent[0], want) {
 					t.Errorf("Do(%s %q) sent %q, which does not hold %q", tt.method, tt.path, sent[0], want)
+				}
+			}
+			if tt.wantOne != "" {
+				head, _, _ := strings.Cut(sent[0], "\r\n\r\n")
+				var n int
+				for l := range strings.SplitSeq(head, "\r\n") {
+					if name, _, ok := strings.Cut(l, ":"); ok && strings.EqualFold(name, tt.wantOne) {
+						n++
+					}
+				}
+				if n != 1 {
+					t.Errorf("Do(%s %q) sent %q, with %d %s headers, want one", tt.method, tt.path, sent[0], n, tt.wantOne)
 				}
 			}
 		})
