@@ -397,7 +397,7 @@ func (c *Container) Exec(ctx context.Context, stdin io.Reader, argv ...string) (
 			return res, fmt.Errorf("%s exec in container %s: attempt %d of %d failed in the engine, as each before it did: exit status %d: %s",
 				c.engine.name, c, attempt, execAttempts, res.Code, combined(res))
 		}
-		if err := sleep(ctx, execRetry); err != nil {
+		if err := Pause(ctx, execRetry); err != nil {
 			return res, fmt.Errorf("%s exec in container %s: waiting to try again after attempt %d failed in the engine, exit status %d: %w",
 				c.engine.name, c, attempt, res.Code, err)
 		}
@@ -690,7 +690,7 @@ func (c *Container) WaitExit(ctx context.Context, within time.Duration) (int, er
 		if !time.Now().Before(deadline) {
 			return -1, fmt.Errorf("container %s is still running after %s", c, within)
 		}
-		if err := sleep(ctx, pollInterval); err != nil {
+		if err := Pause(ctx, pollInterval); err != nil {
 			return -1, err
 		}
 	}
@@ -744,7 +744,7 @@ func (c *Container) EngineHealthy(ctx context.Context, startPeriod time.Duration
 		case !time.Now().Before(deadline):
 			return fmt.Errorf("container %s is still %s after the %s start period%s", c, h.Status, startPeriod, h.logText())
 		}
-		if err := sleep(ctx, pollInterval); err != nil {
+		if err := Pause(ctx, pollInterval); err != nil {
 			return err
 		}
 	}
@@ -761,16 +761,4 @@ func (h *Health) logText() string {
 		fmt.Fprintf(&b, "\n  exit %d: %s", l.ExitCode, strings.TrimSpace(l.Output))
 	}
 	return b.String()
-}
-
-// sleep waits for d, or until ctx is done.
-func sleep(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
 }

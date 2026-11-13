@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The contract suite's minimal fixture, whose entrypoint never serves: it
+# writes one line to its log and exits 3, as a server that refuses what it
+# was given would. It first waits EXITS_AFTER_MS milliseconds, none when
+# that is unset, so a test can have it stop at once, or once the harness
+# has begun to wait for it to serve.
+
+# contract/testdata/minimal, built, which the test passes in
+ARG FIXTURE
+
+FROM ${FIXTURE}
+ENTRYPOINT ["/usr/local/bin/frankenphp", "php-cli", "-r", "usleep(1000 * (int) getenv('EXITS_AFTER_MS')); fwrite(STDERR, 'exits: stopping before it serves' . PHP_EOL); exit(3);"]
