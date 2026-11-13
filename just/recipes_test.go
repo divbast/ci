@@ -219,10 +219,12 @@ func TestAcceptancePipesThroughTestcount(t *testing.T) {
 // TestCIFresh runs common.just's ci-fresh in a repository set up as a
 // caller's, whose workflows pin one commit while .ci holds another, as
 // after a git pull that moved the pin without a `just setup`, or the same
-// one. It must fail naming both commits, or pass. A shared recipe is run
-// from a recipe's body, never named as a dependency, so it builds
-// divbast-pin from its own body when .ci/bin lacks it, and only then. In
-// ci itself, its own checkout, there is no pin to check.
+// one. It must fail naming both commits and saying that just setup moves
+// .ci, or pass. Workflows that pin more than one commit, or none, must
+// fail it too, without that hint, since setup refuses them as well. A
+// shared recipe is run from a recipe's body, never named as a dependency,
+// so it builds divbast-pin from its own body when .ci/bin lacks it, and
+// only then. In ci itself, its own checkout, there is no pin to check.
 func TestCIFresh(t *testing.T) {
 	t.Parallel()
 	needJustAndMise(t)
@@ -239,14 +241,24 @@ func TestCIFresh(t *testing.T) {
 	// A commit no fixture's .ci holds
 	const other = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 
+	// What the fixture's workflows pin, against the commit .ci holds
+	const (
+		fresh = "fresh" // that commit
+		stale = "stale" // another one
+		mixed = "mixed" // that commit and another
+		none  = "none"  // no commit at all
+	)
 	for _, tt := range []struct {
-		name         string
-		stale, built bool
+		name, pins string
+		built      bool
+		want       string // what the output must say, beside the commits
 	}{
-		{name: "stale", stale: true, built: true},
-		{name: "fresh", built: true},
-		{name: "stale, divbast-pin not built", stale: true},
-		{name: "fresh, divbast-pin not built"},
+		{name: "stale", pins: stale, built: true},
+		{name: "fresh", pins: fresh, built: true},
+		{name: "stale, divbast-pin not built", pins: stale},
+		{name: "fresh, divbast-pin not built", pins: fresh},
+		{name: "mixed", pins: mixed, built: true, want: "workflows pin more than one divbast/ci commit"},
+		{name: "none", pins: none, built: true, want: "no workflow pins divbast/ci to a commit"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -254,21 +266,33 @@ func TestCIFresh(t *testing.T) {
 			git(t, dir, "init", "--quiet", ".ci")
 			git(t, filepath.Join(dir, ".ci"), "commit", "--quiet", "--allow-empty", "--message", "ci")
 			have := git(t, filepath.Join(dir, ".ci"), "rev-parse", "HEAD")
-			pinned := have
-			if tt.stale {
-				pinned = other
+			calls := func(sha string) string {
+				return "jobs:\n  lint:\n    uses: divbast/ci/.github/workflows/lint.yml@" + sha + " # v1.0.0\n"
 			}
 			workflows := filepath.Join(dir, ".github", "workflows")
 			if err := os.MkdirAll(workflows, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			for name, body := range map[string]string{
-				filepath.Join(workflows, "build.yml"): "jobs:\n  lint:\n    uses: divbast/ci/.github/workflows/lint.yml@" + pinned + " # v1.0.0\n",
+			files := map[string]string{
 				filepath.Join(dir, "justfile"): `set shell := ["bash", "-euo", "pipefail", "-c"]
 
 import '` + filepath.Join(ci, "just", "common.just") + `'
 `,
-			} {
+			}
+			pinned := have
+			switch tt.pins {
+			case fresh:
+				files[filepath.Join(workflows, "build.yml")] = calls(have)
+			case stale:
+				pinned = other
+				files[filepath.Join(workflows, "build.yml")] = calls(other)
+			case mixed:
+				files[filepath.Join(workflows, "build.yml")] = calls(have)
+				files[filepath.Join(workflows, "stall.yml")] = calls(other)
+			case none:
+				files[filepath.Join(workflows, "build.yml")] = "jobs:\n  lint:\n    uses: ./.github/workflows/lint.yml\n"
+			}
+			for name, body := range files {
 				if err := os.WriteFile(name, []byte(body), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -299,15 +323,21 @@ import '` + filepath.Join(ci, "just", "common.just") + `'
 			if err != nil && !failed {
 				t.Fatalf("just ci-fresh: %v\n%s", err, out)
 			}
+			hint := strings.Contains(string(out), "just setup")
 			switch {
-			case tt.stale && !failed:
-				t.Errorf("just ci-fresh passed, though the workflows pin %s and .ci holds %s:\n%s", pinned, have, out)
-			case tt.stale && (!strings.Contains(string(out), pinned) || !strings.Contains(string(out), have)):
-				t.Errorf("just ci-fresh failed without naming both %s, the pin, and %s, .ci's:\n%s", pinned, have, out)
-			case tt.stale && !strings.Contains(string(out), "just setup"):
-				t.Errorf("just ci-fresh failed without saying `just setup` moves .ci:\n%s", out)
-			case !tt.stale && failed:
+			case tt.pins == fresh && failed:
 				t.Errorf("just ci-fresh failed, though the workflows pin %s, which .ci holds:\n%s", have, out)
+			case tt.pins == fresh:
+			case !failed:
+				t.Errorf("just ci-fresh passed, though the workflows pin %s and .ci holds %s:\n%s", tt.pins, have, out)
+			case tt.pins == stale && (!strings.Contains(string(out), pinned) || !strings.Contains(string(out), have)):
+				t.Errorf("just ci-fresh failed without naming both %s, the pin, and %s, .ci's:\n%s", pinned, have, out)
+			case tt.pins == stale && !hint:
+				t.Errorf("just ci-fresh failed without saying `just setup` moves .ci:\n%s", out)
+			case tt.pins != stale && hint:
+				t.Errorf("just ci-fresh says `just setup` would help, which refuses workflows that pin %s:\n%s", tt.pins, out)
+			case !strings.Contains(string(out), tt.want):
+				t.Errorf("just ci-fresh failed without saying %q:\n%s", tt.want, out)
 			}
 			root, err := os.OpenRoot(stub)
 			if err != nil {

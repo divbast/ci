@@ -51,7 +51,10 @@ ci-fresh:
     [[ -x '{{ ci_dir }}/bin/divbast-pin' ]] || {{ just_executable() }} ci-tools
     have=$(git -C '{{ ci_dir }}' rev-parse HEAD)
     if ! '{{ ci_dir }}/bin/divbast-pin' -expect "${have}"; then
-        echo "ci-fresh: {{ ci_dir }} holds ${have}, not the commit the workflows pin; just setup moves it there" >&2
+        # setup fixes only one pin that is not .ci's, and refuses the rest
+        if pinned=$('{{ ci_dir }}/bin/divbast-pin' 2>/dev/null); then
+            echo "ci-fresh: {{ ci_dir }} holds ${have}, not ${pinned}, which the workflows pin; just setup moves it there" >&2
+        fi
         exit 1
     fi
 
