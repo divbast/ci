@@ -27,6 +27,10 @@ import (
 //	all-pass       two packages, with subtests
 //	panic          a package that passes and one whose TestMain panics,
 //	               so that it fails with no test events at all
+//	pass-without-tests
+//	               a package that passes and one whose TestMain exits 0
+//	               before m.Run when IMAGE is unset, so that it passes
+//	               with no test events at all
 //
 // Every one but all-skip comes from a module made up for them, whose
 // path in the panic's stack trace reads /src/fixtures.
@@ -74,10 +78,11 @@ const (
 	partial    = "example.com/fixtures/partial"
 	boom       = "example.com/fixtures/boom"
 	notests    = "example.com/fixtures/notests"
+	gated      = "example.com/fixtures/gated"
 )
 
 // rule is the last line stderr holds for a run that did not pass.
-const rule = prefix + "a run passes only when a test passed, none failed or skipped, and every package built and passed\n"
+const rule = prefix + "a run passes only when a test passed in every package, none failed or skipped, and every package built and passed\n"
 
 func TestCount(t *testing.T) {
 	t.Parallel()
@@ -94,6 +99,7 @@ func TestCount(t *testing.T) {
 			reasons: []string{
 				"skipped: TestContract in " + acceptance,
 				"skipped: TestTelemetryOff in " + acceptance,
+				"package ran no tests: " + acceptance,
 				"no test passed",
 			},
 		},
@@ -133,6 +139,12 @@ func TestCount(t *testing.T) {
 			code:    1,
 			summary: "4 passed, 0 skipped, 0 failed in 2 package(s)",
 			reasons: []string{"package failed: " + boom},
+		},
+		{
+			fixture: "pass-without-tests.jsonl",
+			code:    1,
+			summary: "4 passed, 0 skipped, 0 failed in 2 package(s)",
+			reasons: []string{"package ran no tests: " + gated},
 		},
 	}
 	for _, tt := range tests {
@@ -193,8 +205,8 @@ func TestRefusals(t *testing.T) {
 	}{
 		{
 			name:    "a test failed in a package that passed",
-			stream:  pass + event("start", beta, "") + event("fail", beta, "TestB") + event("pass", beta, ""),
-			summary: "1 passed, 0 skipped, 1 failed in 2 package(s)",
+			stream:  pass + event("start", beta, "") + event("pass", beta, "TestC") + event("fail", beta, "TestB") + event("pass", beta, ""),
+			summary: "2 passed, 0 skipped, 1 failed in 2 package(s)",
 			reason:  "failed: TestB in " + beta,
 		},
 		{
@@ -225,12 +237,20 @@ func TestRefusals(t *testing.T) {
 		},
 		{
 			// go test -json -run NoSuchTest: the package passes, and no test ran
-			name: "no test passed",
-			stream: event("start", beta, "") +
+			name: "a package passed and ran no tests",
+			stream: pass + event("start", beta, "") +
 				`{"Action":"output","Package":"` + beta + `","Output":"testing: warning: no tests to run\n"}` + "\n" +
 				`{"Action":"output","Package":"` + beta + `","Output":"ok  \t` + beta + `\t0.004s [no tests to run]\n"}` + "\n" +
 				event("pass", beta, ""),
-			summary: "0 passed, 0 skipped, 0 failed in 1 package(s)",
+			summary: "1 passed, 0 skipped, 0 failed in 2 package(s)",
+			reason:  "package ran no tests: " + beta,
+		},
+		{
+			// Made up: every stream go test writes names a package. This
+			// is the backstop for one that names none.
+			name:    "no test passed",
+			stream:  `{"Action":"output","Output":"PASS\n"}` + "\n",
+			summary: "0 passed, 0 skipped, 0 failed in 0 package(s)",
 			reason:  "no test passed",
 		},
 	}
@@ -383,7 +403,7 @@ func TestWriteFailure(t *testing.T) {
 // reads as go test -v's would.
 func TestOutputPassesThrough(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"all-skip.jsonl", "one-fail.jsonl", "build-fail.jsonl", "pass-and-skip.jsonl", "all-pass.jsonl", "panic.jsonl"} {
+	for _, name := range []string{"all-skip.jsonl", "one-fail.jsonl", "build-fail.jsonl", "pass-and-skip.jsonl", "all-pass.jsonl", "panic.jsonl", "pass-without-tests.jsonl"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			stream := fixture(t, name)

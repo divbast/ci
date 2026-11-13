@@ -20,16 +20,16 @@
 //
 //	divbast-testcount: <P> passed, <S> skipped, <F> failed in <K> package(s)
 //
-// Tests and subtests count alike. A run passes only when at least one test
-// passed, none failed or skipped, no package failed to build, and every
-// package the stream names ended in pass.
+// Tests and subtests count alike. A run passes only when every package the
+// stream names ended in pass with at least one test of its own passed, no
+// test failed or skipped, and no package failed to build.
 //
 // Exit codes:
 //
 //	0  the run passed
-//	1  it did not: a test failed or skipped, a package failed, did not
-//	   build, ran no tests or never finished, or no test passed; stderr
-//	   names each test and package. Or a write failed
+//	1  it did not: a test failed or skipped, or a package failed, did not
+//	   build, never finished, or ran no test that passed; stderr names
+//	   each test and package. Or a write failed
 //	2  stdin could not be read, a line of it is not a go test -json
 //	   event, it holds no events at all, or the command line is wrong
 package main

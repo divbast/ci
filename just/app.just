@@ -33,11 +33,13 @@ build:
 
 # Run the acceptance suite against the image. go test exits 0 when every
 # test skipped, so its events go through divbast-testcount, which prints
-# every test's output and a count, and fails unless a test passed and none
-# failed or skipped. The shell's pipefail keeps go test's own exit status.
+# every test's output and a count, and fails unless every package passed a
+# test and none failed or skipped. It sees only what go test printed, so a
+# go test killed between packages leaves a stream that passes: pipefail,
+# set here whatever the caller's shell sets, keeps go test's exit status.
 acceptance:
     [ -x {{ ci_dir }}/bin/divbast-testcount ] || {{ just_executable() }} ci-tools
-    ENGINE={{ ENGINE }} IMAGE={{ IMAGE }} go test -json -count=1 -timeout 90m ./test/acceptance/... | {{ ci_dir }}/bin/divbast-testcount
+    set -o pipefail; ENGINE={{ ENGINE }} IMAGE={{ IMAGE }} go test -json -count=1 -timeout 90m ./test/acceptance/... | {{ ci_dir }}/bin/divbast-testcount
 
 # Build the image, then run the acceptance suite against it
 test: build acceptance

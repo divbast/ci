@@ -85,8 +85,9 @@ The tests that build and run containers run only when `ENGINE` is
 `harness` or `contract`, or to what they use.
 
 `app.just`'s `acceptance` pipes `go test -json` into
-`divbast-testcount`, which fails a run unless a test passed and none
-failed or skipped: go test alone exits 0 when every test skipped. Keep
+`divbast-testcount`, which fails a run unless every package passed a test
+of its own and none failed or skipped: go test alone exits 0 when every
+test skipped. Keep
 that guard off `go-test`. An app's `lint` runs `go-test` with `IMAGE`
 unset, where its acceptance suite must still skip and pass.
 

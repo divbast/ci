@@ -143,10 +143,16 @@ acceptance suite that never ran reads in a log as one that passed.
 divbast-testcount: 109 passed, 0 skipped, 0 failed in 1 package(s)
 ```
 
-It fails the recipe unless at least one test passed, none failed or
-skipped, and every package built and passed, and names on stderr each test
-and package that broke the rule. The shell's `pipefail` keeps go test's own
-exit status. The recipe builds `.ci/bin/divbast-testcount` with `ci-tools`
+It fails the recipe unless every package built and passed with at least
+one test of its own passing, and no test failed or skipped, and names on
+stderr each test and package that broke the rule. A package that passes
+having run no test, such as one whose `TestMain` returns before `m.Run`
+when `IMAGE` is unset, fails it too.
+
+The tool sees only what go test printed, so a go test killed between
+packages leaves a stream that passes. The recipe therefore sets `pipefail`
+itself, whatever the caller's shell sets, and go test's own exit status
+still fails it. It builds `.ci/bin/divbast-testcount` with `ci-tools`
 first when it is missing. `go-test` stays a plain `go test`, so an
 acceptance suite that skips when `IMAGE` is unset still passes in a `lint`
 that runs it.
@@ -519,7 +525,7 @@ what it reads on stdin.
 | `divbast-publish-decision -event E -built SHA -published SHA` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a published commit not on main, a built commit that diverged, or git failed |
 | `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published image lacks | Nothing new, or advisory because nothing is pullable | A new finding, or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, or no token) |
-| `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | A test passed, none failed or skipped, and every package built and passed | A test failed or skipped, a package failed, did not build, ran no tests or never finished, no test passed, or a write failed (2: stdin unreadable, not go test -json's, or empty) |
+| `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-frankenphp [-containerfile FILE]` | Refuses a FrankenPHP binary frankenphp's main build did not attest | Verified | Not verified, or the Containerfile names the image other than once in full |
 | `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; or git or gh failed |

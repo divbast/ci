@@ -6,9 +6,9 @@
 //
 // go test exits 0 when every test skipped, and prints only ok, so a suite
 // that never ran reads in a log as one that passed. Here a run passes only
-// when at least one test passed, no test failed or skipped, no package
-// failed to build, and every package the stream names ended in pass.
-// Tests and subtests count alike.
+// when every package the stream names ended in pass with at least one test
+// of its own passed, no test failed or skipped, and no package failed to
+// build. Tests and subtests count alike.
 package testcount
 
 import (
@@ -29,7 +29,7 @@ var ErrInput = errors.New("not a go test -json stream")
 const prefix = "divbast-testcount: "
 
 // rule closes what Count writes to errOut for a run that did not pass.
-const rule = "a run passes only when a test passed, none failed or skipped, and every package built and passed"
+const rule = "a run passes only when a test passed in every package, none failed or skipped, and every package built and passed"
 
 // Result is what a stream records.
 type Result struct {
@@ -90,7 +90,7 @@ type event struct {
 // read is neither a run that passed nor one that failed. Any other error
 // is a write that failed.
 func Count(r io.Reader, out, errOut io.Writer) (Result, error) {
-	t := tally{ended: map[string]bool{}}
+	t := tally{ended: map[string]bool{}, passed: map[string]int{}}
 	lines := bufio.NewReader(r)
 	events := 0
 	for n := 1; ; n++ {
@@ -142,6 +142,7 @@ type tally struct {
 	res      Result
 	packages []string        // every package named, in the order first named
 	ended    map[string]bool // each of those, and whether its own outcome came
+	passed   map[string]int  // how many of each one's tests passed
 }
 
 // add counts one event.
@@ -157,15 +158,17 @@ func (t *tally) add(e *event) {
 		// start, run, output and the rest say nothing of how a run ended
 	case e.Test == "":
 		t.ended[e.Package] = true
-		switch e.Action {
-		case "fail":
+		switch {
+		case e.Action == "fail":
 			t.res.Reasons = append(t.res.Reasons, "package failed: "+e.Package)
-		case "skip":
-			// go test's "[no test files]"
+		case e.Action == "skip", t.passed[e.Package] == 0:
+			// go test's "[no test files]", or a pass with no test in it:
+			// "[no tests to run]", or a TestMain that never ran m.Run
 			t.res.Reasons = append(t.res.Reasons, "package ran no tests: "+e.Package)
 		}
 	case e.Action == "pass":
 		t.res.Passed++
+		t.passed[e.Package]++
 	case e.Action == "fail":
 		t.res.Failed++
 		t.res.Reasons = append(t.res.Reasons, "failed: "+e.Test+" in "+e.Package)
