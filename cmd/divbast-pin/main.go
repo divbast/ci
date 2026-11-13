@@ -10,16 +10,20 @@
 //
 // With -expect, it also fails unless that commit is SHA. A reusable
 // workflow passes its own job.workflow_sha there, so a caller whose other
-// workflows pin a different commit fails its own CI.
+// workflows pin a different commit fails its own CI. An empty SHA is a
+// wrong command line, not a missing -expect: it comes from an expression
+// or a command that produced nothing, and taken as no -expect it would
+// check nothing.
 //
 // Exit codes:
 //
 //	0  the workflows pin one commit, printed on stdout, and it is SHA
-//	   when -expect is given
+//	   when -expect is given; or -h or -help asked for the usage, which
+//	   goes to stderr
 //	1  no workflow pins divbast/ci to a commit, they pin more than one,
 //	   the pin is not SHA, or the directory cannot be read; stderr says
 //	   which, naming every ref found
-//	2  the command line is wrong
+//	2  the command line is wrong, an empty -expect among it
 package main
 
 import (
@@ -40,7 +44,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("divbast-pin", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dir := flags.String("dir", ".github/workflows", "the `directory` holding the workflows")
-	expect := flags.String("expect", "", "fail unless the workflows pin this `SHA`")
+	var expect string
+	flags.Func("expect", "fail unless the workflows pin this `SHA`", func(sha string) error {
+		if sha == "" {
+			return errors.New("an empty SHA would check nothing")
+		}
+		expect = sha
+		return nil
+	})
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -58,8 +69,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		complain(stderr, "%v", err)
 		return 1
 	}
-	if *expect != "" && sha != *expect {
-		complain(stderr, "the workflows in %s pin divbast/ci at %s, not %s", *dir, sha, *expect)
+	if expect != "" && sha != expect {
+		complain(stderr, "the workflows in %s pin divbast/ci at %s, not %s", *dir, sha, expect)
 		return 1
 	}
 	if _, err = fmt.Fprintln(stdout, sha); err != nil {

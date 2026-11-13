@@ -113,3 +113,54 @@ func TestRun(t *testing.T) {
 		})
 	}
 }
+
+// TestExpectEmptyRefused gives -expect an empty SHA, which a workflow
+// passes when the expression it reads is empty. Taken as no -expect at
+// all, it would check nothing and pass, so it must be refused as a wrong
+// command line, before the workflows are even read.
+func TestExpectEmptyRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, args := range [][]string{{"-expect", ""}, {"-expect="}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Parallel()
+
+			var stdout, stderr bytes.Buffer
+			code := run(append([]string{"-dir", workflows(t, sha1)}, args...), &stdout, &stderr)
+			if code != 2 {
+				t.Errorf("run() = %d, want 2; stderr: %s", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want nothing", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), "-expect") {
+				t.Errorf("stderr = %q, want it to name -expect", stderr.String())
+			}
+		})
+	}
+}
+
+// TestHelpExitsZero asks for the usage, which goes to stderr and is not a
+// failure.
+func TestHelpExitsZero(t *testing.T) {
+	t.Parallel()
+
+	for _, arg := range []string{"-h", "-help"} {
+		t.Run(arg, func(t *testing.T) {
+			t.Parallel()
+
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{arg}, &stdout, &stderr); code != 0 {
+				t.Errorf("run(%s) = %d, want 0; stderr: %s", arg, code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want nothing", stdout.String())
+			}
+			for _, want := range []string{"-dir", "-expect"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr = %q, want the usage, naming %s", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
