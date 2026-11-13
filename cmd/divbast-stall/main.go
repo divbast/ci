@@ -42,6 +42,10 @@
 //	PUBLISHED          the image the slot publishes, such as
 //	                   ghcr.io/divbast/librespeed:latest
 //	SLOT_WORKFLOW      the slot's workflow file, build.yml if unset
+//	SLOT_JOB           for slots -content-gated alone: the job in each slot
+//	                   run that publishes PUBLISHED, as GitHub names it in
+//	                   the run, whose conclusion counts rather than the
+//	                   whole run's; unset, the run's
 //	RENOVATE_WORKFLOW  Renovate's workflow file, renovate.yml if unset
 //
 // Each check reads only its own limit. It prints what it found on stdout:
@@ -147,6 +151,10 @@ func run(ctx context.Context, args []string, getenv func(string) string, r execx
 		c.Published = env.required("PUBLISHED")
 		c.SlotWorkflow = env.or("SLOT_WORKFLOW", "build.yml")
 		c.ContentGated = *gated
+		c.SlotJob = env.or("SLOT_JOB", "")
+		if c.SlotJob != "" && !c.ContentGated {
+			env.err = errors.Join(env.err, errors.New("SLOT_JOB is set, but only slots -content-gated reads a slot run's conclusion"))
+		}
 		lookup := registry.Lookup{Run: r, GH: ghapi.Client{Run: r}}
 		do = func() (stall.Result, error) { return stall.Slots(ctx, src, lookup, &c) }
 	default:

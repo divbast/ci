@@ -554,19 +554,11 @@ func passesContentGated(t *testing.T, workflow string) error {
 		return fmt.Errorf("declares content-gated as %q, not a boolean input that defaults to false", decl)
 	}
 
-	var step []line
-	for _, st := range steps(jobsOf(lines)["stall"]) {
-		if slices.ContainsFunc(st, func(l line) bool { return strings.Contains(l.text, ".ci/bin/divbast-stall") }) {
-			step = st
-		}
+	step, err := stallStep(lines)
+	if err != nil {
+		return err
 	}
-	if step == nil {
-		return errors.New("the stall job has no step that runs .ci/bin/divbast-stall")
-	}
-	if !slices.ContainsFunc(step, func(l line) bool {
-		k, v, ok := strings.Cut(strings.TrimSpace(l.text), ":")
-		return ok && k == "CONTENT_GATED" && unquote(v) == "${{ inputs.content-gated }}"
-	}) {
+	if !setsEnv(step, "CONTENT_GATED", "${{ inputs.content-gated }}") {
 		return fmt.Errorf("line %d runs divbast-stall with no CONTENT_GATED: ${{ inputs.content-gated }} in its env", step[0].n)
 	}
 
@@ -588,6 +580,83 @@ func passesContentGated(t *testing.T, workflow string) error {
 		if got != tt.want {
 			return fmt.Errorf("with CHECK=%s and CONTENT_GATED=%s, runs divbast-stall with %s, want %s", tt.check, tt.gated, got, tt.want)
 		}
+	}
+	return nil
+}
+
+// stallStep returns the stall job's step that runs divbast-stall.
+func stallStep(lines []line) ([]line, error) {
+	var step []line
+	for _, st := range steps(jobsOf(lines)["stall"]) {
+		if slices.ContainsFunc(st, func(l line) bool { return strings.Contains(l.text, ".ci/bin/divbast-stall") }) {
+			step = st
+		}
+	}
+	if step == nil {
+		return nil, errors.New("the stall job has no step that runs .ci/bin/divbast-stall")
+	}
+	return step, nil
+}
+
+// setsEnv reports whether step has a line that sets name to value, as an env
+// entry does.
+func setsEnv(step []line, name, value string) bool {
+	return slices.ContainsFunc(step, func(l line) bool {
+		k, v, ok := strings.Cut(strings.TrimSpace(l.text), ":")
+		return ok && k == name && unquote(v) == value
+	})
+}
+
+// TestStallSlotJob checks that stall.yml's slot-job input, empty unless a
+// caller sets it, reaches divbast-stall as SLOT_JOB in the step that runs
+// it: the job of each slot run whose conclusion a content-gated slots
+// check reads, rather than the whole run's (backlog CI-7). Against
+// stall.yml as it is, then with each link from the input to the command
+// broken, which the check must refuse.
+func TestStallSlotJob(t *testing.T) {
+	t.Parallel()
+	stall := readWorkflows(t)["stall.yml"]
+	if err := passesSlotJob(stall); err != nil {
+		t.Errorf("stall.yml: %v", err)
+	}
+	const (
+		input = "      slot-job:\n"
+		env   = "          SLOT_JOB: ${{ inputs.slot-job }}\n"
+	)
+	for name, mutant := range map[string]string{
+		"input taken out":        strings.Replace(stall, input, "      slot-job-not:\n", 1),
+		"a job by default":       replaceAfter(stall, input, "        default: ''\n", "        default: publish\n"),
+		"a boolean":              replaceAfter(stall, input, "        type: string\n", "        type: boolean\n"),
+		"not passed to the step": strings.Replace(stall, env, "", 1),
+		"another input passed":   strings.Replace(stall, env, "          SLOT_JOB: ${{ inputs.slot-workflow }}\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == stall {
+				t.Fatal("the change changed nothing")
+			}
+			if passesSlotJob(mutant) == nil {
+				t.Error("passes stall.yml with slot-job " + name)
+			}
+		})
+	}
+}
+
+// passesSlotJob returns an error unless the workflow declares a string
+// slot-job input that defaults to empty, and its stall job's step that
+// runs divbast-stall maps the input to SLOT_JOB.
+func passesSlotJob(workflow string) error {
+	lines := linesOf(workflow)
+	decl := declaration(lines, "slot-job")
+	if !slices.Contains(decl, "type: string") || !slices.Contains(decl, "default: ''") {
+		return fmt.Errorf("declares slot-job as %q, not a string input that defaults to empty", decl)
+	}
+	step, err := stallStep(lines)
+	if err != nil {
+		return err
+	}
+	if !setsEnv(step, "SLOT_JOB", "${{ inputs.slot-job }}") {
+		return fmt.Errorf("line %d runs divbast-stall with no SLOT_JOB: ${{ inputs.slot-job }} in its env", step[0].n)
 	}
 	return nil
 }

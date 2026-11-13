@@ -42,8 +42,12 @@ func successRuns(workflow string) []string {
 func slotRuns(workflow string) []string {
 	return []string{
 		"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", "10", "--json", "headSha,createdAt,status,conclusion,url",
+		"--limit", "10", "--json", "databaseId,headSha,createdAt,status,conclusion,url",
 	}
+}
+
+func runJobs(id string) []string {
+	return []string{"gh", "run", "view", id, "--repo", repo, "--json", "jobs"}
 }
 
 func workflowAPI(workflow string) []string {
@@ -53,8 +57,8 @@ func workflowAPI(workflow string) []string {
 // slotsSucceeded is two daily slot runs that built head and succeeded, the
 // newest twenty hours before the bubble's clock.
 const slotsSucceeded = `[` +
-	`{"conclusion":"success","createdAt":"1999-12-31T04:00:00Z","headSha":"` + head + `","status":"completed","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/2"},` +
-	`{"conclusion":"success","createdAt":"1999-12-30T04:00:00Z","headSha":"` + head + `","status":"completed","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/1"}]`
+	`{"conclusion":"success","createdAt":"1999-12-31T04:00:00Z","databaseId":2,"headSha":"` + head + `","status":"completed","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/2"},` +
+	`{"conclusion":"success","createdAt":"1999-12-30T04:00:00Z","databaseId":1,"headSha":"` + head + `","status":"completed","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/1"}]`
 
 // ok is a command that printed out and exited 0.
 func ok(out string) execx.Result { return execx.Result{Stdout: []byte(out)} }
@@ -196,6 +200,36 @@ func TestRun(t *testing.T) {
 				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
 			},
 			wantStdout: "main " + head + " is ahead of :latest " + revision + ", with 0 lost slot(s), under 2\n",
+		},
+		{
+			// Reading the app's own publish job, which failed in both runs
+			// that succeeded as a whole: each is lost (backlog CI-7).
+			name: "slots-content-gated-job",
+			args: []string{"slots", "-content-gated"},
+			env:  map[string]string{"SLOT_JOB": "publish (librespeed)"},
+			calls: []execx.Call{
+				{Argv: inspect, Result: indexOut},
+				{Argv: mainAPI, Result: apiOK(`{"sha":"` + head + `"}`)},
+				{Argv: slotRuns("build.yml"), Result: ok(slotsSucceeded)},
+				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
+				{Argv: runJobs("2"), Result: ok(`{"jobs":[{"name":"publish (baikal)","conclusion":"success"},{"name":"publish (librespeed)","conclusion":"failure"}]}`)},
+				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
+				{Argv: runJobs("1"), Result: ok(`{"jobs":[{"name":"publish (baikal)","conclusion":"success"},{"name":"publish (librespeed)","conclusion":"skipped"}]}`)},
+				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
+			},
+			wantCode: 1,
+			wantStdout: "main " + head + " is unpublished, :latest is " + revision + ", and 2 or more slots were lost:\n" +
+				"  lost slot: https://github.com/divbast/librespeed-oci-image/actions/runs/2 built " + head + "\n" +
+				"  lost slot: https://github.com/divbast/librespeed-oci-image/actions/runs/1 built " + head + "\n",
+		},
+		{
+			// Only a content-gated slot reads a run's conclusion, so a job
+			// to read it from is a mistake anywhere else.
+			name:       "slot-job-not-gated",
+			args:       []string{"slots"},
+			env:        map[string]string{"SLOT_JOB": "publish (librespeed)"},
+			wantCode:   2,
+			wantStderr: []string{"SLOT_JOB", "-content-gated"},
 		},
 		{
 			name:       "content-gated-not-slots",

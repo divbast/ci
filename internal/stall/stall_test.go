@@ -66,7 +66,10 @@ type source struct {
 	compares map[string]comparison // keyed by base...head
 	created  time.Time
 	workflow time.Time // when the slot workflow was created
-	err      error     // returned by every call when set
+	// jobs are each run's jobs, by run ID: each job's name and its
+	// conclusion. A run with an empty map has no jobs.
+	jobs map[int64]map[string]string
+	err  error // returned by every call when set
 }
 
 func (s *source) RenovatePRs(context.Context) ([]stall.PR, error) {
@@ -91,6 +94,24 @@ func (s *source) SlotRuns(_ context.Context, workflow string) ([]stall.Run, erro
 		return nil, fmt.Errorf("asked about workflow %q", workflow)
 	}
 	return s.runs, nil
+}
+
+func (s *source) JobConclusion(_ context.Context, run *stall.Run, job string) (conclusion string, hasJobs bool, err error) {
+	if s.err != nil {
+		return "", false, s.err
+	}
+	jobs, ok := s.jobs[run.ID]
+	if !ok {
+		return "", false, fmt.Errorf("asked for the jobs of run %d, which the test did not script", run.ID)
+	}
+	if len(jobs) == 0 {
+		return "", false, nil
+	}
+	conclusion, ok = jobs[job]
+	if !ok {
+		return "", false, fmt.Errorf("%w: run %d has no job %q", stall.ErrNoJob, run.ID, job)
+	}
+	return conclusion, true, nil
 }
 
 func (s *source) MainSHA(context.Context) (string, error) {
@@ -457,8 +478,10 @@ func TestSlots(t *testing.T) {
 		name string
 		src  source
 		revs revisions
-		// gated is the check's content-gated.
+		// gated is the check's content-gated, and job the slot job it
+		// reads.
 		gated   bool
+		job     string
 		want    stall.Result
 		wantErr error
 	}{
@@ -743,6 +766,93 @@ func TestSlots(t *testing.T) {
 			},
 		},
 		{
+			// Content-gated and reading its own job, a slot run that went
+			// red for another app's build, while this app's publish job
+			// succeeded, is not lost (backlog CI-7).
+			name: "gated_job_red_run_own_job_green_not_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{ID: 2, HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "failure", URL: url2},
+					{ID: 1, HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "failure", URL: url1},
+				},
+				jobs: map[int64]map[string]string{
+					2: {"publish (baikal)": "success", "build (librespeed, amd64)": "failure", "publish (librespeed)": "failure"},
+					1: {"publish (baikal)": "success", "publish (librespeed)": "failure"},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			job:   "publish (baikal)",
+			want:  stall.Result{Headline: "main " + head + " is ahead of :latest " + published + ", with 0 lost slot(s), under 2"},
+		},
+		{
+			// And its own job, skipped or failed, makes a run lost however
+			// the run as a whole ended.
+			name: "gated_job_own_job_not_green_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{ID: 2, HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "success", URL: url2},
+					{ID: 1, HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "failure", URL: url1},
+				},
+				jobs: map[int64]map[string]string{
+					2: {"publish (baikal)": "skipped", "publish (librespeed)": "success"},
+					1: {"publish (baikal)": "failure", "publish (librespeed)": "success"},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			job:   "publish (baikal)",
+			want:  stall.Result{Stalled: true, Headline: unpublished, Details: []string{lost(url2, head), lost(url1, built)}},
+		},
+		{
+			// A run with no jobs at all, as one that never started has
+			// none, ends as the run did.
+			name: "gated_job_run_without_jobs",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{ID: 3, HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "startup_failure", URL: url3},
+					{ID: 2, HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "success", URL: url2},
+				},
+				jobs: map[int64]map[string]string{3: {}, 2: {}},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			job:   "publish (baikal)",
+			want:  stall.Result{Headline: "main " + head + " is ahead of :latest " + published + ", with 1 lost slot(s), under 2"},
+		},
+		{
+			// A run with jobs, none of them the one named: a name written
+			// wrong is an error, not every run lost or none.
+			name: "gated_job_unknown",
+			src: source{
+				main: head,
+				runs: []stall.Run{{ID: 2, HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "success", URL: url2}},
+				jobs: map[int64]map[string]string{2: {"publish (librespeed)": "success"}},
+				compares: map[string]comparison{
+					published + "..." + head: {status: "ahead", first: ago(3 * day)},
+				},
+			},
+			revs:    revisions{revision: published, state: registry.Published},
+			gated:   true,
+			job:     "publish (baikal)",
+			wantErr: stall.ErrNoJob,
+		},
+		{
 			// Main behind :latest, with no slot run and no commit to say
 			// when main stopped being what is published: as many days as
 			// make a stall.
@@ -820,6 +930,7 @@ func TestSlots(t *testing.T) {
 				atEpoch(t)
 				c := config
 				c.ContentGated = tt.gated
+				c.SlotJob = tt.job
 				got, err := stall.Slots(t.Context(), &tt.src, tt.revs, &c)
 				if tt.wantErr != nil {
 					if !errors.Is(err, tt.wantErr) {

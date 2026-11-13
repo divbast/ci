@@ -56,7 +56,19 @@ type Config struct {
 	// that once the image is published, a slot run can succeed and leave
 	// an older commit published.
 	ContentGated bool
+	// SlotJob, when set, names the job in each slot run that publishes
+	// the image, as GitHub names it in the run, such as "publish
+	// (baikal)". A content-gated slot then reads that job's conclusion
+	// rather than the whole run's, so a run that went red elsewhere, in
+	// another image's build say, is not lost when this one's job
+	// succeeded. Only a content-gated slot reads a conclusion at all.
+	SlotJob string
 }
+
+// ErrNoJob marks a slot run with jobs, none of them the one
+// [Config.SlotJob] names: a name written wrong, which would otherwise read
+// every run as lost, or none.
+var ErrNoJob = errors.New("no such job in the slot run")
 
 // Result is what a check found.
 type Result struct {
@@ -120,6 +132,8 @@ func (o Outcome) String() string {
 
 // Run is a run of the slot workflow.
 type Run struct {
+	// ID is the run's ID, as GitHub numbers its runs.
+	ID int64
 	// HeadSHA is the commit it built.
 	HeadSHA string
 	// Created is when GitHub started it.
@@ -142,6 +156,11 @@ type Source interface {
 	// SlotRuns returns the newest scheduled runs of workflow on main,
 	// newest first.
 	SlotRuns(ctx context.Context, workflow string) ([]Run, error)
+	// JobConclusion returns the conclusion of the job called job in run,
+	// as GitHub puts it, and true; or false when the run has no jobs at
+	// all, as one that never started has none. A run with jobs, none of
+	// them called job, is an error wrapping [ErrNoJob].
+	JobConclusion(ctx context.Context, run *Run, job string) (conclusion string, hasJobs bool, err error)
 	// MainSHA returns the commit main is at.
 	MainSHA(ctx context.Context) (string, error)
 	// Compare returns how head stands against base, as GitHub's compare
@@ -247,7 +266,8 @@ func Renovate(ctx context.Context, s Source, c *Config) (Result, error) {
 // never lost: it published, or decided that nothing in the image had
 // moved. One that failed, was cancelled or ended any other way is lost all
 // the same, and so is any run with nothing published yet, since then every
-// run publishes, gated or not.
+// run publishes, gated or not. With c.SlotJob set, it is that job's
+// conclusion that counts, not the whole run's.
 //
 // So is each day with no slot run at all, after 12 hours' grace, since
 // GitHub starts them hours late. Those days count from the newest slot
@@ -381,19 +401,42 @@ func against(status string) string {
 // not. With nothing published, any run since the slot could first run is,
 // content-gated or not: every such run publishes. With a commit published,
 // a run that built a commit ahead of it is, unless content-gated and the
-// run succeeded.
+// run succeeded: the run as a whole, or with c.SlotJob set, that job in it.
 func isLost(ctx context.Context, s Source, c *Config, run *Run, state registry.State, revision string, since time.Time) (bool, error) {
 	if state == registry.Absent {
 		return run.Created.After(since), nil
 	}
-	if c.ContentGated && run.Conclusion == "success" {
-		return false, nil
+	if c.ContentGated {
+		conclusion, err := slotConclusion(ctx, s, c, run)
+		if err != nil {
+			return false, err
+		}
+		if conclusion == "success" {
+			return false, nil
+		}
 	}
 	status, _, err := s.Compare(ctx, revision, run.HeadSHA)
 	if err != nil {
 		return false, fmt.Errorf("compare the slot run %s, which built %s, with %s: %w", run.URL, run.HeadSHA, revision, err)
 	}
 	return status == "ahead", nil
+}
+
+// slotConclusion returns how a slot run ended for the image: the
+// conclusion of its job c.SlotJob names, or the run's own when c names
+// none or the run has no jobs at all.
+func slotConclusion(ctx context.Context, s Source, c *Config, run *Run) (string, error) {
+	if c.SlotJob == "" {
+		return run.Conclusion, nil
+	}
+	conclusion, ok, err := s.JobConclusion(ctx, run, c.SlotJob)
+	if err != nil {
+		return "", fmt.Errorf("the slot run %s: %w", run.URL, err)
+	}
+	if !ok {
+		return run.Conclusion, nil
+	}
+	return conclusion, nil
 }
 
 // line is how a pull request is listed: its number and title.

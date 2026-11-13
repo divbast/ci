@@ -874,6 +874,7 @@ by `divbast-stall`.
 | `run-hours` | number | `24` | Hours Renovate may go without a successful run |
 | `lost-slots` | number | `2` | Lost daily slots that make a stall |
 | `content-gated` | boolean | `false` | The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost |
+| `slot-job` | string | `''` | With `content-gated`, the job in each slot run that publishes the image, as GitHub names it in the run, whose conclusion counts rather than the whole run's |
 
 `content-gated` is for a repository whose daily slot runs
 `divbast-publish-decision -content-gated`, and so can succeed while it
@@ -883,6 +884,16 @@ is never lost once the image is published. One that failed, was cancelled
 or ended any other way still is, as is a day with none, and with nothing
 published yet every slot run publishes, so one that succeeded and left
 nothing published is lost too. Unset, every check runs as it always has.
+
+`slot-job` is for a slot workflow that publishes more than one image, one
+job each. A run in which one image's build failed ends red as a whole,
+though the other image's publish job succeeded; read as a whole, that run
+would count as a lost slot for both. With `slot-job` naming the image's
+own job as the run lists it, such as `publish (baikal)` for a matrix job
+named `publish (${{ matrix.app }})`, only that job's conclusion counts. A
+run that never started, and so has no jobs, counts as the run ended. A
+name that matches no job in a run fails the check, as does `slot-job`
+without `content-gated`, the one slot check that reads a conclusion.
 
 The calling job grants `contents: read`, `pull-requests: read`,
 `actions: read`, `checks: read`, `statuses: read` and `packages: read`.

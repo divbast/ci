@@ -167,6 +167,7 @@ func (g GH) LastSuccess(ctx context.Context, workflow string) (time.Time, bool, 
 // SlotRuns implements [Source].
 func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 	var raw []struct {
+		ID         int64     `json:"databaseId"`
 		HeadSHA    string    `json:"headSha"`
 		CreatedAt  time.Time `json:"createdAt"`
 		Status     string    `json:"status"`
@@ -174,13 +175,14 @@ func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 		URL        string    `json:"url"`
 	}
 	err := g.list(ctx, &raw, "run", "list", "--repo", g.Repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", strconv.Itoa(slotLimit), "--json", "headSha,createdAt,status,conclusion,url")
+		"--limit", strconv.Itoa(slotLimit), "--json", "databaseId,headSha,createdAt,status,conclusion,url")
 	if err != nil {
 		return nil, err
 	}
 	runs := make([]Run, 0, len(raw))
 	for _, r := range raw {
 		runs = append(runs, Run{
+			ID:         r.ID,
 			HeadSHA:    r.HeadSHA,
 			Created:    r.CreatedAt,
 			Completed:  r.Status == "completed",
@@ -189,6 +191,41 @@ func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 		})
 	}
 	return runs, nil
+}
+
+// JobConclusion implements [Source], from the jobs of run's latest
+// attempt, as gh run view lists them. Two jobs of the one name are an
+// error, since either could be the one meant.
+func (g GH) JobConclusion(ctx context.Context, run *Run, job string) (conclusion string, hasJobs bool, err error) {
+	var raw struct {
+		Jobs []struct {
+			Name       string `json:"name"`
+			Conclusion string `json:"conclusion"`
+		} `json:"jobs"`
+	}
+	id := strconv.FormatInt(run.ID, 10)
+	if err := g.list(ctx, &raw, "run", "view", id, "--repo", g.Repo, "--json", "jobs"); err != nil {
+		return "", false, err
+	}
+	if len(raw.Jobs) == 0 {
+		return "", false, nil
+	}
+	names := make([]string, 0, len(raw.Jobs))
+	var found []string
+	for _, j := range raw.Jobs {
+		names = append(names, strconv.Quote(j.Name))
+		if j.Name == job {
+			found = append(found, j.Conclusion)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return "", false, fmt.Errorf("%w: run %s has no job called %q, only %s", ErrNoJob, id, job, strings.Join(names, ", "))
+	case 1:
+		return found[0], true, nil
+	default:
+		return "", false, fmt.Errorf("run %s has %d jobs called %q, so which one publishes is unknown", id, len(found), job)
+	}
 }
 
 // MainSHA implements [Source].
