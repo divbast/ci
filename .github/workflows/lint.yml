@@ -45,8 +45,10 @@ jobs:
       # the caller's workflows pin, and lint with that one. ci's tools build
       # as ci's own module, since Go maps no ./.ci/ path into a caller's
       # module, and run from the caller's root, so -dir's default is its.
+      # Skipped where the caller is this workflow's own repository, ci or a
+      # fork or rename of it, which calls it by path and pins nothing.
       - name: Check the caller pins this commit of divbast/ci
-        if: github.repository != 'divbast/ci'
+        if: github.repository != job.workflow_repository
         env:
           WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
