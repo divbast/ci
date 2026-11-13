@@ -51,19 +51,23 @@ func InstallProbe(ctx context.Context, c *Container, app []byte) (*Probe, error)
 }
 
 // An engine can refuse an exec while a container is starting: Docker once
-// answered "cannot exec in a stopped container" here to one whose server
-// was still coming up. So an exec the engine itself failed, rather than
-// the PHP it ran, is tried again while the container runs, up to
-// installAttempts times, installRetry apart.
+// answered "cannot exec in a stopped container" here, with exit status
+// 128, to one whose server was still coming up. So an exec the engine
+// itself failed, rather than the PHP it ran, is tried again while the
+// container runs, up to installAttempts times, installRetry apart.
 const (
 	installAttempts = 5
 	installRetry    = 500 * time.Millisecond
-	// engineFailure is the lowest exit status an exec gives for a failure
-	// of the engine's own: 125 for the engine, 126 and 127 for a command it
-	// could not run, and 128 where Docker's runtime refused. The install
-	// code itself exits 0 or 1.
-	engineFailure = 125
 )
+
+// engineFailed reports whether an exec's exit status is the engine's own:
+// 125 for the engine, 126 and 127 for a command it could not run, and 128
+// where Docker's runtime refused. Any other is the PHP's, which exits 0 or
+// 1 for the install, or 255 for a fatal error, and would only do the same
+// again.
+func engineFailed(code int) bool {
+	return code >= 125 && code <= 128
+}
 
 func install(ctx context.Context, c *Container, file string, body []byte) error {
 	for attempt := 1; ; attempt++ {
@@ -75,7 +79,7 @@ func install(ctx context.Context, c *Container, file string, body []byte) error 
 			return nil
 		}
 		failed := fmt.Errorf("installing %s in container %s: exit status %d: %s", file, c, res.Code, combined(res))
-		if res.Code < engineFailure || attempt == installAttempts {
+		if !engineFailed(res.Code) || attempt == installAttempts {
 			return failed
 		}
 		ins, err := c.Inspect(ctx)

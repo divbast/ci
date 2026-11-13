@@ -11,6 +11,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -279,6 +281,88 @@ func TestImageConfigPodman(t *testing.T) {
 	}
 }
 
+// TestSaveMemoized shows podman save running once for an image however
+// many times its configuration is read: each save writes out the whole
+// image, some 178 MB of the fixture. The image ID is the digest of that
+// configuration, so what one save read for an ID holds for good. A save
+// that failed is not kept.
+func TestSaveMemoized(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256([]byte(configBlob))
+	id := hex.EncodeToString(sum[:])
+	archive := tarball(t, file{"l1.tar", "a layer"}, file{id + ".json", configBlob},
+		file{"manifest.json", `[{"Config":"` + id + `.json","RepoTags":[],"Layers":["l1.tar"]}]`})
+
+	t.Run("once-for-many", func(t *testing.T) {
+		t.Parallel()
+
+		var saves atomic.Int32
+		save := podmanSaving(t, id, archive)
+		e := newEngine("podman", runFunc(func(argv []string) execx.Result {
+			if argv[1] == "save" {
+				saves.Add(1)
+			}
+			return save(argv)
+		}))
+		read := func() {
+			if got, err := e.ImageConfig(t.Context(), t, "img"); err != nil || !sameConfig(got, wantConfig) {
+				t.Errorf("ImageConfig() = %+v, %v; want %+v", got, err, wantConfig)
+			}
+		}
+		// Checks run beside each other, and then one more after them
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(read)
+		}
+		wg.Wait()
+		read()
+		if n := saves.Load(); n != 1 {
+			t.Errorf("podman save ran %d times for one image, want once", n)
+		}
+	})
+
+	t.Run("a-failed-save-is-not-kept", func(t *testing.T) {
+		t.Parallel()
+
+		var saves atomic.Int32
+		save := podmanSaving(t, id, archive)
+		e := newEngine("podman", runFunc(func(argv []string) execx.Result {
+			if argv[1] == "save" && saves.Add(1) == 1 {
+				return execx.Result{Code: 125, Stderr: []byte("Error: writing to /tmp: no space left on device")}
+			}
+			return save(argv)
+		}))
+		if _, err := e.ImageConfig(t.Context(), t, "img"); err == nil || !strings.Contains(err.Error(), "no space left") {
+			t.Fatalf("ImageConfig() error = %v, want the failed save's", err)
+		}
+		if got, err := e.ImageConfig(t.Context(), t, "img"); err != nil || !sameConfig(got, wantConfig) {
+			t.Errorf("ImageConfig() after a failed save = %+v, %v; want it saved again and read", got, err)
+		}
+		if n := saves.Load(); n != 2 {
+			t.Errorf("podman save ran %d times, want twice: once failing, once again", n)
+		}
+	})
+
+	// contract.Check asks for an engine of its own each time it runs, so
+	// one kept for each engine would save the image for every Check.
+	t.Run("shared-by-engines-from-the-environment", func(t *testing.T) {
+		t.Parallel()
+
+		a, err := EngineFromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := EngineFromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.configs == nil || a.configs != b.configs {
+			t.Errorf("two engines from EngineFromEnv keep configurations in %p and %p, want one place", a.configs, b.configs)
+		}
+	})
+}
+
 func TestBuild(t *testing.T) {
 	t.Parallel()
 
@@ -310,7 +394,7 @@ func TestBuild(t *testing.T) {
 			t.Cleanup(func() {
 				want := [][]string{
 					slices.Concat(
-						[]string{tt.engine, "build", "-q", "--label", "divbast.harness=1", "-t", tag, "-f", "testdata/mutant/Containerfile"},
+						[]string{tt.engine, "build", "-q", "--label", ownLabel, "-t", tag, "-f", "testdata/mutant/Containerfile"},
 						tt.format,
 						[]string{"--build-arg", "A=1", "--build-arg", "B=2", "testdata/mutant"},
 					),

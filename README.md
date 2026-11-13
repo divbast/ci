@@ -336,6 +336,13 @@ replace github.com/divbast/ci => ./.ci
 The shared Renovate preset tells Renovate's gomod manager to leave
 `github.com/divbast/ci` alone.
 
+The harness labels every container, image, network and volume it makes
+`divbast.harness=<module>`, the path of the main module of the test
+binary running it. A repository's acceptance suite is a test of its own
+module, so `Engine.Sweep` in one repository's suite removes what a dead
+run of that suite left behind, and nothing another repository's suite
+on the same host made.
+
 ### ci's tools in `.ci/bin`
 
 `just ci-tools` builds every command under `cmd/` into `.ci/bin/`. A

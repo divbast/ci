@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"path"
 	"path/filepath"
 	"slices"
@@ -22,8 +23,12 @@ import (
 	"github.com/divbast/ci/internal/execx"
 )
 
-// Confinement is how tightly a container runs. The zero Confinement is
-// none at all: the engine's defaults.
+// Confinement is how tightly a container runs. [Engine.Start] and
+// [Engine.Run] refuse the zero Confinement, which would leave the engine's
+// defaults in place, so that a spec which forgot to set one cannot run as
+// root, on a writable root, with the default capabilities, and pass every
+// check for the wrong reason. [Contract] is the confinement divbast's
+// images claim, and [Unconfined] is none, asked for on purpose.
 type Confinement struct {
 	// User is --user, as uid:gid. Empty leaves the image's own.
 	User string
@@ -32,6 +37,10 @@ type Confinement struct {
 	TmpfsSize string
 	// ReadOnly is --read-only, and CapDropAll is --cap-drop ALL.
 	ReadOnly, CapDropAll bool
+
+	// none marks what Unconfined returns: no confinement on purpose, which
+	// the zero Confinement is only by omission.
+	none bool
 }
 
 // Contract returns the confinement every divbast image's contract claims
@@ -39,6 +48,13 @@ type Confinement struct {
 // a tmpfs at /tmp of tmpfsSize, which is the only writable place it has.
 func Contract(tmpfsSize string) Confinement {
 	return Confinement{User: "65532:65532", TmpfsSize: tmpfsSize, ReadOnly: true, CapDropAll: true}
+}
+
+// Unconfined returns the Confinement that adds no flag at all, and leaves
+// the engine's defaults: what the zero Confinement would, which Start and
+// Run refuse, since a spec holding it may only have forgotten to set one.
+func Unconfined() Confinement {
+	return Confinement{none: true}
 }
 
 // flags returns c as run flags, always in the same order.
@@ -96,10 +112,14 @@ type RunSpec struct {
 }
 
 // validate refuses a spec the engine would read differently from what it
-// says.
+// says, and one that sets no confinement at all.
 func (s *RunSpec) validate() error {
 	if s.Image == "" {
 		return errors.New("the run spec names no image")
+	}
+	if s.Confine == (Confinement{}) {
+		return errors.New("the run spec sets no Confine, and would run under the engine's defaults: " +
+			"give it harness.Contract's confinement, or harness.Unconfined() to run with none on purpose")
 	}
 	for _, m := range s.Mounts {
 		v := m.Source + ":" + m.Target
@@ -178,18 +198,27 @@ func jsonArray(words []string) string {
 	return string(b)
 }
 
-// ErrNeverStarted means a container's process never ran: the engine
-// refused to run it, or its entrypoint could not be executed, as a binary
-// carrying a file capability cannot be under --cap-drop ALL. It is what
-// tells a container that never started from one that started and exited.
+// ErrNeverStarted means a container's process never ran: the engine made
+// the container and could not start it, as when its entrypoint could not
+// be executed, as a binary carrying a file capability cannot be under
+// --cap-drop ALL. It is what tells a container that never started from one
+// that started and exited. A run the engine refused before it made a
+// container at all is [ErrRefused] instead.
 var ErrNeverStarted = errors.New("never started")
+
+// ErrRefused means the engine refused a run before it made a container: a
+// flag it does not take, an image it could not pull, or a name another
+// container already has. The error carries the engine's own words, which
+// say which.
+var ErrRefused = errors.New("refused by the engine")
 
 // Start runs spec detached, labelled, and has tb's cleanup remove the
 // container, dumping its log first if tb failed. It returns once the
 // engine has started the process, not once the server in it is serving.
 //
-// A run the engine refuses, or whose process cannot start, is an error
-// wrapping [ErrNeverStarted], with the engine's own words.
+// A run the engine refuses outright is an error wrapping [ErrRefused], and
+// one whose container it made but could not start an error wrapping
+// [ErrNeverStarted], each with the engine's own words.
 func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Container, error) {
 	tb.Helper()
 	s := *spec
@@ -221,7 +250,7 @@ func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Conta
 		return nil, err
 	}
 	if res.Code != 0 {
-		return nil, fmt.Errorf("container %s %w: %s run: exit status %d: %s", s.Name, ErrNeverStarted, e.name, res.Code, bytes.TrimSpace(res.Stderr))
+		return nil, e.notStarted(ctx, s.Name, res)
 	}
 	// The ID is the last thing printed; Podman may print a pull first.
 	fields := strings.Fields(string(res.Stdout))
@@ -231,6 +260,48 @@ func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Conta
 	c.ID = fields[len(fields)-1]
 	c.started = time.Now()
 	return c, nil
+}
+
+// notStarted returns why the run of container name, which exited as res
+// says, started nothing: [ErrNeverStarted] when the engine made the
+// container, and [ErrRefused] when it made none. The engine is asked
+// which, since Podman, unlike Docker, prints nothing of a container it
+// made and could not start. A name in use is the one refusal settled by
+// the engine's words alone, since a container of that name, another's,
+// does exist.
+func (e Engine) notStarted(ctx context.Context, name string, res Result) error {
+	words := fmt.Sprintf("%s run: exit status %d: %s", e.name, res.Code, bytes.TrimSpace(res.Stderr))
+	// Docker names the container with a leading slash, and Podman without
+	for _, inUse := range []string{`name "/` + name + `" is already in use`, `name "` + name + `" is already in use`} {
+		if bytes.Contains(res.Stderr, []byte(inUse)) {
+			return fmt.Errorf("container %s was %w: another container has its name: %s", name, ErrRefused, words)
+		}
+	}
+	made, err := e.made(ctx, name)
+	switch {
+	case err != nil:
+		return fmt.Errorf("container %s: %s; and whether the engine made it is unknown: %w", name, words, err)
+	case made:
+		return fmt.Errorf("container %s %w: %s", name, ErrNeverStarted, words)
+	default:
+		return fmt.Errorf("container %s was %w: %s", name, ErrRefused, words)
+	}
+}
+
+// made reports whether the engine holds a container called name.
+func (e Engine) made(ctx context.Context, name string) (bool, error) {
+	args := []string{"container", "inspect", "--format", "{{.Id}}", name}
+	res, err := e.run.RunStdin(ctx, nil, e.name, args...)
+	switch {
+	case err != nil:
+		return false, err
+	case res.Code == 0:
+		return true, nil
+	case gone(res.Stderr):
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s %s: exit status %d: %s", e.name, strings.Join(args, " "), res.Code, bytes.TrimSpace(res.Stderr))
+	}
 }
 
 // Run runs spec in the foreground, as run --rm, and returns what it
@@ -309,6 +380,14 @@ type Inspect struct {
 	// on its one network if it named none. Empty when it has none, as on
 	// rootless Podman's default network.
 	IP string
+	// Ports holds where each port the run published is bound on the host,
+	// as ip:port, keyed by the container's port as the engine names it,
+	// such as 8080/tcp: how a suite that let the engine pick the host port,
+	// with -p 127.0.0.1::8080, finds it. A port bound on several addresses,
+	// as -p 8080 binds it on both IPv4's and IPv6's, is given at the first
+	// the engine lists, IPv4's. A port the image exposes and the run did
+	// not publish is not in it.
+	Ports map[string]string
 }
 
 // State is the container's process, as the engine last saw it.
@@ -402,6 +481,11 @@ func (c *Container) Inspect(ctx context.Context) (Inspect, error) {
 		HostConfig      HostConfig
 		NetworkSettings struct {
 			Networks map[string]struct{ IPAddress string }
+			// null for a port exposed and not published
+			Ports map[string][]struct {
+				HostIP   string `json:"HostIp"`
+				HostPort string
+			}
 		}
 	}
 	if err := json.Unmarshal(out, &all); err != nil {
@@ -424,6 +508,12 @@ func (c *Container) Inspect(ctx context.Context) (Inspect, error) {
 	} else if c.network == "" && len(got.NetworkSettings.Networks) == 1 {
 		for _, n := range got.NetworkSettings.Networks {
 			ins.IP = n.IPAddress
+		}
+	}
+	ins.Ports = make(map[string]string, len(got.NetworkSettings.Ports))
+	for port, bindings := range got.NetworkSettings.Ports {
+		if len(bindings) > 0 {
+			ins.Ports[port] = net.JoinHostPort(bindings[0].HostIP, bindings[0].HostPort)
 		}
 	}
 	return ins, nil
@@ -476,7 +566,17 @@ func (c *Container) EngineHealthy(ctx context.Context, startPeriod time.Duration
 			return err
 		}
 		if res.Code != 0 {
-			return fmt.Errorf("podman healthcheck run %s: exit status %d: %s", c, res.Code, combined(res))
+			// It prints only the status it found. What the check said is in
+			// the container's health log.
+			failed := fmt.Errorf("podman healthcheck run %s: exit status %d: %s", c, res.Code, combined(res))
+			ins, err := c.Inspect(ctx)
+			if err != nil {
+				return fmt.Errorf("%w; and reading its health log: %w", failed, err)
+			}
+			if h := ins.State.Health; h != nil {
+				return fmt.Errorf("%w%s", failed, h.logText())
+			}
+			return failed
 		}
 		return nil
 	}

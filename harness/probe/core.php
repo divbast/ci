@@ -81,6 +81,16 @@ const TCP_LISTEN = '0A';
  */
 const SOCKET_TARGET = '/\Asocket:\[(\d+)\]\z/';
 
+/**
+ * How many times a process whose descriptors cannot be read is looked at,
+ * this far apart, before it counts as one the probe cannot see into. The
+ * engine starts each exec through its runtime, which joins the container
+ * as root before it becomes the command it runs: a health check started
+ * as the probe looks is one of those for a moment.
+ */
+const DESCRIPTOR_TRIES = 20;
+const DESCRIPTOR_RETRY_MICROSECONDS = 100_000;
+
 const APP_FILE = __DIR__ . '/app.php';
 
 /**
@@ -296,23 +306,63 @@ function probeEgress(): void
 }
 
 /**
- * What every open descriptor of every process in the container points at.
- * A process this one may not look into, or one gone meanwhile, adds
- * nothing.
+ * What every open descriptor of every process in the container points at,
+ * and each process whose descriptors could not be read at all, as its PID
+ * and name. A process gone meanwhile adds nothing to either.
+ *
+ * @return array{targets: list<string>, unreadable: list<string>}
+ */
+function descriptors(): array
+{
+    $targets = [];
+    $unreadable = [];
+    $pending = glob('/proc/[0-9]*', GLOB_ONLYDIR) ?: [];
+    for ($try = 1; $pending !== []; ++$try) {
+        $unreadable = [];
+        foreach ($pending as $process) {
+            $fds = @scandir("$process/fd");
+            if ($fds === false) {
+                clearstatcache(true, $process);
+                if (is_dir($process)) {
+                    $unreadable[] = $process;
+                }
+                continue;
+            }
+            foreach (array_diff($fds, ['.', '..']) as $fd) {
+                $target = @readlink("$process/fd/$fd");
+                if (is_string($target)) {
+                    $targets[] = $target;
+                }
+            }
+        }
+        if ($try === DESCRIPTOR_TRIES) {
+            break;
+        }
+        $pending = $unreadable;
+        if ($pending !== []) {
+            usleep(DESCRIPTOR_RETRY_MICROSECONDS);
+        }
+    }
+
+    return [
+        'targets' => $targets,
+        'unreadable' => array_map(
+            static fn (string $process): string => basename($process)
+                . ' (' . trim((string) @file_get_contents("$process/comm")) . ')',
+            $unreadable,
+        ),
+    ];
+}
+
+/**
+ * What every open descriptor of every process in the container points at,
+ * as descriptors() reads them, for an app.php that wants only those.
  *
  * @return list<string>
  */
 function descriptorTargets(): array
 {
-    $targets = [];
-    foreach (glob('/proc/[0-9]*/fd/*') ?: [] as $fd) {
-        $target = @readlink($fd);
-        if (is_string($target)) {
-            $targets[] = $target;
-        }
-    }
-
-    return $targets;
+    return descriptors()['targets'];
 }
 
 /**
@@ -401,8 +451,10 @@ function listeners(array $tcpTables, array $udpTables, array $held): array
 
 /**
  * The TCP ports given are the only ones a process in the container listens
- * on, and no process in it holds a UDP socket at all. If no descriptor
- * could be read, nothing counts, and the ports given are missing.
+ * on, and no process in it holds a UDP socket at all. Only the sockets of
+ * a process whose descriptors the probe can read count, so one it cannot
+ * read is a failure of its own: whatever that process listened on would
+ * go unseen.
  */
 function assertListeners(string ...$ports): void
 {
@@ -413,7 +465,8 @@ function assertListeners(string ...$ports): void
         }
         $expected[] = (int) $port;
     }
-    $found = listeners(TCP_TABLES, UDP_TABLES, socketInodes(descriptorTargets()));
+    $descriptors = descriptors();
+    $found = listeners(TCP_TABLES, UDP_TABLES, socketInodes($descriptors['targets']));
 
     Assertions::equals(
         'TCP ports a process in the container listens on',
@@ -424,6 +477,11 @@ function assertListeners(string ...$ports): void
         'UDP ports a process in the container holds a socket on',
         'none',
         $found['udp'] === [] ? 'none' : implode(' ', $found['udp']),
+    );
+    Assertions::equals(
+        'processes in the container whose descriptors the probe cannot read',
+        'none',
+        $descriptors['unreadable'] === [] ? 'none' : implode(', ', $descriptors['unreadable']),
     );
 }
 

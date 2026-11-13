@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -65,9 +66,77 @@ func (e Engine) imageID(ctx context.Context, image string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// configCache holds the configurations podman save has read, by image ID.
+// A save writes out the whole image, and the ID names one configuration
+// for good, since it is that configuration's digest.
+type configCache struct {
+	mu  sync.Mutex
+	ids map[string]*savedImage
+}
+
+// savedImage is one image's place in a configCache. Its lock is held while
+// the image is saved, so a check that wants it meanwhile waits for that
+// save rather than making another.
+type savedImage struct {
+	mu  sync.Mutex
+	cfg *Config
+}
+
+func newConfigCache() *configCache {
+	return &configCache{ids: make(map[string]*savedImage)}
+}
+
+// sharedConfigs is what every engine EngineFromEnv returns keeps image
+// configurations in: a suite asks it for an engine as often as it likes,
+// and contract.Check asks for one each time it runs.
+var sharedConfigs = newConfigCache()
+
+// image returns the place of the image with ID id, making it if need be.
+func (c *configCache) image(id string) *savedImage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.ids[id]
+	if !ok {
+		s = &savedImage{}
+		c.ids[id] = s
+	}
+	return s
+}
+
 // savedConfig returns the configuration of the image with ID id, out of
-// Podman's docker-archive of it.
+// Podman's docker-archive of it, which it saves only the first time it is
+// asked for that ID. A save that failed is tried again the next time.
 func (e Engine) savedConfig(ctx context.Context, tb testing.TB, image, id string) (Config, error) {
+	tb.Helper()
+	if e.configs == nil {
+		return e.saveConfig(ctx, tb, image, id)
+	}
+	saved := e.configs.image(id)
+	saved.mu.Lock()
+	defer saved.mu.Unlock()
+	if saved.cfg == nil {
+		cfg, err := e.saveConfig(ctx, tb, image, id)
+		if err != nil {
+			return Config{}, err
+		}
+		saved.cfg = &cfg
+	}
+	return saved.cfg.clone(), nil
+}
+
+// clone returns a copy of c that shares nothing with it, for a caller to
+// change as it likes.
+func (c Config) clone() Config {
+	if c.Healthcheck != nil {
+		hc := *c.Healthcheck
+		hc.Test = slices.Clone(hc.Test)
+		c.Healthcheck = &hc
+	}
+	return c
+}
+
+// saveConfig is savedConfig, saving the image every time.
+func (e Engine) saveConfig(ctx context.Context, tb testing.TB, image, id string) (Config, error) {
 	tb.Helper()
 	dir := tb.TempDir()
 	if _, err := e.output(ctx, "save", "-q", "--format", "docker-archive", "-o", filepath.Join(dir, "image.tar"), id); err != nil {
