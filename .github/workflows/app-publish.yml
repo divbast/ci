@@ -168,15 +168,18 @@ jobs:
       # Before the pin check, which needs the caller's pinned Go, and only
       # Go: an install runs code from outside the repository, and this job
       # can push the image and sign its attestation. Neither the caller's
-      # [env] nor the PATH mise makes reaches the steps below, where a
-      # BASH_ENV or a PATH there would change what the pinned scripts run;
-      # the step that needs Go runs it through mise exec.
+      # [env], nor the PATH mise makes, nor mise's shims reach the steps
+      # below, where a BASH_ENV or a PATH there would change what the
+      # pinned scripts run; the step that needs Go runs it through mise
+      # exec, which needs no shim. mise itself is on PATH whatever these
+      # say.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: core:go
           env: "false"
           export_path: "false"
+          add_shims_to_path: "false"
 
       # `just setup` would otherwise check .ci out again at whatever commit
       # the caller's workflows pin, and lint with that one. ci's tools build

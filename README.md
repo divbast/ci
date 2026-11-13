@@ -762,10 +762,11 @@ Of the caller's `mise.toml` it installs Go alone, declared there as
 `"core:go"` (mise reads the short `go` the same way), and turns mise's
 auto-install off: the job can push the image and sign its attestation, so
 it runs no other tool's install code. Nor does the `mise.toml`'s `[env]`,
-or the `PATH` mise makes, reach the job's steps, where a `BASH_ENV` or a
-`PATH` there would change what the publish scripts run. The one step that
-needs Go, the build of ci's tools, runs it through `mise exec`, which
-gives Go the caller's toolchain and its `[env]`, such as `GOTOOLCHAIN` and
+the `PATH` mise makes, or mise's shims, reach the job's steps, where a
+`BASH_ENV` or a `PATH` there would change what the publish scripts run.
+mise itself stays on `PATH`, and the one step that needs Go, the build of
+ci's tools, runs it through `mise exec`, which needs no shim and gives Go
+the caller's toolchain and its `[env]`, such as `GOTOOLCHAIN` and
 `GOFLAGS`, for that command alone.
 
 An app's build workflow puts the two together, and keeps its own triggers

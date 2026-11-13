@@ -1367,6 +1367,7 @@ func TestPublishShellPinned(t *testing.T) {
 		// tools the pinned steps run (backlog CI-12)
 		"mise exporting the caller's env":  strings.Replace(publish, "          env: \"false\"\n", "          env: \"true\"\n", 1),
 		"mise exporting the caller's PATH": strings.Replace(publish, "          export_path: \"false\"\n", "", 1),
+		"mise's shims put on PATH":         strings.Replace(publish, "          add_shims_to_path: \"false\"\n", "", 1),
 		"the tools built by a bare go":     strings.Replace(publish, "mise exec -- go -C .ci build", "go -C .ci build", 1),
 	}
 	exits := 0
@@ -2557,6 +2558,8 @@ func TestPublishInstallsGoAlone(t *testing.T) {
 		"the caller's env on":          strings.Replace(publish, "          env: \"false\"\n", "          env: \"true\"\n", 1),
 		"the caller's PATH exported":   strings.Replace(publish, "          export_path: \"false\"\n", "", 1),
 		"the caller's PATH on":         strings.Replace(publish, "          export_path: \"false\"\n", "          export_path: true\n", 1),
+		"mise's shims on PATH":         strings.Replace(publish, "          add_shims_to_path: \"false\"\n", "", 1),
+		"mise's shims on PATH, set":    strings.Replace(publish, "          add_shims_to_path: \"false\"\n", "          add_shims_to_path: \"true\"\n", 1),
 		"a second mise step, exported": strings.Replace(publish, "      # For `imagetools create`\n", "      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8\n        with:\n          install_args: core:go\n      # For `imagetools create`\n", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -2573,12 +2576,12 @@ func TestPublishInstallsGoAlone(t *testing.T) {
 
 // installsGoAlone returns an error unless the publish job has a
 // jdx/mise-action step, each such step's install_args is core:go and it
-// sets env and export_path to false, and the job's env sets
-// MISE_AUTO_INSTALL to false. Both inputs default to true, under which the
-// action writes the caller's mise.toml [env], and the PATH entries mise
-// makes, into every later step's environment, where a BASH_ENV or a PATH
-// there would change what the pinned scripts run without a line of them
-// changing (backlog CI-12).
+// sets env, export_path and add_shims_to_path to false, and the job's env
+// sets MISE_AUTO_INSTALL to false. The three inputs default to true, under
+// which the action writes the caller's mise.toml [env], the PATH entries
+// mise makes and its shims' directory into every later step's
+// environment, where a BASH_ENV or a PATH there would change what the
+// pinned scripts run without a line of them changing (backlog CI-12).
 func installsGoAlone(workflow string) error {
 	job := jobsOf(linesOf(workflow))["publish"]
 	st := steps(job)
@@ -2590,9 +2593,9 @@ func installsGoAlone(workflow string) error {
 		if got := value(st[i], "install_args"); got != "core:go" {
 			return fmt.Errorf("line %d installs %q, not core:go", st[i][0].n, got)
 		}
-		for _, input := range []string{"env", "export_path"} {
+		for _, input := range []string{"env", "export_path", "add_shims_to_path"} {
 			if got := withInput(st[i], input); got != "false" {
-				return fmt.Errorf("line %d gives jdx/mise-action %s: %q, not false, so the caller's mise.toml reaches every later step", st[i][0].n, input, got)
+				return fmt.Errorf("line %d gives jdx/mise-action %s: %q, not false, so what mise makes of the caller's mise.toml reaches every later step", st[i][0].n, input, got)
 			}
 		}
 	}

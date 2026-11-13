@@ -12,6 +12,7 @@ version: ${{ env.MISE_VERSION }}
 install_args: core:go
 env: "false"
 export_path: "false"
+add_shims_to_path: "false"
 == Refuse anything but the daily slot or a manual run on main ==
 env: EVENT: ${{ github.event_name }}
 env: REF: ${{ github.ref }}
