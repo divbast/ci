@@ -59,6 +59,13 @@ env:
   # renovate: datasource=github-releases depName=jdx/mise
   MISE_VERSION: 2026.11.7
 
+# bash with -e and pipefail, so a command that fails fails its step, in a
+# pipeline too, such as the last check's skopeo into shasum. A step that
+# names no shell otherwise runs bash -e alone.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   publish:
     name: publish
@@ -362,8 +369,6 @@ jobs:
       # takes no anonymous pulls, so a rehearsal reads with the job's login.
       - name: Check both tags are the attested index as users pull them
         if: steps.decide.outputs.publish == 'true'
-        # bash's pipefail, so a failed inspect fails the pipeline
-        shell: bash
         env:
           IMAGE: ${{ steps.target.outputs.image }}
           VERSION: ${{ steps.version.outputs.version }}

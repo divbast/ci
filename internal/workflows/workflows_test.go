@@ -13,6 +13,7 @@
 package workflows_test
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -1132,6 +1133,15 @@ func TestPublishShellPinned(t *testing.T) {
 		"a run-first step on the gate tagging early": strings.Replace(publish, attestStep, sneakOnGate+attestStep, 1),
 		"a named step tagging latest early":          strings.Replace(publish, attestStep, sneakNamed+attestStep, 1),
 		"a step that neither runs nor uses":          strings.Replace(publish, attestStep, "      - name: Nothing at all\n        if: steps.decide.outputs.publish == 'true'\n"+attestStep, 1),
+		// Ruling R87: what bash reads before a line of the script runs,
+		// and how it is started
+		"BASH_ENV in a pinned step's env":     replaceAfter(publish, "        id: decide\n", "        env:\n", "        env:\n          BASH_ENV: $(id >&2)\n"),
+		"BASH_ENV in the job's env":           strings.Replace(publish, "    env:\n      MISE_AUTO_INSTALL:", "    env:\n      BASH_ENV: $(id >&2)\n      MISE_AUTO_INSTALL:", 1),
+		"BASH_ENV in the workflow's env":      strings.Replace(publish, "\nenv:\n", "\nenv:\n  BASH_ENV: $(id >&2)\n", 1),
+		"PATH moved in a pinned step's env":   replaceAfter(publish, "        id: decide\n", "        env:\n", "        env:\n          PATH: /tmp/elsewhere:/usr/bin:/bin\n"),
+		"a job default shell that runs first": strings.Replace(publish, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: sh -c 'id >&2; exec bash -eo pipefail \"$0\"' {0}\n", 1),
+		"a workflow default without -e":       strings.Replace(publish, "\ndefaults:\n  run:\n    shell: bash\n", "\ndefaults:\n  run:\n    shell: bash {0}\n", 1),
+		"a pinned step's own shell":           replaceAfter(publish, promoteName, "        env:\n", "        shell: bash {0}\n        env:\n"),
 	}
 	exits := 0
 	for i, l := range strings.SplitAfter(publish, "\n") {
@@ -1184,48 +1194,178 @@ func TestPublishShellPinned(t *testing.T) {
 			}
 		})
 	}
+	// The one workflow env value Renovate moves, which the golden leaves
+	// out, while it keeps every name
+	t.Run("a mise release Renovate moves", func(t *testing.T) {
+		t.Parallel()
+		mise := regexp.MustCompile(`(?m)^ {2}MISE_VERSION: (\S+)$`).FindStringSubmatch(publish)
+		if mise == nil {
+			t.Fatal("app-publish.yml sets no MISE_VERSION in its env")
+		}
+		bumped := strings.Replace(publish, "  MISE_VERSION: "+mise[1]+"\n", "  MISE_VERSION: "+mise[1]+"1\n", 1)
+		if bumped == publish {
+			t.Fatal("the change changed nothing")
+		}
+		if err := shellPinned(bumped, string(golden)); err != nil {
+			t.Errorf("refuses app-publish.yml with MISE_VERSION moved: %v", err)
+		}
+	})
+}
+
+// actionsBash is the shell a step whose shell is bash runs under, by
+// GitHub Actions' documentation: bash with -e and pipefail. A step with no
+// shell at all, from itself, its job's defaults or its workflow's, runs
+// under bash -e {0}, with no pipefail.
+const actionsBash = "bash --noprofile --norc -eo pipefail {0}"
+
+// TestPublishShellIsBashWithPipefail (ruling R87) checks that every step
+// of app-publish.yml's publish job runs under bash with -e and pipefail,
+// which the behaviour tests and the pinned shell assume: its own shell,
+// its job's defaults.run.shell or its workflow's, the first that is set,
+// is bash or actionsBash written out. Against app-publish.yml as it is,
+// then with each broken, which the check must refuse, and with each way
+// of writing the same shell, which it must pass.
+func TestPublishShellIsBashWithPipefail(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := runsBashWithPipefail(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const (
+		workflowDefault = "\ndefaults:\n  run:\n    shell: bash\n"
+		jobAt           = "    timeout-minutes: 30\n"
+	)
+	for name, tt := range map[string]struct {
+		mutant string
+		pass   bool
+	}{
+		"no default shell":                        {mutant: strings.Replace(publish, workflowDefault, "\n", 1)},
+		"a workflow default without -e":           {mutant: strings.Replace(publish, workflowDefault, "\ndefaults:\n  run:\n    shell: bash {0}\n", 1)},
+		"a workflow default of sh":                {mutant: strings.Replace(publish, workflowDefault, "\ndefaults:\n  run:\n    shell: sh\n", 1)},
+		"a job default that runs first":           {mutant: strings.Replace(publish, jobAt, jobAt+"    defaults:\n      run:\n        shell: sh -c 'id >&2; exec bash -eo pipefail \"$0\"' {0}\n", 1)},
+		"a job default of sh after its directory": {mutant: strings.Replace(publish, jobAt, jobAt+"    defaults:\n      run:\n        working-directory: .\n        shell: sh\n", 1)},
+		"a step's own shell without pipefail":     {mutant: replaceAfter(publish, promoteName, "        env:\n", "        shell: bash -e {0}\n        env:\n")},
+		"a job default written out":               {mutant: strings.Replace(publish, jobAt, jobAt+"    defaults:\n      run:\n        shell: "+actionsBash+"\n", 1), pass: true},
+		"a step's own bash":                       {mutant: replaceAfter(publish, promoteName, "        env:\n", "        shell: bash\n        env:\n"), pass: true},
+		"a job default of bash, and none else":    {mutant: strings.Replace(strings.Replace(publish, workflowDefault, "\n", 1), jobAt, jobAt+"    defaults:\n      run:\n        shell: bash\n", 1), pass: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if tt.mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if err := runsBashWithPipefail(tt.mutant); (err == nil) != tt.pass {
+				t.Errorf("with %s, runsBashWithPipefail() = %v, want it to pass: %t", name, err, tt.pass)
+			}
+		})
+	}
+}
+
+// runsBashWithPipefail returns an error naming the first step of the
+// publish job whose shell, its own or else its job's or else its
+// workflow's defaults.run.shell, is neither bash nor actionsBash, or which
+// sets none at all.
+func runsBashWithPipefail(workflow string) error {
+	lines := linesOf(workflow)
+	job := jobsOf(lines)["publish"]
+	// The shell: among run:'s keys, in whatever order they come
+	shellIn := func(defaults []string) string {
+		inRun := false
+		for _, l := range defaults {
+			switch {
+			case indent(l) == 0:
+				inRun = l == "run:"
+			case inRun && indent(l) == 2:
+				if v, ok := strings.CutPrefix(l, "  shell:"); ok {
+					return unquote(v)
+				}
+			}
+		}
+		return ""
+	}
+	workflowDefaults, err := mappingOf(lines, 0, "defaults")
+	if err != nil {
+		return err
+	}
+	jobDefaults, err := mappingOf(job, 4, "defaults")
+	if err != nil {
+		return err
+	}
+	inherited := cmp.Or(shellIn(jobDefaults), shellIn(workflowDefaults), "bash -e {0}")
+	for _, s := range steps(job) {
+		shell := inherited
+		if at := stepKey(s, "shell"); at >= 0 {
+			shell = unquote(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(s[at].text), "- "), "shell:"))
+		}
+		if shell != "bash" && shell != actionsBash {
+			return fmt.Errorf("the step from line %d runs under %q, not bash with -e and pipefail", s[0].n, shell)
+		}
+	}
+	return nil
 }
 
 // TestPublishShellReadsEveryForm checks publishShell on a small publish
 // job: it reads a script whether run: comes first in its step or not,
-// inline or as a block, and stops a block at the step's next key; and it
-// refuses, rather than skips, a step it cannot read in the pinned range.
+// inline or as a block, and stops a block at the step's next key; it
+// keeps each step's env and own shell, the job's env and defaults, the
+// workflow's defaults and the names alone of the workflow's env; and it
+// refuses, rather than skips, a step or a mapping it cannot read in the
+// pinned range.
 func TestPublishShellReadsEveryForm(t *testing.T) {
 	t.Parallel()
 	const (
-		head = "jobs:\n  publish:\n    steps:\n" +
+		job   = "jobs:\n  publish:\n"
+		steps = "    steps:\n" +
 			"      - name: Gate\n        run: |\n          case \"${EVENT}\" in\n            schedule | workflow_dispatch) ;;\n          esac\n" +
 			"      - name: Decide\n        id: decide\n        run: echo decide\n"
-		gate = "== Gate ==\ncase \"${EVENT}\" in\n  schedule | workflow_dispatch) ;;\nesac\n== Decide ==\necho decide\n"
+		none = "== workflow env names ==\n(none)\n== workflow defaults ==\n(none)\n" +
+			"== publish job env ==\n(none)\n== publish job defaults ==\n(none)\n"
+		gate = "== Gate ==\nrun:\ncase \"${EVENT}\" in\n  schedule | workflow_dispatch) ;;\nesac\n== Decide ==\nrun:\necho decide\n"
 	)
 	tests := []struct {
-		name, steps, want string
+		name, workflow, want string
 	}{
 		{
-			name:  "a block written run: first, keys after it",
-			steps: "      - run: |\n          echo one\n\n            echo indented\n        name: Block first\n        env:\n          T: latest\n",
-			want:  gate + "== Block first ==\necho one\n\n  echo indented\n",
+			name:     "a block written run: first, keys after it",
+			workflow: job + steps + "      - run: |\n          echo one\n\n            echo indented\n        name: Block first\n        env:\n          T: latest\n",
+			want:     none + gate + "== Block first ==\nenv: T: latest\nrun:\necho one\n\n  echo indented\n",
 		},
 		{
-			name:  "an inline script written run: first",
-			steps: "      - run: echo two\n        name: Inline first\n",
-			want:  gate + "== Inline first ==\necho two\n",
+			name:     "an inline script written run: first",
+			workflow: job + steps + "      - run: echo two\n        name: Inline first\n",
+			want:     none + gate + "== Inline first ==\nrun:\necho two\n",
 		},
 		{
-			name:  "an action between scripts",
-			steps: "      - uses: actions/attest@x\n        with:\n          push-to-registry: true\n      - name: After\n        run: echo after\n",
-			want:  gate + "== After ==\necho after\n",
+			name:     "an action between scripts",
+			workflow: job + steps + "      - uses: actions/attest@x\n        with:\n          push-to-registry: true\n      - name: After\n        run: echo after\n",
+			want:     none + gate + "== After ==\nrun:\necho after\n",
 		},
-		{name: "a script with no name", steps: "      - run: echo nameless\n"},
-		{name: "a step that neither runs nor uses", steps: "      - name: Nothing\n        if: always()\n"},
-		{name: "a step that both runs and uses", steps: "      - name: Both\n        uses: actions/attest@x\n        run: echo both\n"},
-		{name: "a folded script", steps: "      - name: Folded\n        run: >\n          echo folded\n"},
-		{name: "a stripped block", steps: "      - name: Stripped\n        run: |-\n          echo stripped\n"},
+		{
+			name:     "a step's env first and its own shell",
+			workflow: job + steps + "      - env:\n          A: one\n          B: two\n        name: Env first\n        shell: bash\n        run: echo env\n",
+			want:     none + gate + "== Env first ==\nenv: A: one\nenv: B: two\nshell: bash\nrun:\necho env\n",
+		},
+		{
+			name: "the workflow's and the job's env and defaults",
+			workflow: "env:\n  MISE_VERSION: 1\n  OTHER: x\ndefaults:\n  run:\n    shell: bash\n" + job +
+				"    env:\n      MISE_AUTO_INSTALL: \"false\"\n    defaults:\n      run:\n        working-directory: app\n" + steps,
+			want: "== workflow env names ==\nMISE_VERSION\nOTHER\n== workflow defaults ==\nrun:\n  shell: bash\n" +
+				"== publish job env ==\nMISE_AUTO_INSTALL: \"false\"\n== publish job defaults ==\nrun:\n  working-directory: app\n" + gate,
+		},
+		{name: "a script with no name", workflow: job + steps + "      - run: echo nameless\n"},
+		{name: "a step that neither runs nor uses", workflow: job + steps + "      - name: Nothing\n        if: always()\n"},
+		{name: "a step that both runs and uses", workflow: job + steps + "      - name: Both\n        uses: actions/attest@x\n        run: echo both\n"},
+		{name: "a folded script", workflow: job + steps + "      - name: Folded\n        run: >\n          echo folded\n"},
+		{name: "a stripped block", workflow: job + steps + "      - name: Stripped\n        run: |-\n          echo stripped\n"},
+		{name: "a step's env on one line", workflow: job + steps + "      - name: Flow\n        env: { BASH_ENV: x }\n        run: echo flow\n"},
+		{name: "the job's env on one line", workflow: job + "    env: { BASH_ENV: x }\n" + steps},
+		{name: "the workflow's defaults on one line", workflow: "defaults: { run: { shell: sh } }\n" + job + steps},
+		{name: "a workflow env that is no NAME: value", workflow: "env:\n  BASH_ENV: |\n    $(id)\n" + job + steps},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := publishShell(head + tt.steps)
+			got, err := publishShell(tt.workflow)
 			switch {
 			case tt.want == "" && err == nil:
 				t.Errorf("publishShell() = %q, want an error", got)
@@ -1257,22 +1397,70 @@ func shellPinned(workflow, golden string) error {
 // version and digest, which Renovate moves.
 const pinnedRegistry = "registry:<version>@<digest>"
 
-// publishShell returns the run: scripts of the publish job's gate step and
-// of every step from the decision on, each under its name, as written, its
-// indent taken off. The registry image's version and digest are replaced
-// by pinnedRegistry. A step in that range that neither runs a script nor
-// uses an action, a script in a step with no name, and a block scalar
-// other than | are errors, never skipped.
+// publishShell returns what bash runs in the publish job's pinned steps,
+// and everything that shapes how it runs (ruling R87): the names of the
+// workflow's env, whose one value Renovate moves; the workflow's
+// defaults; the publish job's env and defaults; and, under each pinned
+// step's name, its env, its own shell if it sets one, and its run: script
+// as written, its indent taken off. An env entry such as BASH_ENV, which
+// bash expands before the script, or PATH, and a defaults shell, can each
+// change what a script does without a line of it changing. The pinned
+// steps are the gate and every step from the decision on. The registry
+// image's version and digest are replaced by pinnedRegistry. A step in
+// that range that neither runs a script nor uses an action, a script in a
+// step with no name, a block scalar other than |, and an env or defaults
+// written on one line are errors, never skipped.
 func publishShell(workflow string) (string, error) {
 	raw := strings.Split(workflow, "\n")
-	st := publishSteps(workflow)
+	lines := linesOf(workflow)
+	job := jobsOf(lines)["publish"]
+	var b strings.Builder
+	section := func(title string, body []string) {
+		b.WriteString("== " + title + " ==\n")
+		if len(body) == 0 {
+			b.WriteString("(none)\n")
+		}
+		for _, l := range body {
+			b.WriteString(l + "\n")
+		}
+	}
+	workflowEnv, err := mappingOf(lines, 0, "env")
+	if err != nil {
+		return "", err
+	}
+	names := make([]string, 0, len(workflowEnv))
+	for _, e := range workflowEnv {
+		name, _, ok := strings.Cut(e, ": ")
+		if !ok || !envName.MatchString(name) {
+			return "", fmt.Errorf("the workflow's env holds %q, not a one-line NAME: value", e)
+		}
+		names = append(names, name)
+	}
+	section("workflow env names", names)
+	for _, m := range []struct {
+		title string
+		lines []line
+		at    int
+		key   string
+	}{
+		{title: "workflow defaults", lines: lines, at: 0, key: "defaults"},
+		{title: "publish job env", lines: job, at: 4, key: "env"},
+		{title: "publish job defaults", lines: job, at: 4, key: "defaults"},
+	} {
+		body, err := mappingOf(m.lines, m.at, m.key)
+		if err != nil {
+			return "", err
+		}
+		section(m.title, body)
+	}
+
+	st := steps(job)
 	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
 	gate := stepsWhere(st, contains("schedule | workflow_dispatch)"))
 	if len(decide) != 1 || len(gate) != 1 {
 		return "", fmt.Errorf("%d decide steps and %d gate steps, want one of each", len(decide), len(gate))
 	}
 	key := func(l line) string { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") }
-	var b strings.Builder
 	for i, s := range st {
 		if i != gate[0] && i < decide[0] {
 			continue
@@ -1291,6 +1479,17 @@ func publishShell(workflow string) (string, error) {
 			return "", fmt.Errorf("line %d runs a script in a step with no name", run.n)
 		}
 		b.WriteString("== " + name + " ==\n")
+		env, err := stepMapping(s, "env")
+		if err != nil {
+			return "", err
+		}
+		for _, e := range env {
+			b.WriteString("env: " + e + "\n")
+		}
+		if sh := stepKey(s, "shell"); sh >= 0 {
+			b.WriteString(key(s[sh]) + "\n")
+		}
+		b.WriteString("run:\n")
 		v := strings.TrimSpace(strings.TrimPrefix(key(run), "run:"))
 		if v == "" || strings.HasPrefix(v, ">") || (strings.HasPrefix(v, "|") && v != "|") {
 			return "", fmt.Errorf("line %d: run: %s is no script this test reads; write it inline or as a | block", run.n, v)
@@ -1328,6 +1527,17 @@ func publishShell(workflow string) (string, error) {
 		}
 	}
 	return registryPin.ReplaceAllString(b.String(), pinnedRegistry), nil
+}
+
+// envName is the name of an environment variable an env: may set.
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// stepMapping is mappingOf for one of a step's own keys, the one on its
+// "- " line included.
+func stepMapping(step []line, key string) ([]string, error) {
+	first := slices.Clone(step)
+	first[0].text = strings.Replace(first[0].text, "- ", "  ", 1)
+	return mappingOf(first, indent(first[0].text), key)
 }
 
 // registryPin is the registry image's version and digest as the shell
@@ -2030,15 +2240,17 @@ func runStall(t *testing.T, script, check, gated string) (string, error) {
 	return string(res.Stdout), nil
 }
 
-// runStep runs script as GitHub Actions runs a step's, with bash -e from
-// dir, the workspace, and env on top of the test's environment. BASH_ENV
-// is empty, as on a runner, so that no startup file moves PATH out from
-// under a stand-in.
+// runStep runs script as GitHub Actions runs a step whose shell is bash,
+// with -e and pipefail (actionsBash), from dir, the workspace, and env on
+// top of the test's environment. That is app-publish.yml's every step; a
+// step that names no shell runs without pipefail, which only adds
+// failures. BASH_ENV is empty, as on a runner, so that no startup file
+// moves PATH out from under a stand-in.
 func runStep(t *testing.T, dir, script string, env ...string) execx.Result {
 	t.Helper()
 	writeFile(t, dir, "step.sh", script)
 	run := execx.OS{Env: append([]string{"BASH_ENV="}, env...)}
-	res, err := run.Run(t.Context(), "bash", "-c", `cd -- "$1" && bash -e ./step.sh`, "bash", dir)
+	res, err := run.Run(t.Context(), "bash", "-c", `cd -- "$1" && `+strings.Replace(actionsBash, "{0}", "./step.sh", 1), "bash", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2292,6 +2504,44 @@ func jobEnv(job []line) map[string]string {
 		}
 	}
 	return env
+}
+
+// mappingOf returns the lines under the key called key written at indent
+// at among lines, the key's own and its children's indent taken off, or
+// nil when there is no such key. A key whose own line holds a value, such
+// as a flow mapping, is an error: it is no block this reads.
+func mappingOf(lines []line, at int, key string) ([]string, error) {
+	for i, l := range lines {
+		v, ok := strings.CutPrefix(l.text, strings.Repeat(" ", at)+key+":")
+		if !ok || indent(l.text) != at {
+			continue
+		}
+		if v = unquote(v); v != "" {
+			return nil, fmt.Errorf("line %d writes %s: as %q, on one line; write it as a block", l.n, key, v)
+		}
+		var out []string
+		for _, next := range lines[i+1:] {
+			if indent(next.text) <= at {
+				break
+			}
+			out = append(out, next.text[min(at+2, indent(next.text)):])
+		}
+		return out, nil
+	}
+	return nil, nil
+}
+
+// stepKey returns the index in step of the line that sets the step's own
+// key, the one on its "- " line included, or -1 when it sets none.
+func stepKey(step []line, key string) int {
+	keys := indent(step[0].text) + 2
+	return slices.IndexFunc(step, func(l line) bool {
+		text := l.text
+		if l == step[0] {
+			text = strings.Replace(text, "- ", "  ", 1)
+		}
+		return indent(text) == keys && strings.HasPrefix(strings.TrimSpace(text), key+":")
+	})
 }
 
 // unquote returns a plain YAML scalar's value: without a trailing comment,

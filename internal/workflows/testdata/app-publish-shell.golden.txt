@@ -1,4 +1,16 @@
+== workflow env names ==
+MISE_VERSION
+== workflow defaults ==
+run:
+  shell: bash
+== publish job env ==
+MISE_AUTO_INSTALL: "false"
+== publish job defaults ==
+(none)
 == Refuse anything but the daily slot or a manual run on main ==
+env: EVENT: ${{ github.event_name }}
+env: REF: ${{ github.ref }}
+run:
 case "${EVENT}" in
   schedule | workflow_dispatch) ;;
   *)
@@ -11,6 +23,10 @@ if [ "${REF}" != refs/heads/main ]; then
   exit 1
 fi
 == Decide whether to publish ==
+env: EVENT: ${{ github.event_name }}
+env: IMAGE: ${{ inputs.image }}
+env: GH_TOKEN: ${{ github.token }}
+run:
 # actions/checkout points origin/main at the commit this run built,
 # not at main's tip, so a newer published commit would read as one
 # that is not on main. The repository is public; no credentials.
@@ -18,6 +34,7 @@ git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
 published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")
 .ci/bin/divbast-publish-decision -event "${EVENT}" -built "${GITHUB_SHA}" -published "${published}"
 == Start the rehearsal's registry ==
+run:
 # The password is rehearsal, hashed with bcrypt, which is all the
 # registry reads
 cat > "${RUNNER_TEMP}/rehearsal.htpasswd" <<'EOF'
@@ -31,6 +48,8 @@ printf '[[registry]]\nlocation = "localhost:5000"\ninsecure = true\n' \
   > "${HOME}/.config/containers/registries.conf.d/rehearsal.conf"
 echo rehearsal | docker login --username rehearsal --password-stdin localhost:5000
 == Read the version from the Containerfile ==
+env: VERSION_ARG: ${{ inputs.version-arg }}
+run:
 if [[ ! "${VERSION_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
   echo "version-arg must name an ARG, not ${VERSION_ARG}" >&2
   exit 1
@@ -42,12 +61,18 @@ if [[ ! "${v}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
 fi
 echo "version=${v}" >> "${GITHUB_OUTPUT}"
 == Choose where to publish ==
+env: IMAGE: ${{ inputs.image }}
+env: REHEARSE: ${{ inputs.rehearse }}
+run:
 if [ "${REHEARSE}" = true ]; then
   echo "image=localhost:5000/${IMAGE#*/}" >> "${GITHUB_OUTPUT}"
 else
   echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
 fi
 == Push each tested architecture ==
+env: IMAGE: ${{ steps.target.outputs.image }}
+env: VERSION: ${{ steps.version.outputs.version }}
+run:
 for arch in amd64 arm64; do
   skopeo copy --all \
     --digestfile "/tmp/digest-${arch}" \
@@ -56,6 +81,10 @@ for arch in amd64 arm64; do
     "docker://${IMAGE}:${VERSION}-${arch}"
 done
 == Merge the architectures into one index under a staging tag ==
+env: IMAGE: ${{ steps.target.outputs.image }}
+env: VERSION: ${{ steps.version.outputs.version }}
+env: DESCRIPTION: ${{ inputs.description }}
+run:
 created=$(date -u -d "@$(git log -1 --pretty=%ct)" +%Y-%m-%dT%H:%M:%SZ)
 docker buildx imagetools create \
   --metadata-file /tmp/index.json \
@@ -69,6 +98,11 @@ docker buildx imagetools create \
 digest=$(jq -er '."containerimage.descriptor".digest' /tmp/index.json)
 echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
 == Verify the index's attestation ==
+env: IMAGE: ${{ steps.target.outputs.image }}
+env: DIGEST: ${{ steps.merge.outputs.digest }}
+env: REPO: ${{ github.repository }}
+env: GH_TOKEN: ${{ github.token }}
+run:
 skopeo inspect --raw "docker://${IMAGE}@${DIGEST}" > /tmp/index-manifest.json
 fetched=$(shasum -a 256 < /tmp/index-manifest.json)
 if [ "sha256:${fetched%% *}" != "${DIGEST}" ]; then
@@ -91,6 +125,10 @@ signer=$(jq -r '(.[0].verificationResult.signature.certificate.buildSignerURI)? 
   signer=unknown
 echo "${IMAGE}@${DIGEST} verifies, signed by ${signer}"
 == Tag the attested index with the version and latest ==
+env: IMAGE: ${{ steps.target.outputs.image }}
+env: VERSION: ${{ steps.version.outputs.version }}
+env: DIGEST: ${{ steps.merge.outputs.digest }}
+run:
 args=(
   -t "${IMAGE}:${VERSION}"
   -t "${IMAGE}:latest"
@@ -106,6 +144,11 @@ fi
 echo "moving=true" >> "${GITHUB_OUTPUT}"
 docker buildx imagetools create "${args[@]}"
 == Check both tags are the attested index as users pull them ==
+env: IMAGE: ${{ steps.target.outputs.image }}
+env: VERSION: ${{ steps.version.outputs.version }}
+env: DIGEST: ${{ steps.merge.outputs.digest }}
+env: ANONYMOUS: ${{ !inputs.rehearse }}
+run:
 creds=(--no-creds)
 who="an anonymous client"
 if [ "${ANONYMOUS}" = false ]; then
@@ -121,6 +164,8 @@ for tag in "${VERSION}" latest; do
   echo "${IMAGE}:${tag} is ${DIGEST} to ${who}"
 done
 == Say that the public tags did not move ==
+env: VERSION: ${{ steps.version.outputs.version }}
+run:
 echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
   "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
   "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."
