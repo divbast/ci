@@ -10,3 +10,7 @@ parameters:
     phpVersion: 80500
     paths:
         - harness/probe
+        # The minimal fixture's PHP, its health probe by name since it has
+        # no .php
+        - contract/testdata/minimal
+        - contract/testdata/minimal/minimal-health

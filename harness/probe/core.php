@@ -8,7 +8,9 @@ declare(strict_types=1);
 /*
  * The probe divbast's harness runs inside a container, as that container's
  * own PHP: frankenphp php-cli core.php <subcommand> [arguments]. The images
- * have no shell, and this needs nothing but PHP itself.
+ * have no shell, and this needs nothing but PHP itself and its posix
+ * extension, with which presence() tells a path that is absent from one it
+ * may not look up.
  *
  * Output protocol: one tab-separated record per assertion,
  *
@@ -34,13 +36,23 @@ declare(strict_types=1);
 const FORBIDDEN_SHELLS = ['/bin/sh', '/bin/bash', '/bin/dash'];
 
 /**
- * Every capability set in /proc/self/status. A process run as uid 65532
- * holds nothing in CapEff or CapPrm whatever the engine grants, since exec
- * clears both for a user other than root without file or ambient
- * capabilities. --cap-drop ALL empties the bounding set, so CapBnd is the
- * one that shows what the engine was told.
+ * Every capability set, as PID 1's status gives them: the server's, which
+ * is what the contract is about, and not the probe's own, which the engine
+ * may run with other capabilities than the server's. A process run as uid
+ * 65532 holds nothing in CapEff or CapPrm whatever the engine grants,
+ * since exec clears both for a user other than root without file or
+ * ambient capabilities. --cap-drop ALL empties the bounding set, so CapBnd
+ * is the one that shows what the engine was told.
  */
 const CAPABILITY_SETS = ['CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'CapAmb'];
+const PID1_STATUS = '/proc/1/status';
+
+/**
+ * What posix_get_last_error() gives when the path is not there: no such
+ * file or directory, or a component that is no directory. Linux numbers
+ * them alike on every architecture.
+ */
+const ERRNO_ABSENT = [2 => 'ENOENT', 20 => 'ENOTDIR'];
 
 const NO_CAPABILITIES = '0000000000000000';
 const EGRESS_PROBE_HOST = '9.9.9.9';
@@ -210,14 +222,14 @@ function assertPid1(string ...$expected): void
 }
 
 /**
- * Extract capability mask from /proc/self/status as a value.
+ * Extract a capability mask from a process's status as a value.
  */
 function capabilityMask(string $status, string $field): string
 {
     $pattern = '/^' . preg_quote($field, '/') . ':[ \t]*([0-9a-fA-F]+)[ \t]*$/m';
 
     if (preg_match($pattern, $status, $matches) !== 1) {
-        throw new RuntimeException("/proc/self/status has no well-formed $field line");
+        throw new RuntimeException(PID1_STATUS . " has no well-formed $field line");
     }
 
     return $matches[1];
@@ -225,7 +237,7 @@ function capabilityMask(string $status, string $field): string
 
 function assertCaps(): void
 {
-    $status = readOrThrow('/proc/self/status');
+    $status = readOrThrow(PID1_STATUS);
 
     foreach (CAPABILITY_SETS as $field) {
         $mask = capabilityMask($status, $field);
@@ -238,17 +250,43 @@ function assertCaps(): void
     }
 }
 
+/**
+ * Whether anything is at the path: "present", "absent", or why the probe
+ * cannot tell. Only a lookup that fails because nothing is there proves
+ * the path absent. One the probe may not make, as through a directory
+ * only root may search, proves nothing: whatever is there is still there
+ * for root.
+ */
+function presence(string $path): string
+{
+    clearstatcache(true, $path);
+    if (file_exists($path) || is_link($path)) {
+        return 'present';
+    }
+    if (!function_exists('posix_access')) {
+        throw new RuntimeException("cannot tell whether $path is absent without the posix extension");
+    }
+    if (posix_access($path, POSIX_F_OK)) {
+        return 'present';
+    }
+    $errno = posix_get_last_error();
+    if (isset(ERRNO_ABSENT[$errno])) {
+        return 'absent';
+    }
+
+    return sprintf('not looked up (errno %d: %s), so it may be there', $errno, posix_strerror($errno));
+}
+
 function assertNoShell(): void
 {
     foreach (FORBIDDEN_SHELLS as $path) {
-        clearstatcache(true, $path);
-        $present = file_exists($path) || is_link($path);
+        $found = presence($path);
 
         Assertions::record(
-            !$present,
+            $found === 'absent',
             "$path is absent from the image",
             'absent',
-            $present ? 'present' : 'absent',
+            $found,
         );
     }
 }

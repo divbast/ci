@@ -26,10 +26,15 @@ setup:
 # importing it from .ci calls these from a recipe's body instead.
 
 # Every lint gate
-lint: actions-check workflow-audit actionlint shell-lint go-lint reuse-lint
+lint: actions-check workflow-audit actionlint shell-lint go-lint reuse-lint containerfile-lint
     # PHP and Composer come from the host, or setup-php in CI: mise's PHP
     # backend compiles PHP from source
     vendor/bin/phpstan analyse --no-progress
+
+# hadolint over every Containerfile here: the contract suite's fixture and
+# mutants, which its tests build
+containerfile-lint:
+    git ls-files -z '*Containerfile' | xargs -0 -r hadolint
 
 test: go-test
 

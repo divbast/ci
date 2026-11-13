@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The minimal fixture declaring a volume. Under the contract the engine
+# mounts a writable anonymous volume there, which no run flag asked for.
+
+# The minimal fixture, which the test builds and passes in
+ARG FIXTURE
+FROM ${FIXTURE}
+
+VOLUME /data

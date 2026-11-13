@@ -5,7 +5,9 @@
 // through the docker or podman CLI, with the same flags a user would type,
 // so a check runs under exactly the confinement an image's contract claims
 // and never a looser one an SDK might set up instead. It also ships the
-// probe those checks run inside a container, as the container's own PHP.
+// probe those checks run inside a container, as the container's own PHP,
+// which needs the posix extension: no-shell asks it why a path could not
+// be looked up, to tell one that is absent from one it may not reach.
 //
 // Every container, image, network and volume it makes carries the label
 // divbast.harness=<module>, where <module> is the path of the main module
@@ -71,9 +73,9 @@ type Engine struct {
 	// label is the module's label, except in the test of Sweep itself,
 	// which must not remove what tests running beside it made.
 	label string
-	// configs holds the image configurations podman save has read. Every
-	// engine EngineFromEnv returns shares one.
-	configs *configCache
+	// saves holds what its saves of images read. Every engine
+	// EngineFromEnv returns shares one.
+	saves *saveCache
 }
 
 // EngineFromEnv returns the engine $ENGINE names: docker, the default when
@@ -82,7 +84,7 @@ func EngineFromEnv() (Engine, error) {
 	switch name := cmp.Or(os.Getenv("ENGINE"), "docker"); name {
 	case "docker", "podman":
 		e := newEngine(name, execx.OS{})
-		e.configs = sharedConfigs
+		e.saves = sharedSaves
 		return e, nil
 	default:
 		return Engine{}, fmt.Errorf("ENGINE is %q: it must be docker or podman", name)
@@ -90,7 +92,7 @@ func EngineFromEnv() (Engine, error) {
 }
 
 func newEngine(name string, run execx.StdinRunner) Engine {
-	return Engine{name: name, run: run, label: moduleLabel(), configs: newConfigCache()}
+	return Engine{name: name, run: run, label: moduleLabel(), saves: newSaveCache()}
 }
 
 // Name returns the engine's command: docker or podman.

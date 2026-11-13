@@ -3,35 +3,56 @@
 
 // Package contract is the confinement contract every divbast image makes,
 // as checks an app's acceptance suite runs against its image. An app
-// supplies a short [Config], and [Run] makes each check a subtest:
+// supplies a short [Config], and [Run] makes each check a subtest. Each
+// checks exactly this, and no more:
 //
-//   - default-user: with no --user, the image runs as uid/gid 65532;
-//   - file-capability: its FrankenPHP binary runs under --cap-drop ALL,
-//     which the kernel refuses to a binary carrying a file capability;
-//   - caps: the container holds no capability, in any set;
-//   - read-only: its root cannot be written;
-//   - pid1: the server is PID 1, with the argv the app names;
-//   - no-shell: there is no shell to run;
-//   - listeners: it listens on the app's two TCP ports alone, and holds
-//     no UDP socket;
-//   - no-egress: on a network with no route out, it serves and is healthy,
-//     and cannot connect out;
-//   - healthcheck-config: its HEALTHCHECK is the app's health command in
-//     exec form, at the app's timings, exactly;
-//   - health-probe: that command, run in the container, exits 0 and prints
-//     nothing;
+//   - default-user: the image's own configuration names 65532:65532 as
+//     its user;
+//   - file-capability: /usr/local/bin/frankenphp runs under --cap-drop ALL,
+//     which the kernel refuses to a binary whose file capability has the
+//     effective bit;
+//   - no-file-capability-xattr: no file in any layer of the image, as the
+//     engine saves it, carries a security.capability extended attribute,
+//     with the effective bit or without, on whatever file;
+//   - caps: PID 1 holds no capability, in any of its five sets;
+//   - read-only: creating /.divbast-write-probe fails because the root is
+//     mounted read-only;
+//   - no-volume: the image declares no VOLUME, and the mounts the engine
+//     reports (Mounts and HostConfig.Tmpfs) are exactly tmpfs /tmp plus
+//     Config.Mounts. Podman's --read-only adds writable tmpfs mounts of its
+//     own, /run and /var/tmp among them, which it does not report;
+//   - pid1: PID 1's comm is the file name of Config.PID1's first word, as
+//     the kernel cuts it to 15 bytes, and its whole argv is Config.PID1;
+//   - no-shell: nothing is at /bin/sh, /bin/bash or /bin/dash, and a path
+//     the probe may not look up counts as one that is there;
+//   - listeners: the processes in the container listen on Config.AppPort
+//     and Config.HealthPort alone, hold no UDP socket, and the probe can
+//     read the descriptors of every one of them;
+//   - no-egress: the container's network is one the engine reports
+//     internal, and a TCP connect from it to 9.9.9.9:443 fails;
+//   - healthcheck-config: its HEALTHCHECK is Config.Healthcheck, in exec
+//     form, in every field;
+//   - health-probe: Config.HealthCmd, run in the container, exits 0 and
+//     prints nothing;
 //   - engine-healthy: the engine runs the health check and reports it
 //     healthy;
-//   - health-port-only: the health port answers 404 to all but /healthz,
-//     and the app port answers 404 to /healthz;
-//   - host-config: the engine ran the container as the contract says, in
-//     ways a probe inside cannot see.
+//   - health-port-only: each path in Config.HealthOnly404 answers 404 on
+//     the health port, and /healthz answers 404 on the app port;
+//   - host-config: the engine reports adding no capability, no
+//     --privileged, a read-only root, no security option that loosens
+//     seccomp, AppArmor or SELinux, no init before the entrypoint, and a
+//     network namespace of the container's own, and leaves none of those
+//     fields out but Init.
 //
 // Every container a check runs is run under exactly the confinement the
-// contract claims, so no check can pass under a looser one. The records
+// contract claims, so no check can pass under a looser one. The container
+// the checks share is on a network with no route out, so its serving
+// there, and being healthy there, shows the image needs none. The records
 // keep the names LibreSpeed's bash suite gave them, so an app's suite
 // ported from bash still makes every check it made, and logs each one to
-// $DIVBAST_CHECK_LOG through [harness.Checks].
+// $DIVBAST_CHECK_LOG through [harness.Checks]. no-volume's and
+// no-file-capability-xattr's are the contract's own: that suite had
+// neither check.
 package contract
 
 import (
@@ -76,8 +97,15 @@ type Config struct {
 	// a volume made with [harness.Engine.Volume]. It may fail tb.
 	Mounts func(tb testing.TB) []harness.Mount
 	// Ready, when set, returns once the app in c is ready to be checked,
-	// after both ports answer, or an error saying why it never was.
+	// after both ports answer, or an error saying why it never was. Its
+	// context ends a minute after it is called, as long as each port had
+	// to answer.
 	Ready func(ctx context.Context, c *harness.Container) error
+	// ReadyProbe is Ready, given as well the probe the contract installed
+	// in c, with ProbeApp beside it, for an app that asks its app through
+	// the probe: one installed again would be the same files. Set Ready or
+	// ReadyProbe, not both.
+	ReadyProbe func(ctx context.Context, c *harness.Container, p *harness.Probe) error
 	// ProbeApp is the app's own probe subcommands, installed beside the
 	// core probe as app.php. Empty installs none.
 	ProbeApp []byte
@@ -118,6 +146,9 @@ func (c *Config) validate() error {
 	if c.TmpfsSize == "" {
 		errs = append(errs, errors.New("Config.TmpfsSize is empty: the contract's one tmpfs, /tmp, needs its size"))
 	}
+	if c.Ready != nil && c.ReadyProbe != nil {
+		errs = append(errs, errors.New("Config.Ready and Config.ReadyProbe are both set: set one"))
+	}
 	if len(c.PID1) == 0 {
 		errs = append(errs, errors.New("Config.PID1 is empty"))
 	}
@@ -142,23 +173,29 @@ type Result struct {
 	// Records are the assertions the check made, each named as the bash
 	// suites named it. A check that could not run may have made none.
 	Records []harness.Record
+
+	// err is why the check stopped, if it did: a failing record says only
+	// what it found, so a report gives err beside it.
+	err error
 }
 
 // The checks, by name.
 const (
-	checkDefaultUser       = "default-user"
-	checkFileCapability    = "file-capability"
-	checkCaps              = "caps"
-	checkReadOnly          = "read-only"
-	checkPID1              = "pid1"
-	checkNoShell           = "no-shell"
-	checkListeners         = "listeners"
-	checkNoEgress          = "no-egress"
-	checkHealthcheckConfig = "healthcheck-config"
-	checkHealthProbe       = "health-probe"
-	checkEngineHealthy     = "engine-healthy"
-	checkHealthPortOnly    = "health-port-only"
-	checkHostConfig        = "host-config"
+	checkDefaultUser           = "default-user"
+	checkFileCapability        = "file-capability"
+	checkCaps                  = "caps"
+	checkReadOnly              = "read-only"
+	checkPID1                  = "pid1"
+	checkNoShell               = "no-shell"
+	checkListeners             = "listeners"
+	checkNoEgress              = "no-egress"
+	checkHealthcheckConfig     = "healthcheck-config"
+	checkHealthProbe           = "health-probe"
+	checkEngineHealthy         = "engine-healthy"
+	checkHealthPortOnly        = "health-port-only"
+	checkHostConfig            = "host-config"
+	checkNoVolume              = "no-volume"
+	checkNoFileCapabilityXattr = "no-file-capability-xattr"
 )
 
 // scenarioChecks are the checks whose records a Scenario names: those
@@ -167,8 +204,9 @@ var scenarioChecks = map[string]bool{checkHealthProbe: true, checkEngineHealthy:
 
 // allChecks is every check, in the order Check runs and returns them.
 var allChecks = []string{
-	checkDefaultUser, checkFileCapability, checkCaps, checkReadOnly, checkPID1, checkNoShell, checkListeners,
-	checkNoEgress, checkHealthcheckConfig, checkHealthProbe, checkEngineHealthy, checkHealthPortOnly, checkHostConfig,
+	checkDefaultUser, checkFileCapability, checkNoFileCapabilityXattr, checkCaps, checkReadOnly, checkNoVolume,
+	checkPID1, checkNoShell, checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe,
+	checkEngineHealthy, checkHealthPortOnly, checkHostConfig,
 }
 
 // Check runs every check against cfg's image, under the engine $ENGINE
@@ -206,19 +244,21 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 	s.up(ctx, tb, loosen)
 
 	run := map[string]func(context.Context, testing.TB) ([]harness.Record, error){
-		checkDefaultUser:       s.defaultUser,
-		checkFileCapability:    s.fileCapability,
-		checkCaps:              s.probeCheck("assert-caps"),
-		checkReadOnly:          s.probeCheck("assert-read-only"),
-		checkPID1:              s.probeCheck("assert-pid1", cfg.PID1...),
-		checkNoShell:           s.probeCheck("assert-no-shell"),
-		checkListeners:         s.probeCheck("assert-listeners", strconv.Itoa(cfg.AppPort), strconv.Itoa(cfg.HealthPort)),
-		checkNoEgress:          s.noEgress,
-		checkHealthcheckConfig: s.healthcheckConfig,
-		checkHealthProbe:       s.healthProbe,
-		checkEngineHealthy:     s.engineHealthy,
-		checkHealthPortOnly:    s.healthPortOnly,
-		checkHostConfig:        s.hostConfig,
+		checkDefaultUser:           s.defaultUser,
+		checkFileCapability:        s.fileCapability,
+		checkNoFileCapabilityXattr: s.noFileCapabilityXattr,
+		checkCaps:                  s.probeCheck("assert-caps"),
+		checkReadOnly:              s.probeCheck("assert-read-only"),
+		checkNoVolume:              s.noVolume,
+		checkPID1:                  s.probeCheck("assert-pid1", cfg.PID1...),
+		checkNoShell:               s.probeCheck("assert-no-shell"),
+		checkListeners:             s.probeCheck("assert-listeners", strconv.Itoa(cfg.AppPort), strconv.Itoa(cfg.HealthPort)),
+		checkNoEgress:              s.noEgress,
+		checkHealthcheckConfig:     s.healthcheckConfig,
+		checkHealthProbe:           s.healthProbe,
+		checkEngineHealthy:         s.engineHealthy,
+		checkHealthPortOnly:        s.healthPortOnly,
+		checkHostConfig:            s.hostConfig,
 	}
 	results := make([]Result, 0, len(allChecks))
 	for _, name := range allChecks {
@@ -251,7 +291,7 @@ func resultFor(scenario, name string, records []harness.Record, err error) Resul
 // resultOf is the Result of the check name, which made records and then
 // stopped with err, if err is not nil.
 func resultOf(name string, records []harness.Record, err error) Result {
-	r := Result{Check: name, Records: records}
+	r := Result{Check: name, Records: records, err: err}
 	var problems []string
 	for _, rec := range records {
 		if !rec.OK {
@@ -285,24 +325,29 @@ func Run(t *testing.T, cfg *Config) {
 // check.
 func reportAll(t *testing.T, results []Result) {
 	t.Helper()
-	for _, r := range results {
-		t.Run(r.Check, func(t *testing.T) {
+	for i := range results {
+		t.Run(results[i].Check, func(t *testing.T) {
 			t.Helper()
-			report(t, r)
+			report(t, &results[i])
 		})
 	}
 }
 
 // report reports r's records through [harness.Checks], and r's failure
-// itself when no failing record already says it.
-func report(tb testing.TB, r Result) {
+// itself when no failing record already says it: when none failed, or
+// when the check also stopped on an error, which no record holds.
+func report(tb testing.TB, r *Result) {
 	tb.Helper()
 	if len(r.Records) > 0 {
 		harness.NewChecks(tb).Records(r.Records)
 	}
 	failed := slices.ContainsFunc(r.Records, func(rec harness.Record) bool { return !rec.OK })
-	if !r.OK && !failed {
+	switch {
+	case r.OK:
+	case !failed:
 		tb.Errorf("FAIL %s: %s", r.Check, r.Detail)
+	case r.err != nil:
+		tb.Errorf("FAIL %s: %v", r.Check, r.err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -34,6 +35,8 @@ type suite struct {
 	ctr     *harness.Container
 	probe   *harness.Probe
 	ctrErr  error
+	// mounts are those the app's Config gave that container.
+	mounts []harness.Mount
 }
 
 // up starts the container the checks run in: under the contract, on a
@@ -59,6 +62,7 @@ func (s *suite) start(ctx context.Context, tb testing.TB, loosen []string) error
 	if s.cfg.Mounts != nil {
 		mounts = s.cfg.Mounts(tb)
 	}
+	s.mounts = mounts
 	c, err := s.engine.Start(ctx, tb, &harness.RunSpec{
 		Image:     s.cfg.Image,
 		Network:   network,
@@ -80,13 +84,26 @@ func (s *suite) start(ctx context.Context, tb testing.TB, loosen []string) error
 			return err
 		}
 	}
-	if s.cfg.Ready != nil {
-		if err := s.cfg.Ready(ctx, c); err != nil {
-			return stopped(ctx, c, fmt.Errorf("the app never became ready: %w", err))
-		}
+	if err := s.awaitReady(ctx, c, p); err != nil {
+		return stopped(ctx, c, fmt.Errorf("the app never became ready: %w", err))
 	}
 	s.ctr, s.probe = c, p
 	return nil
+}
+
+// awaitReady returns once the app's own Ready or ReadyProbe says the app
+// in c, with the probe p installed, is ready: within readyWithin, as its
+// ports had to answer.
+func (s *suite) awaitReady(ctx context.Context, c *harness.Container, p *harness.Probe) error {
+	if s.cfg.Ready == nil && s.cfg.ReadyProbe == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, readyWithin)
+	defer cancel()
+	if s.cfg.ReadyProbe != nil {
+		return s.cfg.ReadyProbe(ctx, c, p)
+	}
+	return s.cfg.Ready(ctx, c)
 }
 
 // stopped adds to err how c ended and what it logged, if it is no longer
@@ -166,6 +183,23 @@ func (s *suite) fileCapability(ctx context.Context, tb testing.TB) ([]harness.Re
 // container process `/usr/local/bin/frankenphp`: Operation not permitted".
 func execRefused(out string) bool {
 	return strings.Contains(strings.ToLower(out), "operation not permitted") && strings.Contains(out, harness.FrankenPHP)
+}
+
+// xattrRecord is the record no-file-capability-xattr makes.
+const xattrRecord = "no file in any layer of the image carries a security.capability extended attribute"
+
+// noFileCapabilityXattr reads the image's layers, as the engine saves
+// them, for any file carrying a file capability. fileCapability can see
+// only one with the effective bit, which the kernel refuses to exec, and
+// only on the FrankenPHP binary: a capability with no effective bit runs,
+// as does any binary nothing runs.
+func (s *suite) noFileCapabilityXattr(ctx context.Context, tb testing.TB) ([]harness.Record, error) {
+	tb.Helper()
+	caps, err := s.engine.FileCapabilities(ctx, tb, s.cfg.Image)
+	if err != nil {
+		return nil, err
+	}
+	return []harness.Record{equal(xattrRecord, "none", listOrNone(caps))}, nil
 }
 
 // probeCheck returns a check that runs one probe subcommand in the
@@ -298,8 +332,8 @@ func (s *suite) healthPortOnly(ctx context.Context, _ testing.TB) ([]harness.Rec
 		path string
 	}
 	targets := make([]target, 0, len(s.cfg.HealthOnly404)+1)
-	for _, p := range s.cfg.HealthOnly404 {
-		targets = append(targets, target{s.cfg.HealthPort, p})
+	for _, path := range s.cfg.HealthOnly404 {
+		targets = append(targets, target{s.cfg.HealthPort, path})
 	}
 	targets = append(targets, target{s.cfg.AppPort, "/healthz"})
 
@@ -317,6 +351,70 @@ func (s *suite) healthPortOnly(ctx context.Context, _ testing.TB) ([]harness.Rec
 	return records, nil
 }
 
+// The records no-volume makes.
+const (
+	volumeRecord     = "the image declares no VOLUME"
+	mountsRecordWhat = "the mounts the engine reports are exactly the tmpfs at /tmp and Config.Mounts (Mounts, HostConfig.Tmpfs)"
+)
+
+// noVolume checks the image declares no volume, which the engine would
+// mount writable whatever the run asked, and that the mounts the engine
+// reports for the container under the contract are exactly the tmpfs the
+// contract grants and the ones the app's Config gave it. Podman's
+// --read-only adds tmpfs mounts of its own, which it does not report.
+func (s *suite) noVolume(ctx context.Context, _ testing.TB) ([]harness.Record, error) {
+	if s.imageErr != nil {
+		return nil, s.imageErr
+	}
+	declared := equal(volumeRecord, "none", listOrNone(slices.Sorted(maps.Keys(s.image.Volumes))))
+	if _, err := s.container(); err != nil {
+		return []harness.Record{declared}, err
+	}
+	ins, err := s.ctr.Inspect(ctx)
+	if err != nil {
+		return []harness.Record{declared}, err
+	}
+	return []harness.Record{declared, mountsRecord(s.mounts, &ins)}, nil
+}
+
+// mountsRecord checks the mounts ins reports are exactly the contract's
+// tmpfs at /tmp and given, the mounts the app's Config gave the
+// container, each read-only if it was given so.
+func mountsRecord(given []harness.Mount, ins *harness.Inspect) harness.Record {
+	want := make([]string, 0, 1+len(given))
+	want = append(want, "tmpfs /tmp")
+	for _, m := range given {
+		kind := "bind"
+		if m.Volume {
+			kind = "volume"
+		}
+		want = append(want, mountName(kind, m.Target, !m.ReadOnly))
+	}
+	found := make([]string, 0, len(ins.HostConfig.Tmpfs)+len(ins.Mounts))
+	for dest := range ins.HostConfig.Tmpfs {
+		found = append(found, mountName("tmpfs", dest, true))
+	}
+	for _, m := range ins.Mounts {
+		found = append(found, mountName(m.Type, m.Destination, m.RW))
+	}
+	slices.Sort(want)
+	slices.Sort(found)
+	foundText := "none"
+	if len(found) > 0 {
+		foundText = strings.Join(slices.Compact(found), ", ")
+	}
+	return equal(mountsRecordWhat, strings.Join(want, ", "), foundText)
+}
+
+// mountName names a mount for mountsRecord: its kind and where it is in
+// the container, and whether the container may not write to it.
+func mountName(kind, dest string, rw bool) string {
+	if rw {
+		return kind + " " + dest
+	}
+	return kind + " " + dest + " (read-only)"
+}
+
 // hostConfig checks how the engine ran the container, which no probe
 // inside it can see: a raw flag a test passed could have loosened any of
 // it.
@@ -328,28 +426,62 @@ func (s *suite) hostConfig(ctx context.Context, _ testing.TB) ([]harness.Record,
 	if err != nil {
 		return nil, err
 	}
-	return hostConfigRecords(&ins.HostConfig), nil
+	return hostConfigRecords(ins.HostConfigJSON)
 }
 
-// hostConfigRecords checks h is the contract's: no capability added, not
-// privileged, a read-only root, seccomp, AppArmor and SELinux left as the
-// engine confines by default, no init in front of the server, and a
-// network namespace of the container's own.
-func hostConfigRecords(h *harness.HostConfig) []harness.Record {
+// hostConfigRecords checks raw, the HostConfig the engine printed, is the
+// contract's: no capability added, not privileged, a read-only root,
+// seccomp, AppArmor and SELinux left as the engine confines by default, no
+// init in front of the server, and a network namespace of the container's
+// own.
+//
+// A field left out would read as its zero value, which for all but
+// ReadonlyRootfs is the value the contract wants, so each record but
+// Init's fails when its field is not there at all. Docker and Podman both
+// print every one of them, except Docker's Init, which it leaves out
+// unless --init was given.
+func hostConfigRecords(raw json.RawMessage) ([]harness.Record, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("the engine's HostConfig: %w", err)
+	}
+	if fields == nil {
+		return nil, fmt.Errorf("the engine printed no HostConfig, but %q", raw)
+	}
+	var h harness.HostConfig
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return nil, fmt.Errorf("the engine's HostConfig: %w", err)
+	}
+	records := hostConfigValues(&h)
+	for i, field := range hostConfigFields {
+		if _, ok := fields[field]; field != "" && !ok {
+			records[i].OK = false
+			records[i].Found = "absent: the engine printed no HostConfig." + field
+		}
+	}
+	return records, nil
+}
+
+// hostConfigFields names the field each of hostConfigValues' records
+// reads, in order, and must find printed: all but Init's.
+var hostConfigFields = []string{"CapAdd", "Privileged", "ReadonlyRootfs", "SecurityOpt", "", "NetworkMode"}
+
+// hostConfigValues checks the values in h, as hostConfigRecords says.
+func hostConfigValues(h *harness.HostConfig) []harness.Record {
 	withInit := "unset"
 	if h.Init != nil {
 		withInit = strconv.FormatBool(*h.Init)
 	}
 	loosening := slices.DeleteFunc(slices.Clone(h.SecurityOpt), func(opt string) bool { return !loosens(opt) })
 	return []harness.Record{
-		equal("the engine adds no capability (HostConfig.CapAdd)", "none", listOr(h.CapAdd, "none")),
+		equal("the engine adds no capability (HostConfig.CapAdd)", "none", listOrNone(h.CapAdd)),
 		equal("the container is not privileged (HostConfig.Privileged)", "false", strconv.FormatBool(h.Privileged)),
 		equal("the engine mounts the root filesystem read-only (HostConfig.ReadonlyRootfs)", "true", strconv.FormatBool(h.ReadonlyRootfs)),
 		{
 			OK:       len(loosening) == 0,
 			What:     "no security option turns off seccomp, AppArmor or SELinux confinement (HostConfig.SecurityOpt)",
 			Expected: "no seccomp or apparmor option, and no label=disable",
-			Found:    listOr(h.SecurityOpt, "none"),
+			Found:    listOrNone(h.SecurityOpt),
 		},
 		{
 			OK:       h.Init == nil || !*h.Init,
@@ -398,10 +530,10 @@ func equal(what, want, found string) harness.Record {
 	return harness.Record{OK: found == want, What: what, Expected: want, Found: found}
 }
 
-// listOr returns list joined by spaces, or none when it is empty.
-func listOr(list []string, none string) string {
+// listOrNone returns list joined by spaces, or "none" when it is empty.
+func listOrNone(list []string) string {
 	if len(list) == 0 {
-		return none
+		return "none"
 	}
 	return strings.Join(list, " ")
 }

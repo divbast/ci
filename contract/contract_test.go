@@ -4,13 +4,17 @@
 package contract
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/divbast/ci/harness"
@@ -121,9 +125,12 @@ func TestContractOnFixture(t *testing.T) {
 	for _, what := range []string{
 		"the image runs as uid/gid 65532 by default",
 		"/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no file capability",
+		xattrRecord,
 		"CapEff, every capability bit clear",
 		"CapPrm, every capability bit clear",
 		"PID 1 comm",
+		volumeRecord,
+		mountsRecordWhat,
 		"/bin/sh is absent from the image",
 		"/bin/bash is absent from the image",
 		"/bin/dash is absent from the image",
@@ -162,6 +169,21 @@ func TestValidate(t *testing.T) {
 		{name: "no-pid1", change: func(c *Config) { c.PID1 = nil }, want: "PID1"},
 		{name: "no-health-cmd", change: func(c *Config) { c.HealthCmd = nil }, want: "HealthCmd"},
 		{name: "scenario", change: func(c *Config) { c.Scenario = "telemetry off" }},
+		{
+			name: "ready-probe",
+			change: func(c *Config) {
+				c.ReadyProbe = func(context.Context, *harness.Container, *harness.Probe) error { return nil }
+			},
+		},
+		{
+			// Only one of them would run, and which is anyone's guess.
+			name: "ready-and-ready-probe",
+			change: func(c *Config) {
+				c.Ready = func(context.Context, *harness.Container) error { return nil }
+				c.ReadyProbe = func(context.Context, *harness.Container, *harness.Probe) error { return nil }
+			},
+			want: "ReadyProbe",
+		},
 		{
 			// A record is one line; a scenario that broke one would split it.
 			name:   "scenario-on-two-lines",
@@ -224,13 +246,19 @@ func TestCheckRefusesConfig(t *testing.T) {
 func TestHostConfigRecords(t *testing.T) {
 	t.Parallel()
 
-	no, yes := false, true
-	// What each engine reported for a container run under the contract on
-	// a named internal network: Docker leaves what was not asked for null
-	// and names the network; Podman prints empty lists, a false Init and
-	// bridge for any named network.
-	docker := harness.HostConfig{ReadonlyRootfs: true, NetworkMode: "divbast-net"}
-	podman := harness.HostConfig{CapAdd: []string{}, ReadonlyRootfs: true, SecurityOpt: []string{}, Init: &no, NetworkMode: "bridge"}
+	// What each engine printed as HostConfig, cut to the fields the check
+	// reads, for a container run under the contract on a named internal
+	// network: Docker 29 prints null for a list nothing was given for,
+	// leaves Init out unless --init was given, and names the network;
+	// Podman prints empty lists, a false Init and bridge for any named
+	// network.
+	docker := map[string]any{
+		"CapAdd": nil, "Privileged": false, "ReadonlyRootfs": true, "SecurityOpt": nil, "NetworkMode": "divbast-net",
+	}
+	podman := map[string]any{
+		"CapAdd": []string{}, "Privileged": false, "ReadonlyRootfs": true, "SecurityOpt": []string{}, "Init": false,
+		"NetworkMode": "bridge",
+	}
 
 	const (
 		capAdd     = "the engine adds no capability (HostConfig.CapAdd)"
@@ -240,91 +268,120 @@ func TestHostConfigRecords(t *testing.T) {
 		withInit   = "the engine puts no init before the entrypoint (HostConfig.Init)"
 		network    = "the container shares no other network namespace (HostConfig.NetworkMode)"
 	)
-	with := func(h harness.HostConfig, change func(*harness.HostConfig)) harness.HostConfig {
-		change(&h)
+	// with returns h with key set to value, and without with key left out.
+	with := func(h map[string]any, key string, value any) map[string]any {
+		h = maps.Clone(h)
+		h[key] = value
+		return h
+	}
+	without := func(h map[string]any, key string) map[string]any {
+		h = maps.Clone(h)
+		delete(h, key)
 		return h
 	}
 
 	tests := []struct {
-		name string
-		h    harness.HostConfig
-		fail string // the one record that must FAIL; empty for none
+		name  string
+		h     map[string]any
+		fail  string // the one record that must FAIL; empty for none
+		found string // in that record's finding
 	}{
 		{name: "docker", h: docker},
 		{name: "podman", h: podman},
 		{
 			// Docker and Podman print the same for this, and Docker keeps a
 			// capability's name as CAP_<NAME> since 29.
-			name: "cap-add", h: with(docker, func(h *harness.HostConfig) { h.CapAdd = []string{"CAP_NET_RAW"} }),
-			fail: capAdd,
+			name: "cap-add", h: with(docker, "CapAdd", []string{"CAP_NET_RAW"}),
+			fail: capAdd, found: "CAP_NET_RAW",
 		},
-		{name: "privileged", h: with(podman, func(h *harness.HostConfig) { h.Privileged = true }), fail: privileged},
-		{name: "writable-root", h: with(docker, func(h *harness.HostConfig) { h.ReadonlyRootfs = false }), fail: readOnly},
+		{name: "privileged", h: with(podman, "Privileged", true), fail: privileged, found: "true"},
+		{name: "writable-root", h: with(docker, "ReadonlyRootfs", false), fail: readOnly, found: "false"},
 		{
 			name: "docker-seccomp-unconfined",
-			h:    with(docker, func(h *harness.HostConfig) { h.SecurityOpt = []string{"seccomp=unconfined"} }), fail: security,
+			h:    with(docker, "SecurityOpt", []string{"seccomp=unconfined"}), fail: security, found: "seccomp=unconfined",
 		},
 		{
 			// Docker keeps the option as it was typed, and takes a colon too.
 			name: "docker-seccomp-colon",
-			h:    with(docker, func(h *harness.HostConfig) { h.SecurityOpt = []string{"seccomp:unconfined"} }), fail: security,
+			h:    with(docker, "SecurityOpt", []string{"seccomp:unconfined"}), fail: security, found: "seccomp:unconfined",
 		},
 		{
 			// A profile of one's own replaces the engine's, and nothing here
 			// can tell whether it is any tighter.
 			name: "docker-seccomp-profile",
-			h:    with(docker, func(h *harness.HostConfig) { h.SecurityOpt = []string{`seccomp={"defaultAction":"SCMP_ACT_ALLOW"}`} }),
-			fail: security,
+			h:    with(docker, "SecurityOpt", []string{`seccomp={"defaultAction":"SCMP_ACT_ALLOW"}`}),
+			fail: security, found: "SCMP_ACT_ALLOW",
 		},
 		{
 			name: "podman-apparmor-unconfined",
-			h: with(podman, func(h *harness.HostConfig) {
-				h.SecurityOpt = []string{"no-new-privileges", "apparmor=unconfined"}
-			}),
-			fail: security,
+			h:    with(podman, "SecurityOpt", []string{"no-new-privileges", "apparmor=unconfined"}),
+			fail: security, found: "apparmor=unconfined",
 		},
 		{
 			name: "podman-label-disable",
-			h:    with(podman, func(h *harness.HostConfig) { h.SecurityOpt = []string{"label=disable"} }), fail: security,
+			h:    with(podman, "SecurityOpt", []string{"label=disable"}), fail: security, found: "label=disable",
 		},
 		{
 			// no-new-privileges tightens; it is no loosening.
 			name: "no-new-privileges",
-			h:    with(podman, func(h *harness.HostConfig) { h.SecurityOpt = []string{"no-new-privileges"} }),
+			h:    with(podman, "SecurityOpt", []string{"no-new-privileges"}),
 		},
-		{
-			// Docker's Init is null unless --init was given.
-			name: "docker-init", h: with(docker, func(h *harness.HostConfig) { h.Init = &yes }), fail: withInit,
-		},
-		{name: "podman-init", h: with(podman, func(h *harness.HostConfig) { h.Init = &yes }), fail: withInit},
-		{name: "host-network", h: with(docker, func(h *harness.HostConfig) { h.NetworkMode = "host" }), fail: network},
+		{name: "docker-init", h: with(docker, "Init", true), fail: withInit, found: "true"},
+		{name: "podman-init", h: with(podman, "Init", true), fail: withInit, found: "true"},
+		{name: "host-network", h: with(docker, "NetworkMode", "host"), fail: network, found: "host"},
 		{
 			name: "another-containers-network",
-			h:    with(podman, func(h *harness.HostConfig) { h.NetworkMode = "container:0123abcd" }), fail: network,
+			h:    with(podman, "NetworkMode", "container:0123abcd"), fail: network, found: "container:0123abcd",
 		},
 		{
 			// Podman alone joins a namespace by its path, the host's
 			// included.
 			name: "podman-namespace-path",
-			h:    with(podman, func(h *harness.HostConfig) { h.NetworkMode = "ns:/proc/1/ns/net" }), fail: network,
+			h:    with(podman, "NetworkMode", "ns:/proc/1/ns/net"), fail: network, found: "ns:/proc/1/ns/net",
 		},
+		// A field left out reads as its zero value, which for these is the
+		// value the contract wants, so each must be there to pass. Docker
+		// leaves Init out on its own, and Init's absence is no failure.
+		{name: "no-cap-add", h: without(docker, "CapAdd"), fail: capAdd, found: "absent"},
+		{name: "no-privileged", h: without(podman, "Privileged"), fail: privileged, found: "absent"},
+		{name: "no-readonly-rootfs", h: without(docker, "ReadonlyRootfs"), fail: readOnly, found: "absent"},
+		{name: "no-security-opt", h: without(podman, "SecurityOpt"), fail: security, found: "absent"},
+		{name: "no-network-mode", h: without(docker, "NetworkMode"), fail: network, found: "absent"},
+		{name: "podman-no-init", h: without(podman, "Init")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			records := hostConfigRecords(&tt.h)
+			raw, err := json.Marshal(tt.h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			records, err := hostConfigRecords(raw)
+			if err != nil {
+				t.Fatalf("hostConfigRecords(%s) error = %v", raw, err)
+			}
 			whats := make([]string, len(records))
 			for i, r := range records {
 				whats[i] = r.What
 				if want := r.What != tt.fail; r.OK != want {
 					t.Errorf("%s: OK = %t, want %t (found %q)", r.What, r.OK, want, r.Found)
 				}
+				if r.What == tt.fail && !strings.Contains(r.Found, tt.found) {
+					t.Errorf("%s: found %q, which does not say %q", r.What, r.Found, tt.found)
+				}
 			}
 			if want := []string{capAdd, privileged, readOnly, security, withInit, network}; !slices.Equal(whats, want) {
 				t.Errorf("hostConfigRecords() made %q, want %q", whats, want)
 			}
 		})
+	}
+
+	// What is not a HostConfig at all is an error, not a pass.
+	for _, raw := range []string{``, `null`, `[]`, `{"Privileged": "no"}`} {
+		if records, err := hostConfigRecords(json.RawMessage(raw)); err == nil {
+			t.Errorf("hostConfigRecords(%q) = %+v, nil; want an error", raw, records)
+		}
 	}
 }
 
@@ -434,6 +491,7 @@ func TestReport(t *testing.T) {
 		name   string
 		result Result
 		errors int
+		says   string // in one of the failures; empty for no matter
 	}{
 		{name: "ok", result: Result{Check: "pid1", OK: true, Records: []harness.Record{ok}}},
 		{
@@ -450,12 +508,24 @@ func TestReport(t *testing.T) {
 			result: resultOf("no-egress", []harness.Record{ok}, down),
 			errors: 1,
 		},
+		{
+			// A failing record, and then the error that stopped the check:
+			// the record says only what it found, so the error is reported
+			// beside it rather than lost.
+			name:   "a-failing-record-then-an-error",
+			result: resultOf("no-egress", []harness.Record{bad}, down),
+			errors: 2,
+			says:   "did not come up",
+		},
 	}
 	for _, tt := range tests {
 		tb := &recordingTB{TB: t}
-		report(tb, tt.result)
+		report(tb, &tt.result)
 		if len(tb.errors) != tt.errors {
 			t.Errorf("%s: report() reported %d failures, want %d: %q", tt.name, len(tb.errors), tt.errors, tb.errors)
+		}
+		if tt.says != "" && !slices.ContainsFunc(tb.errors, func(e string) bool { return strings.Contains(e, tt.says) }) {
+			t.Errorf("%s: report() reported %q, and none says %q", tt.name, tb.errors, tt.says)
 		}
 	}
 
@@ -474,7 +544,7 @@ func TestReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "PID 1 comm\nPID 1 comm\nPID 1 argv\nPID 1 comm\n"; string(got) != want {
+	if want := "PID 1 comm\nPID 1 comm\nPID 1 argv\nPID 1 comm\nPID 1 argv\n"; string(got) != want {
 		t.Errorf("the check log holds %q, want %q", got, want)
 	}
 }
@@ -548,5 +618,160 @@ func TestScenarioPrefix(t *testing.T) {
 func sawSubtest(t *testing.T) {
 	if !strings.HasSuffix(t.Name(), "#01") {
 		t.Errorf("subtest %q is the first of its name: reportAll made no subtest of that name", t.Name())
+	}
+}
+
+// TestReadyBounded shows the app's own Ready bounded as the wait for its
+// ports is: one that waits for its context gets readyWithin, and not a
+// moment longer, rather than holding the suite until go test's own
+// timeout kills it.
+func TestReadyBounded(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		s := &suite{cfg: &Config{Ready: func(ctx context.Context, _ *harness.Container) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}}
+		start := time.Now()
+		err := s.awaitReady(t.Context(), &harness.Container{}, &harness.Probe{})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("awaitReady() error = %v, want the deadline", err)
+		}
+		if waited := time.Since(start); waited != readyWithin {
+			t.Errorf("awaitReady() returned after %s, want %s", waited, readyWithin)
+		}
+	})
+}
+
+// TestReadyProbe shows ReadyProbe given the container and the probe the
+// contract installed in it, so an app needs no second probe of its own to
+// ask its app anything, and bounded as Ready is.
+func TestReadyProbe(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		c, p := &harness.Container{ID: "abc"}, &harness.Probe{}
+		var gotC *harness.Container
+		var gotP *harness.Probe
+		s := &suite{cfg: &Config{ReadyProbe: func(ctx context.Context, c *harness.Container, p *harness.Probe) error {
+			gotC, gotP = c, p
+			<-ctx.Done()
+			return ctx.Err()
+		}}}
+		start := time.Now()
+		if err := s.awaitReady(t.Context(), c, p); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("awaitReady() error = %v, want the deadline", err)
+		}
+		if waited := time.Since(start); waited != readyWithin {
+			t.Errorf("awaitReady() returned after %s, want %s", waited, readyWithin)
+		}
+		if gotC != c || gotP != p {
+			t.Errorf("ReadyProbe was given %p and %p, want the container %p and its probe %p", gotC, gotP, c, p)
+		}
+	})
+}
+
+func TestMountsRecord(t *testing.T) {
+	t.Parallel()
+
+	// What each engine printed for a container run under the contract,
+	// with a named volume at /data: Docker 29 and Podman both list a volume
+	// or a bind in Mounts, and a --tmpfs only in HostConfig.Tmpfs, with
+	// options of their own.
+	data := harness.Mount{Source: "divbast-abc", Target: "/data", Volume: true}
+	docker := harness.Inspect{
+		HostConfig: harness.HostConfig{Tmpfs: map[string]string{"/tmp": "size=16m"}},
+		Mounts:     []harness.MountPoint{{Type: "volume", Name: "divbast-abc", Destination: "/data", RW: true}},
+	}
+	podman := harness.Inspect{
+		HostConfig: harness.HostConfig{Tmpfs: map[string]string{"/tmp": "rw,rprivate,nosuid,nodev,tmpcopyup,size=16m"}},
+		Mounts:     []harness.MountPoint{{Type: "volume", Name: "divbast-abc", Destination: "/data", RW: true}},
+	}
+	with := func(ins harness.Inspect, change func(*harness.Inspect)) harness.Inspect {
+		ins.HostConfig.Tmpfs = maps.Clone(ins.HostConfig.Tmpfs)
+		ins.Mounts = slices.Clone(ins.Mounts)
+		change(&ins)
+		return ins
+	}
+
+	tests := []struct {
+		name  string
+		given []harness.Mount
+		ins   harness.Inspect
+		found string // the finding, when the record must FAIL
+	}{
+		{name: "docker", given: []harness.Mount{data}, ins: docker},
+		{name: "podman", given: []harness.Mount{data}, ins: podman},
+		{
+			name: "no-mounts",
+			ins:  with(docker, func(ins *harness.Inspect) { ins.Mounts = nil }),
+		},
+		{
+			// An image's VOLUME, which Docker names with a hash
+			name: "anonymous-volume",
+			ins: with(docker, func(ins *harness.Inspect) {
+				ins.Mounts = []harness.MountPoint{{Type: "volume", Name: "0123abcd", Destination: "/data", RW: true}}
+			}),
+			found: "tmpfs /tmp, volume /data",
+		},
+		{
+			name: "another-tmpfs", given: []harness.Mount{data},
+			ins:   with(podman, func(ins *harness.Inspect) { ins.HostConfig.Tmpfs["/run"] = "rw" }),
+			found: "tmpfs /run, tmpfs /tmp, volume /data",
+		},
+		{
+			// --mount type=tmpfs, which Docker lists in Mounts instead
+			name: "tmpfs-mount", given: []harness.Mount{data},
+			ins: with(docker, func(ins *harness.Inspect) {
+				ins.Mounts = append(ins.Mounts, harness.MountPoint{Type: "tmpfs", Destination: "/var/tmp", RW: true})
+			}),
+			found: "tmpfs /tmp, tmpfs /var/tmp, volume /data",
+		},
+		{
+			name:  "no-tmpfs",
+			given: []harness.Mount{data},
+			ins:   with(docker, func(ins *harness.Inspect) { ins.HostConfig.Tmpfs = nil }),
+			found: "volume /data",
+		},
+		{
+			// The volume given read-only, mounted writable
+			name:  "writable",
+			given: []harness.Mount{{Source: "divbast-abc", Target: "/data", Volume: true, ReadOnly: true}},
+			ins:   docker,
+			found: "tmpfs /tmp, volume /data",
+		},
+		{
+			name: "read-only-as-given",
+			given: []harness.Mount{
+				{Source: "divbast-abc", Target: "/data", Volume: true, ReadOnly: true},
+				{Source: "/srv/conf", Target: "/etc/app"},
+			},
+			ins: with(docker, func(ins *harness.Inspect) {
+				ins.Mounts = []harness.MountPoint{
+					{Type: "volume", Name: "divbast-abc", Destination: "/data"},
+					{Type: "bind", Source: "/srv/conf", Destination: "/etc/app", RW: true},
+				}
+			}),
+		},
+		{
+			name: "a-bind-for-a-volume", given: []harness.Mount{data},
+			ins: with(docker, func(ins *harness.Inspect) {
+				ins.Mounts = []harness.MountPoint{{Type: "bind", Source: "/srv/data", Destination: "/data", RW: true}}
+			}),
+			found: "bind /data, tmpfs /tmp",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := mountsRecord(tt.given, &tt.ins)
+			if r.What != mountsRecordWhat {
+				t.Errorf("mountsRecord().What = %q", r.What)
+			}
+			if r.OK != (tt.found == "") || (tt.found != "" && r.Found != tt.found) {
+				t.Errorf("mountsRecord() = ok %t, found %q, expected %q; want ok %t, found %q",
+					r.OK, r.Found, r.Expected, tt.found == "", tt.found)
+			}
+		})
 	}
 }

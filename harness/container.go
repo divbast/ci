@@ -387,6 +387,14 @@ type Inspect struct {
 	State      State
 	Config     Config
 	HostConfig HostConfig
+	// Mounts holds the volumes and binds the engine mounted in the
+	// container: a --tmpfs is in HostConfig.Tmpfs instead, on both
+	// engines. Docker lists a --mount of type tmpfs here too.
+	Mounts []MountPoint
+	// HostConfigJSON is HostConfig as the engine printed it, for a check
+	// that must tell a field the engine left out from one it printed with
+	// its zero value, which HostConfig reads alike.
+	HostConfigJSON json.RawMessage
 	// IP is the container's address on the network it was started on, or
 	// on its one network if it named none. Empty when it has none, as on
 	// rootless Podman's default network.
@@ -401,6 +409,21 @@ type Inspect struct {
 	// 0.0.0.0, and Podman before 5.0 an empty address, read as 0.0.0.0. A
 	// port the image exposes and the run did not publish is not in it.
 	Ports map[string]string
+}
+
+// MountPoint is one mount in a container, as the engine reports it.
+type MountPoint struct {
+	// Type is volume or bind on both engines, tmpfs for Docker's --mount
+	// type=tmpfs, and image for Podman's --mount type=image.
+	Type string
+	// Name is a volume's: the name it was given, or for one the engine
+	// made itself, as for an image's VOLUME, one it chose.
+	Name string
+	// Source is where it comes from on the host, and Destination where it
+	// is in the container.
+	Source, Destination string
+	// RW is whether the container may write to it.
+	RW bool
 }
 
 // State is the container's process, as the engine last saw it.
@@ -441,6 +464,9 @@ type Config struct {
 	// Healthcheck is the health check the engine runs, or the image's
 	// HEALTHCHECK, nil for none.
 	Healthcheck *Healthcheck
+	// Volumes holds the image's VOLUME paths, as keys, each with an empty
+	// value, as both engines write it. Nil for none.
+	Volumes map[string]struct{}
 }
 
 // Healthcheck is a health check's command and timings. A timing left
@@ -476,6 +502,11 @@ type HostConfig struct {
 	// container:<id> for another container's; Podman alone says
 	// ns:<path> for a namespace joined by its path.
 	NetworkMode string
+	// Tmpfs holds each --tmpfs: its path in the container, and its
+	// options, which each engine writes its own way. Docker leaves the
+	// field out when there is none. Podman lists only those the run asked
+	// for, and not the ones --read-only adds itself.
+	Tmpfs map[string]string
 }
 
 // Inspect returns what the engine reports about the container now.
@@ -491,7 +522,8 @@ func (c *Container) Inspect(ctx context.Context) (Inspect, error) {
 			Healthcheck *Health
 		}
 		Config          Config
-		HostConfig      HostConfig
+		HostConfig      json.RawMessage
+		Mounts          []MountPoint
 		NetworkSettings struct {
 			Networks map[string]struct{ IPAddress string }
 			// null for a port exposed and not published
@@ -509,7 +541,12 @@ func (c *Container) Inspect(ctx context.Context) (Inspect, error) {
 	}
 	got := all[0]
 
-	ins := Inspect{State: got.State.State, Config: got.Config, HostConfig: got.HostConfig}
+	ins := Inspect{State: got.State.State, Config: got.Config, Mounts: got.Mounts, HostConfigJSON: got.HostConfig}
+	if len(got.HostConfig) > 0 {
+		if err := json.Unmarshal(got.HostConfig, &ins.HostConfig); err != nil {
+			return Inspect{}, fmt.Errorf("%s container inspect %s printed a HostConfig that is not one: %w", c.engine.name, c, err)
+		}
+	}
 	if ins.State.Health == nil {
 		ins.State.Health = got.State.Healthcheck
 	}

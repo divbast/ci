@@ -467,6 +467,11 @@ the mark, above, that makes the next release major:
   callers import through `.ci`, or what they do wherever an unchanged
   caller would see it: a new contract check that an image which passed
   before now fails, say, or a harness default a caller's suite relies on.
+- **The probe:** more asked of an image than the probe asks today. It
+  runs as the image's own PHP, `/usr/local/bin/frankenphp php-cli`, and
+  needs the `posix` extension, with which `no-shell` tells a path that is
+  absent from one it may not look up. An image without it fails
+  `no-shell`.
 - **Shared configuration:** `go/golangci.yml` or `.github/actionlint.yaml`
   changed so that a caller's unchanged code or workflows fail.
 
@@ -845,6 +850,19 @@ containers run only when `ENGINE` is `docker` or `podman`, so
 `ENGINE=docker just ci` runs them all. `self-ci.yml` runs them on amd64 and
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
 test. A merge to main that passes them is released.
+
+The contract suite runs against two images. One is the published
+LibreSpeed image `internal/testfixture` pins. The other is the minimal
+fixture in `contract/testdata/minimal`, which the tests build from the
+distroless runtime and the FrankenPHP binary the template copies: an app
+with no bootstrap and no volume, and nothing in it the contract does not
+need. A contract change that would fail either kind of app fails here
+first. The mutants under `contract/testdata/mutants` each break one thing
+in one of the two, and exactly the records for that one thing must fail.
+Renovate's dockerfile manager moves the digests every one of those
+Containerfiles pins, and `just lint` runs hadolint over them, and PHPStan
+over the fixture's PHP. The contract package's documentation says
+exactly what each check asserts.
 
 The shell `app-publish.yml`'s publish job runs, from its gate and its
 decision on, is pinned word for word in

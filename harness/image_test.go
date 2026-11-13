@@ -6,8 +6,12 @@ package harness
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -60,7 +64,7 @@ var wantConfig = Config{
 
 // sameConfig reports whether two configurations say the same thing.
 func sameConfig(a, b Config) bool {
-	if a.User != b.User || (a.Healthcheck == nil) != (b.Healthcheck == nil) {
+	if a.User != b.User || (a.Healthcheck == nil) != (b.Healthcheck == nil) || !maps.Equal(a.Volumes, b.Volumes) {
 		return false
 	}
 	if a.Healthcheck == nil {
@@ -237,6 +241,7 @@ func TestImageConfigPodman(t *testing.T) {
 			file{"manifest.json", `[{"Config":"` + digest(blob) + `.json","RepoTags":[],"Layers":["l1.tar"]}]`})
 	}
 	const noHealthcheck = `{"config":{"User":"0:0"}}`
+	const volume = `{"config":{"User":"65532:65532","Volumes":{"/data":{}}}}`
 
 	tests := []struct {
 		name    string
@@ -251,6 +256,18 @@ func TestImageConfigPodman(t *testing.T) {
 			// absent here only when the image itself has none.
 			name: "no-healthcheck", id: digest(noHealthcheck), archive: archive(noHealthcheck),
 			want: Config{User: "0:0"},
+		},
+		{
+			name: "volume", id: digest(volume), archive: archive(volume),
+			want: Config{User: "65532:65532", Volumes: map[string]struct{}{"/data": {}}},
+		},
+		{
+			// Why the configuration could not be found, not merely that it
+			// was not
+			name: "config-missing", id: digest(configBlob),
+			archive: tarball(t, file{"l1.tar", "a layer"},
+				file{"manifest.json", `[{"Config":"` + digest(configBlob) + `.json","RepoTags":[],"Layers":["l1.tar"]}]`}),
+			wantErr: "which the archive does not hold",
 		},
 		{
 			// The image ID is the digest of its configuration, so a blob that
@@ -357,8 +374,8 @@ func TestSaveMemoized(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if a.configs == nil || a.configs != b.configs {
-			t.Errorf("two engines from EngineFromEnv keep configurations in %p and %p, want one place", a.configs, b.configs)
+		if a.saves == nil || a.saves != b.saves {
+			t.Errorf("two engines from EngineFromEnv keep what their saves read in %p and %p, want one place", a.saves, b.saves)
 		}
 	})
 }
@@ -429,5 +446,247 @@ func TestBuildFails(t *testing.T) {
 	_, err := e.Build(t.Context(), t, "testdata/mutant/Containerfile", nil)
 	if err == nil || !strings.Contains(err.Error(), "should not be blank") {
 		t.Errorf("Build() error = %v, want the builder's own words", err)
+	}
+}
+
+// capabilityPAX is the PAX record in which BuildKit and Buildah carry a
+// file's security.capability extended attribute: cap_net_bind_service=ep,
+// as setcap writes it.
+const capabilityPAX = "SCHILY.xattr.security.capability"
+
+var capabilityValue = string([]byte{1, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+
+// entry is one file in a layer layerTar writes, with the PAX records it
+// carries.
+type entry struct {
+	name string
+	pax  map[string]string
+}
+
+// layerTar returns a layer holding entries, each an empty file.
+func layerTar(t *testing.T, entries ...entry) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	w := tar.NewWriter(&b)
+	for _, e := range entries {
+		hdr := &tar.Header{Name: e.name, Mode: 0o755, Typeflag: tar.TypeReg, PAXRecords: e.pax, Format: tar.FormatPAX}
+		if err := w.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+// gzipped returns b compressed, as Docker's containerd store keeps a layer.
+func gzipped(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w := gzip.NewWriter(&out)
+	if _, err := w.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func TestLayerCapabilities(t *testing.T) {
+	t.Parallel()
+
+	capped := entry{"usr/local/bin/frankenphp", map[string]string{capabilityPAX: capabilityValue}}
+	plain := entry{"usr/local/bin/other", nil}
+	tests := []struct {
+		name    string
+		layer   []byte
+		want    []string
+		wantErr bool
+	}{
+		{name: "none", layer: layerTar(t, plain)},
+		{name: "one", layer: layerTar(t, plain, capped), want: []string{"/usr/local/bin/frankenphp"}},
+		{name: "gzip", layer: gzipped(t, layerTar(t, capped, plain)), want: []string{"/usr/local/bin/frankenphp"}},
+		{
+			// libarchive writes its own record beside SCHILY's, and either
+			// alone carries the attribute
+			name:  "libarchive",
+			layer: layerTar(t, entry{"bin/ping", map[string]string{"LIBARCHIVE.xattr.security.capability": "AQAAAgAgAAA"}}),
+			want:  []string{"/bin/ping"},
+		},
+		{
+			// Another attribute is no capability
+			name:  "selinux-label",
+			layer: layerTar(t, entry{"etc/x", map[string]string{"SCHILY.xattr.security.selinux": "system_u:object_r:etc_t:s0"}}),
+		},
+		{name: "empty", layer: []byte{}},
+		{
+			// zstd, which the standard library cannot read: a layer that
+			// cannot be read must not pass for one with nothing in it
+			name:    "zstd",
+			layer:   []byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0},
+			wantErr: true,
+		},
+		{name: "not-a-tar", layer: []byte(strings.Repeat("not a tar archive ", 40)), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := layerCapabilities(bytes.NewReader(tt.layer))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("layerCapabilities() = %q, nil; want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("layerCapabilities() error = %v", err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("layerCapabilities() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// savedArchive is an image as either engine's save writes it, with
+// configBlob as its configuration, named as Podman names it, and the
+// layers given, named as Docker 29 names them.
+func savedArchive(t *testing.T, layers ...[]byte) []byte {
+	t.Helper()
+	sum := sha256.Sum256([]byte(configBlob))
+	configName := hex.EncodeToString(sum[:]) + ".json"
+	files := []file{{configName, configBlob}}
+	names := make([]string, len(layers))
+	for i, l := range layers {
+		names[i] = fmt.Sprintf("blobs/sha256/layer%d", i)
+		files = append(files, file{names[i], string(l)})
+	}
+	manifest, err := json.Marshal([]map[string]any{{"Config": configName, "Layers": names}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tarball(t, append(files, file{"manifest.json", string(manifest)})...)
+}
+
+func TestFileCapabilities(t *testing.T) {
+	t.Parallel()
+
+	capped := layerTar(t, entry{"usr/local/bin/frankenphp", map[string]string{capabilityPAX: capabilityValue}})
+	plain := layerTar(t, entry{"etc/frankenphp/Caddyfile", nil})
+	again := layerTar(t, entry{"usr/local/bin/frankenphp", map[string]string{capabilityPAX: capabilityValue}},
+		entry{"usr/local/bin/helper", map[string]string{capabilityPAX: capabilityValue}})
+
+	tests := []struct {
+		name    string
+		archive []byte
+		want    []string
+		wantErr string
+	}{
+		{name: "none", archive: savedArchive(t, plain, gzipped(t, plain))},
+		{
+			// In whichever layer, sorted, and each path once
+			name:    "found",
+			archive: savedArchive(t, plain, gzipped(t, capped), again),
+			want:    []string{"/usr/local/bin/frankenphp", "/usr/local/bin/helper"},
+		},
+		{
+			name: "a-layer-missing",
+			archive: tarball(t, file{"blobs/sha256/config", configBlob},
+				file{"manifest.json", `[{"Config":"blobs/sha256/config","Layers":["blobs/sha256/gone"]}]`}),
+			wantErr: "does not hold",
+		},
+		{
+			name:    "a-layer-it-cannot-read",
+			archive: savedArchive(t, plain, []byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0}),
+			wantErr: "zstd",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Docker saves by the ID it gives, which with its containerd
+			// store is the index's digest, not the configuration's.
+			e := newEngine("docker", runFunc(func(argv []string) execx.Result {
+				switch {
+				case slices.Equal(argv, []string{"docker", "image", "inspect", "--format", "{{.Id}}", "img"}):
+					return execx.Result{Stdout: []byte("sha256:abc\n")}
+				case len(argv) == 5 && slices.Equal(argv[:3], []string{"docker", "save", "-o"}) && argv[4] == "sha256:abc":
+					if err := os.WriteFile(argv[3], tt.archive, 0o600); err != nil {
+						t.Errorf("writing the archive: %v", err)
+						return execx.Result{Code: 1}
+					}
+					return execx.Result{}
+				default:
+					t.Errorf("unexpected command %q", argv)
+					return execx.Result{Code: 125}
+				}
+			}))
+			got, err := e.FileCapabilities(t.Context(), t, "img")
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("FileCapabilities() = %q, %v; want an error saying %q", got, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FileCapabilities() error = %v", err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("FileCapabilities() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOneSaveForBoth shows Podman saving an image once for its
+// configuration and its layers' capabilities alike, whichever is asked
+// for first, and Docker saving it once for the capabilities, which is all
+// it saves for.
+func TestOneSaveForBoth(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256([]byte(configBlob))
+	id := hex.EncodeToString(sum[:])
+	capped := layerTar(t, entry{"usr/local/bin/frankenphp", map[string]string{capabilityPAX: capabilityValue}})
+	archive := savedArchive(t, capped)
+
+	for _, capsFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("caps-first=%t", capsFirst), func(t *testing.T) {
+			t.Parallel()
+
+			var saves atomic.Int32
+			save := podmanSaving(t, id, archive)
+			e := newEngine("podman", runFunc(func(argv []string) execx.Result {
+				if argv[1] == "save" {
+					saves.Add(1)
+				}
+				return save(argv)
+			}))
+			caps := func() {
+				if got, err := e.FileCapabilities(t.Context(), t, "img"); err != nil || !slices.Equal(got, []string{"/usr/local/bin/frankenphp"}) {
+					t.Errorf("FileCapabilities() = %q, %v", got, err)
+				}
+			}
+			config := func() {
+				if got, err := e.ImageConfig(t.Context(), t, "img"); err != nil || !sameConfig(got, wantConfig) {
+					t.Errorf("ImageConfig() = %+v, %v; want %+v", got, err, wantConfig)
+				}
+			}
+			if capsFirst {
+				caps()
+				config()
+			} else {
+				config()
+				caps()
+			}
+			caps()
+			if n := saves.Load(); n != 1 {
+				t.Errorf("podman save ran %d times for one image, want once", n)
+			}
+		})
 	}
 }

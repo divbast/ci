@@ -60,14 +60,21 @@ const (
 	installRetry    = 500 * time.Millisecond
 )
 
-// engineFailed reports whether an exec's exit status is the engine's own:
-// 125 for the engine, 126 and 127 for a command it could not run, and 128
-// where Docker's runtime refused. Any other is the PHP's, which exits 0 or
-// 1 for the install, or 255 for a fatal error, and would only do the same
-// again.
-func engineFailed(code int) bool {
-	return code >= 125 && code <= 128
+// engineFailed reports whether an exec that exited as res did failed in
+// the engine rather than in the PHP it ran: 125 for the engine, 126 and
+// 127 for a command it could not run, and 128 where Docker's runtime
+// refused. Podman also exits 255 when its runtime fails the exec, as crun
+// once did with "setns `mnt`: Bad file descriptor" into a running
+// container, and then opens stderr with podmanRuntimeError, which no PHP
+// prints. Any other exit is the PHP's, which exits 0 or 1 for the install,
+// or 255 for a fatal error, and would only do the same again.
+func engineFailed(res Result) bool {
+	return res.Code >= 125 && res.Code <= 128 ||
+		res.Code == 255 && bytes.HasPrefix(res.Stderr, []byte(podmanRuntimeError))
 }
+
+// podmanRuntimeError opens what Podman prints when its OCI runtime fails.
+const podmanRuntimeError = "Error: OCI runtime error:"
 
 func install(ctx context.Context, c *Container, file string, body []byte) error {
 	for attempt := 1; ; attempt++ {
@@ -79,7 +86,7 @@ func install(ctx context.Context, c *Container, file string, body []byte) error 
 			return nil
 		}
 		failed := fmt.Errorf("installing %s in container %s: exit status %d: %s", file, c, res.Code, combined(res))
-		if !engineFailed(res.Code) || attempt == installAttempts {
+		if !engineFailed(res) || attempt == installAttempts {
 			return failed
 		}
 		ins, err := c.Inspect(ctx)
