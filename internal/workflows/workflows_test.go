@@ -1557,6 +1557,13 @@ func TestPublishShellReadsEveryForm(t *testing.T) {
 			want: "== workflow env names ==\nMISE_VERSION\nOTHER\n== workflow defaults ==\nrun:\n  shell: bash\n" +
 				"== publish job env ==\nMISE_AUTO_INSTALL: \"false\"\n== publish job defaults ==\nrun:\n  working-directory: app\n" + gate,
 		},
+		{
+			// The step's own run: key is pinned, never an env entry of the
+			// same name ahead of it (backlog CI-10)
+			name:     "an env entry named run before the step's own",
+			workflow: job + steps + "      - name: Decoy\n        env:\n          run: echo decoy\n        run: |\n          echo real\n",
+			want:     none + gate + "== Decoy ==\nenv: run: echo decoy\nrun:\necho real\n",
+		},
 		{name: "a script with no name", workflow: job + steps + "      - run: echo nameless\n"},
 		{name: "a step that neither runs nor uses", workflow: job + steps + "      - name: Nothing\n        if: always()\n"},
 		{name: "a step that both runs and uses", workflow: job + steps + "      - name: Both\n        uses: actions/attest@x\n        run: echo both\n"},
@@ -1674,8 +1681,10 @@ func publishShell(workflow string) (string, error) {
 		if i != gate[0] && i != template[0] && i != rehearse[0] && i < decide[0] {
 			continue
 		}
-		at := slices.IndexFunc(s, func(l line) bool { return strings.HasPrefix(key(l), "run:") })
-		uses := slices.ContainsFunc(s, func(l line) bool { return strings.HasPrefix(key(l), "uses:") })
+		// The step's own keys, at its key column: an env entry named run
+		// or uses is neither
+		at := stepKey(s, "run")
+		uses := stepKey(s, "uses") >= 0
 		switch {
 		case at < 0 && uses:
 			continue
@@ -2594,27 +2603,66 @@ func moveStep(workflow, what, before string) string {
 	return rest[:k] + step + rest[k:]
 }
 
-// runScript returns a step's run: script, from a block scalar or a plain
-// value. Blank lines and comments are already gone.
-func runScript(step []line) (string, error) {
-	for i, l := range step {
-		v, ok := strings.CutPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), "run:")
-		if !ok {
-			continue
-		}
-		if v = strings.TrimSpace(v); v != "|" {
-			return v, nil
-		}
-		var b strings.Builder
-		for _, s := range step[i+1:] {
-			if indent(s.text) <= indent(l.text) {
-				break
+// TestRunScript checks that runScript reads a step's own run: key, at the
+// step's key column, and nothing else: not the step's later keys into a
+// block written run: first (backlog CI-9), and not an env entry named run
+// ahead of the real key (backlog CI-10).
+func TestRunScript(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name, step, want string
+	}{
+		{name: "inline", step: "      - name: A\n        run: echo a\n", want: "echo a"},
+		{name: "block", step: "      - name: A\n        run: |\n          echo a\n          echo b\n", want: "echo a\necho b\n"},
+		{name: "inline first, then an env entry named run", step: "      - run: x\n        env:\n          run: y\n", want: "x"},
+		{name: "block first, then the step's other keys", step: "      - run: |\n          echo one\n        env:\n          T: latest\n        name: B\n", want: "echo one\n"},
+		{name: "an env entry named run before the real one", step: "      - name: C\n        env:\n          run: echo decoy\n        run: echo real\n", want: "echo real"},
+		{name: "a block env entry named run before the real one", step: "      - name: C\n        env:\n          run: |\n            decoy\n        run: |\n          echo real\n", want: "echo real\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st := steps(jobsOf(linesOf("jobs:\n  j:\n    steps:\n" + tt.step))["j"])
+			if len(st) != 1 {
+				t.Fatalf("%d steps, want 1", len(st))
 			}
-			b.WriteString(strings.TrimSpace(s.text) + "\n")
-		}
-		return b.String(), nil
+			got, err := runScript(st[0])
+			if err != nil || got != tt.want {
+				t.Errorf("runScript() = %q, %v; want %q", got, err, tt.want)
+			}
+		})
 	}
-	return "", fmt.Errorf("line %d: the step has no run: script", step[0].n)
+	t.Run("only an env entry named run", func(t *testing.T) {
+		t.Parallel()
+		st := steps(jobsOf(linesOf("jobs:\n  j:\n    steps:\n      - uses: actions/attest@x\n        env:\n          run: echo decoy\n"))["j"])
+		if got, err := runScript(st[0]); err == nil {
+			t.Errorf("runScript() = %q, want an error: the step runs no script", got)
+		}
+	})
+}
+
+// runScript returns a step's run: script, from a block scalar or a plain
+// value. Blank lines and comments are already gone. It reads the step's
+// own run: key, at the step's key column, so neither an env entry named
+// run nor the keys after a block written first are taken for the script.
+func runScript(step []line) (string, error) {
+	i := stepKey(step, "run")
+	if i < 0 {
+		return "", fmt.Errorf("line %d: the step has no run: script", step[0].n)
+	}
+	v, _ := strings.CutPrefix(strings.TrimPrefix(strings.TrimSpace(step[i].text), "- "), "run:")
+	if v = strings.TrimSpace(v); v != "|" {
+		return v, nil
+	}
+	// The block holds every line deeper than the step's keys
+	keys := indent(step[0].text) + 2
+	var b strings.Builder
+	for _, s := range step[i+1:] {
+		if indent(s.text) <= keys {
+			break
+		}
+		b.WriteString(strings.TrimSpace(s.text) + "\n")
+	}
+	return b.String(), nil
 }
 
 // runStall runs script as runStep does, with a .ci/bin/divbast-stall that
