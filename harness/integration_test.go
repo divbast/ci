@@ -866,10 +866,14 @@ func TestServeEnginePickedPort(t *testing.T) {
 }
 
 // TestServeStoppedContainerCarriesLog serves the exits mutant, whose
-// entrypoint stops before it serves: once at once, before Serve has read
-// its ports, and once after a while, as Serve waits. Either way Serve
-// fails as soon as it sees the container stopped, not after ServeWithin,
-// with an error carrying the container's log, which says why.
+// entrypoint stops before it serves: once at once, and once after three
+// seconds, while Serve waits. Either way Serve fails as soon as it sees
+// the container stopped, not after ServeWithin, with an error carrying
+// the container's log, which says why. Which of Serve's checks sees the
+// stop depends on how soon the engine does: on Docker, both cases have
+// been seen to fail in Wait, the ports read while the container still
+// ran. TestStartServingPortsMissing covers a container gone before its
+// ports could be read.
 func TestServeStoppedContainerCarriesLog(t *testing.T) {
 	t.Parallel()
 	e := integration(t)
@@ -915,6 +919,7 @@ func TestServingRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, base, probe := s.C.ID, s.Base, s.Probe
+	before := s.Health()
 
 	if err = s.Restart(ctx); err != nil {
 		t.Fatalf("Restart() error = %v", err)
@@ -943,6 +948,23 @@ func TestServingRestart(t *testing.T) {
 	if s.Probe == nil || s.Probe == probe {
 		t.Errorf("after Restart(), the probe is %p (was %p), want one installed again", s.Probe, probe)
 	}
+	RunRecords(t, s.Probe, "assert-read-only")
+
+	// A health copy taken before the restart sends to the health port
+	// where it is now, which Docker moved, and never to the app port:
+	// / is the health port's 404, and the app port's 200.
+	StatusIs(t, before, "GET /healthz through a health copy taken before the restart", http.StatusOK, "/healthz")
+	StatusIs(t, before, "GET / through that copy is the health port's 404, not the app port's 200", http.StatusNotFound, "/")
+
+	// Restarted through a health copy: the Serving it was taken from is
+	// what restarts, and the copy still sends to the health port.
+	h := s.Health()
+	if err = h.Restart(ctx); err != nil {
+		t.Fatalf("Health().Restart() error = %v", err)
+	}
+	StatusIs(t, h, "GET / through a health copy restarted through is the health port's 404", http.StatusNotFound, "/")
+	StatusIs(t, h, "GET /healthz through that copy", http.StatusOK, "/healthz")
+	StatusIs(t, s, "GET / on the app port, where it is after the restart through the copy", http.StatusOK, "/")
 	RunRecords(t, s.Probe, "assert-read-only")
 }
 

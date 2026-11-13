@@ -67,9 +67,9 @@ type Serving struct {
 	appPort, healthPort int
 	readyPath           string
 	probeApp            []byte
-	// health marks a copy Health made, whose Base is the health port's,
-	// empty when that is unpublished.
-	health bool
+	// parent is the Serving a copy Health made was taken from, whose
+	// health port the copy's requests go to; nil for any other Serving.
+	parent *Serving
 	// transport, when set, sends Get's requests in place of the default
 	// transport, so a test can answer them without a connection.
 	transport http.RoundTripper
@@ -220,7 +220,7 @@ func (s *Serving) Wait(ctx context.Context, path string) error {
 		case !ins.State.Running:
 			return WithLog(ctx, s.C, fmt.Errorf("container %s stopped, exit status %d, before GET %s answered", s.C, ins.State.ExitCode, path))
 		case !time.Now().Before(deadline):
-			return WithLog(ctx, s.C, fmt.Errorf("GET %s%s got no answer within %s: %w", s.Base, path, ServeWithin, err))
+			return WithLog(ctx, s.C, fmt.Errorf("GET %s%s got no answer within %s: %w", s.base(), path, ServeWithin, err))
 		}
 		if err := Pause(ctx, time.Second); err != nil {
 			return err
@@ -231,6 +231,9 @@ func (s *Serving) Wait(ctx context.Context, path string) error {
 		return err
 	}
 	s.Probe = p
+	if s.parent != nil {
+		s.parent.Probe = p
+	}
 	return nil
 }
 
@@ -239,8 +242,12 @@ func (s *Serving) Wait(ctx context.Context, path string) error {
 // since Docker binds others on a restart, waits at the ready path the
 // Serving was started with, and installs the probe again, since a restart
 // empties /tmp. Until that is done, Probe is nil. A container that does
-// not come back is an error carrying its log.
+// not come back is an error carrying its log. On a copy [Serving.Health]
+// made, it restarts the Serving the copy was taken from.
 func (s *Serving) Restart(ctx context.Context) error {
+	if s.parent != nil {
+		return s.parent.Restart(ctx)
+	}
 	s.Probe = nil
 	if err := s.C.Restart(ctx); err != nil {
 		return err
@@ -251,17 +258,39 @@ func (s *Serving) Restart(ctx context.Context) error {
 	return s.Wait(ctx, s.readyPath)
 }
 
-// Health returns a copy of s that sends to the health port: its Base is
-// s's HealthBase, so Get, Do and StatusIs reach the health port through
-// it as they reach the app port through s. With the health port
-// unpublished, every request the copy would send is an error saying so,
-// and none goes to the app port in its place. The copy holds the ports s
-// had when it was taken: after [Serving.Restart], take another.
+// Health returns a copy of s that sends to the health port, so Get, Do
+// and StatusIs reach it through the copy as they reach the app port
+// through s. Each request goes to s's HealthBase as it is when the
+// request is sent, so the copy follows s across a restart, Docker's moved
+// port included, and never goes to the app port in its place: with the
+// health port unpublished, every request is an error saying so. Wait on
+// the copy waits on the health port, and installs the probe for s too,
+// and Restart on it restarts s. The copy's own fields are s's when it was
+// taken, and its Base is the HealthBase s had then.
 func (s *Serving) Health() *Serving {
-	h := *s
-	h.Base = s.HealthBase
-	h.health = true
+	root := s.root()
+	h := *root
+	h.Base = root.HealthBase
+	h.parent = root
 	return &h
+}
+
+// root returns the Serving a copy Health made was taken from, or s
+// itself for any other.
+func (s *Serving) root() *Serving {
+	if s.parent != nil {
+		return s.parent
+	}
+	return s
+}
+
+// base returns where s's requests go now: Base, or for a copy Health
+// made, its parent's HealthBase as it is now, empty when unpublished.
+func (s *Serving) base() string {
+	if s.parent != nil {
+		return s.parent.HealthBase
+	}
+	return s.Base
 }
 
 // Response is the answer to one request from the host.
@@ -291,17 +320,18 @@ func (s *Serving) Get(ctx context.Context, path string, header http.Header) (Res
 // never sent. Each header name keeps the case it was given, as a server
 // that tells them apart sees it; a Host header sets the request's host.
 func (s *Serving) Do(ctx context.Context, client *http.Client, method, path string, header http.Header, body []byte) (Response, error) {
+	base := s.base()
 	switch {
-	case s.Base == "" && s.health:
+	case base == "" && s.parent != nil:
 		return Response{}, fmt.Errorf("%s %s %w: the health port is unpublished, its ServeSpec's HealthPort being 0", method, path, errUnsendable)
-	case s.Base == "":
+	case base == "":
 		return Response{}, fmt.Errorf("%s %s %w: the Serving has no Base, as only Engine.Serve and Engine.StartServing set one", method, path, errUnsendable)
 	}
 	var r io.Reader
 	if body != nil {
 		r = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, s.Base+path, r)
+	req, err := http.NewRequestWithContext(ctx, method, base+path, r)
 	if err != nil {
 		return Response{}, fmt.Errorf("%s %s %w: %w", method, path, errUnsendable, err)
 	}

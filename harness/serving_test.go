@@ -743,6 +743,92 @@ func TestServingHealth(t *testing.T) {
 	})
 }
 
+// TestServingHealthAcrossRestart restarts a serving container with a
+// health copy taken before, once through the Serving it was taken from
+// and once through the copy itself. Either way the copy's requests then
+// go to the health port where the engine has it now, which Docker moves
+// on a restart, and never to the app port, whose answer a check through
+// the copy could otherwise pass on; and the Serving the copy was taken
+// from is the one restarted, its ports read again.
+func TestServingHealthAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	restart := execx.Call{Argv: []string{"docker", "restart", "ctr"}, Result: execx.Result{Stdout: []byte("ctr\n")}}
+	moved := execx.Call{Argv: []string{"docker", "container", "inspect", "abc"}, Result: execx.Result{
+		Stdout: withPorts("running", true, 0, map[string]string{"8080/tcp": "40003", "8081/tcp": "40004"}),
+	}}
+	for _, tt := range []struct {
+		name    string
+		through bool
+	}{{name: "the-serving-restarts"}, {name: "the-copy-restarts", through: true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				rt, urls := replying(http.StatusOK)
+				s := &Serving{
+					C:          &Container{ID: "abc", Name: "ctr", engine: newEngine("docker", execx.NewFake(t, slices.Concat([]execx.Call{restart, moved, moved}, installCalls(nil))...))},
+					Base:       "http://127.0.0.1:40001",
+					HealthBase: "http://127.0.0.1:40002",
+					appPort:    8080,
+					healthPort: 8081,
+					readyPath:  "/ready",
+					transport:  rt,
+				}
+				h := s.Health()
+				// A copy of the copy is a copy of s
+				hh := h.Health()
+				restarted := s
+				if tt.through {
+					restarted = h
+				}
+
+				if err := restarted.Restart(ctx); err != nil {
+					t.Fatalf("Restart() error = %v", err)
+				}
+				for _, c := range []*Serving{h, hh} {
+					if _, err := c.Get(ctx, "/healthz", nil); err != nil {
+						t.Fatalf("Health().Get(/healthz) after the restart: %v", err)
+					}
+				}
+				want := []string{"http://127.0.0.1:40003/ready", "http://127.0.0.1:40004/healthz", "http://127.0.0.1:40004/healthz"}
+				if got := urls(); !slices.Equal(got, want) {
+					t.Errorf("asked for %q, want the app port's ready path and then the health port, each where it is now: %q", got, want)
+				}
+				if s.Base != "http://127.0.0.1:40003" || s.HealthBase != "http://127.0.0.1:40004" || s.Probe == nil {
+					t.Errorf("the Serving the copy was taken from has Base, HealthBase = %q, %q and probe %p; want it restarted: the ports now, and a probe", s.Base, s.HealthBase, s.Probe)
+				}
+			})
+		})
+	}
+}
+
+// TestServingHealthWait waits through a health copy: it asks the health
+// port, and the probe it installs is the Serving's too, since both are
+// the one container's.
+func TestServingHealthWait(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		rt, urls := replying(http.StatusOK)
+		s := &Serving{
+			C:          &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, installCalls(nil)...))},
+			Base:       "http://127.0.0.1:40001",
+			HealthBase: "http://127.0.0.1:40002",
+			transport:  rt,
+		}
+		h := s.Health()
+		if err := h.Wait(t.Context(), "/healthz"); err != nil {
+			t.Fatalf("Health().Wait(/healthz) error = %v", err)
+		}
+		if got := urls(); !slices.Equal(got, []string{"http://127.0.0.1:40002/healthz"}) {
+			t.Errorf("Health().Wait(/healthz) asked for %q, want the health port's /healthz", got)
+		}
+		if h.Probe == nil || s.Probe != h.Probe {
+			t.Errorf("after Health().Wait(), the copy's probe is %p and the Serving's %p; want one probe, both", h.Probe, s.Probe)
+		}
+	})
+}
+
 // TestServingGetUnfollowed answers GET from the host with a redirect,
 // which Get returns as it is, as HostClient does: a 302 to an install
 // wizard is a failure, not a hop on the way to a 200.

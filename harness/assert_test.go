@@ -171,6 +171,27 @@ func TestContainsLacks(t *testing.T) {
 	}
 }
 
+// TestClip quotes a text for a check's detail, whole up to 600 bytes and
+// cut there past it, saying how long the whole was.
+func TestClip(t *testing.T) {
+	t.Parallel()
+
+	x600 := strings.Repeat("x", 600)
+	for _, tt := range []struct{ name, text, want string }{
+		{name: "empty", text: "", want: `""`},
+		{name: "short", text: "a\tb\n", want: `"a\tb\n"`},
+		{name: "exactly-600", text: x600, want: `"` + x600 + `"`},
+		{name: "601", text: x600 + "y", want: `"` + x600 + `"... (601 bytes)`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := Clip(tt.text); got != tt.want {
+				t.Errorf("Clip(%d bytes) = %q, want %q", len(tt.text), got, tt.want)
+			}
+		})
+	}
+}
+
 // TestLogContainsLacks looks for a needle in a container's log, and a
 // log that cannot be read fails either, with why.
 func TestLogContainsLacks(t *testing.T) {

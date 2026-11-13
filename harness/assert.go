@@ -42,7 +42,7 @@ func Contains(tb testing.TB, what, needle, text string) {
 	ok := strings.Contains(text, needle)
 	detail := fmt.Sprintf("holds %q", needle)
 	if !ok {
-		detail = fmt.Sprintf("%q is not in %s", needle, clip(text))
+		detail = fmt.Sprintf("%q is not in %s", needle, Clip(text))
 	}
 	NewChecks(tb).True(what, ok, detail)
 }
@@ -59,7 +59,7 @@ func Lacks(tb testing.TB, what, needle, text string) {
 	case ok:
 		detail = fmt.Sprintf("no %q in %d bytes", needle, len(text))
 	default:
-		detail = fmt.Sprintf("%q is in %s", needle, clip(text))
+		detail = fmt.Sprintf("%q is in %s", needle, Clip(text))
 	}
 	NewChecks(tb).True(what, ok, detail)
 }
@@ -165,7 +165,7 @@ func Refuses(tb testing.TB, e Engine, spec *RunSpec, wantExit int, what, needle 
 	}
 	code, werr := c.WaitExit(ctx, ServeWithin)
 	logs, lerr := c.Logs(ctx)
-	logged := "its log: " + clip(logs)
+	logged := "its log: " + Clip(logs)
 	if lerr != nil {
 		logged = "its log could not be read: " + lerr.Error()
 	}
@@ -184,11 +184,13 @@ func Refuses(tb testing.TB, e Engine, spec *RunSpec, wantExit int, what, needle 
 	Contains(tb, says, needle, logs)
 }
 
-// clipAt is as much of a text as a failing check quotes.
+// clipAt is as much of a text as Clip quotes.
 const clipAt = 600
 
-// clip quotes text, cut short if it is long.
-func clip(text string) string {
+// Clip quotes text for a check's detail, as %q quotes it, so that white
+// space and emptiness show: the whole of it up to 600 bytes, and past
+// that its first 600, then how many bytes the whole held.
+func Clip(text string) string {
 	if len(text) <= clipAt {
 		return fmt.Sprintf("%q", text)
 	}
