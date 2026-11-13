@@ -773,13 +773,14 @@ The calling job grants `contents: read`, `packages: write`,
 Of the caller's `mise.toml` it installs Go alone, declared there as
 `"core:go"` (mise reads the short `go` the same way), and turns mise's
 auto-install off: the job can push the image and sign its attestation, so
-it runs no other tool's install code. Nor does the `mise.toml`'s `[env]`,
-the `PATH` mise makes, or mise's shims, reach the job's steps, where a
-`BASH_ENV` or a `PATH` there would change what the publish scripts run.
-mise itself stays on `PATH`, and the one step that needs Go, the build of
-ci's tools, runs it through `mise exec`, which needs no shim and gives Go
-the caller's toolchain and its `[env]`, such as `GOTOOLCHAIN` and
-`GOFLAGS`, for that command alone.
+it runs no other tool's install code. The steps' own shells get none of
+the `mise.toml`'s `[env]`, the `PATH` mise makes, or mise's shims, where a
+`BASH_ENV` or a `PATH` would change what the publish scripts run; only a
+command run through `mise exec --` gets the `[env]`. mise itself stays on
+`PATH`, and the one step that needs Go, the build of ci's tools, runs it
+through `mise exec`, which needs no shim and gives Go the caller's
+toolchain and its `[env]`, such as `GOTOOLCHAIN` and `GOFLAGS`, for that
+command alone.
 
 An app's build workflow puts the two together, and keeps its own triggers
 and its `required` job, the one check its ruleset requires:
