@@ -186,17 +186,24 @@ jobs:
           password: ${{ github.token }}
 
       # A rehearsal publishes here instead, on the runner's loopback. The
-      # registry takes any login, and actions/attest pushes nowhere without
-      # one in Docker's configuration. buildx and actions/attest speak plain
-      # HTTP to localhost of their own accord; skopeo is told to. Docker's
-      # proxy can take the connection before the registry listens, and reset
-      # it, so the wait retries every error.
+      # registry asks for a throwaway login, which Docker is given:
+      # actions/attest reads it from Docker's configuration, and pushes only
+      # to a registry whose first answer is a Basic or Bearer challenge,
+      # where one that asks no login says 202 to its probe. buildx and
+      # actions/attest speak plain HTTP to localhost of their own accord;
+      # skopeo is told to. Docker's proxy can take the connection before
+      # the registry listens, and reset it, so the wait retries every error.
       - name: Start the rehearsal's registry
         if: steps.decide.outputs.publish == 'true' && inputs.rehearse
         run: |
+          # The password is rehearsal, hashed with bcrypt, which is all the
+          # registry reads
+          cat > "${RUNNER_TEMP}/rehearsal.htpasswd" <<'EOF'
+          rehearsal:$2y$05$EjEe94vjHWGY2fBH.Ugl6OucgCONUqj7tMeTnrww.QLljzQK06KEW
+          EOF
           # renovate: registry
-          docker run -d -p 127.0.0.1:5000:5000 registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
-          curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -o /dev/null http://127.0.0.1:5000/v2/
+          docker run -d -p 127.0.0.1:5000:5000 -v "${RUNNER_TEMP}/rehearsal.htpasswd:/auth/htpasswd:ro" -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=rehearsal -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+          curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -u rehearsal:rehearsal -o /dev/null http://127.0.0.1:5000/v2/
           mkdir -p "${HOME}/.config/containers/registries.conf.d"
           printf '[[registry]]\nlocation = "localhost:5000"\ninsecure = true\n' \
             > "${HOME}/.config/containers/registries.conf.d/rehearsal.conf"
@@ -349,10 +356,11 @@ jobs:
           echo "moving=true" >> "${GITHUB_OUTPUT}"
           docker buildx imagetools create "${args[@]}"
 
-      # What users pull, as they pull it. A private package, or a tag that is
-      # not the index attested, fails the run here rather than when someone
-      # first pulls.
-      - name: Check both tags are the attested index to an anonymous client
+      # What users pull, as they pull it: anonymously. A private package, or
+      # a tag that is not the index attested, fails the run here rather than
+      # when someone first pulls. A rehearsal's registry is the job's own and
+      # takes no anonymous pulls, so a rehearsal reads with the job's login.
+      - name: Check both tags are the attested index as users pull them
         if: steps.decide.outputs.publish == 'true'
         # bash's pipefail, so a failed inspect fails the pipeline
         shell: bash
@@ -360,14 +368,21 @@ jobs:
           IMAGE: ${{ steps.target.outputs.image }}
           VERSION: ${{ steps.version.outputs.version }}
           DIGEST: ${{ steps.merge.outputs.digest }}
+          ANONYMOUS: ${{ !inputs.rehearse }}
         run: |
+          creds=(--no-creds)
+          who="an anonymous client"
+          if [ "${ANONYMOUS}" = false ]; then
+            creds=()
+            who="the job's login"
+          fi
           for tag in "${VERSION}" latest; do
-            if ! pulled=$(skopeo inspect --raw --no-creds "docker://${IMAGE}:${tag}" | shasum -a 256) ||
+            if ! pulled=$(skopeo inspect --raw "${creds[@]}" "docker://${IMAGE}:${tag}" | shasum -a 256) ||
               [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
-              echo "${IMAGE}:${tag} is not anonymously pullable as ${DIGEST}" >&2
+              echo "${IMAGE}:${tag} is not ${DIGEST} to ${who}" >&2
               exit 1
             fi
-            echo "${IMAGE}:${tag} is ${DIGEST} to an anonymous client"
+            echo "${IMAGE}:${tag} is ${DIGEST} to ${who}"
           done
 
       # A failure before the promotion begins to move the tags, its dry run

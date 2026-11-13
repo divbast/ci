@@ -504,7 +504,7 @@ const (
 	targetName  = "      - name: Choose where to publish\n"
 	warnName    = "      - name: Say that this run rehearses\n"
 	gateName    = "      - name: Refuse anything but the daily slot or a manual run on main\n"
-	checkName   = "      - name: Check both tags are the attested index to an anonymous client\n"
+	checkName   = "      - name: Check both tags are the attested index as users pull them\n"
 	gate        = "steps.decide.outputs.publish == 'true'"
 )
 
@@ -1661,7 +1661,12 @@ func TestRehearseRegistryPinned(t *testing.T) {
 	if err := registryPinned(publish); err != nil {
 		t.Errorf("app-publish.yml: %v", err)
 	}
-	const marker = "          # renovate: registry\n"
+	const (
+		marker   = "          # renovate: registry\n"
+		wait     = "curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -u rehearsal:rehearsal -o /dev/null http://127.0.0.1:5000/v2/"
+		htpasswd = "cat > \"${RUNNER_TEMP}/rehearsal.htpasswd\" <<'EOF'\n" +
+			"          rehearsal:$2y$05$EjEe94vjHWGY2fBH.Ugl6OucgCONUqj7tMeTnrww.QLljzQK06KEW\n          EOF"
+	)
 	pinned := registryManager.FindString(publish)
 	_, digest, _ := strings.Cut(pinned, "@")
 	for name, mutant := range map[string]string{
@@ -1673,7 +1678,12 @@ func TestRehearseRegistryPinned(t *testing.T) {
 		"in every publish":                strings.Replace(publish, "        if: steps.decide.outputs.publish == 'true' && inputs.rehearse\n", "        if: steps.decide.outputs.publish == 'true'\n", 1),
 		"a wait that gives up on a reset": strings.Replace(publish, " --retry-all-errors", "", 1),
 		"a wait without end":              strings.Replace(publish, "curl -fsS --retry 10 ", "curl -fsS --retry 1000 ", 1),
-		"no wait":                         strings.Replace(publish, "          curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -o /dev/null http://127.0.0.1:5000/v2/\n", "", 1),
+		"no wait":                         strings.Replace(publish, "          "+wait+"\n", "", 1),
+		"a registry that asks no login":   strings.Replace(publish, " -e REGISTRY_AUTH=htpasswd", "", 1),
+		"no password file mounted":        strings.Replace(publish, ` -v "${RUNNER_TEMP}/rehearsal.htpasswd:/auth/htpasswd:ro"`, "", 1),
+		"the password file never written": strings.Replace(publish, "          "+htpasswd+"\n", "", 1),
+		"a wait without the login":        strings.Replace(publish, " -u rehearsal:rehearsal", "", 1),
+		"no login":                        strings.Replace(publish, "          echo rehearsal | docker login --username rehearsal --password-stdin localhost:5000\n", "", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1726,11 +1736,137 @@ func registryPinned(workflow string) error {
 	if n, _ := strconv.Atoi(m[1]); n < 1 || n > 30 {
 		return fmt.Errorf("line %d retries %s times, not between 1 and 30", l.n, m[1])
 	}
+	// actions/attest pushes only to a registry that answers its first
+	// request with a Basic or Bearer challenge, so the registry asks for the
+	// login the step writes and then gives Docker.
+	mount := htpasswdMount.FindStringSubmatch(pinned[0])
+	if !strings.Contains(pinned[0], " -e REGISTRY_AUTH=htpasswd ") || mount == nil ||
+		!strings.Contains(pinned[0], " -e REGISTRY_AUTH_HTPASSWD_PATH="+mount[2]+" ") {
+		return fmt.Errorf("%q starts a registry that asks no login, which actions/attest cannot push to:"+
+			" give it REGISTRY_AUTH=htpasswd and a password file mounted read-only at REGISTRY_AUTH_HTPASSWD_PATH", pinned[0])
+	}
+	run := slices.IndexFunc(st[found[0]], func(l line) bool { return registryRun.MatchString(l.text) })
+	if !slices.ContainsFunc(st[found[0]][:run], func(l line) bool {
+		return strings.Contains(l.text, `> "`+mount[1]+`"`)
+	}) {
+		return fmt.Errorf("the step from line %d mounts %s before it writes it", st[found[0]][0].n, mount[1])
+	}
+	if !strings.Contains(l.text, " -u ") {
+		return fmt.Errorf("line %d waits for the registry without logging in, which a registry that asks one refuses", l.n)
+	}
+	if !slices.ContainsFunc(st[found[0]], func(l line) bool {
+		return strings.Contains(l.text, "docker login ") && strings.HasSuffix(strings.TrimSpace(l.text), " localhost:5000")
+	}) {
+		return fmt.Errorf("the step from line %d never logs Docker in to localhost:5000", st[found[0]][0].n)
+	}
 	return nil
 }
 
+// htpasswdMount is a read-only bind mount of a password file into the
+// registry: its source and its target.
+var htpasswdMount = regexp.MustCompile(`-v "([^":]+):([^":]+):ro"`)
+
 // boundedRetry is curl's retry count, given with a delay between tries.
 var boundedRetry = regexp.MustCompile(`--retry (\d+) .*--retry-delay \d+`)
+
+// TestPublishChecksAnonymously checks that app-publish.yml's last check,
+// run with bash and a stand-in for skopeo, reads both tags as an anonymous
+// client does, with --no-creds, unless ANONYMOUS is false, which only a
+// rehearsal sets: its registry is the job's own and takes no anonymous
+// pulls. Any other value reads anonymously. A tag that is not the digest
+// fails it either way. Against app-publish.yml as it is, then with each
+// broken, which the check must refuse.
+func TestPublishChecksAnonymously(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := checksAnonymously(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const env = "          ANONYMOUS: ${{ !inputs.rehearse }}\n"
+	for name, mutant := range map[string]string{
+		"the login used outside a rehearsal": strings.Replace(publish, env, "          ANONYMOUS: ${{ inputs.rehearse }}\n", 1),
+		"never anonymous":                    strings.Replace(publish, env, "          ANONYMOUS: false\n", 1),
+		"the login unless told otherwise":    strings.Replace(publish, `if [ "${ANONYMOUS}" = false ]; then`, `if [ "${ANONYMOUS}" != true ]; then`, 1),
+		"no --no-creds at all":               strings.Replace(publish, "creds=(--no-creds)", "creds=()", 1),
+		"a mismatch let through":             replaceAfter(publish, checkName, "              exit 1\n", ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if checksAnonymously(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// checksAnonymously returns an error unless the publish job's step after
+// the promotion that runs skopeo inspect takes ANONYMOUS from
+// ${{ !inputs.rehearse }} and, its script run with bash, reads each tag
+// with --no-creds when ANONYMOUS is true or empty, without it when it is
+// false, and fails on a tag whose bytes are not the digest.
+func checksAnonymously(t *testing.T, workflow string) error {
+	t.Helper()
+	st := publishSteps(workflow)
+	promote := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: promote" })
+	if len(promote) != 1 {
+		return fmt.Errorf("%d steps have id promote, want one", len(promote))
+	}
+	found := stepsWhere(st[promote[0]+1:], contains("skopeo inspect"))
+	if len(found) != 1 {
+		return fmt.Errorf("%d steps after the promotion run skopeo inspect, want one", len(found))
+	}
+	s := st[promote[0]+1+found[0]]
+	if got := value(s, "ANONYMOUS"); got != "${{ !inputs.rehearse }}" {
+		return fmt.Errorf("line %d checks with ANONYMOUS %q, not ${{ !inputs.rehearse }}", s[0].n, got)
+	}
+	script, err := runScript(s)
+	if err != nil {
+		return err
+	}
+	const (
+		image = "ghcr.io/divbast/app"
+		index = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`
+	)
+	sum := sha256.Sum256([]byte(index))
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	anon := "inspect --raw --no-creds docker://" + image + ":1.2.3\ninspect --raw --no-creds docker://" + image + ":latest\n"
+	login := "inspect --raw docker://" + image + ":1.2.3\ninspect --raw docker://" + image + ":latest\n"
+	for _, tt := range []struct {
+		anonymous, bytes, calls string
+		ok                      bool
+	}{
+		{anonymous: "true", bytes: index, calls: anon, ok: true},
+		{anonymous: "", bytes: index, calls: anon, ok: true},
+		{anonymous: "false", bytes: index, calls: login, ok: true},
+		{anonymous: "true", bytes: index + " ", calls: "inspect --raw --no-creds docker://" + image + ":1.2.3\n"},
+		{anonymous: "false", bytes: index + " ", calls: "inspect --raw docker://" + image + ":1.2.3\n"},
+	} {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "bin"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, dir, "pulled", tt.bytes)
+		writeFile(t, dir, "bin/skopeo", "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"${CALLS}\"\ncat \"${PULLED}\"\n")
+		calls := filepath.Join(dir, "calls")
+		res := runStep(t, dir, script, "PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"),
+			"IMAGE="+image, "VERSION=1.2.3", "DIGEST="+digest, "ANONYMOUS="+tt.anonymous,
+			"CALLS="+calls, "PULLED="+filepath.Join(dir, "pulled"))
+		got, err := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
+		if err != nil {
+			return fmt.Errorf("with ANONYMOUS=%q, skopeo never runs: %w", tt.anonymous, err)
+		}
+		if string(got) != tt.calls {
+			return fmt.Errorf("with ANONYMOUS=%q, runs\n%s\nwant\n%s", tt.anonymous, got, tt.calls)
+		}
+		if (res.Code == 0) != tt.ok {
+			return fmt.Errorf("with ANONYMOUS=%q and the tags pulled as %q, the script exits %d: %s", tt.anonymous, tt.bytes, res.Code, res.Stderr)
+		}
+	}
+	return nil
+}
 
 // TestPublishInstallsGoAlone checks that app-publish.yml's job, which can
 // push the image and sign its attestation, installs Go alone from the

@@ -18,9 +18,14 @@ git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
 published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")
 .ci/bin/divbast-publish-decision -event "${EVENT}" -built "${GITHUB_SHA}" -published "${published}"
 == Start the rehearsal's registry ==
+# The password is rehearsal, hashed with bcrypt, which is all the
+# registry reads
+cat > "${RUNNER_TEMP}/rehearsal.htpasswd" <<'EOF'
+rehearsal:$2y$05$EjEe94vjHWGY2fBH.Ugl6OucgCONUqj7tMeTnrww.QLljzQK06KEW
+EOF
 # renovate: registry
-docker run -d -p 127.0.0.1:5000:5000 registry:<version>@<digest>
-curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -o /dev/null http://127.0.0.1:5000/v2/
+docker run -d -p 127.0.0.1:5000:5000 -v "${RUNNER_TEMP}/rehearsal.htpasswd:/auth/htpasswd:ro" -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=rehearsal -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:<version>@<digest>
+curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -u rehearsal:rehearsal -o /dev/null http://127.0.0.1:5000/v2/
 mkdir -p "${HOME}/.config/containers/registries.conf.d"
 printf '[[registry]]\nlocation = "localhost:5000"\ninsecure = true\n' \
   > "${HOME}/.config/containers/registries.conf.d/rehearsal.conf"
@@ -100,14 +105,20 @@ if [ "sha256:${would%% *}" != "${DIGEST}" ]; then
 fi
 echo "moving=true" >> "${GITHUB_OUTPUT}"
 docker buildx imagetools create "${args[@]}"
-== Check both tags are the attested index to an anonymous client ==
+== Check both tags are the attested index as users pull them ==
+creds=(--no-creds)
+who="an anonymous client"
+if [ "${ANONYMOUS}" = false ]; then
+  creds=()
+  who="the job's login"
+fi
 for tag in "${VERSION}" latest; do
-  if ! pulled=$(skopeo inspect --raw --no-creds "docker://${IMAGE}:${tag}" | shasum -a 256) ||
+  if ! pulled=$(skopeo inspect --raw "${creds[@]}" "docker://${IMAGE}:${tag}" | shasum -a 256) ||
     [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
-    echo "${IMAGE}:${tag} is not anonymously pullable as ${DIGEST}" >&2
+    echo "${IMAGE}:${tag} is not ${DIGEST} to ${who}" >&2
     exit 1
   fi
-  echo "${IMAGE}:${tag} is ${DIGEST} to an anonymous client"
+  echo "${IMAGE}:${tag} is ${DIGEST} to ${who}"
 done
 == Say that the public tags did not move ==
 echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
