@@ -2,14 +2,17 @@
 // SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
 // Package just_test runs the shared recipes in common.just through ci's own
-// justfile, which imports them as a caller's does.
+// justfile, which imports them as a caller's does, and reads app.just's
+// through a justfile set up as an app's.
 package just_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -101,6 +104,120 @@ func TestGitHubRecipesRefuseWithoutAGuardedToken(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestAcceptancePipesThroughTestcount checks app.just's acceptance recipe
+// in a justfile set up as an app's. go test exits 0 when every test
+// skipped, so the recipe must pipe go test -json into divbast-testcount,
+// which fails such a run, as the pipeline's last command; and since a
+// shared recipe is run from a recipe's body, never named as a dependency,
+// it builds ci's tools from its own body when .ci/bin lacks that one.
+//
+// The tool sees only the events go test printed before it stopped. A go
+// test killed between packages leaves a stream that passes, and only its
+// own exit status says otherwise, so the recipe must keep that status
+// under a caller's shell that sets no pipefail.
+func TestAcceptancePipesThroughTestcount(t *testing.T) {
+	t.Parallel()
+	ci, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("commands", func(t *testing.T) {
+		t.Parallel()
+		app := appJustfile(t, ci, `["mise", "exec", "--", "bash", "-euo", "pipefail", "-c"]`)
+		// G204 objects to a subprocess whose arguments are variables. They
+		// are this test's own: the justfile it wrote and a recipe it names.
+		cmd := exec.CommandContext(t.Context(), "just", "--justfile", app, "--dry-run", "acceptance") //nolint:gosec // G204: the arguments are this test's own
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("just --dry-run acceptance: %v\n%s", err, out)
+		}
+		commands := strings.Split(strings.TrimSpace(string(out)), "\n")
+
+		build := regexp.MustCompile(`^\[ -x \.ci/bin/divbast-testcount \] \|\| \S*just ci-tools$`)
+		pipe := "set -o pipefail; ENGINE=docker IMAGE=localhost/app:dev go test -json -count=1 -timeout 90m ./test/acceptance/... | .ci/bin/divbast-testcount"
+		if len(commands) != 2 || !build.MatchString(commands[0]) || commands[1] != pipe {
+			t.Errorf("acceptance runs\n%s\nwant a line matching\n%s\nthen\n%s", out, build, pipe)
+		}
+	})
+
+	// The real tool, which passes the stream the stub go prints below
+	tool := filepath.Join(t.TempDir(), "divbast-testcount")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", tool, "./cmd/divbast-testcount") //nolint:gosec // G204: the arguments are this test's own
+	build.Dir = ci
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	for _, tt := range []struct {
+		name, shell string
+	}{
+		{name: "pipefail shell", shell: `["bash", "-euo", "pipefail", "-c"]`},
+		{name: "plain bash", shell: `["bash", "-c"]`},
+	} {
+		for _, goExit := range []int{0, 1} {
+			t.Run(fmt.Sprintf("%s/go test exits %d", tt.name, goExit), func(t *testing.T) {
+				t.Parallel()
+				app := appJustfile(t, ci, tt.shell)
+				dir := filepath.Dir(app)
+				if err := os.MkdirAll(filepath.Join(dir, ".ci", "bin"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(tool, filepath.Join(dir, ".ci", "bin", "divbast-testcount")); err != nil {
+					t.Fatal(err)
+				}
+				// A go that prints a stream divbast-testcount passes, then
+				// exits as the case says
+				stub := t.TempDir()
+				goScript := "#!/bin/sh\ncat <<'EOF'\n" +
+					`{"Action":"start","Package":"example.com/app/test/acceptance"}` + "\n" +
+					`{"Action":"run","Package":"example.com/app/test/acceptance","Test":"TestServes"}` + "\n" +
+					`{"Action":"pass","Package":"example.com/app/test/acceptance","Test":"TestServes"}` + "\n" +
+					`{"Action":"pass","Package":"example.com/app/test/acceptance"}` + "\n" +
+					"EOF\n" + fmt.Sprintf("exit %d\n", goExit)
+				if err := os.WriteFile(filepath.Join(stub, "go"), []byte(goScript), 0o700); err != nil { //nolint:gosec // G306: the stub must be executable, and only by its owner
+					t.Fatal(err)
+				}
+
+				cmd := exec.CommandContext(t.Context(), "just", "--justfile", app, "acceptance") //nolint:gosec // G204: the arguments are this test's own
+				cmd.Env = append(os.Environ(), "PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"))
+				out, err := cmd.CombinedOutput()
+				if !strings.Contains(string(out), "divbast-testcount: 1 passed, 0 skipped, 0 failed in 1 package(s)\n") {
+					t.Errorf("divbast-testcount did not pass the stream:\n%s", out)
+				}
+				switch _, failed := errors.AsType[*exec.ExitError](err); {
+				case err != nil && !failed:
+					t.Fatalf("just acceptance: %v\n%s", err, out)
+				case goExit == 0 && failed:
+					t.Errorf("just acceptance failed though go test passed:\n%s", out)
+				case goExit != 0 && !failed:
+					t.Errorf("just acceptance passed though go test exited %d:\n%s", goExit, out)
+				}
+			})
+		}
+	}
+}
+
+// appJustfile writes a justfile set up as an app's, with shell as its
+// shell, into a directory of its own, and returns its path.
+func appJustfile(t *testing.T, ci, shell string) string {
+	t.Helper()
+	app := filepath.Join(t.TempDir(), "justfile")
+	body := `set shell := ` + shell + `
+
+ENGINE := "docker"
+IMAGE := "localhost/app:dev"
+ARCHIVE := "/tmp/app-image.tar"
+PUBLISHED := "ghcr.io/divbast/app:latest"
+
+import '` + filepath.Join(ci, "just", "common.just") + `'
+import '` + filepath.Join(ci, "just", "app.just") + `'
+`
+	if err := os.WriteFile(app, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return app
 }
 
 // just runs `just recipe` against ci's justfile, with GITHUB_TOKEN and

@@ -127,11 +127,35 @@ PUBLISHED := env_var_or_default("PUBLISHED", "ghcr.io/divbast/librespeed:latest"
 | Recipe | What it does |
 |---|---|
 | `build` | `ENGINE build -t IMAGE -f Containerfile .` |
-| `acceptance` | `go test ./test/acceptance/...` against `IMAGE` under `ENGINE` |
+| `acceptance` | `go test -json ./test/acceptance/...` against `IMAGE` under `ENGINE`, through `divbast-testcount` |
 | `test` | `build`, then `acceptance` |
 | `archive` | Writes `IMAGE` to `ARCHIVE` as an OCI archive |
 | `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED` |
 | `app-lint` | hadolint, and BuildKit's own `docker build --check`, over the Containerfile |
+
+`go test` exits 0 when every test skipped, and prints only `ok`, so an
+acceptance suite that never ran reads in a log as one that passed.
+`acceptance` therefore pipes go test's events into
+[`divbast-testcount`](#tools), which prints each test's output, as
+`go test -v` would, then a count:
+
+```
+divbast-testcount: 109 passed, 0 skipped, 0 failed in 1 package(s)
+```
+
+It fails the recipe unless every package built and passed with at least
+one test of its own passing, and no test failed or skipped, and names on
+stderr each test and package that broke the rule. A package that passes
+having run no test, such as one whose `TestMain` returns before `m.Run`
+when `IMAGE` is unset, fails it too.
+
+The tool sees only what go test printed, so a go test killed between
+packages leaves a stream that passes. The recipe therefore sets `pipefail`
+itself, whatever the caller's shell sets, and go test's own exit status
+still fails it. It builds `.ci/bin/divbast-testcount` with `ci-tools`
+first when it is missing. `go-test` stays a plain `go test`, so an
+acceptance suite that skips when `IMAGE` is unset still passes in a `lint`
+that runs it.
 
 The tools these recipes call come from the repository's `mise.toml`:
 pinact, zizmor, actionlint, ShellCheck, shfmt, Go, golangci-lint, reuse and
@@ -490,8 +514,9 @@ is sending a stale registry login from Docker's configuration: run it with
 
 Each command is a thin `main` over an `internal/` package, prints plain
 text, and documents its usage and exit codes in its package comment
-(`go doc ./cmd/<tool>`). Exit code 2 always means the command line, or for
-`divbast-stall` the environment, is wrong.
+(`go doc ./cmd/<tool>`). Exit code 2 always means the command line is
+wrong, or for `divbast-stall` the environment, or for `divbast-testcount`
+what it reads on stdin.
 
 | Command | What | 0 | 1 |
 |---|---|---|---|
@@ -500,6 +525,7 @@ text, and documents its usage and exit codes in its package comment
 | `divbast-publish-decision -event E -built SHA -published SHA` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a published commit not on main, a built commit that diverged, or git failed |
 | `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published image lacks | Nothing new, or advisory because nothing is pullable | A new finding, or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, or no token) |
+| `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-frankenphp [-containerfile FILE]` | Refuses a FrankenPHP binary frankenphp's main build did not attest | Verified | Not verified, or the Containerfile names the image other than once in full |
 | `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; or git or gh failed |
