@@ -12,9 +12,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/divbast/ci/internal/publish"
 )
 
-const sha = "24e63e21ef880cd22c26964ee987fa593f5e92fc"
+const (
+	sha = "24e63e21ef880cd22c26964ee987fa593f5e92fc"
+	// parent is the commit before sha, where main stood before it moved.
+	parent = "0f6bb73b0bc9f05e62bdb98540c6ee05fa1e8c30"
+)
 
 // onMain is a Git in which every commit is on main and has no other
 // relatives, which is all these tests need: Decide's own tests walk a DAG.
@@ -26,6 +32,17 @@ func (onMain) IsAncestor(_ context.Context, ancestor, descendant string) (bool, 
 	return ancestor == descendant || descendant == "origin/main", nil
 }
 
+// moved is onMain, but with parent before sha: main moved from one to the
+// other.
+type moved struct{ onMain }
+
+func (m moved) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	if ancestor == parent && descendant == sha {
+		return true, nil
+	}
+	return m.onMain.IsAncestor(ctx, ancestor, descendant)
+}
+
 func TestRun(t *testing.T) {
 	t.Parallel()
 
@@ -35,6 +52,8 @@ func TestRun(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
+		// git answers Decide's questions; nil means onMain.
+		git publish.Git
 		// actions is whether GITHUB_OUTPUT and GITHUB_STEP_SUMMARY are set.
 		actions     bool
 		wantCode    int
@@ -125,6 +144,60 @@ func TestRun(t *testing.T) {
 			wantSummary: before + "fail: the built commit \"main\" is not a full commit SHA\n",
 		},
 		{
+			name:        "moved",
+			args:        []string{"-event", "push", "-built", sha, "-published", parent},
+			git:         moved{},
+			actions:     true,
+			wantStdout:  "publish: main moved from " + parent + " to " + sha + "\n",
+			wantOutput:  before + "publish=true\n",
+			wantSummary: before + "publish: main moved from " + parent + " to " + sha + "\n",
+		},
+		{
+			// Ungated, a move publishes whatever the content did.
+			name:        "moved-content",
+			args:        []string{"-event", "push", "-built", sha, "-published", parent, "-content-change", "libaom"},
+			git:         moved{},
+			actions:     true,
+			wantStdout:  "publish: main moved from " + parent + " to " + sha + "\n",
+			wantOutput:  before + "publish=true\n",
+			wantSummary: before + "publish: main moved from " + parent + " to " + sha + "\n",
+		},
+		{
+			name:        "content-gated-skip",
+			args:        []string{"-event", "push", "-built", sha, "-published", parent, "-content-gated"},
+			git:         moved{},
+			actions:     true,
+			wantStdout:  "skip: main moved from " + parent + " to " + sha + ", and no architecture's manifest did\n",
+			wantOutput:  before + "publish=false\n",
+			wantSummary: before + "skip: main moved from " + parent + " to " + sha + ", and no architecture's manifest did\n",
+		},
+		{
+			name:        "content-gated-publish",
+			args:        []string{"-event", "schedule", "-built", sha, "-published", parent, "-content-gated", "-content-change", "libaom"},
+			git:         moved{},
+			actions:     true,
+			wantStdout:  "publish: main moved from " + parent + " to " + sha + "; content moved: libaom\n",
+			wantOutput:  before + "publish=true\n",
+			wantSummary: before + "publish: main moved from " + parent + " to " + sha + "; content moved: libaom\n",
+		},
+		{
+			name:       "content-gated-false",
+			args:       []string{"-event", "schedule", "-built", sha, "-published", parent, "-content-gated=false"},
+			git:        moved{},
+			wantStdout: "publish: main moved from " + parent + " to " + sha + "\n",
+		},
+		{
+			// With main where it was published, gated decides as ungated.
+			name:       "content-gated-same",
+			args:       []string{"-event", "push", "-built", sha, "-published", sha, "-content-gated"},
+			wantStdout: "skip: already published\n",
+		},
+		{
+			name:       "content-gated-same-content",
+			args:       []string{"-event", "schedule", "-built", sha, "-published", sha, "-content-gated", "-content-change", "libaom"},
+			wantStdout: "publish: content moved: libaom\n",
+		},
+		{
 			name:       "event-left-out",
 			args:       []string{"-built", sha, "-published", sha},
 			wantCode:   2,
@@ -163,8 +236,12 @@ func TestRun(t *testing.T) {
 			}
 			getenv := func(key string) string { return env[key] }
 
+			git := tt.git
+			if git == nil {
+				git = onMain{}
+			}
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), tt.args, onMain{}, getenv, &stdout, &stderr)
+			code := run(t.Context(), tt.args, git, getenv, &stdout, &stderr)
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d; stderr: %s", tt.args, code, tt.wantCode, stderr.String())
 			}

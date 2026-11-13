@@ -6,7 +6,7 @@
 //
 // Usage:
 //
-//	divbast-publish-decision -event EVENT -built SHA -published SHA [-content-change TEXT]
+//	divbast-publish-decision -event EVENT -built SHA -published SHA [-content-change TEXT] [-content-gated]
 //
 // EVENT is the run's github.event_name: push, schedule and
 // workflow_dispatch may publish, and any other event is refused. -built
@@ -14,8 +14,15 @@
 // image was built from, as divbast-published-revision prints it, and is
 // empty when nothing is published yet; it must be given all the same, so
 // a caller that forgets it cannot pass for a first publish. Both are full
-// commit SHAs. -content-change says what moved in the image with no commit
-// to show for it, such as a library built from its branch's head.
+// commit SHAs. -content-change says what moved in the image's content
+// since it was published, such as a library built from its branch's head.
+//
+// -content-gated publishes a push or a daily slot that built a commit
+// past the published one only when -content-change is given too, and
+// otherwise skips it, as "skip: main moved from PUBLISHED to BUILT, and no
+// architecture's manifest did". A manual run publishes either way. The
+// flag changes nothing else: with main where it was published, the
+// decision is the one it is without it.
 //
 // It runs in a clone of the repository with origin/main fetched, and
 // prints its decision as "publish: why" or "skip: why". When GitHub
@@ -77,7 +84,8 @@ func run(ctx context.Context, args []string, git publish.Git, getenv func(string
 	event := flags.String("event", "", "the `EVENT` that started the run: push, schedule or workflow_dispatch")
 	built := flags.String("built", "", "the `SHA` of the commit the run built")
 	published := flags.String("published", "", "the `SHA` the published image was built from, empty if none")
-	contentChange := flags.String("content-change", "", "what moved in the image's content with no new commit, if anything")
+	contentChange := flags.String("content-change", "", "what moved in the image's content since it was published, if anything")
+	contentGated := flags.Bool("content-gated", false, "publish a push or daily slot past the published commit only when -content-change is given")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -103,7 +111,7 @@ func run(ctx context.Context, args []string, git publish.Git, getenv func(string
 		}
 	}
 
-	decision, err := publish.Decide(ctx, git, publish.Event(*event), *built, *published, *contentChange)
+	decision, err := publish.Decide(ctx, git, publish.Event(*event), *built, *published, *contentChange, *contentGated)
 	if err != nil {
 		return fail(1, "%v", err)
 	}

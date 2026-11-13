@@ -65,203 +65,300 @@ func (g fakeGit) IsAncestor(_ context.Context, ancestor, descendant string) (boo
 	return false, nil
 }
 
+// errGit is git failing to answer at all.
+var errGit = errors.New("git broke")
+
+// decision is one decision Decide is asked for, and what it must decide.
+type decision struct {
+	name          string
+	git           fakeGit
+	event         publish.Event
+	built         string
+	published     string
+	contentChange string
+	want          publish.Decision
+	// wantErr is the whole error message; empty means no error.
+	wantErr string
+	// wantErrIs is an error the error must wrap, when its message is
+	// not the point.
+	wantErrIs error
+}
+
+// ungated is every branch of the decision with -content-gated off, each
+// deciding as it did before there was a -content-gated.
+var ungated = []decision{
+	// Every branch of librespeed-oci-image's publish-decision.sh, with
+	// its reason strings.
+	{
+		name:      "nothing-published",
+		event:     publish.EventSchedule,
+		built:     c,
+		published: "",
+		want:      publish.Decision{Publish: true, Reason: "nothing is published yet"},
+	},
+	{
+		name:      "pull_request",
+		event:     "pull_request",
+		built:     c,
+		published: b,
+		wantErr:   "only a push to main, the daily slot and a manual run publish, not a pull_request run",
+	},
+	{
+		name:      "not-on-main",
+		event:     publish.EventSchedule,
+		built:     c,
+		published: d,
+		wantErr:   "the published image was built from " + d + ", which is not on main",
+	},
+	{
+		name:      "published-unknown",
+		event:     publish.EventSchedule,
+		built:     c,
+		published: e,
+		wantErr:   "the published image was built from " + e + ", which is not on main",
+	},
+	{
+		name:      "schedule-same",
+		event:     publish.EventSchedule,
+		built:     c,
+		published: c,
+		want:      publish.Decision{Publish: false, Reason: "main has not moved since " + c},
+	},
+	{
+		name:      "dispatch-same",
+		event:     publish.EventDispatch,
+		built:     c,
+		published: c,
+		want:      publish.Decision{Publish: true, Reason: "republishing " + c + " by hand"},
+	},
+	{
+		name:      "main-moved",
+		event:     publish.EventSchedule,
+		built:     c,
+		published: a,
+		want:      publish.Decision{Publish: true, Reason: "main moved from " + a + " to " + c},
+	},
+	{
+		name:      "dispatch-moved",
+		event:     publish.EventDispatch,
+		built:     c,
+		published: b,
+		want:      publish.Decision{Publish: true, Reason: "main moved from " + b + " to " + c},
+	},
+	{
+		name:      "published-newer",
+		event:     publish.EventSchedule,
+		built:     b,
+		published: c,
+		want:      publish.Decision{Publish: false, Reason: c + ", published while this run built " + b + ", is newer"},
+	},
+	{
+		name:      "dispatch-older",
+		event:     publish.EventDispatch,
+		built:     a,
+		published: c,
+		want:      publish.Decision{Publish: false, Reason: c + ", published while this run built " + a + ", is newer"},
+	},
+	{
+		name:      "diverged",
+		event:     publish.EventSchedule,
+		built:     d,
+		published: b,
+		wantErr:   d + " and the published " + b + " have diverged",
+	},
+
+	// push, and a change in content with no new commit.
+	{
+		name:      "push-nothing-published",
+		event:     publish.EventPush,
+		built:     c,
+		published: "",
+		want:      publish.Decision{Publish: true, Reason: "nothing is published yet"},
+	},
+	{
+		name:      "push-same",
+		event:     publish.EventPush,
+		built:     c,
+		published: c,
+		want:      publish.Decision{Publish: false, Reason: "already published"},
+	},
+	{
+		name:          "push-content",
+		event:         publish.EventPush,
+		built:         c,
+		published:     c,
+		contentChange: "libaom",
+		want:          publish.Decision{Publish: true, Reason: "content moved: libaom"},
+	},
+	{
+		name:      "push-moved",
+		event:     publish.EventPush,
+		built:     c,
+		published: b,
+		want:      publish.Decision{Publish: true, Reason: "main moved from " + b + " to " + c},
+	},
+	{
+		name:      "push-not-on-main",
+		event:     publish.EventPush,
+		built:     c,
+		published: d,
+		wantErr:   "the published image was built from " + d + ", which is not on main",
+	},
+	{
+		name:          "schedule-content",
+		event:         publish.EventSchedule,
+		built:         c,
+		published:     c,
+		contentChange: "libaom",
+		want:          publish.Decision{Publish: true, Reason: "content moved: libaom"},
+	},
+	{
+		// A manual run republishes whether or not anything moved.
+		name:          "dispatch-content",
+		event:         publish.EventDispatch,
+		built:         c,
+		published:     c,
+		contentChange: "libaom",
+		want:          publish.Decision{Publish: true, Reason: "republishing " + c + " by hand"},
+	},
+	{
+		// A content change never moves :latest backwards.
+		name:          "content-but-published-newer",
+		event:         publish.EventSchedule,
+		built:         b,
+		published:     c,
+		contentChange: "libaom",
+		want:          publish.Decision{Publish: false, Reason: c + ", published while this run built " + b + ", is newer"},
+	},
+	{
+		name:          "content-but-diverged",
+		event:         publish.EventPush,
+		built:         d,
+		published:     b,
+		contentChange: "libaom",
+		wantErr:       d + " and the published " + b + " have diverged",
+	},
+
+	// What the shell script took on trust.
+	{
+		name:      "built-not-a-sha",
+		event:     publish.EventSchedule,
+		built:     "main",
+		published: c,
+		wantErr:   `the built commit "main" is not a full commit SHA`,
+	},
+	{
+		name:      "published-not-a-sha",
+		event:     publish.EventSchedule,
+		built:     c,
+		published: "--output=x",
+		wantErr:   `the published commit "--output=x" is not a full commit SHA`,
+	},
+	{
+		name:      "git-fails",
+		git:       fakeGit{err: errGit},
+		event:     publish.EventSchedule,
+		built:     c,
+		published: b,
+		wantErrIs: errGit,
+	},
+}
+
+// moved names the decisions in ungated that publish only because main
+// moved, on a push or the daily slot: the only ones -content-gated turns.
+var moved = map[string]bool{"main-moved": true, "push-moved": true}
+
 func TestDecide(t *testing.T) {
 	t.Parallel()
 
-	errGit := errors.New("git broke")
+	t.Run("ungated_unchanged", func(t *testing.T) {
+		t.Parallel()
+		decide(t, ungated, false)
+	})
 
-	tests := []struct {
-		name          string
-		git           fakeGit
-		event         publish.Event
-		built         string
-		published     string
-		contentChange string
-		want          publish.Decision
-		// wantErr is the whole error message; empty means no error.
-		wantErr string
-		// wantErrIs is an error the error must wrap, when its message is
-		// not the point.
-		wantErrIs error
-	}{
-		// Every branch of librespeed-oci-image's publish-decision.sh, with
-		// its reason strings.
-		{
-			name:      "nothing-published",
-			event:     publish.EventSchedule,
-			built:     c,
-			published: "",
-			want:      publish.Decision{Publish: true, Reason: "nothing is published yet"},
-		},
-		{
-			name:      "pull_request",
-			event:     "pull_request",
-			built:     c,
-			published: b,
-			wantErr:   "only a push to main, the daily slot and a manual run publish, not a pull_request run",
-		},
-		{
-			name:      "not-on-main",
-			event:     publish.EventSchedule,
-			built:     c,
-			published: d,
-			wantErr:   "the published image was built from " + d + ", which is not on main",
-		},
-		{
-			name:      "published-unknown",
-			event:     publish.EventSchedule,
-			built:     c,
-			published: e,
-			wantErr:   "the published image was built from " + e + ", which is not on main",
-		},
-		{
-			name:      "schedule-same",
-			event:     publish.EventSchedule,
-			built:     c,
-			published: c,
-			want:      publish.Decision{Publish: false, Reason: "main has not moved since " + c},
-		},
-		{
-			name:      "dispatch-same",
-			event:     publish.EventDispatch,
-			built:     c,
-			published: c,
-			want:      publish.Decision{Publish: true, Reason: "republishing " + c + " by hand"},
-		},
-		{
-			name:      "main-moved",
-			event:     publish.EventSchedule,
-			built:     c,
-			published: a,
-			want:      publish.Decision{Publish: true, Reason: "main moved from " + a + " to " + c},
-		},
-		{
-			name:      "dispatch-moved",
-			event:     publish.EventDispatch,
-			built:     c,
-			published: b,
-			want:      publish.Decision{Publish: true, Reason: "main moved from " + b + " to " + c},
-		},
-		{
-			name:      "published-newer",
-			event:     publish.EventSchedule,
-			built:     b,
-			published: c,
-			want:      publish.Decision{Publish: false, Reason: c + ", published while this run built " + b + ", is newer"},
-		},
-		{
-			name:      "dispatch-older",
-			event:     publish.EventDispatch,
-			built:     a,
-			published: c,
-			want:      publish.Decision{Publish: false, Reason: c + ", published while this run built " + a + ", is newer"},
-		},
-		{
-			name:      "diverged",
-			event:     publish.EventSchedule,
-			built:     d,
-			published: b,
-			wantErr:   d + " and the published " + b + " have diverged",
-		},
+	// A move of main with no move in content publishes nothing.
+	t.Run("content_gated_skip", func(t *testing.T) {
+		t.Parallel()
+		decide(t, []decision{
+			{
+				name:      "schedule-moved",
+				event:     publish.EventSchedule,
+				built:     c,
+				published: a,
+				want:      publish.Decision{Publish: false, Reason: "main moved from " + a + " to " + c + ", and no architecture's manifest did"},
+			},
+			{
+				name:      "push-moved",
+				event:     publish.EventPush,
+				built:     c,
+				published: b,
+				want:      publish.Decision{Publish: false, Reason: "main moved from " + b + " to " + c + ", and no architecture's manifest did"},
+			},
+		}, true)
+	})
 
-		// push, and a change in content with no new commit.
-		{
-			name:      "push-nothing-published",
-			event:     publish.EventPush,
-			built:     c,
-			published: "",
-			want:      publish.Decision{Publish: true, Reason: "nothing is published yet"},
-		},
-		{
-			name:      "push-same",
-			event:     publish.EventPush,
-			built:     c,
-			published: c,
-			want:      publish.Decision{Publish: false, Reason: "already published"},
-		},
-		{
-			name:          "push-content",
-			event:         publish.EventPush,
-			built:         c,
-			published:     c,
-			contentChange: "libaom",
-			want:          publish.Decision{Publish: true, Reason: "content moved: libaom"},
-		},
-		{
-			name:      "push-moved",
-			event:     publish.EventPush,
-			built:     c,
-			published: b,
-			want:      publish.Decision{Publish: true, Reason: "main moved from " + b + " to " + c},
-		},
-		{
-			name:      "push-not-on-main",
-			event:     publish.EventPush,
-			built:     c,
-			published: d,
-			wantErr:   "the published image was built from " + d + ", which is not on main",
-		},
-		{
-			name:          "schedule-content",
-			event:         publish.EventSchedule,
-			built:         c,
-			published:     c,
-			contentChange: "libaom",
-			want:          publish.Decision{Publish: true, Reason: "content moved: libaom"},
-		},
-		{
-			// A manual run republishes whether or not anything moved.
-			name:          "dispatch-content",
-			event:         publish.EventDispatch,
-			built:         c,
-			published:     c,
-			contentChange: "libaom",
-			want:          publish.Decision{Publish: true, Reason: "republishing " + c + " by hand"},
-		},
-		{
-			// A content change never moves :latest backwards.
-			name:          "content-but-published-newer",
-			event:         publish.EventSchedule,
-			built:         b,
-			published:     c,
-			contentChange: "libaom",
-			want:          publish.Decision{Publish: false, Reason: c + ", published while this run built " + b + ", is newer"},
-		},
-		{
-			name:          "content-but-diverged",
-			event:         publish.EventPush,
-			built:         d,
-			published:     b,
-			contentChange: "libaom",
-			wantErr:       d + " and the published " + b + " have diverged",
-		},
+	// A move of main with a move in content publishes, and says both.
+	t.Run("content_gated_publish", func(t *testing.T) {
+		t.Parallel()
+		decide(t, []decision{
+			{
+				name:          "schedule-moved-content",
+				event:         publish.EventSchedule,
+				built:         c,
+				published:     a,
+				contentChange: "libaom",
+				want:          publish.Decision{Publish: true, Reason: "main moved from " + a + " to " + c + "; content moved: libaom"},
+			},
+			{
+				name:          "push-moved-content",
+				event:         publish.EventPush,
+				built:         c,
+				published:     b,
+				contentChange: "amd64: libaom 3.12.1 to 3.13.0",
+				want:          publish.Decision{Publish: true, Reason: "main moved from " + b + " to " + c + "; content moved: amd64: libaom 3.12.1 to 3.13.0"},
+			},
+			{
+				// A manual run publishes whatever moved, as it does when
+				// nothing has.
+				name:      "dispatch-moved",
+				event:     publish.EventDispatch,
+				built:     c,
+				published: b,
+				want:      publish.Decision{Publish: true, Reason: "main moved from " + b + " to " + c},
+			},
+			{
+				name:          "dispatch-moved-content",
+				event:         publish.EventDispatch,
+				built:         c,
+				published:     b,
+				contentChange: "libaom",
+				want:          publish.Decision{Publish: true, Reason: "main moved from " + b + " to " + c + "; content moved: libaom"},
+			},
+		}, true)
+	})
 
-		// What the shell script took on trust.
-		{
-			name:      "built-not-a-sha",
-			event:     publish.EventSchedule,
-			built:     "main",
-			published: c,
-			wantErr:   `the built commit "main" is not a full commit SHA`,
-		},
-		{
-			name:      "published-not-a-sha",
-			event:     publish.EventSchedule,
-			built:     c,
-			published: "--output=x",
-			wantErr:   `the published commit "--output=x" is not a full commit SHA`,
-		},
-		{
-			name:      "git-fails",
-			git:       fakeGit{err: errGit},
-			event:     publish.EventSchedule,
-			built:     c,
-			published: b,
-			wantErrIs: errGit,
-		},
-	}
+	// Every other branch decides gated as it does ungated: above all with
+	// main where it was published, and when the published image is newer.
+	t.Run("content_gated_elsewhere_unchanged", func(t *testing.T) {
+		t.Parallel()
+		var same []decision
+		for _, tt := range ungated {
+			if !moved[tt.name] {
+				same = append(same, tt)
+			}
+		}
+		if len(same) != len(ungated)-len(moved) {
+			t.Fatalf("moved names %d decisions, of which ungated has %d", len(moved), len(ungated)-len(same))
+		}
+		decide(t, same, true)
+	})
+}
 
-	for _, tt := range tests {
+// decide runs Decide over each of decisions, with -content-gated as gated.
+func decide(t *testing.T, decisions []decision, gated bool) {
+	t.Helper()
+	for i := range decisions {
+		tt := &decisions[i]
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -269,7 +366,7 @@ func TestDecide(t *testing.T) {
 			if g.parent == nil && g.err == nil {
 				g = newFakeGit()
 			}
-			got, err := publish.Decide(t.Context(), g, tt.event, tt.built, tt.published, tt.contentChange)
+			got, err := publish.Decide(t.Context(), g, tt.event, tt.built, tt.published, tt.contentChange, gated)
 			if tt.wantErr != "" || tt.wantErrIs != nil {
 				if err == nil {
 					t.Fatalf("Decide() = %+v, nil; want an error", got)
