@@ -1915,6 +1915,7 @@ func TestProbeDispatch(t *testing.T) {
 		{name: "unknown", args: []string{"assert-everything"}, wantCode: 2, want: "unknown subcommand 'assert-everything'"},
 		{name: "variadic-needs-one", args: []string{"assert-pid1"}, wantCode: 2, want: "assert-pid1 takes <argv>..., got 0"},
 		{name: "fixed-arity", args: []string{"probe-egress", "extra"}, wantCode: 2, want: "probe-egress takes no arguments, got 1"},
+		{name: "user-takes-nothing", args: []string{"user", "65532"}, wantCode: 2, want: "user takes no arguments, got 1"},
 		{
 			name:     "a-port-that-is-not",
 			args:     []string{"assert-listeners", "80a"},

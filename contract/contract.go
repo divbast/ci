@@ -8,6 +8,8 @@
 //
 //   - default-user: the image's own configuration names 65532:65532 as
 //     its user;
+//   - runtime-user: PID 1 runs as 65532:65532, in each of the real,
+//     effective, saved and filesystem IDs its status gives for each;
 //   - file-capability: /usr/local/bin/frankenphp runs under --cap-drop ALL,
 //     which the kernel refuses to a binary whose file capability has the
 //     effective bit;
@@ -34,8 +36,11 @@
 //     form, in every field;
 //   - health-probe: Config.HealthCmd, run in the container, exits 0 and
 //     prints nothing;
-//   - engine-healthy: the engine runs the health check and reports it
-//     healthy;
+//   - engine-healthy: the engine runs the health check on its own
+//     schedule, Docker from the image's HEALTHCHECK and Podman from the
+//     systemd timer its --health-cmd sets up, and reports the container
+//     healthy within the image's start period and three of the intervals
+//     it runs the check at;
 //   - health-port-only: each path in Config.HealthOnly404 answers 404 on
 //     the health port, and /healthz answers 404 on the app port;
 //   - host-config: the engine reports adding no capability, no
@@ -50,9 +55,11 @@
 // there, and being healthy there, shows the image needs none. The records
 // keep the names LibreSpeed's bash suite gave them, so an app's suite
 // ported from bash still makes every check it made, and logs each one to
-// $DIVBAST_CHECK_LOG through [harness.Checks]. no-volume's and
-// no-file-capability-xattr's are the contract's own: that suite had
-// neither check.
+// $DIVBAST_CHECK_LOG through [harness.Checks]. no-volume's,
+// no-file-capability-xattr's and runtime-user's are the contract's own:
+// that suite had none of those checks. Three more are named for what they
+// show: file-capability's, healthcheck-config's, and engine-healthy's,
+// which has one name on both engines.
 package contract
 
 import (
@@ -182,6 +189,7 @@ type Result struct {
 // The checks, by name.
 const (
 	checkDefaultUser           = "default-user"
+	checkRuntimeUser           = "runtime-user"
 	checkFileCapability        = "file-capability"
 	checkCaps                  = "caps"
 	checkReadOnly              = "read-only"
@@ -204,8 +212,8 @@ var scenarioChecks = map[string]bool{checkHealthProbe: true, checkEngineHealthy:
 
 // allChecks is every check, in the order Check runs and returns them.
 var allChecks = []string{
-	checkDefaultUser, checkFileCapability, checkNoFileCapabilityXattr, checkCaps, checkReadOnly, checkNoVolume,
-	checkPID1, checkNoShell, checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe,
+	checkDefaultUser, checkRuntimeUser, checkFileCapability, checkNoFileCapabilityXattr, checkCaps, checkReadOnly,
+	checkNoVolume, checkPID1, checkNoShell, checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe,
 	checkEngineHealthy, checkHealthPortOnly, checkHostConfig,
 }
 
@@ -245,6 +253,7 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 
 	run := map[string]func(context.Context, testing.TB) ([]harness.Record, error){
 		checkDefaultUser:           s.defaultUser,
+		checkRuntimeUser:           s.runtimeUser,
 		checkFileCapability:        s.fileCapability,
 		checkNoFileCapabilityXattr: s.noFileCapabilityXattr,
 		checkCaps:                  s.probeCheck("assert-caps"),

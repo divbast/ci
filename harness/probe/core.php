@@ -17,8 +17,8 @@ declare(strict_types=1);
  *     ok<TAB>what<TAB>expected<TAB>found
  *     FAIL<TAB>what<TAB>expected<TAB>found
  *
- * http-request and parse-listeners are the exceptions: they print what they
- * read, and assert nothing.
+ * http-request, parse-listeners and user are the exceptions: they print
+ * what they read, and assert nothing.
  *
  * Exit status: 0 when every record is ok; 1 when any is FAIL, and a
  * subcommand that throws is recorded as one; 2 for a subcommand or
@@ -46,6 +46,12 @@ const FORBIDDEN_SHELLS = ['/bin/sh', '/bin/bash', '/bin/dash'];
  */
 const CAPABILITY_SETS = ['CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'CapAmb'];
 const PID1_STATUS = '/proc/1/status';
+
+/**
+ * The lines of PID 1's status that give the user and group it runs as,
+ * each as four IDs: the real, effective, saved set and filesystem ones
+ */
+const ID_FIELDS = ['Uid', 'Gid'];
 
 /**
  * What posix_get_last_error() gives when the path is not there: no such
@@ -233,6 +239,24 @@ function capabilityMask(string $status, string $field): string
     }
 
     return $matches[1];
+}
+
+/**
+ * PID 1's Uid: and Gid: lines, as its status gives them, one after the
+ * other, each with its four IDs separated by tabs. It asserts nothing:
+ * which IDs the server must run as is the harness's to say.
+ */
+function pid1User(): void
+{
+    $status = readOrThrow(PID1_STATUS);
+
+    foreach (ID_FIELDS as $field) {
+        $pattern = '/^' . $field . ':[ \t]*(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]*$/m';
+        if (preg_match($pattern, $status, $matches) !== 1) {
+            throw new RuntimeException(PID1_STATUS . " has no well-formed $field line");
+        }
+        fwrite(STDOUT, "$field:\t" . implode("\t", array_slice($matches, 1)) . "\n");
+    }
 }
 
 function assertCaps(): void
@@ -615,6 +639,7 @@ function coreCommands(): array
         'assert-read-only' => new Command([], false, assertReadOnly(...)),
         'assert-listeners' => new Command(['tcp-port'], true, assertListeners(...)),
         'probe-egress' => new Command([], false, probeEgress(...)),
+        'user' => new Command([], false, pid1User(...)),
         'http-request' => new Command(['method', 'url', 'headers', 'body'], false, httpRequest(...)),
         'parse-listeners' => new Command(['tcp-table', 'udp-table', 'fd-targets'], false, parseListeners(...)),
     ];

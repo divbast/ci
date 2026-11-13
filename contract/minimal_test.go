@@ -75,6 +75,13 @@ func TestContractMinimal(t *testing.T) {
 			name: "filecap-permitted", dir: "filecap-permitted",
 			fails: []failure{{checkNoFileCapabilityXattr, xattrRecord, []string{"/usr/local/bin/frankenphp"}}},
 		},
+		{
+			// Not an image: the server run in group root, which only what
+			// PID 1 holds once it is up can show. The image still names
+			// 65532:65532.
+			name: "runtime-user", loosen: []string{"--user", "65532:0"},
+			fails: []failure{{checkRuntimeUser, runtimeGIDRecord, []string{"0 0 0 0"}}},
+		},
 	} {
 		t.Run(m.name, func(t *testing.T) {
 			t.Parallel()

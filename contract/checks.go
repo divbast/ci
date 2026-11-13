@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/divbast/ci/harness"
 )
@@ -144,11 +143,73 @@ func (s *suite) defaultUser(context.Context, testing.TB) ([]harness.Record, erro
 	}, nil
 }
 
+// The records runtime-user makes.
+const (
+	runtimeUIDRecord = "PID 1's real, effective, saved and filesystem uids"
+	runtimeGIDRecord = "PID 1's real, effective, saved and filesystem gids"
+)
+
+// runtimeUser checks the user and group the server runs as once it is up,
+// in all four IDs the kernel keeps of each, against the user the contract
+// runs it as. default-user reads only what the image asks for, and every
+// container under the contract is given --user: this reads what PID 1
+// holds, which a run with another --user, or a server that changed its own
+// IDs, would show.
+func (s *suite) runtimeUser(ctx context.Context, _ testing.TB) ([]harness.Record, error) {
+	p, err := s.container()
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.Output(ctx, "user")
+	if err != nil {
+		return nil, err
+	}
+	if res.Code != 0 {
+		return nil, fmt.Errorf("probe user in container %s: exit status %d: %s", s.ctr, res.Code,
+			strings.TrimSpace(string(res.Stdout)+string(res.Stderr)))
+	}
+	return runtimeUserRecords(harness.Contract("").User, string(res.Stdout))
+}
+
+// runtimeUserRecords checks out, what the probe's user subcommand printed,
+// holds PID 1's Uid: and Gid: lines once each, and that each of the four
+// IDs on them is the uid, or the gid, of user, given as uid:gid.
+func runtimeUserRecords(user, out string) ([]harness.Record, error) {
+	uid, gid, ok := strings.Cut(user, ":")
+	if !ok {
+		return nil, fmt.Errorf("the contract's user is %q, not uid:gid", user)
+	}
+	ids := make(map[string]string, 2)
+	for line := range strings.Lines(out) {
+		f := strings.Fields(line)
+		if len(f) == 0 || (f[0] != "Uid:" && f[0] != "Gid:") || ids[f[0]] != "" {
+			return nil, fmt.Errorf("probe user printed %q, want one Uid: and one Gid: line", out)
+		}
+		if len(f) != 5 {
+			return nil, fmt.Errorf("probe user printed %q, whose %s line does not hold four IDs", out, f[0])
+		}
+		ids[f[0]] = strings.Join(f[1:], " ")
+	}
+	if len(ids) != 2 {
+		return nil, fmt.Errorf("probe user printed %q, want one Uid: and one Gid: line", out)
+	}
+	four := func(id string) string { return strings.Join(slices.Repeat([]string{id}, 4), " ") }
+	return []harness.Record{
+		equal(runtimeUIDRecord, four(uid), ids["Uid:"]),
+		equal(runtimeGIDRecord, four(gid), ids["Gid:"]),
+	}, nil
+}
+
+// fileCapabilityRecord is the record file-capability makes. It names what
+// the exec shows: a capability with no effective bit runs as any binary
+// does, and only no-file-capability-xattr's scan sees it.
+const fileCapabilityRecord = harness.FrankenPHP + " runs under --cap-drop ALL, so it carries no effective file capability"
+
 // fileCapability runs the FrankenPHP binary under the contract. A binary
-// carrying a file capability that --cap-drop ALL leaves out of the
-// bounding set cannot be executed at all: the kernel answers EPERM before
-// a line of PHP runs. It runs in the foreground, since crun reports that
-// refusal nowhere else.
+// carrying a file capability with the effective bit, which --cap-drop ALL
+// leaves out of the bounding set, cannot be executed at all: the kernel
+// answers EPERM before a line of PHP runs. It runs in the foreground,
+// since crun reports that refusal nowhere else.
 func (s *suite) fileCapability(ctx context.Context, tb testing.TB) ([]harness.Record, error) {
 	tb.Helper()
 	res, err := s.engine.Run(ctx, tb, &harness.RunSpec{
@@ -171,7 +232,7 @@ func (s *suite) fileCapability(ctx context.Context, tb testing.TB) ([]harness.Re
 	}
 	return []harness.Record{{
 		OK:       res.Code == 0,
-		What:     harness.FrankenPHP + " runs under --cap-drop ALL, so it carries no file capability",
+		What:     fileCapabilityRecord,
 		Expected: "exit status 0",
 		Found:    found,
 	}}, nil
@@ -247,12 +308,15 @@ func (s *suite) healthcheckConfig(context.Context, testing.TB) ([]harness.Record
 	return []harness.Record{healthcheckRecord(s.cfg.Healthcheck, s.image.Healthcheck)}, nil
 }
 
+// healthcheckRecordWhat is the record healthcheck-config makes.
+const healthcheckRecordWhat = "the image's HEALTHCHECK: the probe in exec form, with no shell, at the timings Config.Healthcheck states"
+
 // healthcheckRecord checks got, the image's HEALTHCHECK, is want, in
 // every field. want is in exec form: validate refuses a Config whose is
 // not.
 func healthcheckRecord(want Healthcheck, got *Healthcheck) harness.Record {
 	r := harness.Record{
-		What:     "the image's HEALTHCHECK: the probe in exec form, with no shell, at Baikal's timings",
+		What:     healthcheckRecordWhat,
 		Expected: describe(&want),
 		Found:    describe(got),
 	}
@@ -294,29 +358,30 @@ func (s *suite) healthProbe(ctx context.Context, _ testing.TB) ([]harness.Record
 	}, nil
 }
 
+// engineHealthyRecord is the record engine-healthy makes, under one name
+// on both engines: which engine said so is in what it found.
+const engineHealthyRecord = "the engine reports the container healthy within the start period and three intervals"
+
 // engineHealthy has the engine's own health machinery judge the
-// container: Docker runs the image's HEALTHCHECK, Podman the --health-cmd
-// it was given. A shell-form command needs /bin/sh, which no divbast
-// image has, so only the exec form can pass.
+// container, on its own schedule, as it would for a user: Docker runs the
+// image's HEALTHCHECK, and Podman the --health-cmd it was given, from the
+// systemd timer it sets up for it. A shell-form command needs /bin/sh,
+// which no divbast image has, so only the exec form can pass.
 func (s *suite) engineHealthy(ctx context.Context, _ testing.TB) ([]harness.Record, error) {
 	if _, err := s.container(); err != nil {
 		return nil, err
 	}
-	// Docker runs the image's own, so its own start period bounds the wait.
+	// The image's own start period bounds the wait, as it bounds Docker's
+	// patience with a failing check.
 	startPeriod := s.cfg.Healthcheck.StartPeriod
 	if s.image.Healthcheck != nil {
 		startPeriod = s.image.Healthcheck.StartPeriod
 	}
-	what := fmt.Sprintf("%s reports it healthy within the %d s start period", s.engine.Name(), int(startPeriod/time.Second))
-	want := "healthy"
-	if s.engine.Name() == "podman" {
-		what, want = "podman healthcheck run", "0"
-	}
-	found := want
+	r := harness.Record{OK: true, What: engineHealthyRecord, Expected: "healthy", Found: s.engine.Name() + " reports it healthy"}
 	if err := s.ctr.EngineHealthy(ctx, startPeriod); err != nil {
-		found = err.Error()
+		r.OK, r.Found = false, err.Error()
 	}
-	return []harness.Record{equal(what, want, found)}, nil
+	return []harness.Record{r}, nil
 }
 
 // healthPortOnly checks the health port serves /healthz and nothing else,
