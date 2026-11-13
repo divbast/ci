@@ -509,19 +509,26 @@ func TestPublishAttestsBeforePromote(t *testing.T) {
 		t.Errorf("app-publish.yml: %v", err)
 	}
 	const (
-		staging = `            -t "${IMAGE}:${VERSION}-staging" \` + "\n"
-		version = "            -t \"${IMAGE}:${VERSION}\"\n"
-		latest  = "            -t \"${IMAGE}:latest\"\n"
-		digest  = "          DIGEST: ${{ steps.merge.outputs.digest }}\n"
-		signer  = " --signer-workflow divbast/ci/.github/workflows/app-publish.yml"
-		onGate  = "        if: " + gate + "\n"
-		goOn    = "        continue-on-error: true\n"
+		staging     = `            -t "${IMAGE}:${VERSION}-staging" \` + "\n"
+		version     = "            -t \"${IMAGE}:${VERSION}\"\n"
+		latest      = "            -t \"${IMAGE}:latest\"\n"
+		digest      = "          DIGEST: ${{ steps.merge.outputs.digest }}\n"
+		signer      = " --signer-workflow divbast/ci/.github/workflows/app-publish.yml"
+		onGate      = "        if: " + gate + "\n"
+		goOn        = "        continue-on-error: true\n"
+		from        = `skopeo copy --all "docker://${IMAGE}@$(cat /tmp/digest-amd64)"`
+		loop        = `          for tag in "${VERSION}" latest; do ` + from + ` "docker://${IMAGE}:${tag}"; done` + "\n"
+		viaVariable = `          tag=latest; ` + from + ` "docker://${IMAGE}:${tag}"` + "\n"
+		viaEnv      = "          " + from + ` "docker://${IMAGE}:${PUBLIC}"` + "\n"
 	)
 	for name, mutant := range map[string]string{
 		"the version tagged before attesting":   strings.Replace(publish, staging, `            -t "${IMAGE}:${VERSION}" \`+"\n", 1),
 		"latest tagged before attesting":        strings.Replace(publish, staging, staging+`            -t "${IMAGE}:latest" \`+"\n", 1),
 		"an arch pushed as latest":              strings.Replace(publish, `"docker://${IMAGE}:${VERSION}-${arch}"`, `"docker://${IMAGE}:latest"`, 1),
 		"the version pushed before attesting":   replaceAfter(publish, pushName, "          done\n", "          done\n          skopeo copy --all \"docker://${IMAGE}@$(cat /tmp/digest-amd64)\" \"docker://${IMAGE}:${VERSION}\"\n"),
+		"both tags pushed in a loop":            replaceAfter(publish, pushName, "          done\n", "          done\n"+loop),
+		"latest pushed through a variable":      replaceAfter(publish, pushName, "          done\n", "          done\n"+viaVariable),
+		"latest pushed through the env":         replaceAfter(replaceAfter(publish, pushName, "          done\n", "          done\n"+viaEnv), pushName, "        env:\n", "        env:\n          PUBLIC: latest\n"),
 		"the decision's read moved past a push": replaceAfter(publish, verifyName, "        run: |\n", "        run: |\n          published=$(.ci/bin/divbast-published-revision \"${IMAGE}:latest\")\n"),
 		"promoted before verifying":             moveStep(publish, promoteName, verifyName),
 		"promoted before attesting":             moveStep(publish, promoteName, attestStep),
@@ -563,20 +570,46 @@ var (
 	publicTag = regexp.MustCompile(`:(?:latest|\$\{VERSION\}|\$VERSION|\$\{\{ *steps\.version\.outputs\.version *\}\})(-staging|-\$\{arch\})?`)
 )
 
-// readsPublished is the one line before the first push that may name
-// latest: the decision's read of the commit it was built from, matched as
-// the whole line.
-const readsPublished = `published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")`
+// imageRef is a reference skopeo reads or writes, or one built on
+// ${IMAGE}, to the quote or blank that ends it.
+var imageRef = regexp.MustCompile(`docker://[^"\s]*|\$\{IMAGE\}[^"\s]*|\$IMAGE\b[^"\s]*`)
+
+// notReferences are the lines before the promotion that may name the image
+// otherwise than by digest, staging tag or architecture's tag, each
+// matched as the whole line, in the step with that id alone: the
+// decision's read of the commit latest was built from, and the choice of
+// where to publish, which names the image but no tag of it.
+var notReferences = map[string]string{
+	"decide": `published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")`,
+	"target": `echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"`,
+}
+
+// unmoved reports whether ref, a docker:// reference or one built on
+// ${IMAGE}, names a digest or a tag that ends -staging or -${arch}: one
+// that leaves the version's tag and latest where they are. A reference
+// with no tag at all is latest's.
+func unmoved(ref string) bool {
+	ref = strings.TrimPrefix(ref, "docker://")
+	if _, digest, ok := strings.Cut(ref, "@"); ok {
+		return digest != ""
+	}
+	i := strings.LastIndex(ref, ":")
+	if i < 0 || strings.Contains(ref[i:], "/") {
+		return false
+	}
+	return strings.HasSuffix(ref, "-staging") || strings.HasSuffix(ref, "-${arch}")
+}
 
 // attestsBeforePromote returns an error unless the publish job has one
 // step that tags the index <version>-staging, one that attests it, one
 // that verifies the attestation and one that tags latest, after the first
 // push and in that order. No line of the job lets a step's failure
 // through; every step from the first push to the promotion runs on the
-// decision alone; before the promotion, every tag is -staging and no line
-// names the version's tag or latest, but for the decision's read; the
-// promotion tags the version and latest alone; and all four steps name the
-// one digest. The verification is a user's: gh attestation verify, for the
+// decision alone; before the promotion, every tag is -staging, every
+// docker:// or ${IMAGE} reference is a digest or a -staging or -${arch}
+// tag, and no line names the version's tag or latest, but for the lines
+// notReferences allows; the promotion tags the version and latest alone;
+// and all four steps name the one digest. The verification is a user's: gh attestation verify, for the
 // caller's repository, this workflow and main.
 func attestsBeforePromote(workflow string) error {
 	job := jobsOf(linesOf(workflow))["publish"]
@@ -631,15 +664,22 @@ func attestsBeforePromote(workflow string) error {
 		}
 	}
 
-	for i, s := range st[:promote] {
+	for _, s := range st[:promote] {
+		exempt, isExempt := notReferences[value(s, "id")]
 		for _, l := range s {
 			for _, tag := range tags(l) {
 				if !strings.HasSuffix(tag, "-staging") {
 					return fmt.Errorf("line %d tags %s before the attestation verifies", l.n, tag)
 				}
 			}
-			if i < push && strings.TrimSpace(l.text) == readsPublished {
+			if isExempt && strings.TrimSpace(l.text) == exempt {
 				continue
+			}
+			for _, ref := range imageRef.FindAllString(l.text, -1) {
+				if !unmoved(ref) {
+					return fmt.Errorf("line %d names %s before the attestation verifies,"+
+						" where only a digest or a -staging or -${arch} tag may stand", l.n, ref)
+				}
 			}
 			for _, m := range publicTag.FindAllStringSubmatch(l.text, -1) {
 				if m[1] == "" {
@@ -744,13 +784,16 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 		digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	)
 	for _, tt := range []struct {
-		fails, calls int
-		ok           bool
-		slept        string
+		fails, calls         int
+		ok                   bool
+		slept, shape, signer string
 	}{
-		{fails: 0, calls: 1, ok: true},
-		{fails: 2, calls: 3, ok: true, slept: "10 10 "},
-		{fails: 3, calls: 3, slept: "10 10 "},
+		{fails: 0, calls: 1, ok: true, shape: "array", signer: "signer"},
+		{fails: 2, calls: 3, ok: true, slept: "10 10 ", shape: "array", signer: "signer"},
+		{fails: 3, calls: 3, slept: "10 10 ", shape: "array"},
+		{fails: 0, calls: 1, ok: true, shape: "object", signer: "unknown"},
+		{fails: 0, calls: 1, ok: true, shape: "empty", signer: "unknown"},
+		{fails: 0, calls: 1, ok: true, shape: "text", signer: "unknown"},
 	} {
 		dir := t.TempDir()
 		bin, login := filepath.Join(dir, "bin"), filepath.Join(dir, "login")
@@ -764,14 +807,18 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 		writeFile(t, dir, "bin/gh", "#!/usr/bin/env bash\nprintf 'gh %s\\n' \"$*\" >> \"${CALLS}\"\n"+
 			"[ -z \"$(ls -A \"${DOCKER_CONFIG:?}\")\" ] || exit 3\n"+
 			"[ \"$(grep -c '^gh ' \"${CALLS}\")\" -gt \"${FAILS}\" ] || exit 1\n"+
-			"echo '[{\"verificationResult\":{\"signature\":{\"certificate\":{\"buildSignerURI\":\"signer\"}}}}]'\n")
+			"case \"${SHAPE}\" in\n"+
+			"array) echo '[{\"verificationResult\":{\"signature\":{\"certificate\":{\"buildSignerURI\":\"signer\"}}}}]' ;;\n"+
+			"object) echo '{\"verificationResult\":{}}' ;;\n"+
+			"empty) echo '[]' ;;\n"+
+			"*) echo 'not JSON' ;;\nesac\n")
 		writeFile(t, dir, "bin/sleep", "#!/usr/bin/env bash\nprintf '%s ' \"$*\" >> \"${SLEPT}\"\n")
 		calls, slept := filepath.Join(dir, "calls"), filepath.Join(dir, "slept")
 		writeFile(t, dir, "slept", "")
 		res := runStep(t, dir, strings.ReplaceAll(script, "/tmp/", dir+"/"),
 			"PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+dir, "DOCKER_CONFIG="+login,
 			"IMAGE="+image, "DIGEST="+digest, "REPO=divbast/app",
-			"CALLS="+calls, "SLEPT="+slept, "FAILS="+strconv.Itoa(tt.fails))
+			"CALLS="+calls, "SLEPT="+slept, "FAILS="+strconv.Itoa(tt.fails), "SHAPE="+tt.shape)
 		got, err := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
 		if err != nil {
 			return fmt.Errorf("with %d failures, nothing ran: %w", tt.fails, err)
@@ -786,7 +833,10 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 			return fmt.Errorf("with %d failures, sleeps %q, want %q", tt.fails, s, tt.slept)
 		}
 		if (res.Code == 0) != tt.ok {
-			return fmt.Errorf("with %d failures, the script exits %d: %s", tt.fails, res.Code, res.Stderr)
+			return fmt.Errorf("with %d failures and gh printing %s, the script exits %d: %s", tt.fails, tt.shape, res.Code, res.Stderr)
+		}
+		if tt.ok && !strings.Contains(string(res.Stdout), "verifies, signed by "+tt.signer+"\n") {
+			return fmt.Errorf("with gh printing %s, the script says %q, not that it was signed by %s", tt.shape, res.Stdout, tt.signer)
 		}
 	}
 	return nil
@@ -795,7 +845,9 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 // TestPublishPromotesOnlyTheAttestedDigest checks that app-publish.yml's
 // promotion, run with bash and a stand-in for docker, dry-runs the same
 // imagetools create it runs, and runs it only when the bytes the dry run
-// prints, less its newline, hash to the digest attested. Against
+// prints, less its newline, hash to the digest attested. Only then, and
+// before it runs it, does the step set its moving output, which tells the
+// note that follows whether the public tags may have moved. Against
 // app-publish.yml as it is, then with each broken, which the check must
 // refuse.
 func TestPublishPromotesOnlyTheAttestedDigest(t *testing.T) {
@@ -804,12 +856,19 @@ func TestPublishPromotesOnlyTheAttestedDigest(t *testing.T) {
 	if err := promotesOnlyTheDigest(t, publish); err != nil {
 		t.Errorf("app-publish.yml: %v", err)
 	}
-	const dry = `          docker buildx imagetools create --dry-run "${args[@]}" > /tmp/promoted.json` + "\n"
+	const (
+		dry    = `          docker buildx imagetools create --dry-run "${args[@]}" > /tmp/promoted.json` + "\n"
+		create = `          docker buildx imagetools create "${args[@]}"` + "\n"
+		moving = `          echo "moving=true" >> "${GITHUB_OUTPUT}"` + "\n"
+	)
 	for name, mutant := range map[string]string{
-		"no comparison":           strings.Replace(publish, `if [ "sha256:${would%% *}" != "${DIGEST}" ]; then`, "if false; then", 1),
-		"the newline hashed too":  strings.Replace(publish, "head -c -1 /tmp/promoted.json", "cat /tmp/promoted.json", 1),
-		"tags moved before":       strings.Replace(publish, dry, `          docker buildx imagetools create "${args[@]}"`+"\n"+dry, 1),
-		"a dry run of the source": strings.Replace(publish, dry, `          docker buildx imagetools create --dry-run "${IMAGE}@${DIGEST}" > /tmp/promoted.json`+"\n", 1),
+		"no comparison":                  strings.Replace(publish, `if [ "sha256:${would%% *}" != "${DIGEST}" ]; then`, "if false; then", 1),
+		"the newline hashed too":         strings.Replace(publish, `head -c "$((size - 1))" /tmp/promoted.json`, "cat /tmp/promoted.json", 1),
+		"tags moved before":              strings.Replace(publish, dry, create+dry, 1),
+		"a dry run of the source":        strings.Replace(publish, dry, `          docker buildx imagetools create --dry-run "${IMAGE}@${DIGEST}" > /tmp/promoted.json`+"\n", 1),
+		"moving never said":              strings.Replace(publish, moving, "", 1),
+		"moving said after":              strings.Replace(publish, moving+create, create+moving, 1),
+		"moving said before the dry run": strings.Replace(strings.Replace(publish, moving, "", 1), dry, moving+dry, 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -824,10 +883,11 @@ func TestPublishPromotesOnlyTheAttestedDigest(t *testing.T) {
 }
 
 // promotesOnlyTheDigest returns an error unless the publish job's step
-// with id promote, its /tmp moved into a temporary directory, runs
-// docker buildx imagetools create --dry-run and then the same command
-// without it when the dry run prints the attested index, and the dry run
-// alone, then fails, when it prints another.
+// with id promote, its /tmp moved into a temporary directory, runs docker
+// buildx imagetools create --dry-run and then, having set moving=true in
+// its outputs, the same command without it, when the dry run prints the
+// attested index; and the dry run alone, then fails without setting
+// moving, when it prints another or fails itself.
 func promotesOnlyTheDigest(t *testing.T, workflow string) error {
 	t.Helper()
 	st := publishSteps(workflow)
@@ -846,27 +906,38 @@ func promotesOnlyTheDigest(t *testing.T, workflow string) error {
 	sum := sha256.Sum256([]byte(index))
 	digest := "sha256:" + hex.EncodeToString(sum[:])
 	args := "-t " + image + ":1.2.3 -t " + image + ":latest " + image + "@" + digest
+	dry := "buildx imagetools create --dry-run " + args + "\n"
 	for _, tt := range []struct {
-		name, would, calls string
-		ok                 bool
+		name, would, calls, output string
+		dryFails, ok               bool
 	}{
 		{
-			name: "the index attested", would: index, ok: true,
-			calls: "buildx imagetools create --dry-run " + args + "\nbuildx imagetools create " + args + "\n",
+			name: "the index attested", would: index, ok: true, output: "moving=true\n",
+			calls: dry + "buildx imagetools create " + args + " (moving)\n",
 		},
-		{name: "another index", would: index + " ", calls: "buildx imagetools create --dry-run " + args + "\n"},
+		{name: "another index", would: index + " ", calls: dry},
+		{name: "nothing, failing", dryFails: true, calls: dry},
 	} {
 		dir := t.TempDir()
 		if err := os.Mkdir(filepath.Join(dir, "bin"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		writeFile(t, dir, "would", tt.would)
-		writeFile(t, dir, "bin/docker", "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"${CALLS}\"\n"+
-			"case \" $* \" in *\" --dry-run \"*) cat \"${WOULD}\"; echo ;; esac\n")
-		calls := filepath.Join(dir, "calls")
+		writeFile(t, dir, "output", "")
+		writeFile(t, dir, "bin/docker", "#!/usr/bin/env bash\n"+
+			"case \" $* \" in\n"+
+			"*\" --dry-run \"*) printf '%s\\n' \"$*\" >> \"${CALLS}\"; [ -z \"${DRY_FAILS}\" ] || exit 1; cat \"${WOULD}\"; echo ;;\n"+
+			"*) if grep -qx moving=true \"${GITHUB_OUTPUT}\"; then printf '%s (moving)\\n' \"$*\"; else printf '%s\\n' \"$*\"; fi >> \"${CALLS}\" ;;\n"+
+			"esac\n")
+		dryFails := ""
+		if tt.dryFails {
+			dryFails = "1"
+		}
+		calls, output := filepath.Join(dir, "calls"), filepath.Join(dir, "output")
 		res := runStep(t, dir, strings.ReplaceAll(script, "/tmp/", dir+"/"),
 			"PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"),
-			"IMAGE="+image, "VERSION=1.2.3", "DIGEST="+digest, "CALLS="+calls, "WOULD="+filepath.Join(dir, "would"))
+			"IMAGE="+image, "VERSION=1.2.3", "DIGEST="+digest, "CALLS="+calls, "WOULD="+filepath.Join(dir, "would"),
+			"DRY_FAILS="+dryFails, "GITHUB_OUTPUT="+output)
 		got, err := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
 		if err != nil {
 			return fmt.Errorf("when the dry run prints %s, docker never runs: %w", tt.name, err)
@@ -877,14 +948,17 @@ func promotesOnlyTheDigest(t *testing.T, workflow string) error {
 		if (res.Code == 0) != tt.ok {
 			return fmt.Errorf("when the dry run prints %s, the script exits %d: %s", tt.name, res.Code, res.Stderr)
 		}
+		if out, _ := os.ReadFile(output); string(out) != tt.output { //nolint:gosec // G304: the test's own temporary directory
+			return fmt.Errorf("when the dry run prints %s, the step outputs %q, want %q", tt.name, out, tt.output)
+		}
 	}
 	return nil
 }
 
 // TestPublishSaysWhenRerunningPublishes checks that app-publish.yml, when
-// a step fails after the decision and the promotion never ran, says in an
-// error that the version's tag and latest did not move, and when
-// re-running the failed job publishes. Against app-publish.yml as it is,
+// a step fails after the decision and before the promotion begins to move
+// the tags, its dry run included, says in an error that the version's tag
+// and latest did not move, and when re-running the failed job publishes. Against app-publish.yml as it is,
 // then with each broken, which the check must refuse.
 func TestPublishSaysWhenRerunningPublishes(t *testing.T) {
 	t.Parallel()
@@ -892,13 +966,14 @@ func TestPublishSaysWhenRerunningPublishes(t *testing.T) {
 	if err := saysWhenRerunningPublishes(t, publish); err != nil {
 		t.Errorf("app-publish.yml: %v", err)
 	}
-	const cond = "        if: failure() && " + gate + " && steps.promote.outcome == 'skipped'\n"
+	const cond = "        if: failure() && " + gate + " && steps.promote.outputs.moving != 'true'\n"
 	for name, mutant := range map[string]string{
-		"said after a promotion that failed": strings.Replace(publish, cond, "        if: failure() && "+gate+"\n", 1),
-		"said when nothing failed":           strings.Replace(publish, cond, "        if: "+gate+" && steps.promote.outcome == 'skipped'\n", 1),
-		"said before the promotion":          moveStep(publish, movedName, promoteName),
-		"no tags named":                      strings.Replace(publish, "::error::the public tags :${VERSION:-<version>} and :latest did not move.", "::error::no public tag moved.", 1),
-		"no word on when":                    strings.Replace(publish, `"Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \`+"\n", "", 1),
+		"said after a promotion that failed":       strings.Replace(publish, cond, "        if: failure() && "+gate+"\n", 1),
+		"said when nothing failed":                 strings.Replace(publish, cond, "        if: "+gate+" && steps.promote.outputs.moving != 'true'\n", 1),
+		"said only when the promotion was skipped": strings.Replace(publish, cond, "        if: failure() && "+gate+" && steps.promote.outcome == 'skipped'\n", 1),
+		"said before the promotion":                moveStep(publish, movedName, promoteName),
+		"no tags named":                            strings.Replace(publish, "::error::the public tags :${VERSION:-<version>} and :latest did not move.", "::error::no public tag moved.", 1),
+		"no word on when":                          strings.Replace(publish, `"Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \`+"\n", "", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -915,9 +990,9 @@ func TestPublishSaysWhenRerunningPublishes(t *testing.T) {
 // saysWhenRerunningPublishes returns an error unless the publish job's
 // one step that says the public tags did not move comes after the
 // promotion, runs on a failure once the decision was to publish and the
-// promotion was skipped, and, run with bash, prints one error naming the
-// version's tag and latest and saying a re-run of the failed job publishes
-// for a day after the build.
+// promotion had not begun to move the tags, and, run with bash, prints one
+// error naming the version's tag and latest and saying a re-run of the
+// failed job publishes for a day after the build.
 func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
 	t.Helper()
 	st := publishSteps(workflow)
@@ -930,7 +1005,7 @@ func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
 	if found[0] < promote[0] {
 		return fmt.Errorf("line %d says the tags did not move before the promotion, which then runs", s[0].n)
 	}
-	want := unquote("failure() && " + gate + " && steps.promote.outcome == 'skipped'")
+	want := unquote("failure() && " + gate + " && steps.promote.outputs.moving != 'true'")
 	if cond := value(s, "if"); cond != want {
 		return fmt.Errorf("line %d says the tags did not move on %q, not %q", s[0].n, cond, want)
 	}
@@ -1044,6 +1119,7 @@ func TestRehearsePublishesInsideTheJob(t *testing.T) {
 		"the attestation for the input":       strings.Replace(publish, "subject-name: ${{ steps.target.outputs.image }}", "subject-name: ${{ inputs.image }}", 1),
 		"the input promoted":                  replaceAfter(publish, promoteName, target, input),
 		"the input checked":                   replaceAfter(publish, checkName, target, input),
+		"a push to ghcr.io by name":           strings.Replace(publish, `"docker://${IMAGE}:${VERSION}-${arch}"`, `"docker://ghcr.io/divbast/oci-image-template:${VERSION}-${arch}"`, 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1058,10 +1134,11 @@ func TestRehearsePublishesInsideTheJob(t *testing.T) {
 }
 
 // publishesInside returns an error unless the publish job's ghcr.io login
-// runs only without rehearse, no step after the decision but the one with
-// id target names inputs.image, every IMAGE or subject-name after it is
-// that step's output, and that step's script, run with bash, writes the
-// image to publish to as GitHub Actions reads a step's outputs.
+// runs only without rehearse, no line after the decision names ghcr.io but
+// that login's registry, no step after the decision but the one with id
+// target names inputs.image, every IMAGE or subject-name after it is that
+// step's output, and that step's script, run with bash, writes the image
+// to publish to as GitHub Actions reads a step's outputs.
 func publishesInside(t *testing.T, workflow string) error {
 	t.Helper()
 	st := publishSteps(workflow)
@@ -1075,6 +1152,11 @@ func publishesInside(t *testing.T, workflow string) error {
 		return fmt.Errorf("line %d logs in to ghcr.io on %q, in a rehearsal too", st[login[0]][0].n, cond)
 	}
 	for i := decide[0] + 1; i < len(st); i++ {
+		for _, l := range st[i] {
+			if strings.Contains(l.text, "ghcr.io") && (i != login[0] || strings.TrimSpace(l.text) != "registry: ghcr.io") {
+				return fmt.Errorf("line %d names ghcr.io, which a rehearsal would write to", l.n)
+			}
+		}
 		if i == target[0] {
 			continue
 		}
@@ -1235,12 +1317,15 @@ func TestRehearseRegistryPinned(t *testing.T) {
 	pinned := registryManager.FindString(publish)
 	_, digest, _ := strings.Cut(pinned, "@")
 	for name, mutant := range map[string]string{
-		"no marker":                   strings.Replace(publish, marker, "", 1),
-		"the marker a line away":      strings.Replace(publish, marker, marker+"          true\n", 1),
-		"a tag alone":                 strings.Replace(publish, "@"+digest, "", 1),
-		"a second registry, unpinned": strings.Replace(publish, marker, "          docker run -d -p 127.0.0.1:5001:5000 registry:3\n"+marker, 1),
-		"beyond the loopback":         strings.Replace(publish, "-p 127.0.0.1:5000:5000", "-p 5000:5000", 1),
-		"in every publish":            strings.Replace(publish, "        if: steps.decide.outputs.publish == 'true' && inputs.rehearse\n", "        if: steps.decide.outputs.publish == 'true'\n", 1),
+		"no marker":                       strings.Replace(publish, marker, "", 1),
+		"the marker a line away":          strings.Replace(publish, marker, marker+"          true\n", 1),
+		"a tag alone":                     strings.Replace(publish, "@"+digest, "", 1),
+		"a second registry, unpinned":     strings.Replace(publish, marker, "          docker run -d -p 127.0.0.1:5001:5000 registry:3\n"+marker, 1),
+		"beyond the loopback":             strings.Replace(publish, "-p 127.0.0.1:5000:5000", "-p 5000:5000", 1),
+		"in every publish":                strings.Replace(publish, "        if: steps.decide.outputs.publish == 'true' && inputs.rehearse\n", "        if: steps.decide.outputs.publish == 'true'\n", 1),
+		"a wait that gives up on a reset": strings.Replace(publish, " --retry-all-errors", "", 1),
+		"a wait without end":              strings.Replace(publish, "curl -fsS --retry 10 ", "curl -fsS --retry 1000 ", 1),
+		"no wait":                         strings.Replace(publish, "          curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -o /dev/null http://127.0.0.1:5000/v2/\n", "", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1280,8 +1365,24 @@ func registryPinned(workflow string) error {
 	if cond := value(st[found[0]], "if"); !strings.Contains(cond, "inputs.rehearse") || strings.Contains(cond, "!inputs.rehearse") {
 		return fmt.Errorf("line %d starts the registry on %q, not in a rehearsal alone", st[found[0]][0].n, cond)
 	}
+	waits := slices.IndexFunc(st[found[0]], func(l line) bool { return strings.HasPrefix(strings.TrimSpace(l.text), "curl ") })
+	if waits < 0 {
+		return fmt.Errorf("the step from line %d never waits for the registry with curl", st[found[0]][0].n)
+	}
+	l := st[found[0]][waits]
+	m := boundedRetry.FindStringSubmatch(l.text)
+	if !strings.Contains(l.text, " --retry-all-errors") || m == nil {
+		return fmt.Errorf("line %d waits for the registry without --retry <n> --retry-delay <s> and --retry-all-errors,"+
+			" so a connection the registry resets before it listens fails the rehearsal", l.n)
+	}
+	if n, _ := strconv.Atoi(m[1]); n < 1 || n > 30 {
+		return fmt.Errorf("line %d retries %s times, not between 1 and 30", l.n, m[1])
+	}
 	return nil
 }
+
+// boundedRetry is curl's retry count, given with a delay between tries.
+var boundedRetry = regexp.MustCompile(`--retry (\d+) .*--retry-delay \d+`)
 
 // TestPublishInstallsGoAlone checks that app-publish.yml's job, which can
 // push the image and sign its attestation, installs Go alone from the
