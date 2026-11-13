@@ -542,6 +542,7 @@ concurrency group, so the calling job needs no group of its own.
 | `image` | string, required | The image, without a tag, such as `ghcr.io/divbast/librespeed` |
 | `version-arg` | string, required | The Containerfile `ARG` whose value is the app's version, which tags the image |
 | `description` | string, required | The index's description annotation, which GHCR shows on the package page |
+| `rehearse` | boolean, default `false` | Decide against `image` as ever, then publish into a registry started inside the job instead: [Rehearsal](#rehearsal) |
 
 The calling job grants `contents: read`, `packages: write`,
 `id-token: write` and `attestations: write`.
@@ -590,6 +591,28 @@ jobs:
 
 The checks are then named `check / lint`, `check / build (amd64, ...)`
 and so on.
+
+#### Rehearsal
+
+With `rehearse: true`, the job still runs only from the daily slot or the
+manual run on main, and still decides against `image` on ghcr.io. When it
+publishes, it starts the `registry` image inside the job, on
+`127.0.0.1:5000`, pinned by version and digest, which the org's Renovate
+preset moves. It logs in to it with throwaway credentials, and runs every
+step after the decision there, under `localhost:5000/<path of image>`: it
+pushes, stages, attests, verifies, promotes and checks both tags. The
+attestation is real: signed for the calling repository like any other,
+and pushed to that registry. Nothing reaches ghcr.io, and no package is
+made. Each rehearsal says so in a warning and on the run's summary:
+`rehearsal: nothing was published to ghcr.io`.
+
+`divbast/oci-image-template` rehearses, since it has no package. A
+repository made from it inherits `rehearse: true`, and anywhere but the
+template the line goes on to say how to publish: `to publish, set image
+to this app's own and remove rehearse from the job that calls
+app-publish.yml`. That is the switch, in the calling job's `with:`: set
+`image` to the app's own `ghcr.io/divbast/<app>`, and remove
+`rehearse: true`.
 
 ### `renovate.yml`
 

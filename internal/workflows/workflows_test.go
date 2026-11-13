@@ -416,18 +416,7 @@ func passesContentGated(t *testing.T, workflow string) error {
 	t.Helper()
 	lines := linesOf(workflow)
 
-	var decl []string
-	for i, l := range lines {
-		if l.text != "      content-gated:" {
-			continue
-		}
-		for _, d := range lines[i+1:] {
-			if indent(d.text) <= 6 {
-				break
-			}
-			decl = append(decl, strings.TrimSpace(d.text))
-		}
-	}
+	decl := declaration(lines, "content-gated")
 	if !slices.Contains(decl, "type: boolean") || !slices.Contains(decl, "default: false") {
 		return fmt.Errorf("declares content-gated as %q, not a boolean input that defaults to false", decl)
 	}
@@ -470,6 +459,24 @@ func passesContentGated(t *testing.T, workflow string) error {
 	return nil
 }
 
+// declaration returns the lines below a workflow_call input's name, each
+// trimmed: its type, default and the rest.
+func declaration(lines []line, input string) []string {
+	var decl []string
+	for i, l := range lines {
+		if l.text != "      "+input+":" {
+			continue
+		}
+		for _, d := range lines[i+1:] {
+			if indent(d.text) <= 6 {
+				break
+			}
+			decl = append(decl, strings.TrimSpace(d.text))
+		}
+	}
+	return decl
+}
+
 // The publish job's step names that the mutants below move or change, and
 // the if: every step from the first push to the promotion runs on.
 const (
@@ -479,6 +486,10 @@ const (
 	verifyName  = "      - name: Verify the index's attestation\n"
 	promoteName = "      - name: Tag the attested index with the version and latest\n"
 	movedName   = "      - name: Say that the public tags did not move\n"
+	targetName  = "      - name: Choose where to publish\n"
+	warnName    = "      - name: Say that this run rehearses\n"
+	gateName    = "      - name: Refuse anything but the daily slot or a manual run on main\n"
+	checkName   = "      - name: Check both tags are the attested index to an anonymous client\n"
 	gate        = "steps.decide.outputs.publish == 'true'"
 )
 
@@ -933,6 +944,341 @@ func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
 		!strings.HasPrefix(out, "::error::the public tags :1.2.3 and :latest did not move. ") ||
 		!strings.Contains(out, "Re-running the failed job publishes for a day after this run built its images") {
 		return fmt.Errorf("with VERSION=1.2.3, the script exits %d and prints %q", res.Code, out)
+	}
+	return nil
+}
+
+// TestRehearseStillDecides checks that a rehearsal runs app-publish.yml's
+// gate and its decision as any publish does. Neither step, nor the job, is
+// conditional on rehearse, and the decision reads the image the caller
+// names, so a rehearsal runs only from the daily slot or the manual run on
+// main, and decides against ghcr.io. Against app-publish.yml as it is, then
+// with each broken, which the check must refuse.
+func TestRehearseStillDecides(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := decidesForReal(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const (
+		decide = "        id: decide\n"
+		skip   = "        if: ${{ !inputs.rehearse }}\n"
+	)
+	for name, mutant := range map[string]string{
+		"the decision skipped in a rehearsal": strings.Replace(publish, decide, decide+skip, 1),
+		"the decision told of a rehearsal":    replaceAfter(publish, decide, "        env:\n", "        env:\n          REHEARSE: ${{ inputs.rehearse }}\n"),
+		"a decision against another image":    replaceAfter(publish, decide, "          IMAGE: ${{ inputs.image }}\n", "          IMAGE: ${{ steps.target.outputs.image }}\n"),
+		"the gate skipped in a rehearsal":     strings.Replace(publish, gateName, gateName+skip, 1),
+		"the job skipped in a rehearsal":      strings.Replace(publish, "    name: publish\n", "    name: publish\n    if: ${{ !inputs.rehearse }}\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if decidesForReal(mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// decidesForReal returns an error if the publish job's own if:, its gate
+// step or its decide step mentions rehearse, or the decide step reads
+// another image than the caller's.
+func decidesForReal(workflow string) error {
+	job := jobsOf(linesOf(workflow))["publish"]
+	for _, l := range job {
+		if indent(l.text) == 4 && strings.HasPrefix(strings.TrimSpace(l.text), "if:") && strings.Contains(l.text, "rehearse") {
+			return fmt.Errorf("line %d makes the job conditional on rehearse", l.n)
+		}
+	}
+	st := steps(job)
+	gate := stepsWhere(st, contains("schedule | workflow_dispatch)"))
+	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
+	if len(gate) != 1 || len(decide) != 1 {
+		return fmt.Errorf("%d gate steps and %d decide steps, want one of each", len(gate), len(decide))
+	}
+	for _, i := range []int{gate[0], decide[0]} {
+		if j := slices.IndexFunc(st[i], contains("rehearse")); j >= 0 {
+			return fmt.Errorf("line %d: the step from line %d mentions rehearse", st[i][j].n, st[i][0].n)
+		}
+	}
+	d := st[decide[0]]
+	script, err := runScript(d)
+	if err != nil {
+		return err
+	}
+	if got := value(d, "IMAGE"); got != "${{ inputs.image }}" || !strings.Contains(script, `divbast-published-revision "${IMAGE}:latest"`) {
+		return fmt.Errorf("line %d decides against %q, not the caller's image", d[0].n, got)
+	}
+	return nil
+}
+
+// TestRehearsePublishesInsideTheJob checks that with rehearse set,
+// app-publish.yml writes only to the registry it starts, never to ghcr.io.
+// It logs in to ghcr.io only when not rehearsing; every step after the
+// decision takes the image it writes from the one step that chooses where
+// to publish; and that step, run with bash, chooses
+// localhost:5000/<path of image> in a rehearsal and the caller's image
+// otherwise. Against app-publish.yml as it is, then with each broken,
+// which the check must refuse.
+func TestRehearsePublishesInsideTheJob(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := publishesInside(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const (
+		target = "          IMAGE: ${{ steps.target.outputs.image }}\n"
+		input  = "          IMAGE: ${{ inputs.image }}\n"
+	)
+	for name, mutant := range map[string]string{
+		"a ghcr.io login in a rehearsal":      strings.Replace(publish, " && !inputs.rehearse\n        with:\n          registry: ghcr.io\n", "\n        with:\n          registry: ghcr.io\n", 1),
+		"a rehearsal to ghcr.io":              strings.Replace(publish, `image=localhost:5000/${IMAGE#*/}`, `image=${IMAGE}`, 1),
+		"a rehearsal under the image's host":  strings.Replace(publish, `image=localhost:5000/${IMAGE#*/}`, `image=localhost:5000/${IMAGE}`, 1),
+		"a publish to the rehearsal registry": strings.Replace(publish, `if [ "${REHEARSE}" = true ]; then`, `if true; then`, 1),
+		"the choice blind to rehearse":        replaceAfter(publish, targetName, "          REHEARSE: ${{ inputs.rehearse }}\n", "          REHEARSE: true\n"),
+		"the arches pushed to the input":      replaceAfter(publish, "      - name: Push each tested architecture\n", target, input),
+		"the index staged on the input":       replaceAfter(publish, stageName, target, input),
+		"the attestation for the input":       strings.Replace(publish, "subject-name: ${{ steps.target.outputs.image }}", "subject-name: ${{ inputs.image }}", 1),
+		"the input promoted":                  replaceAfter(publish, promoteName, target, input),
+		"the input checked":                   replaceAfter(publish, checkName, target, input),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if publishesInside(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// publishesInside returns an error unless the publish job's ghcr.io login
+// runs only without rehearse, no step after the decision but the one with
+// id target names inputs.image, every IMAGE or subject-name after it is
+// that step's output, and that step's script, run with bash, writes the
+// image to publish to as GitHub Actions reads a step's outputs.
+func publishesInside(t *testing.T, workflow string) error {
+	t.Helper()
+	st := publishSteps(workflow)
+	login := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "registry: ghcr.io" })
+	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
+	target := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: target" })
+	if len(login) != 1 || len(decide) != 1 || len(target) != 1 {
+		return fmt.Errorf("%d ghcr.io logins, %d decide steps and %d target steps, want one of each", len(login), len(decide), len(target))
+	}
+	if cond := value(st[login[0]], "if"); !strings.Contains(cond, "!inputs.rehearse") {
+		return fmt.Errorf("line %d logs in to ghcr.io on %q, in a rehearsal too", st[login[0]][0].n, cond)
+	}
+	for i := decide[0] + 1; i < len(st); i++ {
+		if i == target[0] {
+			continue
+		}
+		if j := slices.IndexFunc(st[i], contains("inputs.image")); j >= 0 {
+			return fmt.Errorf("line %d names inputs.image, which a rehearsal would write to", st[i][j].n)
+		}
+		for _, key := range []string{"IMAGE", "subject-name"} {
+			if got := value(st[i], key); got != "" && got != "${{ steps.target.outputs.image }}" {
+				return fmt.Errorf("the step from line %d sets %s to %q, not ${{ steps.target.outputs.image }}", st[i][0].n, key, got)
+			}
+		}
+	}
+	s := st[target[0]]
+	if got := value(s, "IMAGE"); got != "${{ inputs.image }}" {
+		return fmt.Errorf("line %d chooses from %q, not ${{ inputs.image }}", s[0].n, got)
+	}
+	if got := value(s, "REHEARSE"); got != "${{ inputs.rehearse }}" {
+		return fmt.Errorf("line %d chooses on %q, not ${{ inputs.rehearse }}", s[0].n, got)
+	}
+	script, err := runScript(s)
+	if err != nil {
+		return err
+	}
+	for _, tt := range []struct{ image, rehearse, want string }{
+		{image: "ghcr.io/divbast/oci-image-template", rehearse: "true", want: "localhost:5000/divbast/oci-image-template"},
+		{image: "ghcr.io/divbast/oci-image-template", rehearse: "false", want: "ghcr.io/divbast/oci-image-template"},
+		{image: "ghcr.io/divbast/librespeed", rehearse: "false", want: "ghcr.io/divbast/librespeed"},
+	} {
+		dir := t.TempDir()
+		res := runStep(t, dir, script, "IMAGE="+tt.image, "REHEARSE="+tt.rehearse, "GITHUB_OUTPUT="+filepath.Join(dir, "output"))
+		if res.Code != 0 {
+			return fmt.Errorf("with IMAGE=%s and REHEARSE=%s, the script exits %d: %s", tt.image, tt.rehearse, res.Code, res.Stderr)
+		}
+		out, err := os.ReadFile(filepath.Join(dir, "output")) //nolint:gosec // G304: the test's own temporary directory
+		if err != nil {
+			return err
+		}
+		if got := string(out); got != "image="+tt.want+"\n" {
+			return fmt.Errorf("with IMAGE=%s and REHEARSE=%s, the script outputs %q, want image=%s", tt.image, tt.rehearse, got, tt.want)
+		}
+	}
+	return nil
+}
+
+// TestRehearseWarnsOutsideTemplate checks that app-publish.yml's rehearse
+// input is off unless a caller sets it, and that a rehearsal says, as a
+// warning and on the run's summary, that nothing reached ghcr.io. In any
+// repository but divbast/oci-image-template, a copy made from it, the line
+// also says how to publish: set image and remove rehearse. Against
+// app-publish.yml as it is, then with each broken, which the check must
+// refuse.
+func TestRehearseWarnsOutsideTemplate(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := warnsOutsideTemplate(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const input = "      rehearse:\n"
+	for name, mutant := range map[string]string{
+		"the input taken out":              strings.Replace(publish, input, "      rehearse-not:\n", 1),
+		"on by default":                    replaceAfter(publish, input, "        default: false\n", "        default: true\n"),
+		"a warning without rehearse":       replaceAfter(publish, warnName, "        if: inputs.rehearse\n", "        if: always()\n"),
+		"no warning":                       strings.Replace(publish, `echo "::warning::${line}"`, `echo "${line}"`, 1),
+		"no summary":                       strings.Replace(publish, `echo "${line}" >> "${GITHUB_STEP_SUMMARY}"`, `echo "${line}" >&2`, 1),
+		"the switch named in the template": strings.Replace(publish, `[ "${REPO}" != divbast/oci-image-template ]`, `[ "${REPO}" != divbast/ci ]`, 1),
+		"the switch named nowhere":         strings.Replace(publish, `[ "${REPO}" != divbast/oci-image-template ]`, `false`, 1),
+		"the repository not given":         replaceAfter(publish, warnName, "          REPO: ${{ github.repository }}\n", "          REPO: divbast/oci-image-template\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if warnsOutsideTemplate(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// warnsOutsideTemplate returns an error unless the workflow declares a
+// boolean rehearse input that defaults to false, and its one step that
+// says nothing was published runs on inputs.rehearse alone, takes REPO from
+// github.repository and, run with bash, prints the warning and writes the
+// summary line, naming the switch outside the template only.
+func warnsOutsideTemplate(t *testing.T, workflow string) error {
+	t.Helper()
+	const said = "rehearsal: nothing was published to ghcr.io"
+	lines := linesOf(workflow)
+	decl := declaration(lines, "rehearse")
+	if !slices.Contains(decl, "type: boolean") || !slices.Contains(decl, "default: false") {
+		return fmt.Errorf("declares rehearse as %q, not a boolean input that defaults to false", decl)
+	}
+	st := publishSteps(workflow)
+	found := stepsWhere(st, contains("nothing was published to ghcr.io"))
+	if len(found) != 1 {
+		return fmt.Errorf("%d steps say nothing was published, want one", len(found))
+	}
+	s := st[found[0]]
+	if cond := value(s, "if"); cond != "inputs.rehearse" {
+		return fmt.Errorf("line %d warns on %q, not inputs.rehearse", s[0].n, cond)
+	}
+	if got := value(s, "REPO"); got != "${{ github.repository }}" {
+		return fmt.Errorf("line %d warns for %q, not ${{ github.repository }}", s[0].n, got)
+	}
+	script, err := runScript(s)
+	if err != nil {
+		return err
+	}
+	for _, repo := range []string{"divbast/oci-image-template", "divbast/new-app"} {
+		dir := t.TempDir()
+		summary := filepath.Join(dir, "summary")
+		res := runStep(t, dir, script, "REPO="+repo, "GITHUB_STEP_SUMMARY="+summary)
+		if res.Code != 0 {
+			return fmt.Errorf("with REPO=%s, the script exits %d: %s", repo, res.Code, res.Stderr)
+		}
+		wrote, err := os.ReadFile(summary) //nolint:gosec // G304: the test's own temporary directory
+		if err != nil {
+			return fmt.Errorf("with REPO=%s, the script writes no summary: %w", repo, err)
+		}
+		line := strings.TrimSuffix(string(wrote), "\n")
+		if string(res.Stdout) != "::warning::"+line+"\n" {
+			return fmt.Errorf("with REPO=%s, the script prints %q, not the warning ::warning::%s", repo, res.Stdout, line)
+		}
+		names := strings.Contains(line, "set image") && strings.Contains(line, "remove rehearse")
+		switch {
+		case !strings.HasPrefix(line, said):
+			return fmt.Errorf("with REPO=%s, the summary says %q, not %q", repo, line, said)
+		case repo == "divbast/oci-image-template" && line != said:
+			return fmt.Errorf("in the template, the summary says %q, not %q alone", line, said)
+		case repo != "divbast/oci-image-template" && !names:
+			return fmt.Errorf("with REPO=%s, the summary says %q, which does not say to set image and remove rehearse", repo, line)
+		}
+	}
+	return nil
+}
+
+// registryManager is the matchStrings of the regex manager in
+// divbast/renovate-config's default.json that moves the rehearsal's
+// registry image, as Renovate reads it.
+var registryManager = regexp.MustCompile(`# renovate: registry\n[^\n]*docker run [^\n]* (?<depName>registry):(?<currentValue>[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})`)
+
+// registryRun is a line that runs the registry image, pinned or not.
+var registryRun = regexp.MustCompile(`docker run .*\sregistry(?:[:@\s]|$)`)
+
+// TestRehearseRegistryPinned checks that app-publish.yml runs the
+// rehearsal's registry by version and digest, on a line the org's Renovate
+// manager reads, binds it to the loopback alone, and starts it only in a
+// rehearsal. Against app-publish.yml as it is, then with each broken, which
+// the check must refuse.
+func TestRehearseRegistryPinned(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := registryPinned(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const marker = "          # renovate: registry\n"
+	pinned := registryManager.FindString(publish)
+	_, digest, _ := strings.Cut(pinned, "@")
+	for name, mutant := range map[string]string{
+		"no marker":                   strings.Replace(publish, marker, "", 1),
+		"the marker a line away":      strings.Replace(publish, marker, marker+"          true\n", 1),
+		"a tag alone":                 strings.Replace(publish, "@"+digest, "", 1),
+		"a second registry, unpinned": strings.Replace(publish, marker, "          docker run -d -p 127.0.0.1:5001:5000 registry:3\n"+marker, 1),
+		"beyond the loopback":         strings.Replace(publish, "-p 127.0.0.1:5000:5000", "-p 5000:5000", 1),
+		"in every publish":            strings.Replace(publish, "        if: steps.decide.outputs.publish == 'true' && inputs.rehearse\n", "        if: steps.decide.outputs.publish == 'true'\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if registryPinned(mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// registryPinned returns an error unless every line that runs the
+// registry image is one registryManager reads, there is one such line,
+// it publishes the registry's port on 127.0.0.1 alone, and its step runs
+// only on inputs.rehearse.
+func registryPinned(workflow string) error {
+	runs := 0
+	for l := range strings.Lines(workflow) {
+		if registryRun.MatchString(l) {
+			runs++
+		}
+	}
+	pinned := registryManager.FindAllString(workflow, -1)
+	if runs != 1 || len(pinned) != 1 {
+		return fmt.Errorf("%d lines run the registry, and Renovate reads %d of them; want one, read", runs, len(pinned))
+	}
+	if !strings.Contains(pinned[0], " -p 127.0.0.1:5000:5000 ") {
+		return fmt.Errorf("%q publishes the registry's port beyond 127.0.0.1:5000", pinned[0])
+	}
+	st := publishSteps(workflow)
+	found := stepsWhere(st, func(l line) bool { return registryRun.MatchString(l.text) })
+	if len(found) != 1 {
+		return fmt.Errorf("%d steps run the registry, want one", len(found))
+	}
+	if cond := value(st[found[0]], "if"); !strings.Contains(cond, "inputs.rehearse") || strings.Contains(cond, "!inputs.rehearse") {
+		return fmt.Errorf("line %d starts the registry on %q, not in a rehearsal alone", st[found[0]][0].n, cond)
 	}
 	return nil
 }
