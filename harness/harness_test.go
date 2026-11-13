@@ -225,7 +225,9 @@ func TestStartNamesTheContainer(t *testing.T) {
 // fail, in the words Docker 29 and Podman print. ErrNeverStarted is for a
 // container the engine made and could not start; a run it refused before
 // making one, for a flag, an image it could not pull or a name already in
-// use, is ErrRefused instead.
+// use, is ErrRefused instead. A container Start did not make is not its
+// to remove: on a name in use, its cleanup issues no rm, which the Fake,
+// having none scripted, would fail.
 func TestNeverStartedOnlyForNeverStarted(t *testing.T) {
 	t.Parallel()
 
@@ -241,6 +243,7 @@ func TestNeverStartedOnlyForNeverStarted(t *testing.T) {
 		name, engine string
 		run          execx.Result
 		inspect      []execx.Call // none for a refusal the engine's words already settle
+		othersName   bool         // the name is another container's, which no cleanup may remove
 		want         error        // nil for neither
 		wantText     string
 	}{
@@ -320,17 +323,19 @@ func TestNeverStartedOnlyForNeverStarted(t *testing.T) {
 		},
 		{
 			// The container of that name is another's, so its state says
-			// nothing of this run, and it is never asked about.
-			name:   "docker-name-in-use",
-			engine: "docker",
+			// nothing of this run: it is never asked about, nor removed.
+			name:       "docker-name-in-use",
+			engine:     "docker",
+			othersName: true,
 			run: execx.Result{Code: 125, Stderr: []byte(`docker: Error response from daemon: Conflict. The container name "/ctr" is already in use by container "3f82dc47df74". ` +
 				`You have to remove (or rename) that container to be able to reuse that name.`)},
 			want:     ErrRefused,
 			wantText: "already in use",
 		},
 		{
-			name:   "podman-name-in-use",
-			engine: "podman",
+			name:       "podman-name-in-use",
+			engine:     "podman",
+			othersName: true,
 			run: execx.Result{Code: 125, Stderr: []byte(`Error: creating container storage: the container name "ctr" is already in use by 3f82dc47df74. ` +
 				`You have to remove that container to be able to reuse that name: that name is already in use`)},
 			want:     ErrRefused,
@@ -354,11 +359,13 @@ func TestNeverStartedOnlyForNeverStarted(t *testing.T) {
 			calls := slices.Concat(
 				[]execx.Call{{Argv: slices.Concat([]string{tt.engine}, e.Argv(spec)), Result: tt.run}},
 				tt.inspect,
-				// Removed all the same, and a missing one is no failure
-				[]execx.Call{{Argv: []string{tt.engine, "rm", "-f", "-v", "ctr"}, Result: execx.Result{
-					Code: 1, Stderr: []byte("Error: no such container ctr"),
-				}}},
 			)
+			if !tt.othersName {
+				// Removed all the same, and a missing one is no failure
+				calls = append(calls, execx.Call{Argv: []string{tt.engine, "rm", "-f", "-v", "ctr"}, Result: execx.Result{
+					Code: 1, Stderr: []byte("Error: no such container ctr"),
+				}})
+			}
 			e.run = execx.NewFake(t, calls...)
 
 			_, err := e.Start(t.Context(), t, spec)
@@ -803,10 +810,18 @@ func TestInspectPodmanHostConfig(t *testing.T) {
 }
 
 // TestInspectPorts reads the host address each published port is bound
-// to, in the shape Docker 29 printed NetworkSettings.Ports for a container
-// run with -p 127.0.0.1::8080 -p 8081, whose image exposes 8080 and 8081:
-// one binding for an address given, one per address family for none, and
-// null for a port exposed but not published. Podman prints the same shape.
+// to. Docker 29 printed NetworkSettings.Ports as the docker case has it,
+// for a container run with -p 127.0.0.1::8080 -p 8081 whose image exposes
+// 8080 and 8081: one binding for an address given, one per address family
+// for none, and null for a port exposed but not published.
+//
+// The podman case is the shape of Podman's define.InspectHostPort
+// (libpod/define/container_inspect.go, v6.2.0), whose HostIp is "" for a
+// port bound on every address. Podman 4.9 printed it so, since its
+// makeInspectPorts (libpod/util.go) copied the address as given; from 5.0
+// on Podman writes 0.0.0.0 there, as Docker does. An exposed port gets a
+// nil binding (addInspectPortsExpose). Podman is not installed where this
+// was written, so the shape is from the source, not a run.
 func TestInspectPorts(t *testing.T) {
 	t.Parallel()
 
@@ -824,8 +839,8 @@ func TestInspectPorts(t *testing.T) {
 		{
 			name:   "podman",
 			engine: "podman",
-			ports:  `{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18290"}],"8081/tcp":[{"HostIp":"::1","HostPort":"18291"}]}`,
-			want:   map[string]string{"8080/tcp": "127.0.0.1:18290", "8081/tcp": "[::1]:18291"},
+			ports:  `{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18290"}],"8081/tcp":[{"HostIp":"","HostPort":"18291"}],"9000/tcp":null}`,
+			want:   map[string]string{"8080/tcp": "127.0.0.1:18290", "8081/tcp": "0.0.0.0:18291"},
 		},
 		{name: "exposed-not-published", engine: "docker", ports: `{"8080/tcp":null,"8081/tcp":[]}`, want: map[string]string{}},
 		{name: "none-exposed", engine: "podman", ports: `{}`, want: map[string]string{}},

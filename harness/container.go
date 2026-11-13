@@ -231,8 +231,13 @@ func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Conta
 
 	c := &Container{Name: s.Name, engine: e, network: s.Network}
 	// Registered before the run: a container can be created and then fail
-	// to start, and it is removed all the same.
+	// to start, and it is removed all the same. One whose name was already
+	// another container's made nothing, and that other is not its to remove.
+	othersName := false
 	tb.Cleanup(func() {
+		if othersName {
+			return
+		}
 		rmCtx, cancel := cleanupContext(ctx)
 		defer cancel()
 		if tb.Failed() && c.ID != "" {
@@ -250,6 +255,7 @@ func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Conta
 		return nil, err
 	}
 	if res.Code != 0 {
+		othersName = nameInUse(res.Stderr, s.Name)
 		return nil, e.notStarted(ctx, s.Name, res)
 	}
 	// The ID is the last thing printed; Podman may print a pull first.
@@ -271,11 +277,8 @@ func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Conta
 // does exist.
 func (e Engine) notStarted(ctx context.Context, name string, res Result) error {
 	words := fmt.Sprintf("%s run: exit status %d: %s", e.name, res.Code, bytes.TrimSpace(res.Stderr))
-	// Docker names the container with a leading slash, and Podman without
-	for _, inUse := range []string{`name "/` + name + `" is already in use`, `name "` + name + `" is already in use`} {
-		if bytes.Contains(res.Stderr, []byte(inUse)) {
-			return fmt.Errorf("container %s was %w: another container has its name: %s", name, ErrRefused, words)
-		}
+	if nameInUse(res.Stderr, name) {
+		return fmt.Errorf("container %s was %w: another container has its name: %s", name, ErrRefused, words)
 	}
 	made, err := e.made(ctx, name)
 	switch {
@@ -286,6 +289,14 @@ func (e Engine) notStarted(ctx context.Context, name string, res Result) error {
 	default:
 		return fmt.Errorf("container %s was %w: %s", name, ErrRefused, words)
 	}
+}
+
+// nameInUse reports whether a run's stderr says another container already
+// has the name the run asked for. Docker names the container with a
+// leading slash, and Podman without.
+func nameInUse(stderr []byte, name string) bool {
+	return bytes.Contains(stderr, []byte(`name "/`+name+`" is already in use`)) ||
+		bytes.Contains(stderr, []byte(`name "`+name+`" is already in use`))
 }
 
 // made reports whether the engine holds a container called name.
@@ -383,10 +394,12 @@ type Inspect struct {
 	// Ports holds where each port the run published is bound on the host,
 	// as ip:port, keyed by the container's port as the engine names it,
 	// such as 8080/tcp: how a suite that let the engine pick the host port,
-	// with -p 127.0.0.1::8080, finds it. A port bound on several addresses,
-	// as -p 8080 binds it on both IPv4's and IPv6's, is given at the first
-	// the engine lists, IPv4's. A port the image exposes and the run did
-	// not publish is not in it.
+	// with -p 127.0.0.1::8080, finds it. A port bound on several addresses
+	// is given at the first the engine lists. A port published on every
+	// address, as -p 8080 publishes it, is 0.0.0.0:<port> on both engines:
+	// Docker lists 0.0.0.0 first and then ::, Podman from 5.0 on writes
+	// 0.0.0.0, and Podman before 5.0 an empty address, read as 0.0.0.0. A
+	// port the image exposes and the run did not publish is not in it.
 	Ports map[string]string
 }
 
@@ -513,7 +526,7 @@ func (c *Container) Inspect(ctx context.Context) (Inspect, error) {
 	ins.Ports = make(map[string]string, len(got.NetworkSettings.Ports))
 	for port, bindings := range got.NetworkSettings.Ports {
 		if len(bindings) > 0 {
-			ins.Ports[port] = net.JoinHostPort(bindings[0].HostIP, bindings[0].HostPort)
+			ins.Ports[port] = net.JoinHostPort(cmp.Or(bindings[0].HostIP, "0.0.0.0"), bindings[0].HostPort)
 		}
 	}
 	return ins, nil

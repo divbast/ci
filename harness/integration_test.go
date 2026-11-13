@@ -188,6 +188,17 @@ func TestWaitExitOnFixture(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The container whose name a-name-in-use asks for is another's,
+		// which that run never made, so its cleanup must leave it be. This
+		// runs once every case below has ended and run its cleanups, and
+		// before taken's own cleanup removes it.
+		t.Cleanup(func() {
+			inspectCtx, cancel := cleanupContext(ctx)
+			defer cancel()
+			if ins, ierr := taken.Inspect(inspectCtx); ierr != nil || !ins.State.Running {
+				t.Errorf("container %s, whose name a refused run asked for: %+v, %v; want it still running", taken, ins.State, ierr)
+			}
+		})
 		for _, tt := range []struct {
 			name string
 			spec RunSpec
@@ -197,11 +208,15 @@ func TestWaitExitOnFixture(t *testing.T) {
 			{name: "an-image-it-cannot-pull", spec: RunSpec{Image: "localhost:1/divbast/none:missing"}},
 			{name: "a-name-in-use", spec: RunSpec{Image: testfixture.LibreSpeed, Name: taken.Name}},
 		} {
-			tt.spec.Confine = Contract("16m")
-			_, err := e.Start(ctx, t, &tt.spec)
-			if !errors.Is(err, ErrRefused) || errors.Is(err, ErrNeverStarted) {
-				t.Errorf("%s: Start() error = %v, want ErrRefused alone", tt.name, err)
-			}
+			// Each a test of its own, whose cleanups run when it ends
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				tt.spec.Confine = Contract("16m")
+				_, err := e.Start(t.Context(), t, &tt.spec)
+				if !errors.Is(err, ErrRefused) || errors.Is(err, ErrNeverStarted) {
+					t.Errorf("Start() error = %v, want ErrRefused alone", err)
+				}
+			})
 		}
 	})
 }
@@ -241,11 +256,26 @@ func TestInspectPortsOnFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET / at %s, from the host: %v", addr, err)
 	}
-	if err := resp.Body.Close(); err != nil {
-		t.Error(err)
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Error(cerr)
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("GET / at %s, from the host: status %d, want 200", addr, resp.StatusCode)
+	}
+
+	// A port published on every address reads as 0.0.0.0 on either engine,
+	// whatever address the engine itself wrote for it.
+	all, err := e.Start(ctx, t, &RunSpec{Image: testfixture.LibreSpeed, Confine: Contract("16m"), Publish: []string{"8080"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, err = all.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port, err = net.SplitHostPort(ins.Ports["8080/tcp"])
+	if err != nil || host != "0.0.0.0" || port == "" || port == "0" {
+		t.Errorf("Inspect().Ports = %q after -p 8080, want 8080/tcp at 0.0.0.0 and the port the engine picked", ins.Ports)
 	}
 }
 
@@ -517,8 +547,17 @@ func TestEngineUnhealthy(t *testing.T) {
 	if out := combined(res); (res.Code != 126 && res.Code != 127) || !strings.Contains(out, "/bin/sh") {
 		t.Fatalf("/bin/sh -c 'exit 0' in the container: exit %d: %s; want 126 or 127, the runtime saying /bin/sh could not be executed", res.Code, out)
 	}
-	// Docker's health log does keep the runtime's words, for each check.
-	if e.Name() == "docker" && !strings.Contains(unhealthy.Error(), "/bin/sh") {
-		t.Fatalf("EngineHealthy() error = %v, want Docker's health log saying /bin/sh could not be run", unhealthy)
+	switch e.Name() {
+	case "docker":
+		// Docker's health log does keep the runtime's words, for each check.
+		if !strings.Contains(unhealthy.Error(), "/bin/sh") {
+			t.Fatalf("EngineHealthy() error = %v, want Docker's health log saying /bin/sh could not be run", unhealthy)
+		}
+	case "podman":
+		// The check ran and failed: podman healthcheck run exits 1 saying
+		// unhealthy, where an error of the engine's own exits 125.
+		if !strings.Contains(unhealthy.Error(), "exit status 1: unhealthy") {
+			t.Fatalf("EngineHealthy() error = %v, want podman healthcheck run's exit status 1 and its word unhealthy", unhealthy)
+		}
 	}
 }
