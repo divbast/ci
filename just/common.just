@@ -12,9 +12,11 @@
 #   lint:
 #       {{ just_executable() }} ci-fresh actions-check workflow-audit go-lint
 #
-# Never as dependencies, as in `lint: actions-check`. just resolves those
-# when it reads the justfile, so until setup has fetched .ci no recipe
-# would run at all, setup included.
+# Never as dependencies of its own recipes, as in `lint: actions-check`.
+# just resolves those when it reads the justfile, so until setup has
+# fetched .ci no recipe would run at all, setup included. The shared
+# recipes can name each other as dependencies, as app.just's acceptance
+# and scan name ci-tools, since they exist only once .ci does.
 #
 # The recipes need that shell: bash, and the tools from the repository's
 # own mise.toml rather than whatever is on PATH.
@@ -36,9 +38,8 @@ ci-tools:
 # A git pull that moves the workflows' pin leaves .ci where it was until
 # `just setup` moves it, and every shared recipe would go on running the
 # old commit's recipes, tools and configuration. A repository's lint runs
-# this first. It builds divbast-pin from its own body when .ci/bin lacks
-# it, since a shared recipe is never named as a dependency. ci, its own
-# checkout, has no pin to check.
+# this first. It builds divbast-pin from its own body, and only when
+# .ci/bin lacks it. ci, its own checkout, has no pin to check.
 
 # Fail unless .ci holds the commit the workflows pin
 ci-fresh:
