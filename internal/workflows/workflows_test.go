@@ -1344,6 +1344,11 @@ func TestPublishShellPinned(t *testing.T) {
 		"a job default shell that runs first": strings.Replace(publish, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: sh -c 'id >&2; exec bash -eo pipefail \"$0\"' {0}\n", 1),
 		"a workflow default without -e":       strings.Replace(publish, "\ndefaults:\n  run:\n    shell: bash\n", "\ndefaults:\n  run:\n    shell: bash {0}\n", 1),
 		"a pinned step's own shell":           replaceAfter(publish, promoteName, "        env:\n", "        shell: bash {0}\n        env:\n"),
+		// What mise-action hands every later step, and the build of the
+		// tools the pinned steps run (backlog CI-12)
+		"mise exporting the caller's env":  strings.Replace(publish, "          env: \"false\"\n", "          env: \"true\"\n", 1),
+		"mise exporting the caller's PATH": strings.Replace(publish, "          export_path: \"false\"\n", "", 1),
+		"the tools built by a bare go":     strings.Replace(publish, "mise exec -- go -C .ci build", "go -C .ci build", 1),
 	}
 	exits := 0
 	for i, l := range strings.SplitAfter(publish, "\n") {
@@ -1521,11 +1526,15 @@ func TestPublishShellReadsEveryForm(t *testing.T) {
 			"      - name: Gate\n        run: |\n          case \"${EVENT}\" in\n            schedule | workflow_dispatch) ;;\n          esac\n" +
 			"      - name: Template\n        id: template\n        run: echo template\n" +
 			"      - name: Rehearse\n        id: rehearse\n        run: echo rehearse\n" +
+			"      - name: Pin\n        id: pin\n        run: echo pin\n" +
 			"      - name: Decide\n        id: decide\n        run: echo decide\n"
-		none = "== workflow env names ==\n(none)\n== workflow defaults ==\n(none)\n" +
-			"== publish job env ==\n(none)\n== publish job defaults ==\n(none)\n"
+		noMise = "== jdx/mise-action inputs ==\n(none)\n"
+		none   = "== workflow env names ==\n(none)\n== workflow defaults ==\n(none)\n" +
+			"== publish job env ==\n(none)\n== publish job defaults ==\n(none)\n" + noMise
 		gate = "== Gate ==\nrun:\ncase \"${EVENT}\" in\n  schedule | workflow_dispatch) ;;\nesac\n" +
-			"== Template ==\nrun:\necho template\n== Rehearse ==\nrun:\necho rehearse\n== Decide ==\nrun:\necho decide\n"
+			"== Template ==\nrun:\necho template\n== Rehearse ==\nrun:\necho rehearse\n== Pin ==\nrun:\necho pin\n" +
+			"== Decide ==\nrun:\necho decide\n"
+		mise = "      - uses: jdx/mise-action@x\n        with:\n          install_args: core:go\n          env: \"false\"\n"
 	)
 	tests := []struct {
 		name, workflow, want string
@@ -1555,8 +1564,18 @@ func TestPublishShellReadsEveryForm(t *testing.T) {
 			workflow: "env:\n  MISE_VERSION: 1\n  OTHER: x\ndefaults:\n  run:\n    shell: bash\n" + job +
 				"    env:\n      MISE_AUTO_INSTALL: \"false\"\n    defaults:\n      run:\n        working-directory: app\n" + steps,
 			want: "== workflow env names ==\nMISE_VERSION\nOTHER\n== workflow defaults ==\nrun:\n  shell: bash\n" +
-				"== publish job env ==\nMISE_AUTO_INSTALL: \"false\"\n== publish job defaults ==\nrun:\n  working-directory: app\n" + gate,
+				"== publish job env ==\nMISE_AUTO_INSTALL: \"false\"\n== publish job defaults ==\nrun:\n  working-directory: app\n" + noMise + gate,
 		},
+		{
+			// What mise-action gives later steps, wherever its step stands
+			// (backlog CI-12)
+			name:     "a mise step's inputs",
+			workflow: job + "    steps:\n" + mise + strings.TrimPrefix(steps, "    steps:\n"),
+			want: strings.Replace(none, noMise, "== jdx/mise-action inputs ==\ninstall_args: core:go\nenv: \"false\"\n", 1) +
+				gate,
+		},
+		{name: "a mise step's inputs on one line", workflow: job + "    steps:\n      - uses: jdx/mise-action@x\n        with: { env: \"false\" }\n" + strings.TrimPrefix(steps, "    steps:\n")},
+		{name: "no step to pin the tools' build", workflow: job + strings.Replace(steps, "        id: pin\n", "", 1)},
 		{
 			// The step's own run: key is pinned, never an env entry of the
 			// same name ahead of it (backlog CI-10)
@@ -1612,13 +1631,16 @@ const pinnedRegistry = "registry:<version>@<digest>"
 // publishShell returns what bash runs in the publish job's pinned steps,
 // and everything that shapes how it runs: the names of the workflow's
 // env, whose one value Renovate moves; the workflow's defaults; the
-// publish job's env and defaults; and, under each pinned step's name, its
-// env, its own shell if it sets one, and its run: script as written, its
-// indent taken off. An env entry such as BASH_ENV, which
-// bash expands before the script, or PATH, and a defaults shell, can each
-// change what a script does without a line of it changing. The pinned
-// steps are the gate, the refusal of the template's image, the refusal of
-// a rehearsal outside the template, and every step from the decision on. The registry image's version and digest are
+// publish job's env and defaults; the inputs of each jdx/mise-action step,
+// which can write the caller's mise.toml [env] and PATH into every later
+// step; and, under each pinned step's name, its env, its own shell if it
+// sets one, and its run: script as written, its indent taken off. An env
+// entry such as BASH_ENV, which bash expands before the script, or PATH,
+// and a defaults shell, can each change what a script does without a line
+// of it changing. The pinned steps are the gate, the refusal of the
+// template's image, the refusal of a rehearsal outside the template, the
+// build of ci's tools, which every step from the decision on runs, and
+// every step from the decision on. The registry image's version and digest are
 // replaced by pinnedRegistry. A step in that range that neither runs a
 // script nor uses an action, a script in a step with no name, a block
 // scalar other than |, and an env or defaults written on one line are
@@ -1668,17 +1690,31 @@ func publishShell(workflow string) (string, error) {
 	}
 
 	st := steps(job)
-	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
+	var mise []string
+	for _, i := range stepsWhere(st, isUses("jdx/mise-action")) {
+		with, err := stepMapping(st[i], "with")
+		if err != nil {
+			return "", err
+		}
+		mise = append(mise, with...)
+	}
+	section("jdx/mise-action inputs", mise)
+
+	id := func(want string) func(line) bool {
+		return func(l line) bool { return strings.TrimSpace(l.text) == "id: "+want }
+	}
+	decide := stepsWhere(st, id("decide"))
 	gate := stepsWhere(st, contains("schedule | workflow_dispatch)"))
-	template := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: template" })
-	rehearse := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: rehearse" })
-	if len(decide) != 1 || len(gate) != 1 || len(template) != 1 || len(rehearse) != 1 {
-		return "", fmt.Errorf("%d decide steps, %d gate steps, %d steps with id template and %d with id rehearse, want one of each",
-			len(decide), len(gate), len(template), len(rehearse))
+	template := stepsWhere(st, id("template"))
+	rehearse := stepsWhere(st, id("rehearse"))
+	pin := stepsWhere(st, id("pin"))
+	if len(decide) != 1 || len(gate) != 1 || len(template) != 1 || len(rehearse) != 1 || len(pin) != 1 {
+		return "", fmt.Errorf("%d decide steps, %d gate steps, and %d, %d and %d steps with id template, rehearse and pin; want one of each",
+			len(decide), len(gate), len(template), len(rehearse), len(pin))
 	}
 	key := func(l line) string { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") }
 	for i, s := range st {
-		if i != gate[0] && i != template[0] && i != rehearse[0] && i < decide[0] {
+		if i != gate[0] && i != template[0] && i != rehearse[0] && i != pin[0] && i < decide[0] {
 			continue
 		}
 		// The step's own keys, at its key column: an env entry named run
@@ -2492,9 +2528,14 @@ func TestPublishInstallsGoAlone(t *testing.T) {
 		t.Errorf("app-publish.yml: %v", err)
 	}
 	for name, mutant := range map[string]string{
-		"another tool too": strings.Replace(publish, "install_args: core:go\n", "install_args: core:go aqua:skopeo\n", 1),
-		"auto-install on":  strings.Replace(publish, "      MISE_AUTO_INSTALL: \"false\"\n", "      MISE_AUTO_INSTALL: \"true\"\n", 1),
-		"no mise step":     strings.Replace(publish, "uses: jdx/mise-action@", "uses: jdx/mise-actions@", 1),
+		"another tool too":             strings.Replace(publish, "install_args: core:go\n", "install_args: core:go aqua:skopeo\n", 1),
+		"auto-install on":              strings.Replace(publish, "      MISE_AUTO_INSTALL: \"false\"\n", "      MISE_AUTO_INSTALL: \"true\"\n", 1),
+		"no mise step":                 strings.Replace(publish, "uses: jdx/mise-action@", "uses: jdx/mise-actions@", 1),
+		"the caller's env exported":    strings.Replace(publish, "          env: \"false\"\n", "", 1),
+		"the caller's env on":          strings.Replace(publish, "          env: \"false\"\n", "          env: \"true\"\n", 1),
+		"the caller's PATH exported":   strings.Replace(publish, "          export_path: \"false\"\n", "", 1),
+		"the caller's PATH on":         strings.Replace(publish, "          export_path: \"false\"\n", "          export_path: true\n", 1),
+		"a second mise step, exported": strings.Replace(publish, "      # For `imagetools create`\n", "      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8\n        with:\n          install_args: core:go\n      # For `imagetools create`\n", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -2509,8 +2550,13 @@ func TestPublishInstallsGoAlone(t *testing.T) {
 }
 
 // installsGoAlone returns an error unless the publish job has a
-// jdx/mise-action step, each such step's install_args is core:go, and the
-// job's env sets MISE_AUTO_INSTALL to false.
+// jdx/mise-action step, each such step's install_args is core:go and it
+// sets env and export_path to false, and the job's env sets
+// MISE_AUTO_INSTALL to false. Both inputs default to true, under which the
+// action writes the caller's mise.toml [env], and the PATH entries mise
+// makes, into every later step's environment, where a BASH_ENV or a PATH
+// there would change what the pinned scripts run without a line of them
+// changing (backlog CI-12).
 func installsGoAlone(workflow string) error {
 	job := jobsOf(linesOf(workflow))["publish"]
 	st := steps(job)
@@ -2521,6 +2567,11 @@ func installsGoAlone(workflow string) error {
 	for _, i := range mise {
 		if got := value(st[i], "install_args"); got != "core:go" {
 			return fmt.Errorf("line %d installs %q, not core:go", st[i][0].n, got)
+		}
+		for _, input := range []string{"env", "export_path"} {
+			if got := withInput(st[i], input); got != "false" {
+				return fmt.Errorf("line %d gives jdx/mise-action %s: %q, not false, so the caller's mise.toml reaches every later step", st[i][0].n, input, got)
+			}
 		}
 	}
 	if got := unquote(jobEnv(job)["MISE_AUTO_INSTALL"]); got != "false" {
@@ -2622,6 +2673,82 @@ func usesOnlyItsActions(workflow string) error {
 	}
 	if !slices.Equal(used, publishActions) {
 		return fmt.Errorf("the publish job uses %q, want exactly %q, in that order", used, publishActions)
+	}
+	return nil
+}
+
+// withInput returns the value of the input called name in a step's with:
+// block, unquoted, or "" when it sets none.
+func withInput(step []line, name string) string {
+	with, err := stepMapping(step, "with")
+	if err != nil {
+		return ""
+	}
+	for _, w := range with {
+		if k, v, ok := strings.Cut(w, ":"); ok && k == name {
+			return unquote(v)
+		}
+	}
+	return ""
+}
+
+// TestPublishRunsGoThroughMise checks that every go app-publish.yml's
+// publish job runs is mise exec's: with the action exporting none of the
+// caller's environment, mise exec is what gives Go the caller's pinned
+// toolchain and the GOTOOLCHAIN and GOFLAGS of its mise.toml [env], for
+// that one command and no other (backlog CI-12). Against app-publish.yml
+// as it is, then with a go that is not, which the check must refuse.
+func TestPublishRunsGoThroughMise(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := runsGoThroughMise(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	for name, mutant := range map[string]string{
+		"go on its own":        strings.Replace(publish, "mise exec -- go -C .ci build", "go -C .ci build", 1),
+		"go after another":     strings.Replace(publish, "mise exec -- go -C .ci build", "true && go -C .ci build", 1),
+		"go in a later step":   strings.Replace(publish, "          published=$(", "          go version\n          published=$(", 1),
+		"go through env alone": strings.Replace(publish, "mise exec -- go -C .ci build", "env go -C .ci build", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if runsGoThroughMise(mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// goCommand is a command, in a script, whose word is go: at the start of
+// a line or after a separator, an env, or anything else that runs it.
+var goCommand = regexp.MustCompile(`(?:^|[;&|(]\s*|\s)go(?:\s|$)`)
+
+// runsGoThroughMise returns an error unless the publish job runs go at
+// least once, and every go it runs is mise exec -- go.
+func runsGoThroughMise(workflow string) error {
+	runs := 0
+	for _, s := range publishSteps(workflow) {
+		if stepKey(s, "run") < 0 {
+			continue
+		}
+		script, err := runScript(s)
+		if err != nil {
+			return err
+		}
+		for l := range strings.Lines(script) {
+			for _, at := range goCommand.FindAllStringIndex(l, -1) {
+				if !strings.HasSuffix(strings.TrimRight(l[:at[1]], " \t\n"), "mise exec -- go") {
+					return fmt.Errorf("line %d runs go other than through mise exec: %s", s[0].n, strings.TrimSpace(l))
+				}
+				runs++
+			}
+		}
+	}
+	if runs == 0 {
+		return errors.New("the publish job runs no go at all, so nothing builds ci's tools")
 	}
 	return nil
 }
