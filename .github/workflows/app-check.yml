@@ -27,9 +27,10 @@ on:
         default: true
       no-cache-filters:
         description: >-
-          Build stages, separated by spaces, that the daily slot and a manual
-          run build without the cache: the ones that fetch from outside the
-          repository
+          No effect. The daily slot and a manual run already build every
+          stage from scratch, with no cache restored, on a builder made for
+          the job, so the stages named here change nothing. Kept so that a
+          caller passing it keeps working
         type: string
         default: ''
 
@@ -169,11 +170,13 @@ jobs:
           )
           if [ "${GITHUB_EVENT_NAME}" = schedule ] ||
             [ "${GITHUB_EVENT_NAME}" = workflow_dispatch ]; then
-            # The daily slot and the button, the two runs that publish. The
-            # stages named here reach outside the repository, so a cache hit
-            # on one means the daily build tested nothing upstream, and a
-            # publish would ship whatever a push or pull request last
-            # fetched, which can be older than what :latest already carries.
+            # The daily slot and the button, the two runs that publish. A
+            # cache hit there would mean the daily build tested nothing
+            # upstream, and a publish would ship whatever a push or pull
+            # request last fetched. Neither restores the cache, and the
+            # builder is the one setup-buildx made for this job, so every
+            # stage builds from scratch already, and the --no-cache-filter
+            # flags below change nothing.
             read -ra stages <<<"${NO_CACHE_FILTERS}"
             for stage in "${stages[@]}"; do
               args+=(--no-cache-filter "${stage}")

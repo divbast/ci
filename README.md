@@ -36,46 +36,68 @@ request. `lint.yml`, `app-check.yml` and `app-publish.yml`, which run the
 repository's own recipes and code, check ci out at their own commit into
 `.ci` and run `divbast-pin -expect <that commit>`, so a repository whose
 workflows name more than one commit, or one other than the commit running,
-fails its CI.
+fails its CI. `divbast-pin` reads ci's name in any case, as GitHub does,
+so `DivBast/CI/...@<other>` counts as a second pin, and it reads a `uses:`
+in YAML's flow style, `{uses: ...}`, as well.
 
 ### `just setup`
 
 The repository's `setup` recipe checks ci out at the pinned commit, by
-object rather than by tarball, and then installs the toolchain. This is
-the recipe, as each repository carries it:
+object rather than by tarball, and then installs the toolchain. These are
+the recipes, as each repository carries them:
 
 ```just
 # Fetch divbast/ci at the commit the workflows pin, then install the toolchain
-setup:
+setup: ci-checkout
     #!/usr/bin/env bash
     # Not through the mise exec shell: this is what installs what it runs
     set -euo pipefail
-    # The one release commit every workflow calls divbast/ci at
+    mise install
+
+# Fetch divbast/ci at the commit the workflows pin, into .ci, and nothing else
+ci-checkout:
+    #!/usr/bin/env bash
+    # Not through the mise exec shell, which would first install what is missing
+    set -euo pipefail
+    # The one commit the workflows call divbast/ci at, spelt in any case
     uses="^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*[\"']?divbast/ci/[^@[:space:]\"']+@[^[:space:]\"'#]+"
-    sha=$(grep -hoE "${uses}" .github/workflows/*.y*ml | sed 's/.*@//' | sort -u | paste -sd ' ' - || true)
+    sha=$(grep -hoiE "${uses}" .github/workflows/*.y*ml | sed 's/.*@//' | sort -u | paste -sd ' ' - || true)
     if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
-        echo "setup: the workflows must call divbast/ci at one full commit SHA, not at: ${sha:-none}" >&2
+        echo "ci-checkout: the workflows must call divbast/ci at one full commit SHA, not at: ${sha:-none}" >&2
+        exit 1
+    elif [[ "$(git -C .ci rev-parse HEAD 2>/dev/null || true)" == "${sha}" ]]; then
+        echo "ci-checkout: .ci is already at ${sha}"
+        exit 0
+    fi
+    changed=$([[ ! -e .ci/.git ]] || git -C .ci status --porcelain)
+    if [[ -n "${changed}" ]]; then
+        printf 'ci-checkout: moving .ci to %s would carry its own changes across, or stop on them; save or discard them first:\n%s\n' "${sha}" "${changed}" >&2
         exit 1
     fi
-    have=$(git -C .ci rev-parse HEAD 2>/dev/null || true)
-    if [[ "${have}" == "${sha}" ]]; then
-        echo "setup: .ci is already at ${sha}"
-    else
-        git init -q .ci
-        git -C .ci fetch -q --depth 1 https://github.com/divbast/ci "${sha}"
-        git -C .ci checkout -q FETCH_HEAD
-    fi
-    mise install
+    git init -q .ci
+    git -C .ci fetch -q --depth 1 https://github.com/divbast/ci "${sha}"
+    git -C .ci checkout -q FETCH_HEAD
 ```
 
-It refuses workflows that call ci at more than one ref, or at anything but
-a full commit, and names every ref it found. It does nothing to `.ci` when
-`.ci` is already at the pinned commit, which is how it finds a checkout
-that one of ci's workflows made, so that CI runs the workflow's own commit
-of the recipes. A repository that needs more, such as `composer install`,
-adds it after `mise install`.
+`ci-checkout` refuses workflows that call ci at more than one ref, or at
+anything but a full commit, and names every ref it found. It reads ci's
+name in any case, as GitHub does, so `DivBast/CI/...@<other>` beside
+`divbast/ci/...@<commit>` is two refs. It reads block-style `uses:` lines
+only, the form Renovate writes; `ci-fresh` and CI's pin check read flow
+style as well. It does nothing to `.ci` when `.ci`
+is already at the pinned commit, which is how it finds a checkout that one
+of ci's workflows made, so that CI runs the workflow's own commit of the
+recipes. It refuses to move a `.ci` that holds changes of its own, edited
+or untracked files, and names each: a checkout would carry them across to
+the new commit, or stop halfway on one. The tools `ci-tools` builds into
+`.ci/bin` are not changes, since ci's own `.gitignore` leaves them out.
 
-`.ci/` goes in both `.gitignore` and `.dockerignore`.
+`setup` runs `ci-checkout`, then `mise install`. A repository that needs
+more, such as `composer install`, adds it after `mise install`.
+`ci-checkout` on its own fetches `.ci` and installs nothing.
+
+`.ci/` goes in `.gitignore`, and in `.dockerignore` in a repository that
+builds an image.
 
 ### The justfile
 
@@ -91,8 +113,14 @@ import? '.ci/just/app.just'
 
 # Every lint gate
 lint:
-    {{ just_executable() }} actions-check workflow-audit actionlint shell-lint go-lint reuse-lint
+    {{ just_executable() }} ci-fresh actions-check workflow-audit actionlint shell-lint go-lint go-test reuse-lint app-lint
 ```
+
+That is an app's `lint`. A repository runs `go-lint` and `go-test` only
+when it has Go code, and `app-lint` only when it builds an image; one with
+neither runs the rest, as in
+[A repository that builds no image](#a-repository-that-builds-no-image).
+Every repository's `lint` runs `ci-fresh` first.
 
 The imports are optional and the shared recipes are run from a recipe's
 body, never named as dependencies (`lint: actions-check`). just resolves
@@ -100,11 +128,21 @@ dependencies when it reads the justfile, so until `setup` has fetched
 `.ci`, a dependency on a shared recipe would stop every recipe running,
 `setup` included.
 
+`ci-fresh` fails when `.ci` does not hold the commit the workflows pin. A
+`git pull` that moves the pin leaves `.ci` where it was until `just setup`
+moves it, and every shared recipe would go on running the old commit's
+recipes, tools and configuration. It runs `divbast-pin -expect` with the
+commit `.ci` holds, so a failure names both commits, and builds
+`.ci/bin/divbast-pin` first when it is missing. In CI it passes, since each
+workflow checks `.ci` out at the commit it checks the pin against. Inside
+ci, its own checkout, it checks nothing.
+
 `common.just` holds what every repository runs:
 
 | Recipe | What it does |
 |---|---|
 | `ci-tools` | Builds ci's tools into `.ci/bin/` |
+| `ci-fresh` | Fails unless `.ci` holds the commit the workflows pin |
 | `actions-check` | pinact: every action pinned to a full SHA whose version comment is right |
 | `actions-pin`, `actions-update` | pinact: pin tag references, or move every action to its latest release |
 | `workflow-audit` | zizmor, auditor persona, over `.github/workflows` |
@@ -123,6 +161,17 @@ IMAGE := "localhost/librespeed:dev"
 ARCHIVE := env_var_or_default("ARCHIVE", "/tmp/librespeed-image.tar")
 PUBLISHED := env_var_or_default("PUBLISHED", "ghcr.io/divbast/librespeed:latest")
 ```
+
+`ENGINE`, `ARCHIVE` and `PUBLISHED` take a value from the environment, so
+`ENGINE=podman just test` works. `IMAGE` here is a plain value, which the
+environment cannot change. To run the acceptance suite against another
+image, set it on just's command line:
+
+```sh
+just IMAGE=ghcr.io/divbast/librespeed:latest acceptance
+```
+
+`IMAGE=... just acceptance` would quietly test the local image.
 
 | Recipe | What it does |
 |---|---|
@@ -161,6 +210,80 @@ The tools these recipes call come from the repository's `mise.toml`:
 pinact, zizmor, actionlint, ShellCheck, shfmt, Go, golangci-lint, reuse and
 just, and for an app hadolint and trivy as well. `ci/mise.toml` holds the
 versions ci itself is tested with.
+
+### A repository that builds no image
+
+A repository that builds no image calls `lint.yml` for its lint, and
+`stall.yml` and `renovate.yml`. This is the least it carries.
+
+Its `mise.toml` lists, at the versions in `ci/mise.toml`:
+
+- Go, as `"core:go"`, with `GOTOOLCHAIN = "local"` under `[env]`. It needs
+  Go even with no Go code of its own: `lint.yml`'s pin check builds ci's
+  tools with the repository's Go, and so does `ci-fresh` locally.
+  `GOTOOLCHAIN=local` keeps that the pinned Go, rather than one that ci's
+  `go.mod` would have Go download.
+- just, pinact, zizmor, actionlint and reuse, which `lint` runs.
+- ShellCheck and shfmt. `shell-lint` does nothing while the repository
+  tracks no `*.sh`, and checks any added later; ShellCheck also gives
+  actionlint its pass over `run:` scripts.
+
+Its `.gitignore` holds `.ci/`. Its justfile is the shell, the import of
+`common.just`, `setup` and `ci-checkout` as above, and:
+
+```just
+# Every lint gate
+lint:
+    {{ just_executable() }} ci-fresh actions-check workflow-audit actionlint shell-lint reuse-lint
+
+# Every gate. Run before committing
+ci: lint
+```
+
+Never `go-lint` or `go-test` without Go code: both fail in a repository
+that has no Go package. A gate of the repository's own, such as a config
+validator, is a recipe and a job of its own beside these, and `required`
+needs that job too.
+
+Its CI workflow calls `lint.yml`, and its `required` job needs the call:
+
+```yaml
+jobs:
+  lint:
+    name: lint
+    uses: divbast/ci/.github/workflows/lint.yml@<commit> # vX.Y.Z
+    permissions:
+      contents: read
+
+  required:
+    name: required
+    needs: [lint]
+    if: always()
+    # ... fails unless every needed job succeeded
+```
+
+Its stall workflow, on a daily schedule, leaves out `slots`, since the
+repository publishes nothing. Its calling job still grants everything
+`stall.yml`'s job asks for: a called job that asks for more than its
+caller grants fails, even for a check the caller leaves out.
+
+```yaml
+jobs:
+  stall:
+    name: stall
+    uses: divbast/ci/.github/workflows/stall.yml@<commit> # vX.Y.Z
+    with:
+      checks: '["open","stuck","renovate"]'
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
+      statuses: read
+      packages: read
+```
+
+`renovate.yml` is called as [below](#renovateyml).
 
 ### Local GitHub token
 
@@ -214,8 +337,11 @@ The shared Renovate preset tells Renovate's gomod manager to leave
 repository runs them from its own root, as `.ci/bin/<tool>`, so the paths
 they are given are its own. Go builds them as ci's own module: it maps no
 `./.ci/...` path into the calling repository's module, so `go run
-./.ci/cmd/<tool>` does not work. In CI, each workflow builds them in its
-pin check, before any step that needs one.
+./.ci/cmd/<tool>` does not work. In CI, `lint.yml`, `app-check.yml` and
+`app-publish.yml` build them in their pin check, before any step that
+needs one. `stall.yml` builds them with ci's own Go and checks no pin,
+since it reads nothing of the calling repository's but GitHub's API and
+the registry. `renovate.yml` builds none.
 
 ## Releases
 
@@ -239,9 +365,8 @@ releases both.
   case, then optional blanks and `:`. So such a line anywhere in a squash
   merge's body counts, and so does one on a merge commit. The words
   mid-sentence do not.
-- A change breaks callers when it changes a reusable workflow's inputs,
-  outputs or the permissions its calling job must grant, or a tool's
-  flags or exit codes.
+- [What breaks a caller](#what-breaks-a-caller) says which changes those
+  are.
 
 Every pull request previews the release its merge would make:
 `self-ci.yml`'s `release-preview` job, which `required` needs, dry-runs
@@ -265,6 +390,41 @@ The job acts as the divbast org's `divbast-renovate` GitHub App, whose key
 is in ci's `renovate` environment, which only main can deploy to: only a
 merged commit is ever released.
 
+### What breaks a caller
+
+A ci change reaches a caller through the pull request that moves its pin,
+where a minor release merges by itself once the caller's checks pass. A
+change breaks callers when one that has changed nothing would stop working
+with it, or fail those checks. Each of these does, and its commit carries
+the mark, above, that makes the next release major:
+
+- **Reusable workflows:** an input, output or secret changed or taken
+  away, or a new one required; a permission added to what the calling job
+  must grant; or more asked of the calling repository: a recipe the
+  workflow runs (`setup`, `lint`, `acceptance`, `scan`), a variable it
+  evaluates (`IMAGE`), a tool it installs by name from the caller's
+  `mise.toml`, a file it reads, or the `required` check that `stall.yml`
+  waits for.
+- **Tools:** a command's flags or exit codes.
+- **Recipes:** a recipe in `common.just` or `app.just` renamed or taken
+  away, or one that needs more of the caller than before: a tool its
+  `mise.toml` lacks, or a variable an app must define beyond the `ENGINE`,
+  `IMAGE`, `ARCHIVE` and `PUBLISHED` that `app.just` needs today.
+- **Names:** a recipe or variable added to `common.just` or `app.just`
+  under a name a caller's justfile already uses. just refuses a recipe or
+  a variable defined twice unless the justfile sets
+  `allow-duplicate-recipes` or `allow-duplicate-variables`, so a caller
+  defines none of the recipes in the tables above, and none of the
+  variables `ci_dir`, `LAYOUT`, `REPORT`, `SARIF` and `BASELINE`. Callers
+  define `setup` and `ci-checkout` themselves, so neither ever goes there.
+- **Go:** the exported API of `harness` and `contract`, the two packages
+  callers import through `.ci`.
+- **Shared configuration:** `go/golangci.yml` or `.github/actionlint.yaml`
+  changed so that a caller's unchanged code or workflows fail.
+
+When unsure whether a change breaks callers, mark it: a major release only
+waits for approval on each caller's Dependency Dashboard.
+
 ## Workflows
 
 The caller grants each called job its permissions. A called job gets no
@@ -275,7 +435,8 @@ job must grant, and each sets `permissions: {}` at its top.
 
 The lint job for repositories that build no image. It checks ci out at its
 own commit, checks the pin, then runs the caller's `just setup` and
-`just lint`.
+`just lint`. What the calling repository carries for it is in
+[A repository that builds no image](#a-repository-that-builds-no-image).
 
 | Input | Type | Default | What |
 |---|---|---|---|
@@ -292,9 +453,11 @@ workflow runs on:
 - `build` verifies the FrankenPHP binary's attestation
   ([below](#the-frankenphp-binary)), then builds the image for amd64 and
   arm64 with BuildKit's provenance and SBOM, as an OCI archive. A pull
-  request or push reuses the build cache; the daily slot and a manual run
-  never restore it, and build each stage in `no-cache-filters` from
-  scratch. Each image is uploaded as the artifact `image-<arch>`.
+  request or push reuses the build cache. The daily slot and a manual run,
+  the two that publish, never restore it, and build on the builder that
+  `docker/setup-buildx-action` has just made for the job, so every stage
+  builds from scratch. Each image is uploaded as the artifact
+  `image-<arch>`.
 - `test` loads each image into Docker and into rootless Podman and runs
   `just acceptance` against it, on both architectures.
 - `scan` runs `just scan` over each image, and on main uploads its
@@ -303,7 +466,7 @@ workflow runs on:
 | Input | Type | Default | What |
 |---|---|---|---|
 | `php` | boolean | `true` | Install PHP 8.5 and Composer for the lint job, which runs PHPStan |
-| `no-cache-filters` | string | `''` | Build stages, separated by spaces, that the daily slot and a manual run build without the cache: the ones that fetch from outside the repository |
+| `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
 
 The calling job grants `contents: read`, `attestations: read` and
 `security-events: write`.
@@ -359,8 +522,6 @@ jobs:
   check:
     name: check
     uses: divbast/ci/.github/workflows/app-check.yml@<commit> # vX.Y.Z
-    with:
-      no-cache-filters: fetch
     permissions:
       contents: read
       attestations: read # verify the FrankenPHP binary
@@ -514,9 +675,13 @@ is sending a stale registry login from Docker's configuration: run it with
 
 Each command is a thin `main` over an `internal/` package, prints plain
 text, and documents its usage and exit codes in its package comment
-(`go doc ./cmd/<tool>`). Exit code 2 always means the command line is
-wrong, or for `divbast-stall` the environment, or for `divbast-testcount`
-what it reads on stdin.
+(`go doc ./cmd/<tool>`). Exit code 0 is success, 1 a refusal or a
+failure, and 2 a wrong command line. Three tools also exit 2 when they
+could not get far enough to answer at all: `divbast-stall` when its
+environment is wrong or GitHub or the registry could not say,
+`divbast-token-leak` when the archive cannot be read, holds no files, or
+`GITHUB_TOKEN` is wrong, and `divbast-testcount` when stdin cannot be
+read, is not go test -json's, or is empty.
 
 | Command | What | 0 | 1 |
 |---|---|---|---|
