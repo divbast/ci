@@ -809,13 +809,14 @@ func TestEngineUnhealthy(t *testing.T) {
 // TestEngineHealthyWaitsForTimer has the engine judge two containers on
 // its own schedule, as their users' engines would: Docker runs the image's
 // HEALTHCHECK, and Podman the --health-cmd it was given, from the
-// transient systemd timer it sets up for it, which runs only in a user
+// transient systemd timer it sets up for it, which needs a systemd user
 // session. Nothing here runs a check. The minimal fixture turns healthy
 // within its start period and three intervals, and the engine's log shows
-// the passing check it ran. The unhealthy mutant, whose probe exits 1 once
-// its server is up, turns unhealthy within the same wait, past the start
-// period in which no failure counts, and EngineHealthy says so as soon as
-// the engine does.
+// the passing check it ran. The unhealthy mutant, whose probe always
+// exits 1, turns unhealthy within the same wait, once it has failed as
+// often as the engine retries, counted on Docker past the start period
+// and on Podman from its first check, and EngineHealthy says so as soon
+// as the engine does.
 func TestEngineHealthyWaitsForTimer(t *testing.T) {
 	t.Parallel()
 	e := integration(t)

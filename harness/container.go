@@ -723,15 +723,21 @@ func (c *Container) WaitExit(ctx context.Context, within time.Duration) (int, er
 // would for a user. Docker runs the image's HEALTHCHECK. Podman runs the
 // --health-cmd it was given, as [RunSpec.HealthCmd] gives it, from the
 // transient systemd timer it sets up for the container, which needs a
-// systemd user session: without one, Podman schedules nothing. The wait
-// lasts startPeriod from when the container started, or was last
+// systemd user session: without one, Podman fails to start the container,
+// or runs no check, and the wait ends in an error saying none has run.
+// The wait lasts startPeriod from when the container started, or was last
 // restarted, and then three of the intervals the engine runs the check
 // at, as it reports them, or 30 s, both engines' default: pass the
-// image's own start period. A check that kept failing past the start
-// period has by then failed as often as either engine's default retries,
-// so the engine has called the container unhealthy, which is an error at
-// once, as is a container that stopped. Every error but the engine's own
-// carries the engine's log of the checks it ran.
+// image's own start period. Docker counts a failed check only once the
+// start period is past; Podman, which is not told the start period,
+// counts each from its first check, one interval in. Either way, a check
+// that keeps failing has failed as often as the engine's default retries
+// by the end of the wait, and the engine calls the container unhealthy.
+// That is an error as soon as the engine reports it, as is a container
+// that stopped. A last failure that lands just as the wait ends, as
+// Podman's third does with a start period of 0, can end it as still
+// starting instead, which is an error too. Every error but the engine's
+// own carries the engine's log of the checks it ran.
 func (c *Container) EngineHealthy(ctx context.Context, startPeriod time.Duration) error {
 	var interval time.Duration
 	for {
@@ -757,8 +763,8 @@ func (c *Container) EngineHealthy(ctx context.Context, startPeriod time.Duration
 			return fmt.Errorf("container %s %s, exit status %d, before %s reported it healthy%s",
 				c, ins.State.Status, ins.State.ExitCode, c.engine.name, h.logText())
 		case !time.Now().Before(c.started.Add(startPeriod + healthIntervals*interval)):
-			return fmt.Errorf("%s reports container %s still %s %s after it started: its start period of %s and three intervals of %s%s",
-				c.engine.name, c, h.Status, time.Since(c.started).Round(time.Second), startPeriod, interval, h.logText())
+			return fmt.Errorf("%s reports container %s still %s %s after it started: its start period of %s and three intervals of %s%s%s",
+				c.engine.name, c, h.Status, time.Since(c.started).Round(time.Second), startPeriod, interval, h.logText(), c.unscheduled(h))
 		}
 		if err := Pause(ctx, pollInterval); err != nil {
 			return err
@@ -777,10 +783,18 @@ const (
 // noHealthCheck says why the engine may report no health check for c.
 func (c *Container) noHealthCheck() string {
 	if c.engine.name == "podman" {
-		return "it was started with no --health-cmd, which Podman needs for an image published as an OCI index, " +
-			"or Podman had no systemd user session to run its timer in"
+		return "it was started with no --health-cmd, which Podman needs for an image published as an OCI index"
 	}
 	return "its image declares no HEALTHCHECK, or it was turned off"
+}
+
+// unscheduled says why Podman may have run no check in c by the end of
+// the wait, and nothing once it has run one, or on Docker.
+func (c *Container) unscheduled(h *Health) string {
+	if c.engine.name != "podman" || len(h.Log) > 0 {
+		return ""
+	}
+	return ", and Podman runs its checks only from a transient systemd timer, which needs a systemd user session"
 }
 
 // logText returns the health checks' log, one run to a line, for an error.
