@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The minimal fixture whose health port serves the page at / as well as
+# /healthz, as a health port that served the app would: GET :8081/
+# answers 200. The fixture's own Caddyfile, with that one route added to
+# the :8081 site, so every other route stays as it was. The health probe
+# asks the health port for /healthz alone, and still passes.
+
+# The minimal fixture, which the test builds and passes in
+ARG FIXTURE
+
+FROM ${FIXTURE} AS fixture
+
+FROM docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6 AS caddyfile
+COPY --from=fixture /etc/frankenphp/Caddyfile /Caddyfile
+# The build fails here, rather than the test later, if the route did not
+# go in: the page's root is then named twice, once for each port.
+RUN printf '\thandle / {\n\t\troot * /var/www/minimal\n\t\trewrite * /index.php\n\t\tphp\n\t}\n' >/page \
+    && sed -i '/^:8081 {$/r /page' /Caddyfile \
+    && test "$(grep -c /var/www/minimal /Caddyfile)" = 2
+
+FROM fixture
+COPY --from=caddyfile /Caddyfile /etc/frankenphp/Caddyfile

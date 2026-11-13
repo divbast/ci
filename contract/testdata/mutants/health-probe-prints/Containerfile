@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The minimal fixture with a health probe that exits 0 and prints a line,
+# as a chatty probe would on every check: the engine calls the container
+# healthy all the same, and only the probe's own record that it prints
+# nothing can tell.
+
+# The minimal fixture, which the test builds and passes in
+ARG FIXTURE
+FROM ${FIXTURE}
+
+COPY --chown=root:root --chmod=0755 health.php /usr/local/bin/minimal-health

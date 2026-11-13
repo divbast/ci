@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The minimal fixture with a health probe that exits 1 and prints nothing.
+# The server starts and serves as the fixture's does, so only the health
+# check fails: the engine's own, run from the image's HEALTHCHECK on
+# Docker and from --health-cmd on Podman, which turns the container
+# unhealthy once the probe has failed as often as the check retries, past
+# its start period.
+
+# The minimal fixture, which the test builds and passes in
+ARG FIXTURE
+FROM ${FIXTURE}
+
+COPY --chown=root:root --chmod=0755 health.php /usr/local/bin/minimal-health

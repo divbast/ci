@@ -88,7 +88,7 @@ func checkNames(results []Result) []string {
 // scenario its bash suite named "telemetry off".
 func TestContractOnFixture(t *testing.T) {
 	t.Parallel()
-	e := integration(t)
+	integration(t)
 
 	cfg := libreSpeed(testfixture.LibreSpeed)
 	cfg.Scenario = "telemetry off"
@@ -117,14 +117,14 @@ func TestContractOnFixture(t *testing.T) {
 
 	// The names LibreSpeed's bash suite gave these checks in its sections
 	// 2, 3, 17 and 19, which its Go suite must keep making: section 17
-	// named its health checks for the scenario, and nothing else.
-	engineHealthy := "telemetry off: docker reports it healthy within the 60 s start period"
-	if e.Name() == "podman" {
-		engineHealthy = "telemetry off: podman healthcheck run"
-	}
+	// named its health checks for the scenario, and nothing else. Beside
+	// them are the records the contract adds, and the three it names for
+	// what they show, engine-healthy's the same on both engines.
 	for _, what := range []string{
 		"the image runs as uid/gid 65532 by default",
-		"/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no file capability",
+		"PID 1's real, effective, saved and filesystem uids",
+		"PID 1's real, effective, saved and filesystem gids",
+		"/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no effective file capability",
 		xattrRecord,
 		"CapEff, every capability bit clear",
 		"CapPrm, every capability bit clear",
@@ -137,10 +137,10 @@ func TestContractOnFixture(t *testing.T) {
 		"TCP ports a process in the container listens on",
 		"test network really is internal",
 		"outbound TCP to 9.9.9.9:443 is refused",
-		"the image's HEALTHCHECK: the probe in exec form, with no shell, at Baikal's timings",
+		"the image's HEALTHCHECK: the probe in exec form, with no shell, at the timings Config.Healthcheck states",
 		"telemetry off: /usr/local/bin/librespeed-health exits 0",
 		"telemetry off: /usr/local/bin/librespeed-health prints nothing",
-		engineHealthy,
+		"telemetry off: the engine reports the container healthy within the start period and three intervals",
 		"GET :8081/",
 		"GET :8081/backend/getIP.php",
 		"GET :8081/index.php",
@@ -221,6 +221,112 @@ func TestValidate(t *testing.T) {
 				t.Errorf("validate() error = %v, want nil", err)
 			case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
 				t.Errorf("validate() error = %v, want one naming %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateRefusesEmptyHealthOnly404 shows a Config naming no path for
+// the health port to refuse is refused: health-port-only would then check
+// only the app port, and prove nothing of the health port at all.
+func TestValidateRefusesEmptyHealthOnly404(t *testing.T) {
+	t.Parallel()
+
+	for _, paths := range [][]string{nil, {}} {
+		cfg := libreSpeed("img")
+		cfg.HealthOnly404 = paths
+		if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "Config.HealthOnly404 is empty") {
+			t.Errorf("validate() with HealthOnly404 %#v: error = %v, want one saying Config.HealthOnly404 is empty", paths, err)
+		}
+	}
+}
+
+// TestRecordNames pins the names of the records this package renamed, or
+// added, since LibreSpeed's bash suite named the rest. An app's suite logs
+// each name to $DIVBAST_CHECK_LOG, so a name that moves reads there as a
+// check lost and another gained.
+func TestRecordNames(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct{ got, want string }{
+		{fileCapabilityRecord, "/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no effective file capability"},
+		{
+			healthcheckRecord(libreSpeed("img").Healthcheck, nil).What,
+			"the image's HEALTHCHECK: the probe in exec form, with no shell, at the timings Config.Healthcheck states",
+		},
+		{engineHealthyRecord, "the engine reports the container healthy within the start period and three intervals"},
+		{runtimeUIDRecord, "PID 1's real, effective, saved and filesystem uids"},
+		{runtimeGIDRecord, "PID 1's real, effective, saved and filesystem gids"},
+	} {
+		if tt.got != tt.want {
+			t.Errorf("record named %q, want %q", tt.got, tt.want)
+		}
+	}
+}
+
+// TestRuntimeUser reads what the probe's user subcommand prints, PID 1's
+// Uid: and Gid: lines, into runtime-user's two records: each of the four
+// IDs on a line must be the contract's, and anything but those two lines,
+// each once, is an error rather than a record.
+func TestRuntimeUser(t *testing.T) {
+	t.Parallel()
+
+	const contract = "65532:65532"
+	tests := []struct {
+		name     string
+		user     string
+		out      string
+		uid, gid string // the IDs each record finds, when it FAILs; empty for ok
+		wantErr  string
+	}{
+		{name: "the-contracts", user: contract, out: "Uid:\t65532\t65532\t65532\t65532\nGid:\t65532\t65532\t65532\t65532\n"},
+		{
+			// --user 65532:0, as a run looser than the contract would give
+			name: "group-root", user: contract,
+			out: "Uid:\t65532\t65532\t65532\t65532\nGid:\t0\t0\t0\t0\n",
+			gid: "0 0 0 0",
+		},
+		{
+			// Only the saved set uid is root, which a server that dropped
+			// root badly would keep, and could take back.
+			name: "saved-root", user: contract,
+			out: "Uid:\t65532\t65532\t0\t65532\nGid:\t65532\t65532\t65532\t65532\n",
+			uid: "65532 65532 0 65532",
+		},
+		{name: "another-contract", user: "1000:1000", out: "Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"},
+		{name: "no-gid-line", user: contract, out: "Uid:\t65532\t65532\t65532\t65532\n", wantErr: "one Uid: and one Gid: line"},
+		{name: "three-ids", user: contract, out: "Uid:\t65532\t65532\t65532\nGid:\t65532\t65532\t65532\t65532\n", wantErr: "four IDs"},
+		{
+			name: "twice", user: contract,
+			out:     "Uid:\t65532\t65532\t65532\t65532\nUid:\t65532\t65532\t65532\t65532\nGid:\t65532\t65532\t65532\t65532\n",
+			wantErr: "one Uid: and one Gid: line",
+		},
+		{name: "something-else", user: contract, out: "Groups:\t65532\n", wantErr: "one Uid: and one Gid: line"},
+		{name: "nothing", user: contract, wantErr: "one Uid: and one Gid: line"},
+		{name: "a-user-that-is-not-uid-gid", user: "65532", out: "Uid:\t65532\t65532\t65532\t65532\nGid:\t65532\t65532\t65532\t65532\n", wantErr: "uid:gid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			records, err := runtimeUserRecords(tt.user, tt.out)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("runtimeUserRecords() = %+v, %v; want an error saying %q", records, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("runtimeUserRecords() error = %v", err)
+			}
+			if len(records) != 2 || records[0].What != runtimeUIDRecord || records[1].What != runtimeGIDRecord {
+				t.Fatalf("runtimeUserRecords() = %+v, want the uid record and then the gid record", records)
+			}
+			for i, failing := range []string{tt.uid, tt.gid} {
+				r := records[i]
+				if want := failing == ""; r.OK != want || (!want && r.Found != failing) {
+					t.Errorf("%s: ok %t, found %q, expected %q; want ok %t, found %q", r.What, r.OK, r.Found, r.Expected, want, failing)
+				}
 			}
 		})
 	}
@@ -416,7 +522,7 @@ func TestHealthcheckRecord(t *testing.T) {
 			t.Parallel()
 
 			r := healthcheckRecord(want, tt.got)
-			if r.What != "the image's HEALTHCHECK: the probe in exec form, with no shell, at Baikal's timings" {
+			if r.What != healthcheckRecordWhat {
 				t.Errorf("healthcheckRecord().What = %q", r.What)
 			}
 			if r.OK != tt.ok {

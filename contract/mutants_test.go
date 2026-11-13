@@ -17,8 +17,8 @@ import (
 // contract, rather than reading the image or running a container of its
 // own.
 var needsContainer = map[string]bool{
-	checkCaps: true, checkReadOnly: true, checkNoVolume: true, checkPID1: true, checkNoShell: true, checkListeners: true,
-	checkNoEgress: true, checkHealthProbe: true, checkEngineHealthy: true, checkHealthPortOnly: true,
+	checkRuntimeUser: true, checkCaps: true, checkReadOnly: true, checkNoVolume: true, checkPID1: true, checkNoShell: true,
+	checkListeners: true, checkNoEgress: true, checkHealthProbe: true, checkEngineHealthy: true, checkHealthPortOnly: true,
 	checkHostConfig: true,
 }
 
@@ -82,22 +82,14 @@ func TestContractMutants(t *testing.T) {
 			// of the layers finds the capability without running anything.
 			name: "filecap", dir: "filecap",
 			fails: []failure{
-				{
-					checkFileCapability,
-					"/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no file capability",
-					[]string{"operation not permitted", "/usr/local/bin/frankenphp"},
-				},
+				{checkFileCapability, fileCapabilityRecord, []string{"operation not permitted", "/usr/local/bin/frankenphp"}},
 				{checkNoFileCapabilityXattr, xattrRecord, []string{"/usr/local/bin/frankenphp"}},
 			},
 			unstartable: true,
 		},
 		{
 			name: "healthcheck", dir: "healthcheck",
-			fails: []failure{{
-				checkHealthcheckConfig,
-				"the image's HEALTHCHECK: the probe in exec form, with no shell, at Baikal's timings",
-				[]string{"interval 31s"},
-			}},
+			fails: []failure{{checkHealthcheckConfig, healthcheckRecordWhat, []string{"interval 31s"}}},
 		},
 		{
 			name: "listener", dir: "listener",
