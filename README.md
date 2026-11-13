@@ -410,7 +410,10 @@ the mark, above, that makes the next release major:
   evaluates (`IMAGE`), a tool it installs by name from the caller's
   `mise.toml`, a file it reads, or the `required` check that `stall.yml`
   waits for.
-- **Tools:** a command's flags or exit codes.
+- **Tools:** a flag or exit code a caller relies on: a flag taken away or
+  changed, or another exit code for a command line a caller runs.
+  Refusing a command line that no caller runs, such as an empty
+  `divbast-pin -expect`, breaks no one.
 - **Recipes:** a recipe in `common.just` or `app.just` renamed or taken
   away, or one that needs more of the caller than before: a tool its
   `mise.toml` lacks, or a variable an app must define beyond the `ENGINE`,
@@ -418,12 +421,19 @@ the mark, above, that makes the next release major:
 - **Names:** a recipe or variable added to `common.just` or `app.just`
   under a name a caller's justfile already uses. just refuses a recipe or
   a variable defined twice unless the justfile sets
-  `allow-duplicate-recipes` or `allow-duplicate-variables`, so a caller
-  defines none of the recipes in the tables above, and none of the
-  variables `ci_dir`, `LAYOUT`, `REPORT`, `SARIF` and `BASELINE`. Callers
-  define `setup` and `ci-checkout` themselves, so neither ever goes there.
+  `allow-duplicate-recipes` or `allow-duplicate-variables`. So a caller
+  defines none of the recipes in the tables above, nor `common.just`'s
+  private `_github-token`, and none of the variables `ci_dir`, `LAYOUT`,
+  `REPORT`, `SARIF` and `BASELINE`. In turn, neither file ever defines
+  what callers define themselves: the recipes `default`, `setup`,
+  `ci-checkout`, `lint` and `ci`, and an app's `ENGINE`, `IMAGE`,
+  `ARCHIVE` and `PUBLISHED`. Any other new name is checked against every
+  caller's justfile first: frankenphp's, for one, defines `test` and
+  `build-app`.
 - **Go:** the exported API of `harness` and `contract`, the two packages
-  callers import through `.ci`.
+  callers import through `.ci`, or what they do wherever an unchanged
+  caller would see it: a new contract check that an image which passed
+  before now fails, say, or a harness default a caller's suite relies on.
 - **Shared configuration:** `go/golangci.yml` or `.github/actionlint.yaml`
   changed so that a caller's unchanged code or workflows fail.
 
@@ -454,7 +464,9 @@ The calling job grants `contents: read`.
 Lint, build, test and scan for an app repository, on every event its build
 workflow runs on:
 
-- `lint` is `lint.yml`'s job, step for step.
+- `lint` repeats `lint.yml`'s steps. Only its pin check's skip differs:
+  it names divbast/ci, which never calls `app-check.yml`, so an app's pin
+  is always checked.
 - `build` verifies the FrankenPHP binary's attestation
   ([below](#the-frankenphp-binary)), then builds the image for amd64 and
   arm64 with BuildKit's provenance and SBOM, as an OCI archive. A pull

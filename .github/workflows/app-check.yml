@@ -37,9 +37,10 @@ on:
 permissions: {}
 
 jobs:
-  # lint.yml's job, step for step. A job calling lint.yml would be a
-  # reusable workflow nested in this one, and its check would be named
-  # `<caller> / lint / lint`.
+  # lint.yml's steps, but for the pin check's skip, which names divbast/ci:
+  # ci never calls this workflow, so a caller's pin is always checked. A
+  # job calling lint.yml would be a reusable workflow nested in this one,
+  # and its check would be named `<caller> / lint / lint`.
   lint:
     name: lint
     runs-on: ubuntu-26.04
