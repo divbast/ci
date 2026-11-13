@@ -165,26 +165,8 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 	inActions := getenv("GITHUB_ACTIONS") == "true"
 	lookup := registry.Lookup{Run: r, GH: ghapi.Client{Run: r}, RegistryOnly: !inActions}
 	state, err := lookup.Presence(ctx, *published)
-	var advisory *unshipped
-	switch {
-	case err == nil && state == registry.Published:
-	case err == nil && state == registry.Absent:
-		advisory = &unshipped{
-			reason: "is not published yet", heading: "nothing published yet",
-			more: "nothing is shipped to compare with. It blocks on new findings once " + *published + " is published.",
-		}
-	case errors.Is(err, registry.ErrPrivate):
-		advisory = &unshipped{
-			reason: "is private", heading: "nothing public yet",
-			more: "no user can pull it, and nothing is shipped to compare with. It stays advisory until " + *published + " is public.",
-		}
-	case errors.Is(err, registry.ErrRefused):
-		advisory = &unshipped{
-			reason: "was refused by ghcr.io", heading: "nothing readable to compare with",
-			more: "outside GitHub Actions nothing asks GitHub whether that means it is not published yet, is private, or is " +
-				"public and failing to serve: the token a person gives the recipes cannot read packages. CI's scan asks, and decides.",
-		}
-	default:
+	advisory, err := unshippedFor(state, err, inActions, *published)
+	if err != nil {
 		complain(stderr, "could not tell whether %s is published, so no finding can be told apart from one already published: %v", *published, err)
 		return 1
 	}
@@ -259,6 +241,39 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 // finding is an advisory: reason follows the image's name, heading
 // follows "advisory: ", and more follows the reason in the warning.
 type unshipped struct{ reason, heading, more string }
+
+// unshippedFor turns what [registry.Lookup.Presence] answered for
+// published, state and err, into why nothing is shipped to compare with:
+// nil when published is published, and the scan compares with it. A
+// refusal GitHub was not asked about, [registry.ErrRefused], is an
+// advisory only outside GitHub Actions; in Actions it is an error, as is
+// anything else that says neither, and an error fails the scan.
+func unshippedFor(state registry.State, err error, inActions bool, published string) (*unshipped, error) {
+	switch {
+	case err == nil && state == registry.Published:
+		return nil, nil
+	case err == nil && state == registry.Absent:
+		return &unshipped{
+			reason: "is not published yet", heading: "nothing published yet",
+			more: "nothing is shipped to compare with. It blocks on new findings once " + published + " is published.",
+		}, nil
+	case errors.Is(err, registry.ErrPrivate):
+		return &unshipped{
+			reason: "is private", heading: "nothing public yet",
+			more: "no user can pull it, and nothing is shipped to compare with. It stays advisory until " + published + " is public.",
+		}, nil
+	case !inActions && errors.Is(err, registry.ErrRefused):
+		return &unshipped{
+			reason: "was refused by ghcr.io", heading: "nothing readable to compare with",
+			more: "outside GitHub Actions nothing asks GitHub whether that means it is not published yet, is private, or is " +
+				"public and failing to serve: the token a person gives the recipes cannot read packages. CI's scan asks, and decides.",
+		}, nil
+	case err == nil:
+		return nil, fmt.Errorf("the lookup answered %v, and no error", state)
+	default:
+		return nil, err
+	}
+}
 
 // readBaseline returns the findings in the report on the published image
 // at path, and the image it names.

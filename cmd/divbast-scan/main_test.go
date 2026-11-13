@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"maps"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/registry"
 )
 
 const (
@@ -624,6 +626,61 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 				if err != nil || string(got) != tt.wantBaseline {
 					t.Errorf("baseline = %q (%v), want %q", got, err, tt.wantBaseline)
 				}
+			}
+		})
+	}
+}
+
+// TestUnshippedFor checks each answer the registry lookup can give, in
+// GitHub Actions and outside it. A refusal nothing asked GitHub about is
+// advisory only outside Actions, where nothing does ask: in Actions it is
+// an error, which run exits 1 on, whoever made the lookup that gave it.
+func TestUnshippedFor(t *testing.T) {
+	t.Parallel()
+
+	refused := fmt.Errorf("%w: ghcr.io refused to show %s: denied", registry.ErrRefused, published)
+	private := fmt.Errorf("%w: GitHub gives it the visibility \"private\"", registry.ErrPrivate)
+	unreadable := errors.New("could not read " + published + ": skopeo exit status 1")
+	tests := []struct {
+		name      string
+		state     registry.State
+		err       error
+		inActions bool
+		// wantReason is the advisory's reason, empty for none; wantErr
+		// the error it returns, nil for none.
+		wantReason string
+		wantErr    error
+	}{
+		{name: "published", state: registry.Published, inActions: true},
+		{name: "absent", state: registry.Absent, inActions: true, wantReason: "is not published yet"},
+		{name: "private", err: private, inActions: true, wantReason: "is private"},
+		{name: "refused-outside-actions", err: refused, wantReason: "was refused by ghcr.io"},
+		{name: "refused-in-actions", err: refused, inActions: true, wantErr: registry.ErrRefused},
+		{name: "unreadable", err: unreadable, inActions: true, wantErr: unreadable},
+		{name: "unreadable-outside-actions", err: unreadable, wantErr: unreadable},
+		{name: "no-state-and-no-error", inActions: true, wantErr: errors.New("the lookup answered State(0), and no error")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := unshippedFor(tt.state, tt.err, tt.inActions, published)
+			if tt.wantErr != nil {
+				if err == nil || (!errors.Is(err, tt.wantErr) && err.Error() != tt.wantErr.Error()) {
+					t.Errorf("unshippedFor() = %+v, %v; want the error %v", got, err, tt.wantErr)
+				}
+				if got != nil {
+					t.Errorf("unshippedFor() = %+v with error %v, want no advisory", got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unshippedFor() error = %v, want nil", err)
+			}
+			switch {
+			case tt.wantReason == "" && got != nil:
+				t.Errorf("unshippedFor() = %+v, want no advisory", got)
+			case tt.wantReason != "" && (got == nil || got.reason != tt.wantReason):
+				t.Errorf("unshippedFor() = %+v, want an advisory because %s %s", got, published, tt.wantReason)
 			}
 		})
 	}
