@@ -247,6 +247,90 @@ func TestBuildFormat(t *testing.T) {
 	}
 }
 
+// TestActionsRecipesUseCIsPinactConfig (CI-38) checks that each recipe
+// that runs pinact gives it ci's configuration and nothing else: with -c,
+// so a caller's own .pinact.yaml or .github/pinact.yaml is never read, and
+// as PINACT_GLOBAL_CONFIG, so no global configuration is merged into it.
+// Then, with the real pinact, offline, that the two keep out the rules a
+// caller's and a global configuration hold: a workflow whose unpinned
+// action both say to ignore passes without them, and fails with them.
+func TestActionsRecipesUseCIsPinactConfig(t *testing.T) {
+	t.Parallel()
+	needJustAndMise(t)
+	ci, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := appJustfile(t, ci, `["mise", "exec", "--", "bash", "-euo", "pipefail", "-c"]`)
+	const config = "'.ci/.github/pinact.yaml'"
+	for recipe, args := range map[string]string{
+		"actions-check":  "run --verify --check",
+		"actions-pin":    "run",
+		"actions-update": "run --update",
+	} {
+		t.Run(recipe, func(t *testing.T) {
+			t.Parallel()
+			cmd := exec.CommandContext(t.Context(), "just", "--justfile", app, "--dry-run", recipe) //nolint:gosec // G204: the arguments are this test's own
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("just --dry-run %s: %v\n%s", recipe, err, out)
+			}
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			want := "PINACT_GLOBAL_CONFIG=" + config + " pinact -c " + config + " " + args
+			if got := lines[len(lines)-1]; got != want {
+				t.Errorf("just %s runs\n%s\nwant\n%s", recipe, got, want)
+			}
+		})
+	}
+
+	t.Run("the configuration keeps out others", func(t *testing.T) {
+		t.Parallel()
+		if _, err := exec.LookPath("pinact"); err != nil {
+			t.Skip("pinact is not on PATH: run these tests through `just ci`, which runs them with ci's toolchain")
+		}
+		caller := t.TempDir()
+		ignore := "version: 3\nignore_actions:\n  - name: actions/checkout\n    ref: v4\n"
+		for name, body := range map[string]string{
+			".github/workflows/w.yml": "on: push\njobs:\n  a:\n    runs-on: ubuntu-26.04\n    steps:\n      - uses: actions/checkout@v4\n",
+			".pinact.yaml":            ignore,
+			"global.yaml":             ignore,
+		} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(caller, name)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(caller, name), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ours := filepath.Join(ci, ".github", "pinact.yaml")
+		for _, tt := range []struct {
+			name, global string
+			args         []string
+			pass         bool
+		}{
+			// The fixture's rules do work, or the case after proves nothing
+			{name: "the caller's and the global rules", global: filepath.Join(caller, "global.yaml"), args: []string{"run", "--fix=false", "--no-api"}, pass: true},
+			{name: "ci's alone", global: ours, args: []string{"-c", ours, "run", "--fix=false", "--no-api"}},
+		} {
+			cmd := exec.CommandContext(t.Context(), "pinact", tt.args...) //nolint:gosec // G204: the arguments are this test's own
+			cmd.Dir = caller
+			cmd.Env = append(os.Environ(), "PINACT_GLOBAL_CONFIG="+tt.global, "NO_COLOR=1")
+			out, err := cmd.CombinedOutput()
+			if _, failed := errors.AsType[*exec.ExitError](err); err != nil && !failed {
+				t.Fatalf("%s: pinact: %v\n%s", tt.name, err, out)
+			}
+			if passed := err == nil; passed != tt.pass {
+				t.Errorf("with %s, pinact passed: %t, want %t\n%s", tt.name, passed, tt.pass, out)
+			}
+			// Failing for the unpinned action, not for a configuration it
+			// could not read
+			if !tt.pass && !strings.Contains(string(out), ".github/workflows/w.yml:6") {
+				t.Errorf("with %s, pinact did not fail on the unpinned action:\n%s", tt.name, out)
+			}
+		}
+	})
+}
+
 // TestCIFresh runs common.just's ci-fresh in a repository set up as a
 // caller's, whose workflows pin one commit while .ci holds another, as
 // after a git pull that moved the pin without a `just setup`, or the same

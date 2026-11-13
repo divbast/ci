@@ -386,11 +386,14 @@ the registry. `renovate.yml` builds none.
 Every green merge to ci's main is a release. Once `required` has passed
 on a push to main, `self-ci.yml`'s `release` job runs `divbast-release`,
 which tags the merged commit with the next version and publishes it as a
-GitHub Release, immutable once published. Its notes list the subject of
-every commit since the last release, leaving out merge commits. When two
-merges land close together, the run for the earlier one finds main has
-moved on and leaves the release to the run for the later one, which
-releases both.
+GitHub Release, immutable once published, then reads the tag back from
+origin and fails unless it is at that commit. Its notes list the subject
+of every commit since the last release, leaving out merge commits. When
+two merges land close together, the run for the earlier one finds main
+has moved on and leaves the release to the run for the later one, which
+releases both; a re-run of the earlier one once that release is out says
+which release holds it. Only origin's release tags count: a tag in a
+clone alone releases nothing and moves no version.
 
 - The version is the last release's with its minor number raised:
   v1.4.0 follows v1.3.0. The first release is v1.0.0.
@@ -402,7 +405,9 @@ releases both.
   `*` or `-` bullet followed by blanks, with `Breaking-change`, in any
   case, then optional blanks and `:`. So such a line anywhere in a squash
   merge's body counts, and so does one on a merge commit. The words
-  mid-sentence do not.
+  mid-sentence do not, nor does a bullet with no blank after it, as in
+  `*Breaking-change:`: GitHub writes a squash body's bullets `* `. A
+  trailer folded over several lines gives the notes all of them.
 - [What breaks a caller](#what-breaks-a-caller) says which changes those
   are.
 
@@ -410,7 +415,10 @@ Every pull request previews the release its merge would make:
 `self-ci.yml`'s `release-preview` job, which `required` needs, dry-runs
 `divbast-release` on GitHub's test merge of the pull request into main
 and writes the version, minor or major, and its notes to the run's
-summary.
+summary. Re-running an old preview fails once a later release is out: it
+runs on the test merge GitHub made at the time, whose next version is
+taken now. A push to the pull request, or a rebase, makes a new test
+merge.
 
 A repository pins ci at a release, the release's commit with its tag as
 the comment, and zizmor and pinact check that pair as they do any other
@@ -472,8 +480,9 @@ the mark, above, that makes the next release major:
   needs the `posix` extension, with which `no-shell` tells a path that is
   absent from one it may not look up. An image without it fails
   `no-shell`.
-- **Shared configuration:** `go/golangci.yml` or `.github/actionlint.yaml`
-  changed so that a caller's unchanged code or workflows fail.
+- **Shared configuration:** `go/golangci.yml`, `.github/actionlint.yaml`
+  or `.github/pinact.yaml` changed so that a caller's unchanged code or
+  workflows fail.
 
 When unsure whether a change breaks callers, mark it: a major release only
 waits for approval on each caller's Dependency Dashboard.
@@ -639,13 +648,14 @@ publishes, it starts the `registry` image inside the job, on
 `127.0.0.1:5000`, pinned by version and digest, which the org's Renovate
 preset moves. The registry asks for a throwaway login, which the job
 writes and gives Docker: actions/attest pushes only to a registry whose
-first answer is a challenge for one. The job runs every step after the
-decision there, under `localhost:5000/<path of image>`: it pushes,
-stages, attests, verifies, promotes and checks both tags. The attestation
-is real: signed for the calling repository like any other, and pushed to
-that registry. The registry takes no anonymous pulls, so the last check
-reads the tags with the job's login. Nothing reaches ghcr.io, and no
-package is made. Each rehearsal says so in a warning and on the run's summary:
+first answer is a 200 or a challenge for one, and one that asks no login
+answers 202. The job runs every step after the decision there, under
+`localhost:5000/<path of image>`: it pushes, stages, attests, verifies,
+promotes and checks both tags. The attestation is real: signed for the
+calling repository like any other, and pushed to that registry. The
+registry takes no anonymous pulls, so the last check reads the tags with
+the job's login. Nothing reaches ghcr.io, and no package is made. Each
+rehearsal says so in a warning and on the run's summary:
 `rehearsal: nothing was published to ghcr.io`.
 
 `divbast/oci-image-template` rehearses, since it has no package. A
@@ -654,7 +664,9 @@ template the line goes on to say how to publish: `to publish, set image
 to this app's own and remove rehearse from the job that calls
 app-publish.yml`. That is the switch, in the calling job's `with:`: set
 `image` to the app's own `ghcr.io/divbast/<app>`, and remove
-`rehearse: true`.
+`rehearse: true`. A job that drops `rehearse` but keeps the template's
+image fails before it logs in anywhere or pushes, and says to set image
+to the app's own name.
 
 ### `renovate.yml`
 
@@ -750,7 +762,8 @@ So only a binary that divbast/frankenphp's build workflow made from its
 main branch is built into an app: not a pull request's build, and not
 another repository's image. The Containerfile must name the image exactly
 once, as `<tag>@sha256:<digest>`, so that Renovate can move it; a tag with
-no digest, or a `--from=` built from a variable, fails the build.
+no digest, a `--from=` built from a variable, or one that takes from a
+stage whose image holds an unresolved build argument, fails the build.
 
 A local `just build` does not verify the attestation. It builds from
 whatever digest the Containerfile names. To check a Containerfile by hand,
@@ -794,7 +807,9 @@ could not get far enough to answer at all: `divbast-stall` when its
 environment is wrong or GitHub or the registry could not say,
 `divbast-token-leak` when the archive cannot be read, holds no files, or
 `GITHUB_TOKEN` is wrong, and `divbast-testcount` when stdin cannot be
-read, is not go test -json's, or is empty.
+read, is not go test -json's, or is empty. `divbast-token-leak` exits 2,
+too, when it cannot write that the archive is clean, since its 1 means
+the token was found.
 
 | Command | What | 0 | 1 |
 |---|---|---|---|
@@ -802,11 +817,11 @@ read, is not go test -json's, or is empty.
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
 | `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published image lacks | Nothing new, or advisory because nothing is pullable | A new finding, or the scan failed |
-| `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, or no token) |
+| `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-frankenphp [-containerfile FILE]` | Refuses a FrankenPHP binary frankenphp's main build did not attest | Verified | Not verified, or the Containerfile names the image other than once in full |
-| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; or git or gh failed |
+| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
 ## Shared configuration
 
@@ -818,6 +833,10 @@ with the pin:
 - `.github/actionlint.yaml`: the ubuntu-26.04 runner labels, and an
   ignore for each name GitHub documents that actionlint 1.7.12 does not
   know yet, scoped to that name.
+- `.github/pinact.yaml`: pinact's, with no rule that leaves an action
+  unchecked, which the actions recipes pass as both the project's and the
+  global configuration, so that neither a repository's own `.pinact.yaml`
+  nor a user's is read.
 
 ## Pinned build tools
 

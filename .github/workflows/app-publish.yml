@@ -10,7 +10,7 @@
 # would, and only then tags it with the app's version and latest, so that
 # neither ever names an index whose attestation has not verified. Last, it
 # checks that both tags are that index to an anonymous client, as users
-# pull it.
+# pull it, or, in a rehearsal, to the job's login.
 #
 # The attestation is signed by this workflow, for the caller's repository
 # and ref, so it verifies with
@@ -59,6 +59,13 @@ env:
   # renovate: datasource=github-releases depName=jdx/mise
   MISE_VERSION: 2026.11.7
 
+# bash with -e and pipefail, so a command that fails fails its step, in a
+# pipeline too, such as the last check's skopeo into shasum. A step that
+# names no shell otherwise runs bash -e alone.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   publish:
     name: publish
@@ -101,6 +108,21 @@ jobs:
           esac
           if [ "${REF}" != refs/heads/main ]; then
             echo "only main publishes, not ${REF}" >&2
+            exit 1
+          fi
+
+      # The template's image publishes only in a rehearsal, inside the job.
+      # An app made from the template that drops rehearse but keeps that
+      # image would make the template's package from its own repository, so
+      # it stops here, before any login or push.
+      - name: Refuse the template's image outside a rehearsal
+        id: template
+        env:
+          IMAGE: ${{ inputs.image }}
+          REHEARSE: ${{ inputs.rehearse }}
+        run: |
+          if [ "${IMAGE}" = ghcr.io/divbast/oci-image-template ] && [ "${REHEARSE}" != true ]; then
+            echo "image is ghcr.io/divbast/oci-image-template, the template's, which publishes only in a rehearsal: set image to your app's own name" >&2
             exit 1
           fi
 
@@ -188,8 +210,8 @@ jobs:
       # A rehearsal publishes here instead, on the runner's loopback. The
       # registry asks for a throwaway login, which Docker is given:
       # actions/attest reads it from Docker's configuration, and pushes only
-      # to a registry whose first answer is a Basic or Bearer challenge,
-      # where one that asks no login says 202 to its probe. buildx and
+      # to a registry whose first answer to its probe is a 200 or a Basic or
+      # Bearer challenge, where one that asks no login says 202. buildx and
       # actions/attest speak plain HTTP to localhost of their own accord;
       # skopeo is told to. Docker's proxy can take the connection before
       # the registry listens, and reset it, so the wait retries every error.
@@ -362,8 +384,6 @@ jobs:
       # takes no anonymous pulls, so a rehearsal reads with the job's login.
       - name: Check both tags are the attested index as users pull them
         if: steps.decide.outputs.publish == 'true'
-        # bash's pipefail, so a failed inspect fails the pipeline
-        shell: bash
         env:
           IMAGE: ${{ steps.target.outputs.image }}
           VERSION: ${{ steps.version.outputs.version }}

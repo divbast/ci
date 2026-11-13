@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +52,34 @@ func gz(t *testing.T, s string) string {
 		t.Fatal(err)
 	}
 	return buf.String()
+}
+
+// failingWriter is a stdout whose every write fails.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("stdout is closed") }
+
+// TestRunVerdictUnwritable (CI-21) checks that a clean verdict that cannot
+// be written exits 2, as an archive that could not be read does: never 1,
+// which says the token was found.
+func TestRunVerdictUnwritable(t *testing.T) {
+	t.Parallel()
+
+	token := "divbast-synthetic-token-" + rand.Text()
+	clean := writeTar(t, [2]string{"index.json", "{}"})
+	getenv := func(key string) string {
+		if key == "GITHUB_TOKEN" {
+			return token
+		}
+		return ""
+	}
+	var stderr bytes.Buffer
+	if code := run(t.Context(), []string{clean}, getenv, execx.OS{}, failingWriter{}, &stderr); code != 2 {
+		t.Errorf("run() = %d, want 2; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "write the verdict: stdout is closed") {
+		t.Errorf("stderr = %q, want it to say the verdict could not be written", stderr.String())
+	}
 }
 
 func TestRun(t *testing.T) {

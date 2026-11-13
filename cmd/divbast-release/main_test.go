@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,6 +59,13 @@ func history(t *testing.T) (dir string, h commits) {
 	return dir, h
 }
 
+// releasedAtC releases c, as v2.0.0, on origin and in the clone.
+func releasedAtC(t *testing.T, dir string, h commits) {
+	t.Helper()
+	gitIn(t, dir, "tag", "v2.0.0", h.c)
+	gitIn(t, dir, "push", "--quiet", "origin", "v2.0.0")
+}
+
 // commits are history's.
 type commits struct{ a, b, c, side string }
 
@@ -65,6 +73,32 @@ const (
 	notes  = "## Breaking changes\n\n- divbast-scan's -layout is now -oci-layout\n\n## Changes\n\n- scan: rename -layout\n- docs: say so\n"
 	notesB = "## Breaking changes\n\n- divbast-scan's -layout is now -oci-layout\n\n## Changes\n\n- scan: rename -layout\n"
 )
+
+// github stands in for gh: it answers as fake does, and once gh release
+// create has succeeded, makes the release's tag on origin as GitHub does,
+// at the --target commit, or at at when set, as when the tag was already
+// there.
+type github struct {
+	t      *testing.T
+	fake   *execx.Fake
+	origin string
+	at     string
+}
+
+func (g github) RunStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (execx.Result, error) {
+	res, err := g.fake.RunStdin(ctx, stdin, name, args...)
+	if err != nil || res.Code != 0 || len(args) < 5 || args[0] != "release" || args[1] != "create" {
+		return res, err
+	}
+	at := args[4]
+	if g.at != "" {
+		at = g.at
+	}
+	if made, err := (inDir{g.origin}).Run(ctx, "git", "tag", args[2], at); err != nil || made.Code != 0 {
+		g.t.Fatalf("git tag %s %s on origin: %v, exit %d: %s", args[2], at, err, made.Code, made.Stderr)
+	}
+	return res, nil
+}
 
 func create(c string) []string {
 	return []string{"gh", "release", "create", "v2.0.0", "--target", c, "--title", "v2.0.0", "--notes-file", "-"}
@@ -82,6 +116,10 @@ func TestRun(t *testing.T) {
 		stdout   func(h commits) string
 		// wantStderr lists what stderr must contain.
 		wantStderr []string
+		// setup, when set, changes the history before the run.
+		setup func(t *testing.T, dir string, h commits)
+		// tagAt, when set, is the commit gh's release finds its tag at.
+		tagAt func(h commits) string
 	}{
 		{
 			name:   "dry-run",
@@ -131,6 +169,40 @@ func TestRun(t *testing.T) {
 			stdout: func(h commits) string {
 				return h.b + " is no longer main's tip (" + h.c + "); the run for " + h.c + " releases it\n"
 			},
+		},
+		// CI-36: re-run once the later merge's release is out, which holds
+		// this commit too.
+		{
+			name:  "superseded-and-released-since",
+			args:  func(h commits) []string { return []string{"-sha", h.b} },
+			setup: releasedAtC,
+			stdout: func(h commits) string {
+				return h.b + " is no longer main's tip (" + h.c + "), and v2.0.0, a later release, holds it: nothing to do\n"
+			},
+		},
+		{
+			name:  "dry-run-superseded-and-released-since",
+			args:  func(h commits) []string { return []string{"-sha", h.b, "-dry-run"} },
+			setup: releasedAtC,
+			stdout: func(h commits) string {
+				return h.b + " is no longer main's tip (" + h.c + "), and v2.0.0, a later release, holds it: nothing to do\n"
+			},
+		},
+		// CI-37: a tag already at another commit takes the release, which
+		// the run must not call done.
+		{
+			name: "tag-at-another-commit",
+			args: func(h commits) []string { return []string{"-sha", h.c} },
+			gh: func(h commits) []execx.Call {
+				return []execx.Call{{
+					Argv:   create(h.c),
+					Stdin:  []byte(notes),
+					Result: execx.Result{Stdout: []byte("https://github.com/divbast/ci/releases/tag/v2.0.0\n")},
+				}}
+			},
+			tagAt:      func(h commits) string { return h.b },
+			wantCode:   1,
+			wantStderr: []string{"v2.0.0 points at "},
 		},
 		{
 			name:       "not-on-main",
@@ -189,13 +261,20 @@ func TestRun(t *testing.T) {
 			t.Parallel()
 
 			dir, h := history(t)
+			if tt.setup != nil {
+				tt.setup(t, dir, h)
+			}
 			var calls []execx.Call
 			if tt.gh != nil {
 				calls = tt.gh(h)
 			}
+			gh := github{t: t, fake: execx.NewFake(t, calls...), origin: filepath.Join(filepath.Dir(dir), "origin.git")}
+			if tt.tagAt != nil {
+				gh.at = tt.tagAt(h)
+			}
 			args := tt.args(h)
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), args, inDir{dir}, execx.NewFake(t, calls...), &stdout, &stderr)
+			code := run(t.Context(), args, inDir{dir}, gh, &stdout, &stderr)
 
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d; stderr:\n%s", args, code, tt.wantCode, stderr.String())

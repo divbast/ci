@@ -80,17 +80,21 @@ _github-token:
     echo "GITHUB_TOKEN is ${kind}; these recipes take a fine-grained personal access token (github_pat_) or CI's job token (ghs_): see https://github.com/divbast/ci#local-github-token" >&2
     exit 1
 
+# pinact runs with ci's configuration alone, given as the project's and
+# the global one, so neither a repository's own nor a user's can loosen
+# what actions-check checks.
+
 # Fail if any action is not pinned to a full SHA
 actions-check: _github-token
-    pinact run --verify --check
+    PINACT_GLOBAL_CONFIG='{{ ci_dir }}/.github/pinact.yaml' pinact -c '{{ ci_dir }}/.github/pinact.yaml' run --verify --check
 
 # Rewrite tag references to the SHA
 actions-pin: _github-token
-    pinact run
+    PINACT_GLOBAL_CONFIG='{{ ci_dir }}/.github/pinact.yaml' pinact -c '{{ ci_dir }}/.github/pinact.yaml' run
 
 # Move every action to its latest release
 actions-update: _github-token
-    pinact run --update
+    PINACT_GLOBAL_CONFIG='{{ ci_dir }}/.github/pinact.yaml' pinact -c '{{ ci_dir }}/.github/pinact.yaml' run --update
 
 # Audit the workflows for security problems
 workflow-audit: _github-token

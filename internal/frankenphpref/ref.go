@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -53,8 +54,9 @@ var (
 	// <tag>@sha256:<64 hex>, which Renovate needs to follow the tag and
 	// move the digest.
 	ErrUnpinned = errors.New("the binary is not pinned as " + Repository + ":<tag>@sha256:<digest>")
-	// ErrNotLiteral means a COPY --from= is built from a variable. It
-	// could name [Repository] at anything, and Renovate cannot move it.
+	// ErrNotLiteral means a COPY --from= is built from a variable, which
+	// could name [Repository] at anything and which Renovate cannot move,
+	// or names a stage whose image holds an unresolved build argument.
 	ErrNotLiteral = errors.New("a COPY --from= names a variable, not an image")
 )
 
@@ -75,10 +77,11 @@ var pinned = regexp.MustCompile(`^` + regexp.QuoteMeta(Repository) +
 // count.
 //
 // The error wraps [ErrNotLiteral] when any COPY --from= holds a variable,
-// [ErrNoRef] when nothing, or nothing but another instruction, names
-// [Repository], [ErrManyRefs] when more than one place does, and
-// [ErrUnpinned] when the one COPY --from= is not <tag>@sha256:<64 hex>. Its
-// message names the lines involved.
+// or names a stage, by name or by number, whose image holds an unresolved
+// build argument or is a stage that does; [ErrNoRef] when nothing, or
+// nothing but another instruction, names [Repository]; [ErrManyRefs] when
+// more than one place does; and [ErrUnpinned] when the one COPY --from= is
+// not <tag>@sha256:<64 hex>. Its message names the lines involved.
 func Find(containerfile io.Reader) (Ref, error) {
 	type from struct {
 		line  int
@@ -89,16 +92,24 @@ func Find(containerfile io.Reader) (Ref, error) {
 		mentions []int
 		// Each COPY --from= that names Repository.
 		copies []from
+		// Every COPY --from=, and every stage, in order.
+		froms  []from
+		stages []stage
 	)
 
 	err := instructions(containerfile, func(line int, text string) error {
 		for range countMentions(text) {
 			mentions = append(mentions, line)
 		}
+		if s, ok := fromStage(text); ok {
+			s.line = line
+			stages = append(stages, s)
+		}
 		for _, value := range copyFroms(text) {
 			if strings.Contains(value, "$") {
 				return fmt.Errorf("%w: line %d has --from=%s", ErrNotLiteral, line, value)
 			}
+			froms = append(froms, from{line, value})
 			if names(value) {
 				copies = append(copies, from{line, value})
 			}
@@ -107,6 +118,12 @@ func Find(containerfile io.Reader) (Ref, error) {
 	})
 	if err != nil {
 		return Ref{}, err
+	}
+	for _, f := range froms {
+		if s, ok := unresolved(stages, f.value); ok {
+			return Ref{}, fmt.Errorf("%w: line %d has --from=%s, which takes from the stage on line %d, built from %s, an unresolved build argument",
+				ErrNotLiteral, f.line, f.value, s.line, s.image)
+		}
 	}
 
 	switch {
@@ -212,6 +229,57 @@ func isHostByte(b byte) bool {
 // "frankenphp" followed by it names some other repository.
 func isNameByte(b byte) bool {
 	return isHostByte(b) || b == '/'
+}
+
+// stage is a FROM instruction: the image it is built from, the name it
+// gives the stage, if any, which BuildKit matches without regard to case,
+// and the line it starts on.
+type stage struct {
+	image, name string
+	line        int
+}
+
+// fromStage reads a FROM instruction: its flags, such as --platform, then
+// its image, then AS and the stage's name, if it names one.
+func fromStage(text string) (stage, bool) {
+	fields := strings.Fields(text)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "FROM") {
+		return stage{}, false
+	}
+	rest := fields[1:]
+	for len(rest) > 0 && strings.HasPrefix(rest[0], "--") {
+		rest = rest[1:]
+	}
+	if len(rest) == 0 {
+		return stage{}, false
+	}
+	s := stage{image: rest[0]}
+	if len(rest) >= 3 && strings.EqualFold(rest[1], "AS") {
+		s.name = rest[2]
+	}
+	return s, true
+}
+
+// unresolved returns the stage a COPY --from= value takes from, by name or
+// by number, when its image holds an unresolved build argument, following
+// a stage built on another stage down to the first. It reports false for a
+// value that names no stage, which is an image.
+func unresolved(stages []stage, value string) (stage, bool) {
+	seen := map[int]bool{}
+	for {
+		at := slices.IndexFunc(stages, func(s stage) bool { return s.name != "" && strings.EqualFold(s.name, value) })
+		if n, err := strconv.Atoi(value); at < 0 && err == nil && n >= 0 && n < len(stages) {
+			at = n
+		}
+		if at < 0 || seen[at] {
+			return stage{}, false
+		}
+		seen[at] = true
+		if s := stages[at]; strings.Contains(s.image, "$") {
+			return s, true
+		}
+		value = stages[at].image
+	}
 }
 
 // copyFroms returns the value of every --from= flag on a COPY instruction.

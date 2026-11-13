@@ -35,20 +35,23 @@ var (
 	zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
 )
 
-// Scan reads every regular file in the tar archive at archive, without
-// unpacking it, and returns how many it read and the names of those that
-// hold token.
+// Scan reads every file in the tar archive at archive, without unpacking
+// it, and returns how many it read and the names of those that hold token.
+// An entry is a file unless its type says it holds no bytes of its own: a
+// link, a device, a directory, a FIFO or a PAX global header. An entry of
+// a type this does not know is read as a file.
 //
 // A file is decompressed by its first bytes: gzip in process, zstd by the
-// zstd command, through zstd, and anything else is read as it is. A zstd
-// file is copied to a temporary file for the command to read, and its
-// decompressed bytes held in memory.
+// zstd command, through zstd, which reads the file on its stdin, and
+// anything else is read as it is. Each is searched as it is read, so no
+// file is ever held whole in memory.
 //
 // A file that cannot be read through, an archive that is not a tar or
-// holds no regular file, and an empty token are errors: a file this check
-// cannot read is not one it has cleared. The names found before such an
-// error are returned with it. The token is in no error.
-func Scan(ctx context.Context, archive string, token []byte, zstd execx.Runner) (scanned int, hits []string, err error) {
+// holds no file, and an empty token are errors: a file this check cannot
+// read is not one it has cleared. So is ctx ending, which stops the scan
+// inside the file it is reading. The names found before such an error are
+// returned with it. The token is in no error.
+func Scan(ctx context.Context, archive string, token []byte, zstd execx.StreamRunner) (scanned int, hits []string, err error) {
 	if len(token) == 0 {
 		return 0, nil, errors.New("no token to look for: an empty one is in every file")
 	}
@@ -75,13 +78,18 @@ func Scan(ctx context.Context, archive string, token []byte, zstd execx.Runner) 
 		if nextErr != nil {
 			return scanned, hits, fmt.Errorf("read %s: %w", archive, nextErr)
 		}
+		switch hdr.Typeflag {
 		// A hard link's bytes are those of the file it names, which the
-		// archive holds, and this reads, under that name.
-		if !hdr.FileInfo().Mode().IsRegular() || hdr.Typeflag == tar.TypeLink {
+		// archive holds, and this reads, under that name. A PAX global
+		// header's are records the tar reader has already taken.
+		case tar.TypeLink, tar.TypeSymlink, tar.TypeChar, tar.TypeBlock, tar.TypeDir, tar.TypeFifo, tar.TypeXGlobalHeader:
 			continue
 		}
 		name := path.Clean(hdr.Name)
 		found, how, readErr := search(ctx, tr, token, zstd)
+		if ctxErr := ctx.Err(); readErr != nil && ctxErr != nil {
+			return scanned, hits, fmt.Errorf("scan %s: %w", archive, ctxErr)
+		}
 		if readErr != nil {
 			return scanned, hits, fmt.Errorf("could not read %s%s: %w; a blob this check cannot read is not a blob it has cleared",
 				name, how, readErr)
@@ -99,7 +107,7 @@ func Scan(ctx context.Context, archive string, token []byte, zstd execx.Runner) 
 
 // search reports whether the file r holds token once decompressed, and
 // says how it was read, for an error to name.
-func search(ctx context.Context, r io.Reader, token []byte, zstd execx.Runner) (found bool, how string, err error) {
+func search(ctx context.Context, r io.Reader, token []byte, zstd execx.StreamRunner) (found bool, how string, err error) {
 	br := bufio.NewReaderSize(r, chunk)
 	// Fewer bytes than asked for is a file too short to be compressed
 	magic, err := br.Peek(len(zstdMagic))
@@ -108,65 +116,71 @@ func search(ctx context.Context, r io.Reader, token []byte, zstd execx.Runner) (
 	}
 	switch {
 	case bytes.HasPrefix(magic, gzipMagic):
-		found, err = gunzip(br, token)
+		found, err = gunzip(ctx, br, token)
 		return found, " as gzip", err
 	case bytes.HasPrefix(magic, zstdMagic):
 		found, err = unzstd(ctx, br, token, zstd)
 		return found, " with zstd -dcq", err
 	default:
-		found, err = contains(br, token)
+		found, err = contains(ctx, br, token)
 		return found, "", err
 	}
 }
 
-func gunzip(r io.Reader, token []byte) (bool, error) {
+func gunzip(ctx context.Context, r io.Reader, token []byte) (bool, error) {
 	zr, err := gzip.NewReader(r)
 	if err != nil {
 		return false, err
 	}
-	found, err := contains(zr, token)
+	found, err := contains(ctx, zr, token)
 	if err != nil {
 		return found, err
 	}
-	// Close repeats any error a read met, and has one of its own for a
-	// stream that ended early
+	// Close only repeats an error a read has already returned, so after
+	// reads that reached the end it has nothing to add
 	return found, zr.Close()
 }
 
-// unzstd decompresses r with the zstd command, which reads no stdin
-// through a Runner, so it gets a copy of r in a temporary file.
-func unzstd(ctx context.Context, r io.Reader, token []byte, zstd execx.Runner) (found bool, err error) {
-	tmp, err := os.CreateTemp("", "divbast-token-leak-*.zst")
-	if err != nil {
-		return false, err
+// unzstd decompresses r with the zstd command, which reads it on its
+// stdin, and searches what it writes as it writes it.
+func unzstd(ctx context.Context, r io.Reader, token []byte, zstd execx.StreamRunner) (bool, error) {
+	out, in := io.Pipe()
+	ran := make(chan error, 1)
+	go func() {
+		res, err := zstd.RunStream(ctx, r, in, "zstd", "-dcq")
+		if err == nil && res.Code != 0 {
+			err = fmt.Errorf("zstd exit status %d: %s", res.Code, bytes.TrimSpace(res.Stderr))
+		}
+		// Ends the search's reads with this error, or at the end of what
+		// zstd wrote when there is none
+		_ = in.CloseWithError(err)
+		ran <- err
+	}()
+	found, err := contains(ctx, out, token)
+	// A search that stopped early leaves zstd's writes nowhere to go
+	_ = out.Close()
+	if ranErr := <-ran; err == nil {
+		err = ranErr
 	}
-	defer func() { err = errors.Join(err, os.Remove(tmp.Name())) }()
-	_, copyErr := io.Copy(tmp, r)
-	if copied := errors.Join(copyErr, tmp.Close()); copied != nil {
-		return false, copied
-	}
-	res, err := zstd.Run(ctx, "zstd", "-dcq", tmp.Name())
-	if err != nil {
-		return false, err
-	}
-	if res.Code != 0 {
-		return false, fmt.Errorf("zstd exit status %d: %s", res.Code, bytes.TrimSpace(res.Stderr))
-	}
-	return contains(bytes.NewReader(res.Stdout), token)
+	return found, err
 }
 
 // contains reports whether r holds token, reading it to its end, so that
-// a file that fails partway is an error even after the token was seen.
+// a file that fails partway is an error even after the token was seen. It
+// stops with ctx's error once ctx ends.
 //
 // It reads chunk bytes at a time, and searches each chunk with the last
 // len(token)-1 bytes of the one before, so a token split across the
 // boundary between two reads is found.
-func contains(r io.Reader, token []byte) (bool, error) {
+func contains(ctx context.Context, r io.Reader, token []byte) (bool, error) {
 	carry := len(token) - 1
 	buf := make([]byte, carry+chunk)
 	found := false
 	kept := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return found, err
+		}
 		n, err := fill(r, buf[kept:kept+chunk])
 		window := buf[:kept+n]
 		found = found || bytes.Contains(window, token)

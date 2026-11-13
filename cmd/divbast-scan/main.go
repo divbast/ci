@@ -108,13 +108,14 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		complain(stderr, "%v", err)
 		return 1
 	}
-	candidate, packages, arch, err := scan.ParseTrivy(bytes.NewReader(data))
+	candidate, err := scan.ParseTrivy(bytes.NewReader(data))
 	if err != nil {
 		complain(stderr, "%s: %v", *report, err)
 		return 1
 	}
+	arch := candidate.Arch
 	// A clean report from a scan that saw no packages means it never looked
-	if packages == 0 {
+	if candidate.Packages == 0 {
 		complain(stderr, "no packages in %s: the scan found nothing to scan, not nothing wrong", *layout)
 		return 1
 	}
@@ -143,7 +144,7 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		// With nothing published, nothing is already shipped, and a first
 		// image could never pass a scan that blocks on what it inherits
 		// from the FrankenPHP binary.
-		if err = os.WriteFile(*baseline, []byte("{}\n"), 0o600); err != nil {
+		if err = writeFile(*baseline, "{}\n"); err != nil {
 			complain(stderr, "write the baseline: %v", err)
 			return 1
 		}
@@ -163,7 +164,7 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		return 1
 	}
 
-	split := scan.Compare(candidate, shipped)
+	split := scan.Compare(candidate.Findings, shipped)
 	verdict, heading := "new, so blocking", "New, so blocking"
 	if unpullable {
 		verdict, heading = "advisory: nothing published yet", "Advisory: nothing published yet"
@@ -204,17 +205,14 @@ func readBaseline(path, image string) (shipped []scan.Finding, ref string, err e
 	if err != nil {
 		return nil, "", err
 	}
-	shipped, packages, _, err := scan.ParseTrivy(bytes.NewReader(data))
+	rep, err := scan.ParseTrivy(bytes.NewReader(data))
 	if err != nil {
 		return nil, "", fmt.Errorf("%s: %w", path, err)
 	}
-	if packages == 0 {
+	if rep.Packages == 0 {
 		return nil, "", fmt.Errorf("no packages in %s: the scan found nothing to scan, not nothing wrong", image)
 	}
-	if ref, err = scan.ImageRef(bytes.NewReader(data)); err != nil {
-		return nil, "", fmt.Errorf("%s: %w", path, err)
-	}
-	return shipped, ref, nil
+	return rep.Findings, rep.Ref, nil
 }
 
 // readFile reads the file at path, through an [os.Root] on its directory.
@@ -225,6 +223,17 @@ func readFile(path string) (data []byte, err error) {
 	}
 	defer func() { err = errors.Join(err, dir.Close()) }()
 	return dir.ReadFile(filepath.Base(path))
+}
+
+// writeFile writes text to the file at path, inside its directory as an
+// [os.Root], as appendTo does.
+func writeFile(path, text string) (err error) {
+	dir, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, dir.Close()) }()
+	return dir.WriteFile(filepath.Base(path), []byte(text), 0o600)
 }
 
 // appendTo appends text to the file at path, one of the files GitHub

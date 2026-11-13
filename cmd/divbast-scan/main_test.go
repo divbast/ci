@@ -173,7 +173,7 @@ func TestRun(t *testing.T) {
 			candidate:      report(t, "amd64", "", 3, "CVE-1", "CVE-2"),
 			layoutResult:   &execx.Result{},
 			sarifResult:    &execx.Result{},
-			baselineResult: &execx.Result{Stderr: recorded(t, "trivy-no-such-package.txt"), Code: 1},
+			baselineResult: &execx.Result{Stderr: recorded(t, "trivy-no-such-tag.txt"), Code: 1},
 			wantStdout: "compared with nothing, because " + published + " is not anonymously pullable\n" +
 				"2 advisory: nothing published yet:\n" + line("CVE-1") + line("CVE-2") +
 				"0 already published, so advisory:\n" +
@@ -224,6 +224,20 @@ func TestRun(t *testing.T) {
 			wantCode:       1,
 			wantStderr: []string{
 				"TOOMANYREQUESTS: retry-after: 1s",
+				"could not scan " + published + ", so no finding can be told apart from one already published",
+			},
+		},
+		{
+			// CI-25(a): the registry refused another repository, not the
+			// published one, so nothing says it is unpublished
+			name:           "another-repository-refused",
+			candidate:      report(t, "amd64", "", 3, "CVE-1"),
+			layoutResult:   &execx.Result{},
+			sarifResult:    &execx.Result{},
+			baselineResult: &execx.Result{Stderr: recorded(t, "trivy-no-such-package.txt"), Code: 1},
+			wantCode:       1,
+			wantStderr: []string{
+				"no-such-package-t5%3Apull&service=ghcr.io: DENIED",
 				"could not scan " + published + ", so no finding can be told apart from one already published",
 			},
 		},
@@ -451,6 +465,49 @@ func TestRunUnwritableSummary(t *testing.T) {
 	}
 }
 
+// TestRunBaselineStaysInItsDirectory (CI-24) checks that the empty
+// baseline written when nothing is published is written inside its
+// directory, as the summary is: a -baseline that is a symlink leading out
+// of it fails the run, and the file it leads to is left as it was.
+func TestRunBaselineStaysInItsDirectory(t *testing.T) {
+	t.Parallel()
+
+	dir, outside := t.TempDir(), t.TempDir()
+	layout, rep, base, sarif := filepath.Join(dir, "layout"), filepath.Join(dir, "r.json"), filepath.Join(dir, "b.json"), filepath.Join(dir, "r.sarif")
+	target := filepath.Join(outside, "elsewhere.json")
+	if err := os.WriteFile(target, []byte("untouched\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, base); err != nil {
+		t.Fatal(err)
+	}
+	scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+	runner := trivy{
+		fake: execx.NewFake(t,
+			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
+			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+			execx.Call{
+				Argv: append(append([]string{
+					"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
+				}, scanArgs...), "--output", base, published),
+				Result: execx.Result{Stderr: recorded(t, "trivy-no-such-tag.txt"), Code: 1},
+			},
+		),
+		reports: map[string]string{rep: report(t, "amd64", "", 1)},
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
+	if code := run(t.Context(), args, runner, func(string) string { return "" }, &stdout, &stderr); code != 1 {
+		t.Errorf("run() = %d, want 1; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "write the baseline") {
+		t.Errorf("stderr = %q, want it to say the baseline could not be written", stderr.String())
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "untouched\n" { //nolint:gosec // G304: the test's own temporary file
+		t.Errorf("the file the symlink leads to holds %q (%v), want it untouched", got, err)
+	}
+}
+
 func TestRunUsage(t *testing.T) {
 	t.Parallel()
 
@@ -498,15 +555,17 @@ const fixture = "ghcr.io/divbast/librespeed@sha256:d9ea226a05957bd70876b6b3eb81c
 // TestScanAgainstItself scans the fixture as an OCI layout and compares it
 // with itself as published, with the real trivy, which must find nothing
 // new. It needs the network, skopeo and trivy, so it runs only where the
-// engine matrix does, with ENGINE set.
+// engine matrix does, with ENGINE set, and skips without either tool.
 func TestScanAgainstItself(t *testing.T) {
 	t.Parallel()
 
 	if os.Getenv("ENGINE") == "" {
 		t.Skip("ENGINE is unset: the scan against the published fixture runs in the engine matrix")
 	}
-	if _, err := exec.LookPath("trivy"); err != nil {
-		t.Skip("trivy is not on PATH")
+	for _, tool := range []string{"skopeo", "trivy"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skip(tool + " is not on PATH")
+		}
 	}
 
 	dir := t.TempDir()
