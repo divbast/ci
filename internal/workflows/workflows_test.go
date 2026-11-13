@@ -307,6 +307,108 @@ func TestProblems(t *testing.T) {
 	}
 }
 
+// TestScanReadsPackages checks that app-check.yml's scan job, and no other
+// job of it, may read packages, and that the job's token reaches its
+// vulnerability scan alone, as GH_TOKEN. When the registry refuses to show
+// the published image, divbast-scan asks GitHub, through gh, whether it is
+// absent, private, or public and failing, and only a token that may read
+// packages gets an answer. A caller's check job grants packages: read for
+// it. Against app-check.yml as it is, then with each broken, which the
+// check must refuse.
+func TestScanReadsPackages(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := scanReadsPackages(check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		grant = "      packages: read # ask GitHub whether a published image the registry refuses is absent or private\n"
+		token = "          GH_TOKEN: ${{ github.token }}\n"
+		scan  = "      - name: Vulnerability scan\n"
+		build = "      attestations: read # verify the FrankenPHP binary's attestation\n"
+	)
+	for name, mutant := range map[string]string{
+		"no grant":                   strings.Replace(check, grant, "", 1),
+		"a write grant":              strings.Replace(check, grant, strings.Replace(grant, "read", "write", 1), 1),
+		"a grant without a reason":   strings.Replace(check, grant, "      packages: read\n", 1),
+		"build reading packages too": strings.Replace(check, build, build+grant, 1),
+		"no token":                   replaceAfter(check, scan, token, ""),
+		"another token":              replaceAfter(check, scan, token, "          GH_TOKEN: ${{ secrets.GH_TOKEN }}\n"),
+		"the token on the job": replaceAfter(replaceAfter(check, scan, token, ""),
+			"    name: scan\n", "      MISE_AUTO_INSTALL: \"false\"\n", "      MISE_AUTO_INSTALL: \"false\"\n      GH_TOKEN: ${{ github.token }}\n"),
+		"the token on another step": replaceAfter(check, "      - name: Check the caller's mise.toml pins each tool installed above\n",
+			"        run: |\n", "        env:\n"+token+"        run: |\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if scanReadsPackages(mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// scanReadsPackages returns an error unless the workflow's scan job grants
+// packages: read, saying why, and no other job grants packages at all;
+// and unless, in the scan job, GH_TOKEN is ${{ github.token }} in the env
+// of the one step that runs just scan, and of no other step nor the job.
+func scanReadsPackages(workflow string) error {
+	jobs := jobsOf(linesOf(workflow))
+	if jobs["scan"] == nil {
+		return errors.New("no scan job")
+	}
+	for _, name := range slices.Sorted(maps.Keys(jobs)) {
+		perms, err := mappingOf(jobs[name], 4, "permissions")
+		if err != nil {
+			return fmt.Errorf("job %s: %w", name, err)
+		}
+		var grants []string
+		for _, p := range perms {
+			if k, _, _ := strings.Cut(p, ":"); k == "packages" {
+				grants = append(grants, p)
+			}
+		}
+		switch {
+		case name != "scan" && len(grants) > 0:
+			return fmt.Errorf("job %s grants %q, which only scan needs", name, grants)
+		case name != "scan":
+		case len(grants) != 1 || unquote(strings.TrimPrefix(grants[0], "packages:")) != "read":
+			return fmt.Errorf("job scan grants %q, not packages: read", grants)
+		case !strings.Contains(grants[0], " # "):
+			return fmt.Errorf("job scan grants %q without a comment saying what for", grants[0])
+		}
+	}
+	job := jobs["scan"]
+	if v, ok := jobEnv(job)["GH_TOKEN"]; ok {
+		return fmt.Errorf("job scan sets GH_TOKEN:%s for every step", v)
+	}
+	var given []string
+	for _, s := range steps(job) {
+		env, err := stepMapping(s, "env")
+		if err != nil {
+			return err
+		}
+		for _, e := range env {
+			if k, v, _ := strings.Cut(e, ":"); k == "GH_TOKEN" {
+				given = append(given, value(s, "name"))
+				if unquote(v) != "${{ github.token }}" {
+					return fmt.Errorf("line %d gives GH_TOKEN %s, not ${{ github.token }}", s[0].n, strings.TrimSpace(v))
+				}
+				if script, err := runScript(s); err != nil || strings.TrimSpace(script) != "just scan" {
+					return fmt.Errorf("line %d gives the token to a step that runs %q, not just scan", s[0].n, script)
+				}
+			}
+		}
+	}
+	if len(given) != 1 {
+		return fmt.Errorf("job scan gives GH_TOKEN to the steps %q, want the one that runs just scan", given)
+	}
+	return nil
+}
+
 // TestRenovateTokenReadsDependabotAlerts checks that renovate.yml's App
 // token asks to read Dependabot alerts. Renovate reads a repository's
 // alerts to raise its security updates, and given a token that cannot, it

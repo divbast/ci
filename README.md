@@ -596,15 +596,15 @@ workflow runs on:
 - `test` loads each image into Docker and into rootless Podman and runs
   `just acceptance` against it, on both architectures.
 - `scan` runs `just scan` over each image, and on main uploads its
-  findings to code scanning.
+  findings to code scanning: [Scan](#scan), below.
 
 | Input | Type | Default | What |
 |---|---|---|---|
 | `php` | boolean | `true` | Install PHP 8.5 and Composer for the lint job, which runs PHPStan |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
 
-The calling job grants `contents: read`, `attestations: read` and
-`security-events: write`.
+The calling job grants `contents: read`, `attestations: read`,
+`packages: read` and `security-events: write`.
 
 `scan`, which can change code scanning alerts, installs only Go, just and
 Trivy from the caller's `mise.toml`, and turns mise's auto-install off. The
@@ -613,6 +613,35 @@ short `go` the same way), and just and Trivy as exactly
 `"aqua:casey/just"` and `"aqua:aquasecurity/trivy"`. mise would install a
 name that `mise.toml` does not declare at its latest version, so `scan`
 fails unless all three are there.
+
+#### Scan
+
+`divbast-scan` fails only on a HIGH or CRITICAL finding that the published
+image, `PUBLISHED`, lacks for the same architecture: the same
+vulnerability in the same package, at any version. A new advisory against
+something already shipped is reported, not blocked. Whether anything is
+published is the registry's to say, never Trivy's: the tool first reads
+`PUBLISHED` as an anonymous client, as users pull it, and when ghcr.io
+refuses, asks the GitHub API why, through gh and the job's token, which
+is what `packages: read` is for.
+
+| `PUBLISHED` is | The scan |
+|---|---|
+| readable | Compares with what Trivy finds in it, from the same vulnerability database. Any failure of that scan fails, whatever Trivy says about why |
+| not published yet | Advisory, with a warning: nothing is shipped to compare with |
+| private | Advisory, with a warning that it stays advisory until the package is public |
+| public, but refused | Fails: a registry failing to serve the image is not nothing published |
+| unreadable, or GitHub does not answer | Fails |
+
+Each warning is a GitHub Actions warning and a callout on the run's
+summary. Only gh gets the token: Trivy and skopeo run without it.
+
+Outside GitHub Actions the tool never asks GitHub, since the token a
+person gives the recipes, a fine-grained one, cannot read packages: the
+API answers it HTTP 403. A local `just scan`
+whose `PUBLISHED` the registry refuses is therefore advisory too, with a
+warning that only CI can tell what the refusal means; one the registry
+shows compares as CI does.
 
 #### VEX
 
@@ -692,6 +721,7 @@ jobs:
     permissions:
       contents: read
       attestations: read # verify the FrankenPHP binary
+      packages: read # the scan asks GitHub whether the published image is absent or private
       security-events: write # code scanning, from main
 
   required:
@@ -897,7 +927,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published image lacks | Nothing new, or advisory because nothing is pullable | A new finding, or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

@@ -1,8 +1,0 @@
-2026-11-11T13:13:43+11:00	INFO	[vuln] Vulnerability scanning is enabled
-2026-11-11T13:13:43+11:00	INFO	[secret] Secret scanning is enabled
-2026-11-11T13:13:43+11:00	INFO	[secret] If your scanning is slow, please try '--scanners vuln' to disable secret scanning
-2026-11-11T13:13:43+11:00	INFO	[secret] Please see https://trivy.dev/docs/v0.76/guide/scanner/secret#recommendation for faster secret detection
-2026-11-11T13:13:48+11:00	FATAL	Fatal error	run error: image scan error: scan error: unable to initialize a scan service: unable to initialize artifact: unable to initialize container image: unable to find the specified image "127.0.0.1:55130/divbast/librespeed:latest" in ["remote"]: 1 error occurred:
-	* remote error: GET http://127.0.0.1:55130/v2/divbast/librespeed/manifests/latest: unexpected status code 503 Service Unavailable
-
-
