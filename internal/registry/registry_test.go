@@ -403,11 +403,15 @@ func TestPresence(t *testing.T) {
 		name         string
 		registryOnly bool
 		skopeo       execx.Result
+		skopeoErr    error
 		// gh is GitHub's answer about the package, nil when it must not be
 		// asked.
-		gh          *execx.Result
-		wantState   registry.State
-		wantErr     []string
+		gh        *execx.Result
+		wantState registry.State
+		wantErr   []string
+		// notErr lists what the error must not contain: Presence's callers,
+		// the scan among them, ask nothing about a commit.
+		notErr      []string
 		wantPrivate bool
 		wantRefused bool
 	}{
@@ -416,9 +420,15 @@ func TestPresence(t *testing.T) {
 		{name: "absent", skopeo: tokenRefused, gh: new(status(404, "Package not found.")), wantState: registry.Absent},
 		{name: "missing-tag-public", skopeo: failed(t, "skopeo-no-such-tag.txt", 2), gh: new(pkg("public")), wantState: registry.Absent},
 		{name: "private", skopeo: tokenRefused, gh: new(pkg("private")), wantErr: []string{"package is private"}, wantPrivate: true},
-		{name: "refused-though-public", skopeo: tokenRefused, gh: new(pkg("public")), wantErr: []string{"public", "403 Forbidden"}},
+		{
+			name: "refused-though-public", skopeo: tokenRefused, gh: new(pkg("public")),
+			wantErr: []string{"public", "403 Forbidden"}, notErr: []string{"commit"},
+		},
 		{name: "api-5xx", skopeo: tokenRefused, gh: new(status(502, "Bad Gateway")), wantErr: []string{"502"}},
-		{name: "unreachable", skopeo: failed(t, "skopeo-manifest-503.txt", 1), wantErr: []string{"could not read " + latest, "503"}},
+		{
+			name: "unreachable", skopeo: failed(t, "skopeo-manifest-503.txt", 1),
+			wantErr: []string{"could not read " + latest, "503"}, notErr: []string{"commit"},
+		},
 		{
 			name: "registry-only-published", registryOnly: true,
 			skopeo: execx.Result{Stdout: readTestdata(t, "skopeo-librespeed-latest.json")}, wantState: registry.Published,
@@ -433,7 +443,12 @@ func TestPresence(t *testing.T) {
 		},
 		{
 			name: "registry-only-unreachable", registryOnly: true, skopeo: failed(t, "skopeo-manifest-503.txt", 1),
-			wantErr: []string{"could not read " + latest, "503"},
+			wantErr: []string{"could not read " + latest, "503"}, notErr: []string{"commit"},
+		},
+		{
+			// A local scan on a host without skopeo
+			name: "registry-only-skopeo-missing", registryOnly: true, skopeoErr: exec.ErrNotFound,
+			wantErr: []string{"could not read " + latest, "executable file not found"}, notErr: []string{"commit"},
 		},
 	}
 
@@ -441,7 +456,7 @@ func TestPresence(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			calls := []execx.Call{{Argv: skopeoArgv(latest), Result: tt.skopeo}}
+			calls := []execx.Call{{Argv: skopeoArgv(latest), Result: tt.skopeo, Err: tt.skopeoErr}}
 			if tt.gh != nil {
 				calls = append(calls, execx.Call{Argv: []string{"gh", "api", "-i", librespeedAPI}, Result: *tt.gh})
 			}
@@ -466,6 +481,14 @@ func TestPresence(t *testing.T) {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("Presence() error = %q, want it to contain %q", err, want)
 				}
+			}
+			for _, not := range tt.notErr {
+				if strings.Contains(err.Error(), not) {
+					t.Errorf("Presence() error = %q, want it not to contain %q", err, not)
+				}
+			}
+			if tt.skopeoErr != nil && !errors.Is(err, tt.skopeoErr) {
+				t.Errorf("Presence() error = %v, want it to wrap %v", err, tt.skopeoErr)
 			}
 			if got := errors.Is(err, registry.ErrPrivate); got != tt.wantPrivate {
 				t.Errorf("errors.Is(%v, ErrPrivate) = %t, want %t", err, got, tt.wantPrivate)
