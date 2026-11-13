@@ -759,7 +759,8 @@ So only a binary that divbast/frankenphp's build workflow made from its
 main branch is built into an app: not a pull request's build, and not
 another repository's image. The Containerfile must name the image exactly
 once, as `<tag>@sha256:<digest>`, so that Renovate can move it; a tag with
-no digest, or a `--from=` built from a variable, fails the build.
+no digest, a `--from=` built from a variable, or one that takes from a
+stage whose image holds an unresolved build argument, fails the build.
 
 A local `just build` does not verify the attestation. It builds from
 whatever digest the Containerfile names. To check a Containerfile by hand,

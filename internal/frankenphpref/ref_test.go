@@ -130,6 +130,56 @@ func TestFind(t *testing.T) {
 			containerfile: app("COPY --from=$FP /frankenphp /usr/local/bin/frankenphp"),
 			wantErr:       frankenphpref.ErrNotLiteral,
 		},
+		// CI-49: a stage built from an unresolved build argument, which a
+		// COPY --from= names, is refused as the argument itself is: by
+		// name, by number and through a stage built on it.
+		{
+			name: "stage-from-an-unresolved-build-argument",
+			containerfile: app(
+				"COPY --from="+pinned+" /frankenphp /usr/local/bin/frankenphp",
+				"FROM ${BASE} AS base",
+				"FROM ${RUNTIME_IMAGE}",
+				"COPY --from=base /tool /usr/local/bin/tool",
+			),
+			wantErr: frankenphpref.ErrNotLiteral,
+			wantIn:  []string{"line 11", "--from=base", "line 9", "${BASE}"},
+		},
+		{
+			name: "stage-by-number-from-an-unresolved-build-argument",
+			containerfile: app(
+				"COPY --from="+pinned+" /frankenphp /usr/local/bin/frankenphp",
+				"FROM $BASE",
+				"FROM ${RUNTIME_IMAGE}",
+				"COPY --from=2 /tool /usr/local/bin/tool",
+			),
+			wantErr: frankenphpref.ErrNotLiteral,
+			wantIn:  []string{"--from=2", "$BASE"},
+		},
+		{
+			name: "stage-on-a-stage-from-an-unresolved-build-argument",
+			containerfile: app(
+				"COPY --from="+pinned+" /frankenphp /usr/local/bin/frankenphp",
+				"FROM ${BASE} AS Base",
+				"FROM base AS tools",
+				"FROM ${RUNTIME_IMAGE}",
+				"COPY --from=tools /tool /usr/local/bin/tool",
+			),
+			wantErr: frankenphpref.ErrNotLiteral,
+			wantIn:  []string{"--from=tools", "${BASE}"},
+		},
+		// A build argument in a FROM's flag, not its image, is no image
+		// built from one, and a stage no COPY --from= names is not read.
+		{
+			name: "stage-with-a-platform-argument",
+			containerfile: app(
+				"COPY --from="+pinned+" /frankenphp /usr/local/bin/frankenphp",
+				"FROM --platform=${BUILDPLATFORM} debian:13-slim@"+other+" AS tools",
+				"FROM ${RUNTIME_IMAGE}",
+				"COPY --from=tools /tool /usr/local/bin/tool",
+				"COPY --from=2 /other /usr/local/bin/other",
+			),
+			want: want,
+		},
 		{
 			name:          "digest-only",
 			containerfile: app("COPY --from=ghcr.io/divbast/frankenphp@" + digest + " /frankenphp /usr/local/bin/frankenphp"),

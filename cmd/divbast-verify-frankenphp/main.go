@@ -22,8 +22,9 @@
 // So a digest passes only when frankenphp's build workflow made it from
 // main: not a pull request's build, not another repository's image. The
 // image must be named once, written out in full, so that Renovate can move
-// it; a tag without a digest, or a --from= built from a variable, is
-// refused.
+// it; a tag without a digest, a --from= built from a variable, or one
+// that takes from a stage whose image holds an unresolved build argument,
+// is refused.
 //
 // gh must be 2.102.0 or newer and have a token that can read attestations:
 // in a workflow, GH_TOKEN with attestations: read. It runs with
