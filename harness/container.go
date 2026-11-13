@@ -417,8 +417,8 @@ func (c *Container) Exec(ctx context.Context, stdin io.Reader, argv ...string) (
 				c.engine.name, c, attempt, execAttempts, res.Code, combined(res))
 		}
 		if err := Pause(ctx, execRetry); err != nil {
-			return res, fmt.Errorf("%s exec in container %s: waiting to try again after attempt %d failed in the engine, exit status %d: %w",
-				c.engine.name, c, attempt, res.Code, err)
+			return res, fmt.Errorf("%s exec in container %s: waiting to try again after attempt %d failed in the engine, exit status %d: %s: %w",
+				c.engine.name, c, attempt, res.Code, combined(res), err)
 		}
 	}
 }

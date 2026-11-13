@@ -895,7 +895,7 @@ func TestExecRetryCodes(t *testing.T) {
 
 // TestExecRetryHonoursContext ends the context while Exec waits to try an
 // exec the engine failed again: it stops waiting, runs nothing more, and
-// says why.
+// says why, with the engine's words for the attempt that failed.
 func TestExecRetryHonoursContext(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
@@ -908,6 +908,9 @@ func TestExecRetryHonoursContext(t *testing.T) {
 		_, err := c.Exec(ctx, nil, "true")
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Exec() error = %v, want the context's deadline", err)
+		}
+		if want := "exit status 128: " + string(stoppedRefusal.Stderr); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Exec() error = %v, want it to carry the engine's words, %q", err, want)
 		}
 		if waited := time.Since(start); waited != 300*time.Millisecond {
 			t.Errorf("Exec() returned after %s, want at the deadline, 300ms", waited)
