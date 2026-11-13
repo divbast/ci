@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/divbast/ci/internal/execx"
 	"github.com/divbast/ci/internal/release"
@@ -234,10 +236,12 @@ func TestPrepare(t *testing.T) {
 		setup        func(r *repo) string
 		wantErr      error
 		wantReleased string
-		wantPrevious string
-		wantVersion  string
-		wantSubjects []string
-		wantBreaking []string
+		// wantReleasedIn is the later release that holds the commit.
+		wantReleasedIn string
+		wantPrevious   string
+		wantVersion    string
+		wantSubjects   []string
+		wantBreaking   []string
 		// wantTip is whether origin's main is the commit released.
 		wantTip bool
 		// wantSuperseded is whether a later commit on origin's main holds it.
@@ -335,7 +339,7 @@ func TestPrepare(t *testing.T) {
 				r.git("tag", "v3.0.0")
 				r.git("checkout", "--quiet", "main")
 				sha := r.commit("c: three" + trailers)
-				r.push()
+				r.push("v1.9.0", "v1.10.0", "v3.0.0")
 				return sha
 			},
 			wantPrevious: "v1.10.0",
@@ -607,6 +611,45 @@ func TestPrepare(t *testing.T) {
 			wantSubjects: []string{squashSubject},
 			wantTip:      true,
 		},
+		// CI-41: a bullet takes a blank after it, as GitHub's squash
+		// bodies write it, so one written against the key does not count.
+		{
+			name:         "squash-bullet-against-the-key",
+			setup:        squash("*Breaking-change: the input was renamed"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{squashSubject},
+			wantTip:      true,
+		},
+		// CI-35: a buried trailer folded over lines, as git folds one,
+		// gives the notes all of its lines.
+		{
+			name:         "squash-buried-folded-trailer",
+			setup:        squash("Breaking-change: the input\n  was renamed\n\tto -oci-layout"),
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{squashSubject},
+			wantBreaking: []string{"the input was renamed to -oci-layout"},
+			wantTip:      true,
+		},
+		// A buried text that only starts another one is its own.
+		{
+			name: "squash-buried-text-that-starts-a-trailer",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("ci: rework the scan (#8)\n\n" +
+					"* scan: drop -layout\n\nWhy.\n\nBreaking-change: the scan\nDeveloped-by: X <x@x.invalid>\n\n" +
+					"* scan: need -vex\n\nWhy.\n\nBreaking-change: the scan needs -vex\nDeveloped-by: X <x@x.invalid>")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{"ci: rework the scan (#8)"},
+			wantBreaking: []string{"the scan needs -vex", "the scan"},
+			wantTip:      true,
+		},
 		// A trailer that says nothing still breaks, and the notes name its
 		// commit.
 		{
@@ -643,8 +686,10 @@ func TestPrepare(t *testing.T) {
 			wantBreaking: []string{"lint.yml drops its php input"},
 			wantTip:      true,
 		},
+		// CI-39: a release tag only the clone has was never released, so
+		// it neither takes the next version's name nor counts as one.
 		{
-			name: "next-tag-taken-here",
+			name: "next-tag-only-in-the-clone",
 			setup: func(r *repo) string {
 				r.commit("a: one" + trailers)
 				r.git("tag", "v1.0.0")
@@ -656,7 +701,108 @@ func TestPrepare(t *testing.T) {
 				r.push("v1.0.0")
 				return sha
 			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"b: two"},
+			wantTip:      true,
+		},
+		{
+			name: "tag-at-the-commit-only-in-the-clone",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("b: two" + trailers)
+				r.git("tag", "v1.1.0")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"b: two"},
+			wantTip:      true,
+		},
+		{
+			name: "tag-on-its-history-only-in-the-clone",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				r.commit("b: two" + trailers)
+				r.git("tag", "v1.5.0")
+				sha := r.commit("c: three" + trailers)
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"b: two", "c: three"},
+			wantTip:      true,
+		},
+		// CI-36: a superseded commit re-run once the later merge's release
+		// is out is released, in that release, and has nothing to do.
+		{
+			name: "superseded-and-released-since",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("b: two" + trailers)
+				r.commit("c: three" + trailers)
+				r.git("tag", "v1.1.0")
+				r.push("v1.0.0", "v1.1.0")
+				return sha
+			},
+			wantSuperseded: true,
+			wantReleasedIn: "v1.1.0",
+		},
+		{
+			name: "superseded-and-released-twice-since",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("b: two" + trailers)
+				r.commit("c: three" + trailers)
+				r.git("tag", "v1.1.0")
+				r.commit("d: four" + trailers)
+				r.git("tag", "v1.2.0")
+				r.push("v1.0.0", "v1.1.0", "v1.2.0")
+				return sha
+			},
+			wantSuperseded: true,
+			wantReleasedIn: "v1.1.0",
+		},
+		// A release tag that holds the commit but is not on main is no
+		// later release of main's: it takes the next version's name.
+		{
+			name: "superseded-and-held-off-main",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("b: two" + trailers)
+				r.git("checkout", "--quiet", "-b", "side")
+				r.commit("s: side" + trailers)
+				r.git("tag", "v1.1.0")
+				r.git("checkout", "--quiet", "main")
+				r.commit("c: three" + trailers)
+				r.push("v1.0.0", "v1.1.0")
+				return sha
+			},
 			wantErr: release.ErrTagExists,
+		},
+		// A later release only the clone has holds nothing.
+		{
+			name: "superseded-and-released-only-in-the-clone",
+			setup: func(r *repo) string {
+				r.commit("a: one" + trailers)
+				r.git("tag", "v1.0.0")
+				sha := r.commit("b: two" + trailers)
+				r.commit("c: three" + trailers)
+				r.git("tag", "v1.1.0")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious:   "v1.0.0",
+			wantVersion:    "v1.1.0",
+			wantSubjects:   []string{"b: two"},
+			wantSuperseded: true,
 		},
 		// A clone without origin's newest tags would count from an older
 		// one, and could take a version origin already has, or a lower one.
@@ -753,7 +899,10 @@ func TestPrepare(t *testing.T) {
 			if plan.Superseded != tt.wantSuperseded {
 				t.Errorf("Prepare().Superseded = %t, want %t", plan.Superseded, tt.wantSuperseded)
 			}
-			if tt.wantReleased != "" {
+			if plan.ReleasedIn != tt.wantReleasedIn {
+				t.Errorf("Prepare().ReleasedIn = %q, want %q", plan.ReleasedIn, tt.wantReleasedIn)
+			}
+			if tt.wantReleased != "" || tt.wantReleasedIn != "" {
 				return
 			}
 			if plan.Previous != tt.wantPrevious {
@@ -781,11 +930,13 @@ func TestPrepare(t *testing.T) {
 func TestPrepareGitFails(t *testing.T) {
 	t.Parallel()
 
-	const sha = "51b68da129260de083e7c2ca36c4b1440378c527"
+	const (
+		sha = "51b68da129260de083e7c2ca36c4b1440378c527"
+		tip = "9f2c1e0d4b3a29180f6e5d4c3b2a19087f6e5d4c"
+	)
 	var (
 		catFile = execx.Call{Argv: []string{"git", "cat-file", "-e", sha + "^{commit}"}}
 		remote  = []string{"git", "ls-remote", "origin", "refs/heads/main", "refs/tags/v*"}
-		here    = []string{"git", "tag", "--points-at", sha, "--list", "v*"}
 		local   = []string{"git", "tag", "--list", "v*"}
 		merged  = []string{"git", "tag", "--merged", sha, "--list", "v*"}
 		fatal   = execx.Result{Code: 128, Stderr: []byte("fatal: something broke\n")}
@@ -807,19 +958,27 @@ func TestPrepareGitFails(t *testing.T) {
 			want:  "unable to access",
 		},
 		{
-			name:  "tags-unreadable",
-			calls: []execx.Call{catFile, {Argv: remote}, {Argv: here, Result: fatal}},
-			want:  "something broke",
-		},
-		{
 			name:  "local-tags-unreadable",
-			calls: []execx.Call{catFile, {Argv: remote}, {Argv: here}, {Argv: local, Result: fatal}},
+			calls: []execx.Call{catFile, {Argv: remote}, {Argv: local, Result: fatal}},
 			want:  "something broke",
 		},
 		{
 			name:  "history-unreadable",
-			calls: []execx.Call{catFile, {Argv: remote}, {Argv: here}, {Argv: local}, {Argv: merged, Result: fatal}},
+			calls: []execx.Call{catFile, {Argv: remote}, {Argv: local}, {Argv: merged, Result: fatal}},
 			want:  "something broke",
+		},
+		// A commit main has moved past, whose later releases git cannot list
+		{
+			name: "later-releases-unreadable",
+			calls: []execx.Call{
+				catFile,
+				{Argv: remote, Result: execx.Result{Stdout: []byte(tip + "\trefs/heads/main\n")}},
+				{Argv: local},
+				{Argv: []string{"git", "cat-file", "-e", tip + "^{commit}"}},
+				{Argv: []string{"git", "merge-base", "--is-ancestor", sha, tip}},
+				{Argv: []string{"git", "tag", "--contains", sha, "--merged", tip, "--list", "v*"}, Result: fatal},
+			},
+			want: "something broke",
 		},
 		{
 			name:  "git-missing",
@@ -842,37 +1001,90 @@ func TestPrepareGitFails(t *testing.T) {
 	}
 }
 
+// TestCreate checks that Create refuses a plan it must not carry out,
+// and that, once gh has made the release, it reads the tag back from
+// origin and fails unless it points at the commit (CI-37): a tag that was
+// already there, at another commit, would have taken the release. A tag
+// not yet there is read again, five times in all, two seconds apart; the
+// bubble's clock says how long it waited.
 func TestCreate(t *testing.T) {
 	t.Parallel()
 
-	const sha = "51b68da129260de083e7c2ca36c4b1440378c527"
+	const (
+		sha   = "51b68da129260de083e7c2ca36c4b1440378c527"
+		other = "9f2c1e0d4b3a29180f6e5d4c3b2a19087f6e5d4c"
+		url   = "https://github.com/divbast/ci/releases/tag/v1.1.0\n"
+	)
 	plan := release.Plan{
 		SHA:     sha,
 		Tip:     sha,
 		Version: release.Version{Major: 1, Minor: 1},
 		Commits: []release.Commit{{Subject: "a: one"}},
 	}
-	argv := []string{"gh", "release", "create", "v1.1.0", "--target", sha, "--title", "v1.1.0", "--notes-file", "-"}
 	notes := []byte(release.Notes(plan.Commits))
+	created := []execx.Call{{
+		Argv:   []string{"gh", "release", "create", "v1.1.0", "--target", sha, "--title", "v1.1.0", "--notes-file", "-"},
+		Stdin:  notes,
+		Result: execx.Result{Stdout: []byte(url)},
+	}}
+	lsRemote := []string{"git", "ls-remote", "origin", "refs/heads/main", "refs/tags/v*"}
+	origin := func(lines ...string) execx.Call {
+		return execx.Call{Argv: lsRemote, Result: execx.Result{Stdout: []byte(sha + "\trefs/heads/main\n" + strings.Join(lines, ""))}}
+	}
+	tagAt := func(target string) execx.Call { return origin(target + "\trefs/tags/v1.1.0\n") }
+	noTag := origin(other + "\trefs/tags/v1.0.0\n")
 
 	tests := []struct {
 		name    string
 		plan    func(p release.Plan) release.Plan
-		calls   []execx.Call
+		gh, git []execx.Call
 		wantErr error
 		// wantMsg is what the error message must contain.
-		wantMsg string
-		wantOut string
+		wantMsg    string
+		wantOut    string
+		wantWaited time.Duration
 	}{
+		{name: "creates", gh: created, git: []execx.Call{tagAt(sha)}, wantOut: url},
 		{
-			name: "creates",
-			plan: func(p release.Plan) release.Plan { return p },
-			calls: []execx.Call{{
-				Argv:   argv,
-				Stdin:  notes,
-				Result: execx.Result{Stdout: []byte("https://github.com/divbast/ci/releases/tag/v1.1.0\n")},
-			}},
-			wantOut: "https://github.com/divbast/ci/releases/tag/v1.1.0\n",
+			name:    "an-annotated-tag-that-peels-to-the-commit",
+			gh:      created,
+			git:     []execx.Call{origin(other + "\trefs/tags/v1.1.0\n" + sha + "\trefs/tags/v1.1.0^{}\n")},
+			wantOut: url,
+		},
+		{
+			name:       "the-tag-seen-on-the-third-read",
+			gh:         created,
+			git:        []execx.Call{noTag, noTag, tagAt(sha)},
+			wantOut:    url,
+			wantWaited: 4 * time.Second,
+		},
+		{
+			name:    "the-tag-at-another-commit",
+			gh:      created,
+			git:     []execx.Call{tagAt(other)},
+			wantErr: release.ErrTagMismatch,
+			wantMsg: "v1.1.0 points at " + other + ", not " + sha,
+		},
+		{
+			name:    "an-annotated-tag-that-peels-elsewhere",
+			gh:      created,
+			git:     []execx.Call{origin(sha + "\trefs/tags/v1.1.0\n" + other + "\trefs/tags/v1.1.0^{}\n")},
+			wantErr: release.ErrTagMismatch,
+			wantMsg: "v1.1.0 points at " + other,
+		},
+		{
+			name:       "the-tag-never-seen",
+			gh:         created,
+			git:        []execx.Call{noTag, noTag, noTag, noTag, noTag},
+			wantErr:    release.ErrTagMismatch,
+			wantMsg:    "origin has no tag v1.1.0",
+			wantWaited: 8 * time.Second,
+		},
+		{
+			name:    "origin-unreadable-after",
+			gh:      created,
+			git:     []execx.Call{{Argv: lsRemote, Result: execx.Result{Code: 128, Stderr: []byte("fatal: unable to access\n")}}},
+			wantMsg: "unable to access",
 		},
 		{
 			name:    "not-the-tip",
@@ -887,10 +1099,18 @@ func TestCreate(t *testing.T) {
 			wantMsg: "v1.0.0",
 		},
 		{
+			name: "released-in-a-later-release",
+			plan: func(p release.Plan) release.Plan {
+				p.Tip, p.Superseded, p.ReleasedIn = other, true, "v1.1.0"
+				return p
+			},
+			wantErr: release.ErrReleased,
+			wantMsg: "in v1.1.0",
+		},
+		{
 			name: "gh-fails",
-			plan: func(p release.Plan) release.Plan { return p },
-			calls: []execx.Call{{
-				Argv:   argv,
+			gh: []execx.Call{{
+				Argv:   created[0].Argv,
 				Stdin:  notes,
 				Result: execx.Result{Code: 1, Stderr: []byte("HTTP 403: Resource not accessible by integration\n")},
 			}},
@@ -900,24 +1120,56 @@ func TestCreate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
-			p := tt.plan(plan)
-			out, err := release.Create(t.Context(), execx.NewFake(t, tt.calls...), &p)
-			switch {
-			case tt.wantErr == nil && tt.wantMsg == "":
-				if err != nil {
-					t.Fatalf("Create() error = %v, want nil", err)
+			synctest.Test(t, func(t *testing.T) {
+				p := plan
+				if tt.plan != nil {
+					p = tt.plan(plan)
 				}
-			case err == nil:
-				t.Fatal("Create() error = nil, want an error")
-			case tt.wantErr != nil && !errors.Is(err, tt.wantErr):
-				t.Errorf("Create() error = %v, want %v", err, tt.wantErr)
-			case !strings.Contains(err.Error(), tt.wantMsg):
-				t.Errorf("Create() error = %q, want it to contain %q", err, tt.wantMsg)
-			}
-			if string(out) != tt.wantOut {
-				t.Errorf("Create() output = %q, want %q", out, tt.wantOut)
-			}
+				start := time.Now()
+				out, err := release.Create(t.Context(), execx.NewFake(t, tt.git...), execx.NewFake(t, tt.gh...), &p)
+				switch {
+				case tt.wantErr == nil && tt.wantMsg == "":
+					if err != nil {
+						t.Fatalf("Create() error = %v, want nil", err)
+					}
+				case err == nil:
+					t.Fatal("Create() error = nil, want an error")
+				case tt.wantErr != nil && !errors.Is(err, tt.wantErr):
+					t.Errorf("Create() error = %v, want %v", err, tt.wantErr)
+				case !strings.Contains(err.Error(), tt.wantMsg):
+					t.Errorf("Create() error = %q, want it to contain %q", err, tt.wantMsg)
+				}
+				if string(out) != tt.wantOut {
+					t.Errorf("Create() output = %q, want %q", out, tt.wantOut)
+				}
+				if waited := time.Since(start); waited != tt.wantWaited {
+					t.Errorf("Create() waited %v, want %v", waited, tt.wantWaited)
+				}
+			})
 		})
 	}
+}
+
+// TestCreateCancelledWhileWaiting checks that a context that ends while
+// Create waits to read the tag again ends the wait, with its error.
+func TestCreateCancelledWhileWaiting(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		const sha = "51b68da129260de083e7c2ca36c4b1440378c527"
+		plan := release.Plan{SHA: sha, Tip: sha, Version: release.Version{Major: 1, Minor: 1}}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		gh := execx.NewFake(t, execx.Call{
+			Argv:  []string{"gh", "release", "create", "v1.1.0", "--target", sha, "--title", "v1.1.0", "--notes-file", "-"},
+			Stdin: []byte(release.Notes(nil)),
+		})
+		git := execx.NewFake(t, execx.Call{Argv: []string{"git", "ls-remote", "origin", "refs/heads/main", "refs/tags/v*"}})
+		start := time.Now()
+		if _, err := release.Create(ctx, git, gh, &plan); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Create() error = %v, want context.DeadlineExceeded", err)
+		}
+		if waited := time.Since(start); waited != time.Second {
+			t.Errorf("Create() waited %v, want the context's 1s", waited)
+		}
+	})
 }

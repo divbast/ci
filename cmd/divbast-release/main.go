@@ -35,21 +35,24 @@
 //
 // with the notes on stdin, so gh needs a token that can write the
 // repository's contents, in GH_TOKEN, and the repository, in GH_REPO or
-// as the clone's origin. It does nothing when a release tag already points
-// at SHA. When a later merge has already landed on main, it releases
-// nothing and says the run for main's tip releases SHA with it. It
-// refuses a SHA main does not hold at all. It never moves or deletes a
-// tag.
+// as the clone's origin. It then reads the new tag back from origin, and
+// fails unless it points at SHA. It does nothing when a release tag
+// already points at SHA. When a later merge has already landed on main,
+// it releases nothing and says the run for main's tip releases SHA with
+// it, or, once that release is out, which release holds SHA. It refuses a
+// SHA main does not hold at all. Only origin's release tags count, never
+// one the clone alone has. It never moves or deletes a tag.
 //
 // Exit codes:
 //
 //	0  released; or a release tag already points at SHA; or SHA is on main
-//	   but a later merge landed first, whose run releases it; or the dry
-//	   run printed the release
+//	   but a later merge landed first, whose run releases it or whose
+//	   release holds it; or the dry run printed the release
 //	1  refused or failed: SHA is not a commit here, or not on origin's main;
 //	   origin has a release tag the clone has not fetched; the next
-//	   version's tag is taken by another commit; or git or gh failed;
-//	   stderr says which
+//	   version's tag is taken by another commit; the release was made but
+//	   its tag does not point at SHA; or git or gh failed; stderr says
+//	   which
 //	2  the command line is wrong
 package main
 
@@ -111,8 +114,12 @@ func run(ctx context.Context, args []string, git execx.Runner, gh execx.StdinRun
 		complain(stderr, "%v", err)
 		return 1
 	}
-	if plan.Released != "" {
+	switch {
+	case plan.Released != "":
 		return say(stdout, stderr, "%s is already released as %s: nothing to do\n", plan.SHA, plan.Released)
+	case plan.ReleasedIn != "":
+		return say(stdout, stderr, "%s is no longer main's tip (%s), and %s, a later release, holds it: nothing to do\n",
+			plan.SHA, plan.Tip, plan.ReleasedIn)
 	}
 
 	if *dryRun {
@@ -137,7 +144,7 @@ func run(ctx context.Context, args []string, git execx.Runner, gh execx.StdinRun
 		return 1
 	}
 
-	out, err := release.Create(ctx, gh, &plan)
+	out, err := release.Create(ctx, git, gh, &plan)
 	if err != nil {
 		complain(stderr, "%v", err)
 		return 1

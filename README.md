@@ -386,11 +386,14 @@ the registry. `renovate.yml` builds none.
 Every green merge to ci's main is a release. Once `required` has passed
 on a push to main, `self-ci.yml`'s `release` job runs `divbast-release`,
 which tags the merged commit with the next version and publishes it as a
-GitHub Release, immutable once published. Its notes list the subject of
-every commit since the last release, leaving out merge commits. When two
-merges land close together, the run for the earlier one finds main has
-moved on and leaves the release to the run for the later one, which
-releases both.
+GitHub Release, immutable once published, then reads the tag back from
+origin and fails unless it is at that commit. Its notes list the subject
+of every commit since the last release, leaving out merge commits. When
+two merges land close together, the run for the earlier one finds main
+has moved on and leaves the release to the run for the later one, which
+releases both; a re-run of the earlier one once that release is out says
+which release holds it. Only origin's release tags count: a tag in a
+clone alone releases nothing and moves no version.
 
 - The version is the last release's with its minor number raised:
   v1.4.0 follows v1.3.0. The first release is v1.0.0.
@@ -402,7 +405,9 @@ releases both.
   `*` or `-` bullet followed by blanks, with `Breaking-change`, in any
   case, then optional blanks and `:`. So such a line anywhere in a squash
   merge's body counts, and so does one on a merge commit. The words
-  mid-sentence do not.
+  mid-sentence do not, nor does a bullet with no blank after it, as in
+  `*Breaking-change:`: GitHub writes a squash body's bullets `* `. A
+  trailer folded over several lines gives the notes all of them.
 - [What breaks a caller](#what-breaks-a-caller) says which changes those
   are.
 
@@ -410,7 +415,10 @@ Every pull request previews the release its merge would make:
 `self-ci.yml`'s `release-preview` job, which `required` needs, dry-runs
 `divbast-release` on GitHub's test merge of the pull request into main
 and writes the version, minor or major, and its notes to the run's
-summary.
+summary. Re-running an old preview fails once a later release is out: it
+runs on the test merge GitHub made at the time, whose next version is
+taken now. A push to the pull request, or a rebase, makes a new test
+merge.
 
 A repository pins ci at a release, the release's commit with its tag as
 the comment, and zizmor and pinact check that pair as they do any other
@@ -808,7 +816,7 @@ the token was found.
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-frankenphp [-containerfile FILE]` | Refuses a FrankenPHP binary frankenphp's main build did not attest | Verified | Not verified, or the Containerfile names the image other than once in full |
-| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; or git or gh failed |
+| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
 ## Shared configuration
 

@@ -16,10 +16,13 @@
 // squash merge buries in its body, where it lists each squashed commit's
 // message, and errs towards a major release: a needless major waits for
 // an approval, where a missed one would merge a break into every caller.
+// A bullet counts only with a blank after it, as GitHub writes a squash
+// body's.
 //
-// The notes list the text of each breaking change, once, then the subject
-// of every commit since the last release but merges, which bring changes
-// and say nothing of their own.
+// The notes list the text of each breaking change, once, a folded one
+// with all its lines, then the subject of every commit since the last
+// release but merges, which bring changes and say nothing of their own.
+// Only origin's release tags count, never one the clone alone has.
 package release
 
 import (
@@ -31,6 +34,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/divbast/ci/internal/execx"
 )
@@ -149,9 +153,13 @@ type Plan struct {
 	// Superseded is whether SHA is on origin's main but no longer its tip:
 	// a later merge landed first, and the run for Tip releases SHA with it.
 	Superseded bool
-	// Released is the release tag already at SHA, when there is one, on
-	// origin or in the clone. The fields below are then empty.
+	// Released is the release tag already at SHA on origin, when there is
+	// one. The fields below are then empty.
 	Released string
+	// ReleasedIn is the earliest release tag on origin that holds SHA,
+	// when SHA is Superseded and a later merge's release already holds
+	// it. The fields below are then empty.
+	ReleasedIn string
 	// Previous is the latest release tag SHA descends from, empty when
 	// there is none.
 	Previous string
@@ -176,14 +184,21 @@ var (
 	// ErrStaleTags means origin has release tags the clone has not
 	// fetched, so the version cannot be counted from the clone's.
 	ErrStaleTags = errors.New("origin has release tags this clone has not fetched")
+	// ErrTagMismatch means gh made the release, but origin's tag of its
+	// version does not point at the commit: a tag of that name was
+	// already there, and the release took it.
+	ErrTagMismatch = errors.New("the release's tag is not at the commit released")
 )
 
 // Prepare works out the release of sha in the clone git runs in, which
 // must have fetched origin's tags. It reads origin's main and release tags
 // from origin itself, and when main has moved past sha, whether main holds
-// it, fetching main if the clone lacks it. It refuses nothing but a
-// version tag already taken elsewhere, or a clone missing origin's tags:
-// [Create], and its caller, decide whether the plan may be carried out.
+// it, fetching main if the clone lacks it, and whether a later release
+// holds it already. Only origin's release tags count: one the clone alone
+// has releases nothing, takes no version and holds nothing. It refuses
+// nothing but a version tag already taken elsewhere, or a clone missing
+// origin's tags: [Create], and its caller, decide whether the plan may be
+// carried out.
 //
 // The error wraps [ErrNoCommit] when sha is not a commit there,
 // [ErrStaleTags] when origin has a release tag the clone has not fetched,
@@ -208,11 +223,8 @@ func Prepare(ctx context.Context, git execx.Runner, sha string) (Plan, error) {
 		return Plan{}, err
 	}
 
-	// Released already, by this clone's tags or by origin's.
-	here, err := g.versions(ctx, "--points-at", sha)
-	if err != nil {
-		return Plan{}, err
-	}
+	// Released already, by origin's tags, the only ones that count.
+	var here []Version
 	for name, target := range remote {
 		if v, ok := ParseVersion(name); ok && target == sha {
 			here = append(here, v)
@@ -221,6 +233,10 @@ func Prepare(ctx context.Context, git execx.Runner, sha string) (Plan, error) {
 	if len(here) > 0 {
 		plan.Released = slices.MaxFunc(here, Version.Compare).String()
 		return plan, nil
+	}
+	released := func(v Version) bool {
+		_, ok := remote[v.String()]
+		return ok
 	}
 
 	// Counted from the clone's tags, so they must be all of origin's.
@@ -244,11 +260,23 @@ func Prepare(ctx context.Context, git execx.Runner, sha string) (Plan, error) {
 			return Plan{}, err
 		}
 	}
+	// Released already, with a later merge whose run came first.
+	if plan.Superseded {
+		var later []Version
+		if later, err = g.versions(ctx, "--contains", sha, "--merged", plan.Tip); err != nil {
+			return Plan{}, err
+		}
+		if later = slices.DeleteFunc(later, func(v Version) bool { return !released(v) }); len(later) > 0 {
+			plan.ReleasedIn = slices.MinFunc(later, Version.Compare).String()
+			return plan, nil
+		}
+	}
 
 	reachable, err := g.versions(ctx, "--merged", sha)
 	if err != nil {
 		return Plan{}, err
 	}
+	reachable = slices.DeleteFunc(reachable, func(v Version) bool { return !released(v) })
 	since := sha
 	var previous Version
 	if len(reachable) > 0 {
@@ -263,7 +291,7 @@ func Prepare(ctx context.Context, git execx.Runner, sha string) (Plan, error) {
 
 	// Every tag sha descends from is older than the next version, so a
 	// tag that already has its name is on some other history.
-	if slices.Contains(have, plan.Version) {
+	if released(plan.Version) {
 		return Plan{}, fmt.Errorf("%w: %s, on a commit %s does not descend from", ErrTagExists, plan.Version, sha)
 	}
 	return plan, nil
@@ -275,13 +303,20 @@ func Prepare(ctx context.Context, git execx.Runner, sha string) (Plan, error) {
 // repository's contents. Create never moves or deletes a tag.
 //
 // It refuses, wrapping [ErrReleased], when a release tag already points at
-// the commit, and, wrapping [ErrNotTip], unless the commit is origin's
-// main.
-func Create(ctx context.Context, gh execx.StdinRunner, plan *Plan) ([]byte, error) {
-	if plan.Released != "" {
+// the commit or a later release holds it, and, wrapping [ErrNotTip],
+// unless the commit is origin's main. Once gh has made the release, it
+// reads the tag back from origin, through git, and fails, wrapping
+// [ErrTagMismatch], unless the tag points at the commit: gh gives a
+// release a tag of its name that is already there, wherever that points.
+// A tag origin does not show yet is read again, up to tagReads times in
+// all, tagWait apart.
+func Create(ctx context.Context, git execx.Runner, gh execx.StdinRunner, plan *Plan) ([]byte, error) {
+	switch {
+	case plan.Released != "":
 		return nil, fmt.Errorf("%s is %w as %s", plan.SHA, ErrReleased, plan.Released)
-	}
-	if plan.Tip != plan.SHA {
+	case plan.ReleasedIn != "":
+		return nil, fmt.Errorf("%s is %w in %s", plan.SHA, ErrReleased, plan.ReleasedIn)
+	case plan.Tip != plan.SHA:
 		return nil, fmt.Errorf("%s is %w, which is %q", plan.SHA, ErrNotTip, plan.Tip)
 	}
 	v := plan.Version.String()
@@ -292,6 +327,9 @@ func Create(ctx context.Context, gh execx.StdinRunner, plan *Plan) ([]byte, erro
 	}
 	if res.Code != 0 {
 		return nil, fmt.Errorf("gh release create %s: exit status %d: %s", v, res.Code, bytes.TrimSpace(res.Stderr))
+	}
+	if err = (runner{git}).tagged(ctx, v, plan.SHA); err != nil {
+		return nil, fmt.Errorf("gh made release %s, but %w", v, err)
 	}
 	return res.Stdout, nil
 }
@@ -353,6 +391,40 @@ func (r runner) origin(ctx context.Context) (tip string, tags map[string]string,
 	return tip, tags, nil
 }
 
+// How often, and how far apart, Create reads origin for the tag gh has
+// just made.
+const (
+	tagReads = 5
+	tagWait  = 2 * time.Second
+)
+
+// tagged returns nil once origin's tag name points at sha, an error
+// wrapping ErrTagMismatch when it points elsewhere, or when origin still
+// shows no such tag after tagReads reads, and any other error when origin
+// cannot be read or ctx ends.
+func (r runner) tagged(ctx context.Context, name, sha string) error {
+	for read := 1; ; read++ {
+		_, tags, err := r.origin(ctx)
+		if err != nil {
+			return fmt.Errorf("its tag could not be read back: %w", err)
+		}
+		at, ok := tags[name]
+		switch {
+		case ok && at == sha:
+			return nil
+		case ok:
+			return fmt.Errorf("%w: %s points at %s, not %s", ErrTagMismatch, name, at, sha)
+		case read == tagReads:
+			return fmt.Errorf("%w: origin has no tag %s after %d reads, %v apart", ErrTagMismatch, name, tagReads, tagWait)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("its tag could not be read back: %w", ctx.Err())
+		case <-time.After(tagWait):
+		}
+	}
+}
+
 // holds reports whether tip's history holds sha. When the clone lacks
 // tip, because origin's main moved after the clone fetched, it fetches
 // origin's main first.
@@ -383,36 +455,56 @@ func (r runner) holds(ctx context.Context, tip, sha string) (bool, error) {
 
 // breakingIn returns what each breaking change a commit marks says, once
 // each, given its subject, its Breaking-change trailers as git prints them
-// and its whole message. A line breakingLine matches that is the first
-// line of a folded trailer, read whole already, is not counted twice. A
-// mark that says nothing is the subject.
+// and its whole message. A line breakingLine matches takes the lines below
+// it that start with a blank, and are not such a line themselves, joined
+// as git joins a folded trailer's, so a buried folded trailer reads whole,
+// and one git has read already reads as the same text and is not counted
+// twice. A mark that says nothing is the subject.
 func breakingIn(subject, trailers, message string) []string {
 	var (
 		texts  []string
 		marked bool
 	)
+	add := func(text string) {
+		if text != "" && !slices.Contains(texts, text) {
+			texts = append(texts, text)
+		}
+	}
 	for trailer := range strings.SplitSeq(trailers, trailerSep) {
 		if strings.TrimSpace(trailer) == "" {
 			continue
 		}
 		marked = true
 		_, value, _ := strings.Cut(trailer, ":")
-		if value = strings.TrimSpace(value); value != "" && !slices.Contains(texts, value) {
-			texts = append(texts, value)
-		}
+		add(strings.TrimSpace(value))
 	}
-	for _, m := range breakingLine.FindAllStringSubmatch(message, -1) {
-		marked = true
-		text := strings.TrimSpace(m[1])
-		if text == "" || slices.ContainsFunc(texts, func(t string) bool { return strings.HasPrefix(t, text) }) {
+	lines := strings.Split(message, "\n")
+	for i := 0; i < len(lines); i++ {
+		m := breakingLine.FindStringSubmatch(lines[i])
+		if m == nil {
 			continue
 		}
-		texts = append(texts, text)
+		marked = true
+		var text strings.Builder
+		text.WriteString(m[1])
+		for i+1 < len(lines) && folds(lines[i+1]) {
+			i++
+			text.WriteString(" " + strings.TrimLeft(lines[i], " \t"))
+		}
+		add(strings.TrimSpace(text.String()))
 	}
 	if marked && len(texts) == 0 {
 		texts = []string{subject}
 	}
 	return texts
+}
+
+// folds reports whether line continues the trailer above it, as git reads
+// a trailer: it starts with a blank and has more than blanks. A line that
+// marks a breaking change of its own does not.
+func folds(line string) bool {
+	blank := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
+	return blank && strings.TrimSpace(line) != "" && !breakingLine.MatchString(line)
 }
 
 // versions returns the release tags git tag lists, every one or those the
