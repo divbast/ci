@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The fixture with a shell at /bin/sh, in a /usr/bin only root may search:
+# uid 65532 cannot look the shell up, and cannot tell it is not there
+# either, which is no proof of its absence. /bin is a link to usr/bin in
+# the fixture.
+
+# testfixture.LibreSpeed, pinned by its index digest, which the test
+# passes in so that the fixture is named in one place only
+ARG FIXTURE
+
+FROM docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6 AS shell
+RUN mkdir -p /out/usr/bin \
+    && cp /bin/busybox /out/usr/bin/sh \
+    && chmod 0700 /out/usr/bin
+
+FROM ${FIXTURE}
+# --link builds the layer on its own, so its usr/bin keeps mode 0700 over
+# the fixture's. A COPY onto the fixture would keep the fixture's mode.
+COPY --link --from=shell /out/ /

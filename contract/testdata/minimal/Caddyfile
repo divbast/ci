@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+{
+	# Plain HTTP, and no admin API, which would listen on 127.0.0.1:2019,
+	# outside the contract's two ports
+	auto_https off
+	admin off
+	frankenphp
+}
+
+# The page, at / alone
+:8080 {
+	root /var/www/minimal
+	handle / {
+		rewrite * /index.php
+		php
+	}
+	handle {
+		respond 404
+	}
+}
+
+# /healthz alone, from a root outside the served tree
+:8081 {
+	root /usr/local/share/minimal-health
+	handle /healthz {
+		rewrite * /index.php
+		php
+	}
+	handle {
+		respond 404
+	}
+}

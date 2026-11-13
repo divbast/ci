@@ -1,0 +1,44 @@
+<?php
+
+// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+declare(strict_types=1);
+
+/*
+ * The minimal fixture's health probe, which its HEALTHCHECK runs: /healthz
+ * on :8081 and the page on :8080 must each answer 200 with their own words.
+ * It exits 0 and prints nothing, or 1 with a line for each that did not.
+ * Bare sockets, over HTTP/1.0, so an answer ends where the server closes
+ * the connection.
+ */
+
+const TIMEOUT = 4;
+
+/**
+ * The whole answer to GET path on port, or why there is none.
+ */
+function get(int $port, string $path): string
+{
+    $socket = @fsockopen('127.0.0.1', $port, $errno, $errstr, TIMEOUT);
+    if ($socket === false) {
+        return "no connection (errno $errno: $errstr)";
+    }
+    stream_set_timeout($socket, TIMEOUT);
+    @fwrite($socket, "GET $path HTTP/1.0\r\nHost: 127.0.0.1:$port\r\n\r\n");
+    $answer = @stream_get_contents($socket);
+    fclose($socket);
+
+    return $answer === false ? 'no answer' : $answer;
+}
+
+$failed = false;
+foreach ([[8081, '/healthz', "ok\n"], [8080, '/', "Hello from frankenphp\n"]] as [$port, $path, $body]) {
+    $answer = get($port, $path);
+    if (preg_match('#\AHTTP/1\.[01] 200 #', $answer) !== 1 || !str_ends_with($answer, "\r\n\r\n$body")) {
+        fwrite(STDERR, "minimal-health: :$port$path answered " . json_encode(substr($answer, 0, 200)) . "\n");
+        $failed = true;
+    }
+}
+
+exit($failed ? 1 : 0);

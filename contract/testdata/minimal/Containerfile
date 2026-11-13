@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The minimal fixture: no more than an image needs to pass the contract,
+# with no bootstrap before its server and no volume. ci's own tests build
+# it and run the contract against it, as an app's acceptance suite runs it
+# against the app, so a contract change that would fail such an app fails
+# there first.
+
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
+
+# The binary divbast/frankenphp builds, by digest: the one the template
+# copies, built for Baikal
+COPY --from=ghcr.io/divbast/frankenphp:baikal@sha256:23c042d9259caa052bc9a0131f58f75a15f73602fd182a2546b6759dc1e0d1db --chmod=0755 /frankenphp /usr/local/bin/frankenphp
+
+# Root-owned, and never written. Only the probe takes --chmod: COPY gives
+# a directory it creates the mode it gives the file, and then no one could
+# enter it. The rest keep the checkout's modes.
+COPY --chown=root:root Caddyfile /etc/frankenphp/Caddyfile
+COPY --chown=root:root index.php /var/www/minimal/index.php
+COPY --chown=root:root healthz.php /usr/local/share/minimal-health/index.php
+COPY --chown=root:root --chmod=0755 minimal-health /usr/local/bin/minimal-health
+
+# Caddy keeps its state, and the configuration it autosaves, under these
+ENV XDG_DATA_HOME=/tmp \
+    XDG_CONFIG_HOME=/tmp
+
+EXPOSE 8080 8081
+# Exec form, since the image has no shell to run any other
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/frankenphp", "php-cli", "/usr/local/bin/minimal-health"]
+USER 65532:65532
+# The server itself, as PID 1: nothing runs before it
+ENTRYPOINT ["/usr/local/bin/frankenphp", "run", "--config", "/etc/frankenphp/Caddyfile"]

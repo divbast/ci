@@ -5,6 +5,9 @@ package harness
 
 import (
 	"archive/tar"
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,8 +25,9 @@ import (
 	"testing"
 )
 
-// ImageConfig returns the user and the HEALTHCHECK image declares, as its
-// own configuration holds them, pulling it first if it is not here.
+// ImageConfig returns the user, the HEALTHCHECK and the volumes image
+// declares, as its own configuration holds them, pulling it first if it is
+// not here.
 //
 // Docker's image inspect reads both from that configuration. Podman's
 // reads a health check only from an image whose manifest is Docker's, and
@@ -66,33 +70,75 @@ func (e Engine) imageID(ctx context.Context, image string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// configCache holds the configurations podman save has read, by image ID.
-// A save writes out the whole image, and the ID names one configuration
-// for good, since it is that configuration's digest.
-type configCache struct {
+// FileCapabilities returns the path of every file in image's layers that
+// carries a security.capability extended attribute, sorted and each once,
+// pulling the image first if it is not here. It reads the layers as the
+// engine saves them, and runs nothing, so it sees what no exec can: a
+// capability with no effective bit, which the kernel runs as it would any
+// other binary, and one on a file nothing runs. A file counts in whichever
+// layer holds it, even one a later layer replaces or removes, since that
+// layer ships in the image all the same.
+//
+// A layer it cannot read is an error, never a layer with nothing in it:
+// one compressed with zstd, say, which the standard library cannot read.
+func (e Engine) FileCapabilities(ctx context.Context, tb testing.TB, image string) ([]string, error) {
+	tb.Helper()
+	id, err := e.imageID(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	read, err := e.saved(ctx, tb, image, id)
+	if err != nil {
+		return nil, err
+	}
+	if read.capsErr != nil {
+		return nil, fmt.Errorf("%s save of %s: %w", e.name, image, read.capsErr)
+	}
+	return slices.Clone(read.caps), nil
+}
+
+// saveCache holds what each save has read, by image ID, so an image is
+// saved once however often it is asked about: a save writes out the whole
+// image. An ID names one image for good, since it is a digest: of its
+// configuration on Podman, and of its manifest or index on Docker's
+// containerd store.
+type saveCache struct {
 	mu  sync.Mutex
 	ids map[string]*savedImage
 }
 
-// savedImage is one image's place in a configCache. Its lock is held while
+// savedImage is one image's place in a saveCache. Its lock is held while
 // the image is saved, so a check that wants it meanwhile waits for that
 // save rather than making another.
 type savedImage struct {
-	mu  sync.Mutex
-	cfg *Config
+	mu   sync.Mutex
+	read *saveRead
 }
 
-func newConfigCache() *configCache {
-	return &configCache{ids: make(map[string]*savedImage)}
+// saveRead is what one save of an image held.
+type saveRead struct {
+	// cfg is the image's configuration, unless cfgErr says why it could
+	// not be read: on Podman only, whose ID for an image is its digest.
+	// Docker's image inspect reads it instead.
+	cfg    Config
+	cfgErr error
+	// caps holds the files in its layers that carry a file capability,
+	// unless capsErr says why they could not be read.
+	caps    []string
+	capsErr error
 }
 
-// sharedConfigs is what every engine EngineFromEnv returns keeps image
-// configurations in: a suite asks it for an engine as often as it likes,
-// and contract.Check asks for one each time it runs.
-var sharedConfigs = newConfigCache()
+func newSaveCache() *saveCache {
+	return &saveCache{ids: make(map[string]*savedImage)}
+}
+
+// sharedSaves is what every engine EngineFromEnv returns keeps what its
+// saves read in: a suite asks it for an engine as often as it likes, and
+// contract.Check asks for one each time it runs.
+var sharedSaves = newSaveCache()
 
 // image returns the place of the image with ID id, making it if need be.
-func (c *configCache) image(id string) *savedImage {
+func (c *saveCache) image(id string) *savedImage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s, ok := c.ids[id]
@@ -104,24 +150,38 @@ func (c *configCache) image(id string) *savedImage {
 }
 
 // savedConfig returns the configuration of the image with ID id, out of
-// Podman's docker-archive of it, which it saves only the first time it is
-// asked for that ID. A save that failed is tried again the next time.
+// Podman's docker-archive of it.
 func (e Engine) savedConfig(ctx context.Context, tb testing.TB, image, id string) (Config, error) {
 	tb.Helper()
-	if e.configs == nil {
-		return e.saveConfig(ctx, tb, image, id)
+	read, err := e.saved(ctx, tb, image, id)
+	if err != nil {
+		return Config{}, err
 	}
-	saved := e.configs.image(id)
+	if read.cfgErr != nil {
+		return Config{}, read.cfgErr
+	}
+	return read.cfg.clone(), nil
+}
+
+// saved returns what a save of the image with ID id holds, saving it only
+// the first time it is asked for that ID. A save that failed is tried
+// again the next time.
+func (e Engine) saved(ctx context.Context, tb testing.TB, image, id string) (*saveRead, error) {
+	tb.Helper()
+	if e.saves == nil {
+		return e.save(ctx, tb, image, id)
+	}
+	saved := e.saves.image(id)
 	saved.mu.Lock()
 	defer saved.mu.Unlock()
-	if saved.cfg == nil {
-		cfg, err := e.saveConfig(ctx, tb, image, id)
+	if saved.read == nil {
+		read, err := e.save(ctx, tb, image, id)
 		if err != nil {
-			return Config{}, err
+			return nil, err
 		}
-		saved.cfg = &cfg
+		saved.read = read
 	}
-	return saved.cfg.clone(), nil
+	return saved.read, nil
 }
 
 // clone returns a copy of c that shares nothing with it, for a caller to
@@ -132,24 +192,42 @@ func (c Config) clone() Config {
 		hc.Test = slices.Clone(hc.Test)
 		c.Healthcheck = &hc
 	}
+	c.Volumes = maps.Clone(c.Volumes)
 	return c
 }
 
-// saveConfig is savedConfig, saving the image every time.
-func (e Engine) saveConfig(ctx context.Context, tb testing.TB, image, id string) (Config, error) {
+// save is saved, saving the image every time: Podman as a docker-archive,
+// which Docker's save writes without being asked, beside an OCI layout.
+func (e Engine) save(ctx context.Context, tb testing.TB, image, id string) (*saveRead, error) {
 	tb.Helper()
 	dir := tb.TempDir()
-	if _, err := e.output(ctx, "save", "-q", "--format", "docker-archive", "-o", filepath.Join(dir, "image.tar"), id); err != nil {
-		return Config{}, err
+	argv := []string{"save", "-o", filepath.Join(dir, "image.tar"), id}
+	if e.name == "podman" {
+		argv = []string{"save", "-q", "--format", "docker-archive", "-o", filepath.Join(dir, "image.tar"), id}
 	}
-	blob, err := archiveFileConfig(dir, "image.tar")
+	if _, err := e.output(ctx, argv...); err != nil {
+		return nil, err
+	}
+	blob, read, err := readSave(dir, "image.tar")
 	if err != nil {
-		return Config{}, fmt.Errorf("%s save of %s: %w", e.name, image, err)
+		return nil, fmt.Errorf("%s save of %s: %w", e.name, image, err)
 	}
+	if e.name == "podman" {
+		read.cfg, read.cfgErr = savedImageConfig(blob, image, id)
+	}
+	return read, nil
+}
 
+// savedImageConfig returns the configuration in blob, which a save of
+// image held, unless blob has some other digest than id, the image's ID
+// on Podman, or is not a configuration at all.
+func savedImageConfig(blob []byte, image, id string) (Config, error) {
+	if blob == nil {
+		return Config{}, fmt.Errorf("the save of %s holds no configuration", image)
+	}
 	sum := sha256.Sum256(blob)
 	if got, want := hex.EncodeToString(sum[:]), strings.TrimPrefix(id, "sha256:"); got != want {
-		return Config{}, fmt.Errorf("%s save of %s holds a configuration whose digest, %s, is not its ID, %s", e.name, image, got, want)
+		return Config{}, fmt.Errorf("the save of %s holds a configuration whose digest, %s, is not its ID, %s", image, got, want)
 	}
 	var doc struct {
 		Config Config `json:"config"`
@@ -160,32 +238,125 @@ func (e Engine) saveConfig(ctx context.Context, tb testing.TB, image, id string)
 	return doc.Config, nil
 }
 
-// archiveFileConfig returns the configuration blob in the docker-archive
-// file name, in dir.
-func archiveFileConfig(dir, name string) (blob []byte, err error) {
+// readSave reads the docker-archive file name, in dir, for its
+// configuration blob, nil if it holds none it can find, and the file
+// capabilities in its layers. It reads the file twice, since
+// manifest.json, which names the rest, may come last, as Podman writes it.
+func readSave(dir, name string) (blob []byte, read *saveRead, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { err = errors.Join(err, root.Close()) }()
 	f, err := root.Open(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
-	return archiveConfig(f)
+
+	idx, err := readIndex(f)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Docker 29 names its configuration with no .json, and it is not read
+	blob, _ = idx.configBlob()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, err
+	}
+	read = &saveRead{}
+	read.caps, read.capsErr = archiveCapabilities(f, idx.layers)
+	return blob, read, nil
 }
 
-// maxConfig bounds what archiveConfig keeps of any one file: an image's
+// maxConfig bounds what readIndex keeps of any one file: an image's
 // configuration and the archive's manifest are a few kilobytes, and a
 // layer is never kept at all.
 const maxConfig = 1 << 20
 
-// archiveConfig returns the configuration blob of the one image in a
-// docker-archive, as podman save and docker save write it: manifest.json
-// names it, and may come after it, as Podman writes it last of all.
-func archiveConfig(r io.Reader) ([]byte, error) {
+// archiveIndex is what the first read of a docker-archive found: the one
+// image its manifest.json describes, and the small JSON files it holds.
+type archiveIndex struct {
+	// configPath is the image's configuration's place in the archive,
+	// and layers its layers', in order.
+	configPath string
+	layers     []string
+	small      map[string][]byte
+}
+
+// readIndex reads a docker-archive, as podman save and docker save write
+// it, for its manifest.json, which may come last, and the small JSON files
+// beside it.
+func readIndex(r io.Reader) (archiveIndex, error) {
 	small := make(map[string][]byte)
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return archiveIndex{}, fmt.Errorf("reading the archive: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg || hdr.Size > maxConfig || path.Ext(hdr.Name) != ".json" {
+			continue
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			return archiveIndex{}, fmt.Errorf("reading %s from the archive: %w", hdr.Name, err)
+		}
+		small[path.Clean(hdr.Name)] = body
+	}
+
+	raw, ok := small["manifest.json"]
+	if !ok {
+		return archiveIndex{}, fmt.Errorf("the archive has no manifest.json, among %q", slices.Sorted(maps.Keys(small)))
+	}
+	var manifest []struct {
+		Config string
+		Layers []string
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return archiveIndex{}, fmt.Errorf("the archive's manifest.json: %w", err)
+	}
+	if len(manifest) != 1 {
+		return archiveIndex{}, fmt.Errorf("the archive's manifest.json describes %d images, want 1", len(manifest))
+	}
+	layers := make([]string, len(manifest[0].Layers))
+	for i, l := range manifest[0].Layers {
+		layers[i] = path.Clean(l)
+	}
+	return archiveIndex{configPath: path.Clean(manifest[0].Config), layers: layers, small: small}, nil
+}
+
+// configBlob returns the configuration blob the archive's manifest names.
+func (a archiveIndex) configBlob() ([]byte, error) {
+	blob, ok := a.small[a.configPath]
+	if !ok {
+		return nil, fmt.Errorf("the archive's manifest.json names the configuration %q, which the archive does not hold", a.configPath)
+	}
+	return blob, nil
+}
+
+// archiveConfig returns the configuration blob of the one image in a
+// docker-archive.
+func archiveConfig(r io.Reader) ([]byte, error) {
+	idx, err := readIndex(r)
+	if err != nil {
+		return nil, err
+	}
+	return idx.configBlob()
+}
+
+// archiveCapabilities returns the path of every file in layers, entries
+// of the docker-archive r, that carries a file capability, sorted and each
+// once. A layer the archive lacks is an error, as is one it cannot read.
+func archiveCapabilities(r io.Reader, layers []string) ([]string, error) {
+	want := make(map[string]bool, len(layers))
+	for _, l := range layers {
+		want[l] = true
+	}
+	seen := make(map[string]bool, len(layers))
+	var caps []string
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -195,32 +366,81 @@ func archiveConfig(r io.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading the archive: %w", err)
 		}
-		if hdr.Typeflag != tar.TypeReg || hdr.Size > maxConfig || path.Ext(hdr.Name) != ".json" {
+		name := path.Clean(hdr.Name)
+		if !want[name] || seen[name] {
 			continue
 		}
-		body, err := io.ReadAll(tr)
-		if err != nil {
-			return nil, fmt.Errorf("reading %s from the archive: %w", hdr.Name, err)
+		// Docker before 25 saved a layer that repeats one before it as a
+		// link to that one: no Docker since does, nor any Podman.
+		if hdr.Typeflag != tar.TypeReg {
+			return nil, fmt.Errorf("the layer %s is not a regular file, the one kind of layer this reads", name)
 		}
-		small[path.Clean(hdr.Name)] = body
+		found, err := layerCapabilities(tr)
+		if err != nil {
+			return nil, fmt.Errorf("the layer %s: %w", name, err)
+		}
+		caps = append(caps, found...)
+		seen[name] = true
 	}
+	for _, l := range layers {
+		if !seen[l] {
+			return nil, fmt.Errorf("the archive's manifest.json names the layer %q, which the archive does not hold", l)
+		}
+	}
+	slices.Sort(caps)
+	return slices.Compact(caps), nil
+}
 
-	raw, ok := small["manifest.json"]
-	if !ok {
-		return nil, fmt.Errorf("the archive has no manifest.json, among %q", slices.Sorted(maps.Keys(small)))
+// fileCapabilityRecord ends the name of the PAX record in which a tar
+// carries a file's security.capability extended attribute: SCHILY.xattr.,
+// as BuildKit, Buildah and Go write it, or libarchive's LIBARCHIVE.xattr.
+// with its value in base64.
+const fileCapabilityRecord = ".xattr.security.capability"
+
+// gzipMagic and zstdMagic open a layer compressed with gzip or zstd.
+var (
+	gzipMagic = []byte{0x1f, 0x8b}
+	zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+)
+
+// layerCapabilities returns the path of every file in the layer r that
+// carries a file capability, in the layer's order. r is the layer as the
+// archive holds it: a tar, or one compressed with gzip, as Docker's
+// containerd store keeps a layer.
+func layerCapabilities(r io.Reader) (caps []string, err error) {
+	br := bufio.NewReader(r)
+	magic, err := br.Peek(len(zstdMagic))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
 	}
-	var manifest []struct{ Config string }
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, fmt.Errorf("the archive's manifest.json: %w", err)
+	var layer io.Reader = br
+	switch {
+	case bytes.HasPrefix(magic, zstdMagic):
+		return nil, errors.New("it is compressed with zstd, which this cannot read")
+	case bytes.HasPrefix(magic, gzipMagic):
+		zr, err := gzip.NewReader(br)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { err = errors.Join(err, zr.Close()) }()
+		layer = zr
 	}
-	if len(manifest) != 1 {
-		return nil, fmt.Errorf("the archive's manifest.json describes %d images, want 1", len(manifest))
+	tr := tar.NewReader(layer)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return caps, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		for key := range hdr.PAXRecords {
+			if strings.HasSuffix(key, fileCapabilityRecord) {
+				caps = append(caps, path.Clean("/"+hdr.Name))
+				break
+			}
+		}
 	}
-	blob, ok := small[path.Clean(manifest[0].Config)]
-	if !ok {
-		return nil, fmt.Errorf("the archive's manifest.json names the configuration %q, which the archive does not hold", manifest[0].Config)
-	}
-	return blob, nil
 }
 
 // Build builds containerfile, with its directory as the context and args

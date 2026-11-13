@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -351,6 +353,50 @@ func TestProbeOnFixture(t *testing.T) {
 		detail = err.Error()
 	}
 	checks.True(e.Name()+" reports the container healthy, on an internal network", detail == "healthy", detail)
+}
+
+// TestProbeCapsArePID1s runs assert-caps in an exec the engine grants
+// every capability, beside a server run under the contract with none: its
+// records must be the server's, PID 1's, and so all ok. A probe that read
+// its own process would find the exec's full bounding set.
+func TestProbeCapsArePID1s(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+
+	c, _ := startServed(t, e, &RunSpec{Image: testfixture.LibreSpeed, Confine: Contract("16m")})
+	privileged := func(argv ...string) Result {
+		t.Helper()
+		res, err := e.run.RunStdin(ctx, nil, e.name, slices.Concat([]string{"exec", "--privileged", c.ID}, argv)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	// That the exec holds a capability at all, or this shows nothing
+	self := privileged(FrankenPHP, "php-cli", "-r", `echo file_get_contents('/proc/self/status');`)
+	if !regexp.MustCompile(`(?m)^CapBnd:\s*0*[1-9a-f]`).Match(self.Stdout) {
+		t.Fatalf("exec --privileged holds no capability, so it cannot tell PID 1's from its own: exit %d: %s",
+			self.Code, combined(self))
+	}
+
+	res := privileged(FrankenPHP, "php-cli", path.Join(ProbeDir, "core.php"), "assert-caps")
+	records, err := parseRecords(res.Stdout)
+	if err != nil {
+		t.Fatalf("assert-caps: %v: %s", err, combined(res))
+	}
+	if len(records) != 5 {
+		t.Errorf("assert-caps made %d records, want one for each of the five sets: %+v", len(records), records)
+	}
+	for _, r := range records {
+		if !r.OK {
+			t.Errorf("%s: found %q, want PID 1's, %q", r.What, r.Found, r.Expected)
+		}
+	}
+	if res.Code != 0 {
+		t.Errorf("assert-caps exited %d, want 0: %s", res.Code, combined(res))
+	}
 }
 
 // TestProbeNegative loosens one thing at a time, and the probe must catch

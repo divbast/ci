@@ -6,6 +6,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -740,8 +741,10 @@ const inspectJSON = `[{
 	},
 	"HostConfig": {
 		"CapAdd": null, "CapDrop": ["ALL"], "Privileged": false, "ReadonlyRootfs": true,
-		"SecurityOpt": null, "Init": null, "NetworkMode": "net"
+		"SecurityOpt": null, "Init": null, "NetworkMode": "net", "Tmpfs": {"/tmp": "size=16m"}
 	},
+	"Mounts": [{"Type": "volume", "Name": "divbast-abc", "Source": "/var/lib/docker/volumes/divbast-abc/_data",
+		"Destination": "/data", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""}],
 	"NetworkSettings": {"Networks": {"net": {"IPAddress": "10.89.66.3"}, "other": {"IPAddress": "10.0.0.9"}}}
 }]`
 
@@ -788,6 +791,19 @@ func TestInspect(t *testing.T) {
 	if h := got.HostConfig; len(h.CapAdd) != 0 || h.Privileged || !h.ReadonlyRootfs || len(h.SecurityOpt) != 0 ||
 		h.Init != nil || h.NetworkMode != "net" {
 		t.Errorf("Inspect().HostConfig = %+v, want Docker's null CapAdd, SecurityOpt and Init, read-only, on net", h)
+	}
+	// As printed, with what HostConfig does not read, so a check can see
+	// which fields the engine left out
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(got.HostConfigJSON, &raw); err != nil || string(raw["CapDrop"]) != `["ALL"]` || len(raw) != 8 {
+		t.Errorf("Inspect().HostConfigJSON = %s (%v), want the HostConfig inspect printed", got.HostConfigJSON, err)
+	}
+	if !maps.Equal(got.HostConfig.Tmpfs, map[string]string{"/tmp": "size=16m"}) {
+		t.Errorf("Inspect().HostConfig.Tmpfs = %q", got.HostConfig.Tmpfs)
+	}
+	want := []MountPoint{{Type: "volume", Name: "divbast-abc", Source: "/var/lib/docker/volumes/divbast-abc/_data", Destination: "/data", RW: true}}
+	if !slices.Equal(got.Mounts, want) {
+		t.Errorf("Inspect().Mounts = %+v, want %+v", got.Mounts, want)
 	}
 }
 
