@@ -507,12 +507,32 @@ or when run by hand, and never replaces `:latest` with an image of an
 older commit. When it publishes, it:
 
 1. pushes each architecture as `<image>:<version>-<arch>`;
-2. merges them into one index, tagged `<image>:<version>` and
-   `<image>:latest`, annotated with the version, the commit, the commit's
-   time and the description;
+2. merges them into one index, annotated with the version, the commit, the
+   commit's time and the description, and tags it
+   `<image>:<version>-staging` alone;
 3. attests the index, and pushes the attestation to the registry;
-4. checks that `<image>:latest`, as an anonymous client pulls it, is that
-   index, and fails if it is not: a private package fails here.
+4. verifies that attestation as a user would, with `gh attestation verify`
+   for the calling repository, this workflow and `refs/heads/main`, against
+   the index's bytes, fetched by digest and checked against it, trying three
+   times, ten seconds apart;
+5. only then tags the index `<image>:<version>` and `<image>:latest`, once
+   a dry run of that `imagetools create` shows it would push the index
+   attested, byte for byte;
+6. checks that both tags, as an anonymous client pulls them, are that
+   index, and fails if they are not: a private package fails here.
+
+The staging tag is where the index waits while it is attested and
+verified. Like each architecture's tag, it sits in the package as any tag
+does, but it is not for pulling, and the next publish overwrites it.
+Neither `<image>:<version>` nor `<image>:latest` ever names an index whose
+attestation has not verified. When a step after the decision fails before
+those two move, the job says so in an error: the public tags
+`:<version>` and `:latest` did not move. Re-running the failed job then
+publishes, since the decision still reads the last index published, but
+only within a day of the build: it downloads the images `app-check.yml`
+built, whose artifacts are kept for a day. A newer image published in the
+meantime keeps `:latest`, and once the artifacts are gone the next daily
+slot or a manual run publishes.
 
 Publishes queue one at a time in the calling repository's `publish`
 concurrency group, so the calling job needs no group of its own.
@@ -522,6 +542,7 @@ concurrency group, so the calling job needs no group of its own.
 | `image` | string, required | The image, without a tag, such as `ghcr.io/divbast/librespeed` |
 | `version-arg` | string, required | The Containerfile `ARG` whose value is the app's version, which tags the image |
 | `description` | string, required | The index's description annotation, which GHCR shows on the package page |
+| `rehearse` | boolean, default `false` | Decide against `image` as ever, then publish into a registry started inside the job instead: [Rehearsal](#rehearsal) |
 
 The calling job grants `contents: read`, `packages: write`,
 `id-token: write` and `attestations: write`.
@@ -570,6 +591,28 @@ jobs:
 
 The checks are then named `check / lint`, `check / build (amd64, ...)`
 and so on.
+
+#### Rehearsal
+
+With `rehearse: true`, the job still runs only from the daily slot or the
+manual run on main, and still decides against `image` on ghcr.io. When it
+publishes, it starts the `registry` image inside the job, on
+`127.0.0.1:5000`, pinned by version and digest, which the org's Renovate
+preset moves. It logs in to it with throwaway credentials, and runs every
+step after the decision there, under `localhost:5000/<path of image>`: it
+pushes, stages, attests, verifies, promotes and checks both tags. The
+attestation is real: signed for the calling repository like any other,
+and pushed to that registry. Nothing reaches ghcr.io, and no package is
+made. Each rehearsal says so in a warning and on the run's summary:
+`rehearsal: nothing was published to ghcr.io`.
+
+`divbast/oci-image-template` rehearses, since it has no package. A
+repository made from it inherits `rehearse: true`, and anywhere but the
+template the line goes on to say how to publish: `to publish, set image
+to this app's own and remove rehearse from the job that calls
+app-publish.yml`. That is the switch, in the calling job's `with:`: set
+`image` to the app's own `ghcr.io/divbast/<app>`, and remove
+`rehearse: true`.
 
 ### `renovate.yml`
 
@@ -678,7 +721,8 @@ just ci-tools && .ci/bin/divbast-verify-frankenphp
 ### Published images
 
 `app-publish.yml` signs each image's attestation itself, for the app's
-repository and its main branch. To verify an image:
+repository and its main branch, and moves the image's version tag and
+`:latest` only once that attestation verifies. To verify an image:
 
 ```sh
 gh attestation verify oci://ghcr.io/divbast/librespeed:latest \
@@ -743,6 +787,15 @@ containers run only when `ENGINE` is `docker` or `podman`, so
 `ENGINE=docker just ci` runs them all. `self-ci.yml` runs them on amd64 and
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
 test. A merge to main that passes them is released.
+
+The shell `app-publish.yml`'s publish job runs, from its gate and its
+decision on, is pinned word for word in
+`internal/workflows/testdata/app-publish-shell.golden.txt`, so a change to
+it fails the tests with a diff until the file is rewritten on purpose:
+
+```sh
+go test ./internal/workflows -run TestPublishShellPinned -update
+```
 
 To see what the next release would be, from a clone with origin's tags:
 
