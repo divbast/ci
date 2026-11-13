@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,6 +130,79 @@ func TestSweepOnlyOwnLabel(t *testing.T) {
 				t.Errorf("after the sweep of %s, %s %s for %s lists %q, want the one it made", swept.label, e.name, strings.Join(list, " "), eng.label, left)
 			}
 		}
+	}
+}
+
+// TestBuildBesideImageRemoval builds one image beside the removal of
+// another, on Podman, as the parallel tests of a suite do (backlog
+// CI-S3-1). store-race/second takes its first step from store-race/
+// first's cache, then sleeps in its second, and store-race/first's image
+// is removed meanwhile, by the cleanup Build gave it.
+//
+// Podman's image rm -f also removes each parent image it leaves dangling,
+// and with -f, every container still using one: Buildah's build
+// containers among them, so the second build lost its container and
+// failed, as ci's own CI saw it fail. The harness keeps an image's
+// removal from overlapping any build, so the second build ends as it
+// would alone.
+//
+// Docker's builder keeps what a build uses out of reach of image rm, so
+// the race is Podman's alone, and the test runs only there.
+func TestBuildBesideImageRemoval(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	if e.name != "podman" {
+		t.Skip("only Podman's image rm reaches into a build that is running")
+	}
+	ctx := t.Context()
+
+	// The first build's cleanups run when this says, and not when the
+	// test ends
+	first := &cleanups{TB: t}
+	t.Cleanup(first.run)
+	if _, err := e.Build(ctx, first, filepath.Join("testdata", "store-race", "first", "Containerfile"), nil); err != nil {
+		t.Fatal(err)
+	}
+	second := make(chan error, 1)
+	go func() {
+		_, err := e.Build(ctx, t, filepath.Join("testdata", "store-race", "second", "Containerfile"), nil)
+		second <- err
+	}()
+	// Long enough for the second build to take its first step from the
+	// cache and start the slow one, which takes 20 s
+	if err := Pause(ctx, 8*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	first.run()
+	if err := <-second; err != nil {
+		t.Fatalf("the second build, while the first's image was removed: %v", err)
+	}
+}
+
+// cleanups is a testing.TB whose cleanups run when the test calls run,
+// rather than when the test ends.
+type cleanups struct {
+	testing.TB
+
+	mu  sync.Mutex
+	fns []func()
+}
+
+// Cleanup implements testing.TB.
+func (c *cleanups) Cleanup(f func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fns = append(c.fns, f)
+}
+
+// run runs the cleanups registered so far, last first, each once.
+func (c *cleanups) run() {
+	c.mu.Lock()
+	fns := c.fns
+	c.fns = nil
+	c.mu.Unlock()
+	for _, f := range slices.Backward(fns) {
+		f()
 	}
 }
 

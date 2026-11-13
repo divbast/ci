@@ -1167,6 +1167,38 @@ func TestRun(t *testing.T) {
 	}
 }
 
+// TestRunNameInUse runs a spec whose name another container already has
+// (backlog CI-24). That container is not the run's: the engine made
+// nothing, and the run's cleanup must not remove what it found under the
+// name, as Start's does not. The Fake scripts no rm, so one fails the
+// test.
+func TestRunNameInUse(t *testing.T) {
+	t.Parallel()
+
+	spec := &RunSpec{Image: "img", Name: "ctr", Network: "none", Confine: Contract("16m")}
+	for _, tt := range []struct {
+		engine string
+		stderr string
+	}{
+		{engine: "docker", stderr: `docker: Error response from daemon: Conflict. The container name "/ctr" is already in use by container "3f82dc47df74". ` +
+			`You have to remove (or rename) that container to be able to reuse that name.`},
+		{engine: "podman", stderr: `Error: creating container storage: the container name "ctr" is already in use by 3f82dc47df74. ` +
+			`You have to remove that container to be able to reuse that name: that name is already in use`},
+	} {
+		t.Run(tt.engine, func(t *testing.T) {
+			t.Parallel()
+			e := newEngine(tt.engine, nil)
+			inUse := execx.Result{Code: 125, Stderr: []byte(tt.stderr)}
+			e.run = execx.NewFake(t, execx.Call{Argv: slices.Concat([]string{tt.engine}, e.argv(spec, "--rm")), Result: inUse})
+
+			got, err := e.Run(t.Context(), t, spec)
+			if err != nil || got.Code != 125 || !bytes.Equal(got.Stderr, inUse.Stderr) {
+				t.Errorf("Run() = %+v, %v; want the engine's refusal as the Result", got, err)
+			}
+		})
+	}
+}
+
 func TestRunRejects(t *testing.T) {
 	t.Parallel()
 

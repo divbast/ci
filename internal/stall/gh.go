@@ -167,6 +167,7 @@ func (g GH) LastSuccess(ctx context.Context, workflow string) (time.Time, bool, 
 // SlotRuns implements [Source].
 func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 	var raw []struct {
+		ID         int64     `json:"databaseId"`
 		HeadSHA    string    `json:"headSha"`
 		CreatedAt  time.Time `json:"createdAt"`
 		Status     string    `json:"status"`
@@ -174,13 +175,14 @@ func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 		URL        string    `json:"url"`
 	}
 	err := g.list(ctx, &raw, "run", "list", "--repo", g.Repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", strconv.Itoa(slotLimit), "--json", "headSha,createdAt,status,conclusion,url")
+		"--limit", strconv.Itoa(slotLimit), "--json", "databaseId,headSha,createdAt,status,conclusion,url")
 	if err != nil {
 		return nil, err
 	}
 	runs := make([]Run, 0, len(raw))
 	for _, r := range raw {
 		runs = append(runs, Run{
+			ID:         r.ID,
 			HeadSHA:    r.HeadSHA,
 			Created:    r.CreatedAt,
 			Completed:  r.Status == "completed",
@@ -189,6 +191,25 @@ func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 		})
 	}
 	return runs, nil
+}
+
+// Jobs implements [Source], from the latest attempt of run, as gh run view
+// lists its jobs.
+func (g GH) Jobs(ctx context.Context, run *Run) ([]Job, error) {
+	var raw struct {
+		Jobs []struct {
+			Name       string `json:"name"`
+			Conclusion string `json:"conclusion"`
+		} `json:"jobs"`
+	}
+	if err := g.list(ctx, &raw, "run", "view", strconv.FormatInt(run.ID, 10), "--repo", g.Repo, "--json", "jobs"); err != nil {
+		return nil, err
+	}
+	jobs := make([]Job, 0, len(raw.Jobs))
+	for _, j := range raw.Jobs {
+		jobs = append(jobs, Job{Name: j.Name, Conclusion: j.Conclusion})
+	}
+	return jobs, nil
 }
 
 // MainSHA implements [Source].

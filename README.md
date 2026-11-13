@@ -208,8 +208,9 @@ when `IMAGE` is unset, fails it too.
 The tool sees only what go test printed, so a go test killed between
 packages leaves a stream that passes. The recipe therefore sets `pipefail`
 itself, whatever the caller's shell sets, and go test's own exit status
-still fails it. It builds `.ci/bin/divbast-testcount` with `ci-tools`
-first when it is missing. `go-test` stays a plain `go test`, so an
+still fails it. It runs `ci-tools` first, every time, so the tool is the
+one the pinned ci builds, never one an older checkout left in `.ci/bin`;
+go's build cache makes that cheap. `go-test` stays a plain `go test`, so an
 acceptance suite that skips when `IMAGE` is unset still passes in a `lint`
 that runs it.
 
@@ -344,6 +345,20 @@ binary running it. A repository's acceptance suite is a test of its own
 module, so `Engine.Sweep` in one repository's suite removes what a dead
 run of that suite left behind, and nothing another repository's suite
 on the same host made.
+
+On Podman, the harness never removes an image while a build is running.
+`podman image rm -f` also removes each parent image it leaves dangling
+and, being forced, every container still using one, Buildah's build
+containers among them, so a build that took a step from the removed
+image's cache would lose its container and fail. `Engine.Build` holds
+the image store shared, as other builds may, and the removal of an image,
+by a `Build`'s cleanup or by `Engine.Sweep`, holds it alone. Across the
+test binaries running at once, such as two packages', the hold is a
+`flock` of `divbast-harness-podman-store-<uid>.lock`, which every process
+of the user's shares, as rootless Podman keeps one store for each user.
+It is in `$XDG_RUNTIME_DIR` when that is set, the user's own directory,
+and otherwise in the temporary directory. Docker is never held: its builder keeps
+what a build uses out of `image rm`'s reach.
 
 Before that, every suite labelled what it made `divbast.harness=1`.
 Suites on this version no longer remove anything carrying that label.
@@ -746,7 +761,13 @@ The calling job grants `contents: read`, `packages: write`,
 Of the caller's `mise.toml` it installs Go alone, declared there as
 `"core:go"` (mise reads the short `go` the same way), and turns mise's
 auto-install off: the job can push the image and sign its attestation, so
-it runs no other tool's install code.
+it runs no other tool's install code. Nor does the `mise.toml`'s `[env]`,
+the `PATH` mise makes, or mise's shims, reach the job's steps, where a
+`BASH_ENV` or a `PATH` there would change what the publish scripts run.
+mise itself stays on `PATH`, and the one step that needs Go, the build of
+ci's tools, runs it through `mise exec`, which needs no shim and gives Go
+the caller's toolchain and its `[env]`, such as `GOTOOLCHAIN` and
+`GOFLAGS`, for that command alone.
 
 An app's build workflow puts the two together, and keeps its own triggers
 and its `required` job, the one check its ruleset requires:
@@ -805,7 +826,10 @@ calling repository like any other, and pushed to that registry. The
 registry takes no anonymous pulls, so the last check reads the tags with
 the job's login. Nothing reaches ghcr.io, and no package is made. Each
 rehearsal says so in a warning and on the run's summary:
-`rehearsal: nothing was published to ghcr.io`.
+`rehearsal: nothing was published to ghcr.io`. A rehearsal that fails
+before its promotion names the rehearsal registry's tags in its error,
+not the public ones, and says that re-running the failed job rehearses
+again while the images' artifacts last.
 
 Only `divbast/oci-image-template` rehearses, since it has no package. A
 repository made from it inherits `rehearse: true`, and its publish job
@@ -873,6 +897,7 @@ by `divbast-stall`.
 | `run-hours` | number | `24` | Hours Renovate may go without a successful run |
 | `lost-slots` | number | `2` | Lost daily slots that make a stall |
 | `content-gated` | boolean | `false` | The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost |
+| `slot-job` | string | `''` | With `content-gated`, the job in each slot run that publishes the image, as GitHub names it in the run, whose conclusion counts rather than the whole run's |
 
 `content-gated` is for a repository whose daily slot runs
 `divbast-publish-decision -content-gated`, and so can succeed while it
@@ -882,6 +907,22 @@ is never lost once the image is published. One that failed, was cancelled
 or ended any other way still is, as is a day with none, and with nothing
 published yet every slot run publishes, so one that succeeded and left
 nothing published is lost too. Unset, every check runs as it always has.
+
+`slot-job` is for a slot workflow that publishes more than one image, one
+job each. A run in which one image's build failed ends red as a whole,
+though the other image's publish job succeeded; read as a whole, that run
+would count as a lost slot for both. With `slot-job` naming the image's
+own job as the run lists it, such as `publish (baikal)` for a matrix job
+named `publish (${{ matrix.app }})`, only that job's conclusion counts.
+GitHub decides a job's `if:` before it expands the job's matrix, so a run
+in which it skipped or cancelled the matrix, its lint red say, lists the
+job once, by its unexpanded name, which stands for every name it expands
+to: that job did not succeed. A run that never started, and so has no
+jobs, counts as the run ended. Only a run of a commit ahead of the
+published one has its jobs read, and one whose jobs include neither the
+name nor an unexpanded name standing for it fails the check, as does
+`slot-job` without `content-gated`, the one slot check that reads a
+conclusion.
 
 The calling job grants `contents: read`, `pull-requests: read`,
 `actions: read`, `checks: read`, `statuses: read` and `packages: read`.

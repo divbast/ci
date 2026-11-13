@@ -89,6 +89,10 @@ type event struct {
 // no events is one. It then writes no summary, since what it could not
 // read is neither a run that passed nor one that failed. Any other error
 // is a write that failed.
+//
+// Once it stops at such a line or write, it reads the rest of r and
+// discards it. r is a pipe from go test, which would otherwise be killed
+// for writing to a pipe no one reads, before its tests' cleanups ran.
 func Count(r io.Reader, out, errOut io.Writer) (Result, error) {
 	t := tally{ended: map[string]bool{}, passed: map[string]int{}}
 	lines := bufio.NewReader(r)
@@ -103,10 +107,12 @@ func Count(r io.Reader, out, errOut io.Writer) (Result, error) {
 		}
 		e, err := parse(line)
 		if err != nil {
+			drain(lines)
 			return t.res, fmt.Errorf("%w: line %d %w", ErrInput, n, err)
 		}
 		events++
 		if _, err = io.WriteString(out, e.Output); err != nil {
+			drain(lines)
 			return t.res, fmt.Errorf("write the output: %w", err)
 		}
 		t.add(&e)
@@ -135,6 +141,13 @@ func Count(r io.Reader, out, errOut io.Writer) (Result, error) {
 		return res, fmt.Errorf("write why the run did not pass: %w", err)
 	}
 	return res, nil
+}
+
+// drain reads r to its end, keeping nothing. A read that fails ends it:
+// there is no more to read, and the error Count returns already says why
+// it stopped.
+func drain(r io.Reader) {
+	_, _ = io.Copy(io.Discard, r)
 }
 
 // tally is what the events so far record.

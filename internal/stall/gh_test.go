@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -41,11 +42,25 @@ const (
 //	gh-api-compare-404-baikal.txt      gh api -i repos/divbast/baikal-oci-image/compare/<40 zeros>...<baikalMain>
 //	gh-api-repo-baikal.txt             gh api -i repos/divbast/baikal-oci-image
 //
-// and with gh 2.104.0 on 2026-11-13,
+// with gh 2.104.0 on 2026-11-13,
 //
-//	gh-run-list-slots-baikal.json      gh run list --repo divbast/baikal-oci-image --workflow build.yml --event schedule --branch main --limit 10 --json headSha,createdAt,status,conclusion,url
-//	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
 //	gh-api-workflow-build-baikal.txt   gh api -i repos/divbast/baikal-oci-image/actions/workflows/build.yml
+//
+// and with gh 2.104.0 on 2026-11-14,
+//
+//	gh-run-list-slots-baikal.json      gh run list --repo divbast/baikal-oci-image --workflow build.yml --event schedule --branch main --limit 10 --json databaseId,headSha,createdAt,status,conclusion,url
+//	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
+//	gh-run-view-jobs-frankenphp.json   gh run view 43493850688 --repo divbast/frankenphp --json jobs
+//	gh-run-view-jobs-baikal-failed.json  gh run view 42310287997 --repo divbast/baikal-oci-image --json jobs
+//	gh-run-view-jobs-frankenphp-skipped.json  gh run view 43481642005 --repo divbast/frankenphp --json jobs
+//
+// The two slot lists hold the same runs as their recordings of the day
+// before, which lacked databaseId. The frankenphp run is a daily slot in
+// which every job succeeded; the Baikal one is the slot of 2026-11-06,
+// whose arm64 build failed and whose publish job was skipped. The other
+// frankenphp run is a pull request's, on which the publish job's if: is
+// false, so GitHub skipped the job before expanding its matrix, and lists
+// it once, by its unexpanded name, as it does for a slot whose lint failed.
 //
 // From each gh api -i recording, the headers that describe the caller
 // rather than the response are taken out: the token's OAuth scopes and
@@ -87,8 +102,12 @@ func successRuns(repo, workflow string) []string {
 func slotRuns(repo, workflow string) []string {
 	return []string{
 		"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", "10", "--json", "headSha,createdAt,status,conclusion,url",
+		"--limit", "10", "--json", "databaseId,headSha,createdAt,status,conclusion,url",
 	}
+}
+
+func runJobs(repo string, id int64) []string {
+	return []string{"gh", "run", "view", strconv.FormatInt(id, 10), "--repo", repo, "--json", "jobs"}
 }
 
 func api(path string) []string { return []string{"gh", "api", "-i", path} }
@@ -351,6 +370,7 @@ func TestGHSlotRuns(t *testing.T) {
 			wantLen: 10,
 			want: []stall.Run{
 				{
+					ID:         43330795962,
 					HeadSHA:    "f235a10b970004f0b16b700a76ea7fbf98908586",
 					Created:    rfc3339(t, "2026-11-12T23:40:15Z"),
 					Completed:  true,
@@ -358,6 +378,7 @@ func TestGHSlotRuns(t *testing.T) {
 					URL:        "https://github.com/divbast/baikal-oci-image/actions/runs/43330795962",
 				},
 				{
+					ID:         43129777907,
 					HeadSHA:    baikalMain,
 					Created:    rfc3339(t, "2026-11-12T00:46:44Z"),
 					Completed:  true,
@@ -378,10 +399,11 @@ func TestGHSlotRuns(t *testing.T) {
 			// A run still going has no conclusion yet, which gh prints as "".
 			name: "running",
 			repo: baikal,
-			result: stdout([]byte(`[{"conclusion":"","createdAt":"2026-11-11T18:50:00Z","headSha":"` + baikalMain +
+			result: stdout([]byte(`[{"conclusion":"","createdAt":"2026-11-11T18:50:00Z","databaseId":1,"headSha":"` + baikalMain +
 				`","status":"in_progress","url":"https://github.com/divbast/baikal-oci-image/actions/runs/1"}]`)),
 			wantLen: 1,
 			want: []stall.Run{{
+				ID:      1,
 				HeadSHA: baikalMain,
 				Created: rfc3339(t, "2026-11-11T18:50:00Z"),
 				URL:     "https://github.com/divbast/baikal-oci-image/actions/runs/1",
@@ -413,7 +435,7 @@ func TestGHSlotRuns(t *testing.T) {
 				t.Fatalf("SlotRuns() returned %d runs, want %d", len(runs), tt.wantLen)
 			}
 			for i, want := range tt.want {
-				if got := runs[i]; got.HeadSHA != want.HeadSHA || !got.Created.Equal(want.Created) ||
+				if got := runs[i]; got.ID != want.ID || got.HeadSHA != want.HeadSHA || !got.Created.Equal(want.Created) ||
 					got.Completed != want.Completed || got.Conclusion != want.Conclusion || got.URL != want.URL {
 					t.Errorf("run %d = %+v, want %+v", i, got, want)
 				}
@@ -431,6 +453,77 @@ func TestGHSlotRuns(t *testing.T) {
 				if tt.name == "baikal" && !r.Completed {
 					t.Errorf("run %d = %+v, want it completed, as every recorded run is", i, r)
 				}
+			}
+		})
+	}
+}
+
+// TestGHJobs reads the jobs of a slot run, each by its name as GitHub
+// shows it in the run, and its conclusion (backlog CI-7).
+func TestGHJobs(t *testing.T) {
+	t.Parallel()
+
+	const frankenphp = "divbast/frankenphp"
+	tests := []struct {
+		name   string
+		repo   string
+		id     int64
+		result execx.Result
+		// count is how many jobs the run has, and has one of them.
+		count   int
+		has     stall.Job
+		wantErr []string
+	}{
+		{
+			name: "frankenphp", repo: frankenphp, id: 43493850688,
+			result: stdout(testdata(t, "gh-run-view-jobs-frankenphp.json")),
+			count:  8, has: stall.Job{Name: "publish (baikal)", Conclusion: "success"},
+		},
+		{
+			// The run failed in its arm64 build, and so never published.
+			name: "baikal-publish-skipped", repo: baikal, id: 42310287997,
+			result: stdout(testdata(t, "gh-run-view-jobs-baikal-failed.json")),
+			count:  6, has: stall.Job{Name: "publish", Conclusion: "skipped"},
+		},
+		{
+			// GitHub skipped the publish matrix before expanding it, and
+			// names the job as written
+			name: "frankenphp-matrix-skipped", repo: frankenphp, id: 43481642005,
+			result: stdout(testdata(t, "gh-run-view-jobs-frankenphp-skipped.json")),
+			count:  7, has: stall.Job{Name: "publish (${{ matrix.app }})", Conclusion: "skipped"},
+		},
+		{
+			// A run that never started has no jobs.
+			name: "no-jobs", repo: baikal, id: 7,
+			result: stdout([]byte(`{"jobs":[]}`)),
+		},
+		{
+			name: "gh-fails", repo: baikal, id: 7,
+			result:  ghFailed("HTTP 404: Not Found\n"),
+			wantErr: []string{"gh run view", "Not Found"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: runJobs(tt.repo, tt.id), Result: tt.result}), Repo: tt.repo}
+			jobs, err := gh.Jobs(t.Context(), &stall.Run{ID: tt.id})
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("Jobs() = %q, want an error", jobs)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("Jobs() error = %q, want it to contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs) != tt.count || (tt.count > 0 && !slices.Contains(jobs, tt.has)) {
+				t.Errorf("Jobs() = %q, want %d jobs, %+v among them", jobs, tt.count, tt.has)
 			}
 		})
 	}
@@ -727,7 +820,9 @@ func (hang) Run(ctx context.Context, name string, _ ...string) (execx.Result, er
 
 // TestGHTimeout checks that a gh that hangs is given up on after a minute,
 // or after GH's own Timeout, whether GH runs it to list or to call the API,
-// with an error that names the call and the limit.
+// with an error that names the call and the limit. A deadline of the
+// caller's that comes first is the caller's to report: the error then
+// says nothing of GH giving up (backlog CI-6).
 // The bubble's clock moves only when everything in it waits, so no test
 // waits a minute.
 func TestGHTimeout(t *testing.T) {
@@ -757,23 +852,37 @@ func TestGHTimeout(t *testing.T) {
 		for _, tt := range []struct {
 			name    string
 			timeout time.Duration
-			want    time.Duration
+			// caller is a deadline the caller's context sets; zero for
+			// none.
+			caller time.Duration
+			want   time.Duration
 		}{
 			{name: "default", want: time.Minute},
 			{name: "set", timeout: 4 * time.Second, want: 4 * time.Second},
+			{name: "caller-first", caller: 2 * time.Second, want: 2 * time.Second},
 		} {
 			t.Run(name+"-"+tt.name, func(t *testing.T) {
 				t.Parallel()
 				synctest.Test(t, func(t *testing.T) {
+					ctx := t.Context()
+					if tt.caller != 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, tt.caller)
+						defer cancel()
+					}
 					start := time.Now()
-					err := c.call(t.Context(), stall.GH{Run: hang{}, Repo: baikal, Timeout: tt.timeout})
+					err := c.call(ctx, stall.GH{Run: hang{}, Repo: baikal, Timeout: tt.timeout})
 					if !errors.Is(err, context.DeadlineExceeded) {
 						t.Fatalf("got %v, want an error wrapping %v", err, context.DeadlineExceeded)
 					}
 					if waited := time.Since(start); waited != tt.want {
 						t.Errorf("gave up after %v, want %v", waited, tt.want)
 					}
-					if want := fmt.Sprintf("%s gave up after %v: ", c.says, tt.want); !strings.Contains(err.Error(), want) {
+					want := fmt.Sprintf("%s gave up after %v: ", c.says, tt.want)
+					switch said := err.Error(); {
+					case tt.caller != 0 && strings.Contains(said, "gave up"):
+						t.Errorf("error = %q, want it not to say GH gave up on a deadline of the caller's", err)
+					case tt.caller == 0 && !strings.Contains(said, want):
 						t.Errorf("error = %q, want it to contain %q", err, want)
 					}
 				})

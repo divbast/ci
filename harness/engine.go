@@ -76,6 +76,10 @@ type Engine struct {
 	// saves holds what its saves of images read. Every engine
 	// EngineFromEnv returns shares one.
 	saves *saveCache
+	// store keeps an image's removal from overlapping a build, on
+	// Podman. Every engine EngineFromEnv returns shares one, with every
+	// other process of the user's on the host.
+	store *storeLock
 }
 
 // EngineFromEnv returns the engine $ENGINE names: docker, the default when
@@ -85,6 +89,7 @@ func EngineFromEnv() (Engine, error) {
 	case "docker", "podman":
 		e := newEngine(name, execx.OS{})
 		e.saves = sharedSaves
+		e.store = sharedStore()
 		return e, nil
 	default:
 		return Engine{}, fmt.Errorf("ENGINE is %q: it must be docker or podman", name)
@@ -92,7 +97,7 @@ func EngineFromEnv() (Engine, error) {
 }
 
 func newEngine(name string, run execx.StdinRunner) Engine {
-	return Engine{name: name, run: run, label: moduleLabel(), saves: newSaveCache()}
+	return Engine{name: name, run: run, label: moduleLabel(), saves: newSaveCache(), store: newStoreLock("")}
 }
 
 // Name returns the engine's command: docker or podman.
@@ -108,7 +113,9 @@ func (e Engine) Label() string { return e.label }
 // uses cannot go. That label is the module's, so whatever another module's
 // suite made on the same host stays. Another run of this module's would
 // not, so Sweep belongs before a suite starts, never beside one running.
-// Every failure is returned, joined, and none stops the rest.
+// On Podman, its removal of images waits for every build running to end,
+// as [Engine.Build]'s cleanup does. Every failure is returned, joined, and
+// none stops the rest.
 func (e Engine) Sweep(ctx context.Context) error {
 	filter := []string{"--filter", "label=" + e.label}
 	kinds := []struct{ list, remove []string }{
@@ -135,11 +142,25 @@ func (e Engine) Sweep(ctx context.Context) error {
 		if len(ids) == 0 {
 			continue
 		}
-		if _, err := e.output(ctx, append(k.remove, ids...)...); err != nil {
+		if err := e.removeAll(ctx, k.remove, ids); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// removeAll runs the engine's remove command for ids, once no build holds
+// the store when what it removes is images.
+func (e Engine) removeAll(ctx context.Context, remove, ids []string) error {
+	if remove[0] == "image" {
+		release, err := e.hold(ctx, true)
+		if err != nil {
+			return fmt.Errorf("%s %s: waiting for the builds beside it to end: %w", e.name, strings.Join(remove, " "), err)
+		}
+		defer release()
+	}
+	_, err := e.output(ctx, append(remove, ids...)...)
+	return err
 }
 
 // output runs the engine and returns what it printed. A command that exits

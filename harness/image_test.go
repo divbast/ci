@@ -18,7 +18,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"testing/synctest"
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
@@ -381,6 +380,41 @@ func TestSaveMemoized(t *testing.T) {
 	})
 }
 
+// TestImageConfigReturnsACopy changes the configuration ImageConfig
+// returned, its volumes and its healthcheck's command, then reads the
+// image's again (backlog CI-20). What the save cache holds is the image's
+// own, so no check's change to what it was given reaches the next check
+// that asks.
+func TestImageConfigReturnsACopy(t *testing.T) {
+	t.Parallel()
+
+	const blob = `{"config":{"User":"65532:65532","Volumes":{"/data":{}},"Healthcheck":{"Test":["CMD","/probe"]}}}`
+	sum := sha256.Sum256([]byte(blob))
+	id := hex.EncodeToString(sum[:])
+	archive := tarball(t, file{"l1.tar", "a layer"}, file{id + ".json", blob},
+		file{"manifest.json", `[{"Config":"` + id + `.json","RepoTags":[],"Layers":["l1.tar"]}]`})
+	e := newEngine("podman", podmanSaving(t, id, archive))
+	want := Config{User: "65532:65532", Volumes: map[string]struct{}{"/data": {}}, Healthcheck: &Healthcheck{Test: []string{"CMD", "/probe"}}}
+
+	got, err := e.ImageConfig(t.Context(), t, "img")
+	if err != nil || !sameConfig(got, want) {
+		t.Fatalf("ImageConfig() = %+v, %v; want %+v", got, err, want)
+	}
+	got.Volumes["/elsewhere"] = struct{}{}
+	delete(got.Volumes, "/data")
+	got.Healthcheck.Test[1] = "/another"
+	got.Healthcheck.Retries = 9
+
+	again, err := e.ImageConfig(t.Context(), t, "img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameConfig(again, want) {
+		t.Errorf("ImageConfig() after a change to what it returned = %+v, healthcheck %+v; want %+v, healthcheck %+v",
+			again, again.Healthcheck, want, want.Healthcheck)
+	}
+}
+
 func TestBuild(t *testing.T) {
 	t.Parallel()
 
@@ -447,73 +481,6 @@ func TestBuildFails(t *testing.T) {
 	_, err := e.Build(t.Context(), t, "testdata/mutant/Containerfile", nil)
 	if err == nil || !strings.Contains(err.Error(), "should not be blank") {
 		t.Errorf("Build() error = %v, want the builder's own words", err)
-	}
-}
-
-// cacheRace is what Podman printed, on a runner, for a build whose look
-// for a cached step lost an image a parallel test's cleanup removed.
-const cacheRace = "Error: checking if cached image exists from a previous build: getting top layer info: layer not known"
-
-// TestBuildRetriesCacheRace shows a build that failed only in Buildah's
-// look through the local images for a cached step built again, a second
-// apart, up to three times in all, and every other failure of a build
-// left as the builder's own, at once.
-func TestBuildRetriesCacheRace(t *testing.T) {
-	t.Parallel()
-
-	race := execx.Result{Code: 125, Stderr: []byte(cacheRace + "\n")}
-	tests := []struct {
-		name    string
-		builds  []execx.Result
-		wantErr string // in the error; empty for a tag
-	}{
-		{name: "raced-once", builds: []execx.Result{race, {Stdout: []byte("abc\n")}}},
-		{name: "raced-twice", builds: []execx.Result{race, race, {Stdout: []byte("abc\n")}}},
-		{name: "raced-every-time", builds: []execx.Result{race, race, race}, wantErr: "attempt 3 of 3: podman build"},
-		{
-			// The Containerfile's own failure, which a second build would only
-			// repeat
-			name:    "the-containerfiles-own",
-			builds:  []execx.Result{{Code: 125, Stderr: []byte("Error: building at STEP \"COPY health.php /x\": no such file\n")}},
-			wantErr: "building at STEP",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			synctest.Test(t, func(t *testing.T) {
-				builds := 0
-				e := newEngine("podman", runFunc(func(argv []string) execx.Result {
-					if argv[1] != "build" {
-						return execx.Result{}
-					}
-					builds++
-					if builds > len(tt.builds) {
-						t.Errorf("build %d ran, want %d at most", builds, len(tt.builds))
-						return execx.Result{Code: 125}
-					}
-					return tt.builds[builds-1]
-				}))
-				start := time.Now()
-
-				tag, err := e.Build(t.Context(), t, "testdata/mutant/Containerfile", nil)
-				if builds != len(tt.builds) {
-					t.Errorf("Build() built %d times, want %d", builds, len(tt.builds))
-				}
-				if waited, want := time.Since(start), time.Duration(len(tt.builds)-1)*time.Second; waited != want {
-					t.Errorf("Build() took %s, want %s: a second between builds", waited, want)
-				}
-				if tt.wantErr == "" {
-					if err != nil || !strings.HasPrefix(tag, "localhost/divbast-") {
-						t.Errorf("Build() = %q, %v; want a tag", tag, err)
-					}
-					return
-				}
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Errorf("Build() = %q, %v; want an error saying %q", tag, err, tt.wantErr)
-				}
-			})
-		})
 	}
 }
 

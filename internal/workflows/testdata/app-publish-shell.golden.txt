@@ -7,6 +7,12 @@ run:
 MISE_AUTO_INSTALL: "false"
 == publish job defaults ==
 (none)
+== jdx/mise-action inputs ==
+version: ${{ env.MISE_VERSION }}
+install_args: core:go
+env: "false"
+export_path: "false"
+add_shims_to_path: "false"
 == Refuse anything but the daily slot or a manual run on main ==
 env: EVENT: ${{ github.event_name }}
 env: REF: ${{ github.ref }}
@@ -41,6 +47,11 @@ fi
 line="rehearsal: nothing was published to ghcr.io"
 echo "::warning::${line}"
 echo "${line}" >> "${GITHUB_STEP_SUMMARY}"
+== Check the caller pins this commit of divbast/ci ==
+env: WORKFLOW_SHA: ${{ job.workflow_sha }}
+run:
+mise exec -- go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
+.ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
 == Decide whether to publish ==
 env: EVENT: ${{ github.event_name }}
 env: IMAGE: ${{ inputs.image }}
@@ -182,9 +193,16 @@ for tag in "${VERSION}" latest; do
   fi
   echo "${IMAGE}:${tag} is ${DIGEST} to ${who}"
 done
-== Say that the public tags did not move ==
+== Say that the tags did not move ==
 env: VERSION: ${{ steps.version.outputs.version }}
+env: REHEARSE: ${{ inputs.rehearse }}
 run:
-echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
-  "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
-  "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."
+if [ "${REHEARSE}" = true ]; then
+  echo "::error::the rehearsal registry's tags :${VERSION:-<version>} and :latest did not move, and a rehearsal publishes nothing outside its job." \
+    "Re-running the failed job rehearses again for a day after this run built its images, while their artifacts last;" \
+    "after that, the next daily slot or a manual run rehearses."
+else
+  echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
+    "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
+    "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."
+fi

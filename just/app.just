@@ -42,8 +42,9 @@ build:
 # test and none failed or skipped. It sees only what go test printed, so a
 # go test killed between packages leaves a stream that passes: pipefail,
 # set here whatever the caller's shell sets, keeps go test's exit status.
-acceptance:
-    [ -x {{ ci_dir }}/bin/divbast-testcount ] || {{ just_executable() }} ci-tools
+# ci-tools runs first every time, as for scan, so the tool is the one this
+# checkout of ci builds and never one an older checkout left in .ci/bin.
+acceptance: ci-tools
     set -o pipefail; ENGINE={{ ENGINE }} IMAGE={{ IMAGE }} go test -json -count=1 -timeout 90m ./test/acceptance/... | {{ ci_dir }}/bin/divbast-testcount
 
 # Build the image, then run the acceptance suite against it
