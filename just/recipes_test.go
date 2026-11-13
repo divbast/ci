@@ -125,9 +125,10 @@ func TestGitHubRecipesRefuseWithoutAGuardedToken(t *testing.T) {
 // TestAcceptancePipesThroughTestcount checks app.just's acceptance recipe
 // in a justfile set up as an app's. go test exits 0 when every test
 // skipped, so the recipe must pipe go test -json into divbast-testcount,
-// which fails such a run, as the pipeline's last command; and since a
-// shared recipe is run from a recipe's body, never named as a dependency,
-// it builds ci's tools from its own body when .ci/bin lacks that one.
+// which fails such a run, as the pipeline's last command; and it builds
+// ci's tools first, every time, as scan does (backlog CI-2): a tool left
+// in .ci/bin by an older checkout of ci would otherwise judge the run,
+// and go build's cache makes a build with nothing to do cost nothing.
 //
 // The tool sees only the events go test printed before it stopped. A go
 // test killed between packages leaves a stream that passes, and only its
@@ -153,7 +154,7 @@ func TestAcceptancePipesThroughTestcount(t *testing.T) {
 		}
 		commands := strings.Split(strings.TrimSpace(string(out)), "\n")
 
-		build := regexp.MustCompile(`^\[ -x \.ci/bin/divbast-testcount \] \|\| \S*just ci-tools$`)
+		build := regexp.MustCompile(`^go -C '\.ci' build -o '/\S+/\.ci/bin/' \./cmd/\.{3}$`)
 		pipe := "set -o pipefail; ENGINE=docker IMAGE=localhost/app:dev go test -json -count=1 -timeout 90m ./test/acceptance/... | .ci/bin/divbast-testcount"
 		if len(commands) != 2 || !build.MatchString(commands[0]) || commands[1] != pipe {
 			t.Errorf("acceptance runs\n%s\nwant a line matching\n%s\nthen\n%s", out, build, pipe)
@@ -184,10 +185,11 @@ func TestAcceptancePipesThroughTestcount(t *testing.T) {
 				if err := os.Symlink(tool, filepath.Join(dir, ".ci", "bin", "divbast-testcount")); err != nil {
 					t.Fatal(err)
 				}
-				// A go that prints a stream divbast-testcount passes, then
-				// exits as the case says
+				// A go that builds nothing, since the tool above is in
+				// place, and as go test prints a stream divbast-testcount
+				// passes, then exits as the case says
 				stub := t.TempDir()
-				goScript := "#!/bin/sh\ncat <<'EOF'\n" +
+				goScript := "#!/bin/sh\n[ \"$1\" = -C ] && exit 0\ncat <<'EOF'\n" +
 					`{"Action":"start","Package":"example.com/app/test/acceptance"}` + "\n" +
 					`{"Action":"run","Package":"example.com/app/test/acceptance","Test":"TestServes"}` + "\n" +
 					`{"Action":"pass","Package":"example.com/app/test/acceptance","Test":"TestServes"}` + "\n" +

@@ -208,8 +208,9 @@ when `IMAGE` is unset, fails it too.
 The tool sees only what go test printed, so a go test killed between
 packages leaves a stream that passes. The recipe therefore sets `pipefail`
 itself, whatever the caller's shell sets, and go test's own exit status
-still fails it. It builds `.ci/bin/divbast-testcount` with `ci-tools`
-first when it is missing. `go-test` stays a plain `go test`, so an
+still fails it. It runs `ci-tools` first, every time, so the tool is the
+one the pinned ci builds, never one an older checkout left in `.ci/bin`;
+go's build cache makes that cheap. `go-test` stays a plain `go test`, so an
 acceptance suite that skips when `IMAGE` is unset still passes in a `lint`
 that runs it.
 
