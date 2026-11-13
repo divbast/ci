@@ -25,6 +25,11 @@ import (
 //	gh-api-404.txt  gh api -i orgs/divbast/packages/container/no-such-package
 //	gh-api-403.txt  gh api -i orgs/divbast/packages/container/librespeed
 //	                (a token without read:packages)
+//
+// The headers that describe the caller rather than the response are taken
+// out: the token's OAuth scopes and client, its rate limit, the edge
+// region that answered and the request's ID. The rest, and the status line
+// and body, are as gh printed them, line endings included.
 func recorded(t *testing.T, name string) []byte {
 	t.Helper()
 	return readTestdata(t, name)

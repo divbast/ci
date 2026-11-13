@@ -12,16 +12,7 @@ X-Accepted-Oauth-Scopes:
 X-Content-Type-Options: nosniff
 X-Frame-Options: deny
 X-Github-Api-Version-Selected: 2022-11-28
-X-Github-Edge-Region: australiaeast
 X-Github-Media-Type: github.v3; format=json
-X-Github-Request-Id: BB13:320051:184432:24A99D:6AF3C6B4
-X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
-X-Oauth-Scopes: admin:public_key, gist, read:org, repo
-X-Ratelimit-Limit: 5000
-X-Ratelimit-Remaining: 4988
-X-Ratelimit-Reset: 1794361302
-X-Ratelimit-Resource: core
-X-Ratelimit-Used: 12
 X-Xss-Protection: 0
 
 {"message":"Package not found.","documentation_url":"https://docs.github.com/rest/packages/packages#get-a-package-for-an-organization","status":"404"}

@@ -12,16 +12,7 @@ X-Accepted-Oauth-Scopes:
 X-Content-Type-Options: nosniff
 X-Frame-Options: deny
 X-Github-Api-Version-Selected: 2022-11-28
-X-Github-Edge-Region: australiaeast
 X-Github-Media-Type: github.v3; format=json
-X-Github-Request-Id: F9A6:161B9A:3BE38B:5B5008:6AF3DED0
-X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
-X-Oauth-Scopes: admin:public_key, gist, read:org, repo
-X-Ratelimit-Limit: 5000
-X-Ratelimit-Remaining: 4977
-X-Ratelimit-Reset: 1794370576
-X-Ratelimit-Resource: core
-X-Ratelimit-Used: 23
 X-Xss-Protection: 0
 
 {"message":"Not Found","documentation_url":"https://docs.github.com/rest/commits/commits#compare-two-commits","status":"404"}

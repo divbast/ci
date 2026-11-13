@@ -47,6 +47,12 @@ const (
 //	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
 //	gh-api-workflow-build-baikal.txt   gh api -i repos/divbast/baikal-oci-image/actions/workflows/build.yml
 //
+// From each gh api -i recording, the headers that describe the caller
+// rather than the response are taken out: the token's OAuth scopes and
+// client, its rate limit, the edge region that answered and the request's
+// ID. The rest, and the status line and body, are as gh printed them, line
+// endings included.
+//
 // No Renovate pull request was open in either repository, so the open
 // list is empty. The ones with checks to read are merged, or closed with
 // a check that never reported, which is what status:pending finds:
