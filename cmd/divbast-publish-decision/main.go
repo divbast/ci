@@ -70,8 +70,8 @@ func run(ctx context.Context, args []string, git publish.Git, getenv func(string
 	summary := getenv("GITHUB_STEP_SUMMARY")
 	// fail reports why the run failed, on stderr and on the run's summary,
 	// and returns code.
-	fail := func(code int, format string, args ...any) int {
-		why := fmt.Sprintf(format, args...)
+	fail := func(code int, format string, a ...any) int {
+		why := fmt.Sprintf(format, a...)
 		complain(stderr, "%s", why)
 		if err := appendTo(summary, "fail: "+why); err != nil {
 			complain(stderr, "write the run summary: %v", err)
