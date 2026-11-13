@@ -5,9 +5,12 @@
 # its daily slot and its manual run on main, once app-check.yml and the
 # caller's required job have passed. It decides whether to publish, and
 # never moves :latest backwards. When it publishes, it pushes the two images
-# app-check built and tested, merges them into one index tagged with the
-# app's version and latest, attests that index, and checks that :latest is
-# that index to an anonymous client, as users pull it.
+# app-check built and tested, and merges them into one index under a
+# staging tag. It attests that index and verifies the attestation as a user
+# would, and only then tags it with the app's version and latest, so that
+# neither ever names an index whose attestation has not verified. Last, it
+# checks that both tags are that index to an anonymous client, as users
+# pull it.
 #
 # The attestation is signed by this workflow, for the caller's repository
 # and ref, so it verifies with
@@ -185,7 +188,10 @@ jobs:
               "oci-archive:/tmp/images/image-${arch}/image.tar" \
               "docker://${IMAGE}:${VERSION}-${arch}"
           done
-      - name: Merge the architectures into one index
+      # Under a tag no one is meant to pull, so that no public tag moves
+      # before the attestation below verifies. The next publish overwrites
+      # it.
+      - name: Merge the architectures into one index under a staging tag
         if: steps.decide.outputs.publish == 'true'
         id: merge
         env:
@@ -200,8 +206,7 @@ jobs:
             --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
             --annotation "index:org.opencontainers.image.created=${created}" \
             --annotation "index:org.opencontainers.image.description=${DESCRIPTION}" \
-            -t "${IMAGE}:${VERSION}" \
-            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${VERSION}-staging" \
             "${IMAGE}@$(cat /tmp/digest-amd64)" \
             "${IMAGE}@$(cat /tmp/digest-arm64)"
           digest=$(jq -er '."containerimage.descriptor".digest' /tmp/index.json)
@@ -217,20 +222,91 @@ jobs:
           push-to-registry: true
           create-storage-record: false
 
-      # What users pull, as they pull it. A private package, or a :latest
-      # that is not the index just pushed, fails the run here rather than
-      # when someone first pulls.
-      - name: Check :latest is the pushed index to an anonymous client
+      # What a user runs before trusting the image, against the index's own
+      # bytes, fetched by digest: gh looks the attestation up by the file's
+      # digest, so it needs nothing from the registry, and an empty
+      # DOCKER_CONFIG keeps the login above from it. Off a terminal, gh
+      # prints nothing when it succeeds, so the JSON is what the log shows.
+      - name: Verify the index's attestation
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          skopeo inspect --raw "docker://${IMAGE}@${DIGEST}" > /tmp/index-manifest.json
+          empty=$(mktemp -d)
+          verify() {
+            DOCKER_CONFIG="${empty}" gh attestation verify /tmp/index-manifest.json \
+              --repo "${REPO}" \
+              --signer-workflow divbast/ci/.github/workflows/app-publish.yml \
+              --source-ref refs/heads/main \
+              --format json > /tmp/verified.json
+          }
+          # Three tries, ten seconds apart, for an attestation made moments
+          # ago that the API does not return yet
+          verify || { sleep 10 && verify; } || { sleep 10 && verify; }
+          signer=$(jq -r '.[0].verificationResult.signature.certificate.buildSignerURI' /tmp/verified.json)
+          echo "${IMAGE}@${DIGEST} verifies, signed by ${signer}"
+
+      # The index is attested, and the attestation verifies: the public tags
+      # move now. Given one index and no annotations, imagetools pushes the
+      # index's own bytes, and its dry run prints the bytes it would push and
+      # a newline, so the tags move only once those are known to be the
+      # index attested.
+      - name: Tag the attested index with the version and latest
+        if: steps.decide.outputs.publish == 'true'
+        id: promote
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: |
+          args=(
+            -t "${IMAGE}:${VERSION}"
+            -t "${IMAGE}:latest"
+            "${IMAGE}@${DIGEST}"
+          )
+          docker buildx imagetools create --dry-run "${args[@]}" > /tmp/promoted.json
+          would=$(head -c -1 /tmp/promoted.json | shasum -a 256)
+          if [ "sha256:${would%% *}" != "${DIGEST}" ]; then
+            echo "imagetools would tag sha256:${would%% *}, not ${DIGEST}, the index attested;" \
+              "the public tags :${VERSION} and :latest did not move" >&2
+            exit 1
+          fi
+          docker buildx imagetools create "${args[@]}"
+
+      # What users pull, as they pull it. A private package, or a tag that is
+      # not the index attested, fails the run here rather than when someone
+      # first pulls.
+      - name: Check both tags are the attested index to an anonymous client
         if: steps.decide.outputs.publish == 'true'
         # bash's pipefail, so a failed inspect fails the pipeline
         shell: bash
         env:
           IMAGE: ${{ inputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
           DIGEST: ${{ steps.merge.outputs.digest }}
         run: |
-          if ! pulled=$(skopeo inspect --raw --no-creds "docker://${IMAGE}:latest" | shasum -a 256) ||
-            [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
-            echo "${IMAGE}:latest is not anonymously pullable as ${DIGEST}" >&2
-            exit 1
-          fi
-          echo "${IMAGE}:latest is ${DIGEST} to an anonymous client"
+          for tag in "${VERSION}" latest; do
+            if ! pulled=$(skopeo inspect --raw --no-creds "docker://${IMAGE}:${tag}" | shasum -a 256) ||
+              [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
+              echo "${IMAGE}:${tag} is not anonymously pullable as ${DIGEST}" >&2
+              exit 1
+            fi
+            echo "${IMAGE}:${tag} is ${DIGEST} to an anonymous client"
+          done
+
+      # A failure before the promotion leaves the public tags where they
+      # were. A re-run of the failed job downloads this run's images again,
+      # which app-check keeps for a day, and the decision reads :latest
+      # again, so it publishes unless a newer image has taken :latest since.
+      - name: Say that the public tags did not move
+        if: failure() && steps.decide.outputs.publish == 'true' && steps.promote.outcome == 'skipped'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
+            "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
+            "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."

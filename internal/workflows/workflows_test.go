@@ -13,12 +13,15 @@
 package workflows_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -467,6 +470,596 @@ func passesContentGated(t *testing.T, workflow string) error {
 	return nil
 }
 
+// The publish job's step names that the mutants below move or change, and
+// the if: every step from the first push to the promotion runs on.
+const (
+	pushName    = "      - name: Push each tested architecture\n"
+	stageName   = "      - name: Merge the architectures into one index under a staging tag\n"
+	attestStep  = "      - uses: actions/attest@"
+	verifyName  = "      - name: Verify the index's attestation\n"
+	promoteName = "      - name: Tag the attested index with the version and latest\n"
+	movedName   = "      - name: Say that the public tags did not move\n"
+	gate        = "steps.decide.outputs.publish == 'true'"
+)
+
+// TestPublishAttestsBeforePromote checks that app-publish.yml moves no
+// public tag until the index is attested and the attestation verified.
+// The index is tagged <version>-staging alone, attested, verified as a
+// user verifies it, and only then tagged with the version and latest, all
+// by the one digest. Every step from the first push to the promotion runs
+// on the one decision, and none lets a failure through, so a failed
+// attestation leaves the public tags on the last attested index, where a
+// re-run decides against them and publishes. Against app-publish.yml as it
+// is, then with each of those broken, which the check must refuse.
+func TestPublishAttestsBeforePromote(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := attestsBeforePromote(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const (
+		staging = `            -t "${IMAGE}:${VERSION}-staging" \` + "\n"
+		version = "            -t \"${IMAGE}:${VERSION}\"\n"
+		latest  = "            -t \"${IMAGE}:latest\"\n"
+		digest  = "          DIGEST: ${{ steps.merge.outputs.digest }}\n"
+		signer  = " --signer-workflow divbast/ci/.github/workflows/app-publish.yml"
+		onGate  = "        if: " + gate + "\n"
+		goOn    = "        continue-on-error: true\n"
+	)
+	for name, mutant := range map[string]string{
+		"the version tagged before attesting":   strings.Replace(publish, staging, `            -t "${IMAGE}:${VERSION}" \`+"\n", 1),
+		"latest tagged before attesting":        strings.Replace(publish, staging, staging+`            -t "${IMAGE}:latest" \`+"\n", 1),
+		"an arch pushed as latest":              strings.Replace(publish, `"docker://${IMAGE}:${VERSION}-${arch}"`, `"docker://${IMAGE}:latest"`, 1),
+		"the version pushed before attesting":   replaceAfter(publish, pushName, "          done\n", "          done\n          skopeo copy --all \"docker://${IMAGE}@$(cat /tmp/digest-amd64)\" \"docker://${IMAGE}:${VERSION}\"\n"),
+		"the decision's read moved past a push": replaceAfter(publish, verifyName, "        run: |\n", "        run: |\n          published=$(.ci/bin/divbast-published-revision \"${IMAGE}:latest\")\n"),
+		"promoted before verifying":             moveStep(publish, promoteName, verifyName),
+		"promoted before attesting":             moveStep(publish, promoteName, attestStep),
+		"verified before attesting":             moveStep(publish, verifyName, attestStep),
+		"attested before staging":               moveStep(publish, attestStep, stageName),
+		"promoted whatever happened":            replaceAfter(publish, promoteName, onGate, "        if: always() && "+gate+"\n"),
+		"verified whatever happened":            replaceAfter(publish, verifyName, onGate, "        if: ${{ !cancelled() }}\n"),
+		"an attestation that may fail":          replaceAfter(publish, attestStep, onGate, onGate+goOn),
+		"a verification that may fail":          replaceAfter(publish, verifyName, onGate, onGate+goOn),
+		"never verified":                        replaceAfter(publish, verifyName, "gh attestation verify", "gh attestation download"),
+		"verified for any signer":               replaceAfter(publish, verifyName, signer, ""),
+		"verified from any ref":                 replaceAfter(publish, verifyName, " --source-ref refs/heads/main", ""),
+		"verified for any repository":           replaceAfter(publish, verifyName, "          REPO: ${{ github.repository }}\n", "          REPO: divbast/oci-image-template\n"),
+		"another digest attested":               strings.Replace(publish, "subject-digest: ${{ steps.merge.outputs.digest }}", "subject-digest: ${{ steps.merge.outputs.amd64 }}", 1),
+		"another digest verified":               replaceAfter(publish, verifyName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
+		"another digest promoted":               replaceAfter(publish, promoteName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
+		"another source promoted":               strings.Replace(publish, `            "${IMAGE}@${DIGEST}"`+"\n", `            "${IMAGE}@$(cat /tmp/digest-amd64)"`+"\n", 1),
+		"latest left out of the promotion":      strings.Replace(publish, version+latest, version, 1),
+		"the version left out of the promotion": strings.Replace(publish, version+latest, latest, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if attestsBeforePromote(mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+var (
+	// tagArg is a -t or --tag argument and the reference it names.
+	tagArg = regexp.MustCompile(`(?:^|\s)(?:-t|--tag)[ =]"?([^"\s]+)`)
+	// publicTag is the version's tag or latest, however the version is
+	// written, with the suffix, if any, that makes it the staging tag or
+	// an architecture's.
+	publicTag = regexp.MustCompile(`:(?:latest|\$\{VERSION\}|\$VERSION|\$\{\{ *steps\.version\.outputs\.version *\}\})(-staging|-\$\{arch\})?`)
+)
+
+// readsPublished is the one line before the first push that may name
+// latest: the decision's read of the commit it was built from, matched as
+// the whole line.
+const readsPublished = `published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")`
+
+// attestsBeforePromote returns an error unless the publish job has one
+// step that tags the index <version>-staging, one that attests it, one
+// that verifies the attestation and one that tags latest, after the first
+// push and in that order. No line of the job lets a step's failure
+// through; every step from the first push to the promotion runs on the
+// decision alone; before the promotion, every tag is -staging and no line
+// names the version's tag or latest, but for the decision's read; the
+// promotion tags the version and latest alone; and all four steps name the
+// one digest. The verification is a user's: gh attestation verify, for the
+// caller's repository, this workflow and main.
+func attestsBeforePromote(workflow string) error {
+	job := jobsOf(linesOf(workflow))["publish"]
+	if i := slices.IndexFunc(job, func(l line) bool {
+		return strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), "continue-on-error:")
+	}); i >= 0 {
+		return fmt.Errorf("line %d lets a failure through", job[i].n)
+	}
+	st := steps(job)
+	tags := func(l line) []string {
+		found := tagArg.FindAllStringSubmatch(l.text, -1)
+		out := make([]string, 0, len(found))
+		for _, m := range found {
+			out = append(out, m[1])
+		}
+		return out
+	}
+	tagsWith := func(suffix string) func(line) bool {
+		return func(l line) bool {
+			return slices.ContainsFunc(tags(l), func(t string) bool { return strings.HasSuffix(t, suffix) })
+		}
+	}
+	var at [4]int
+	for i, s := range []struct {
+		what string
+		f    func(line) bool
+	}{
+		{"tag the index <version>-staging", tagsWith("-staging")},
+		{"run actions/attest", isUses("actions/attest")},
+		{"run gh attestation verify", contains("gh attestation verify")},
+		{"tag latest", tagsWith(":latest")},
+	} {
+		found := stepsWhere(st, s.f)
+		if len(found) != 1 {
+			return fmt.Errorf("%d steps %s, want one", len(found), s.what)
+		}
+		at[i] = found[0]
+	}
+	stage, attest, verify, promote := at[0], at[1], at[2], at[3]
+	pushes := stepsWhere(st, contains("skopeo copy"))
+	if len(pushes) == 0 {
+		return errors.New("no step pushes with skopeo copy")
+	}
+	push := pushes[0]
+	if push >= stage || stage >= attest || attest >= verify || verify >= promote {
+		return fmt.Errorf("steps %d, %d, %d, %d and %d push, stage, attest, verify and promote; want them in that order",
+			push+1, stage+1, attest+1, verify+1, promote+1)
+	}
+	for _, s := range st[push : promote+1] {
+		if cond := value(s, "if"); cond != unquote(gate) {
+			return fmt.Errorf("line %d runs on %q, not %s alone", s[0].n, cond, gate)
+		}
+	}
+
+	for i, s := range st[:promote] {
+		for _, l := range s {
+			for _, tag := range tags(l) {
+				if !strings.HasSuffix(tag, "-staging") {
+					return fmt.Errorf("line %d tags %s before the attestation verifies", l.n, tag)
+				}
+			}
+			if i < push && strings.TrimSpace(l.text) == readsPublished {
+				continue
+			}
+			for _, m := range publicTag.FindAllStringSubmatch(l.text, -1) {
+				if m[1] == "" {
+					return fmt.Errorf("line %d names %s before the attestation verifies", l.n, m[0])
+				}
+			}
+		}
+	}
+	var promoted []string
+	for _, l := range st[promote] {
+		promoted = append(promoted, tags(l)...)
+	}
+	if len(promoted) != 2 || !slices.ContainsFunc(promoted, func(t string) bool { return strings.HasSuffix(t, ":${VERSION}") }) ||
+		!slices.ContainsFunc(promoted, func(t string) bool { return strings.HasSuffix(t, ":latest") }) {
+		return fmt.Errorf("line %d promotes to %q, want the version's tag and latest", st[promote][0].n, promoted)
+	}
+
+	id := value(st[stage], "id")
+	want := "${{ steps." + id + ".outputs.digest }}"
+	if got := value(st[attest], "subject-digest"); id == "" || got != want {
+		return fmt.Errorf("line %d attests %q, not the staged index's digest %s", st[attest][0].n, got, want)
+	}
+	for _, i := range []int{verify, promote} {
+		script, err := runScript(st[i])
+		if err != nil {
+			return err
+		}
+		if got := value(st[i], "DIGEST"); got != want {
+			return fmt.Errorf("line %d sets DIGEST to %q, not %s, the digest attested", st[i][0].n, got, want)
+		}
+		if !strings.Contains(script, `${IMAGE}@${DIGEST}`) {
+			return fmt.Errorf("line %d never names ${IMAGE}@${DIGEST}, the index attested", st[i][0].n)
+		}
+	}
+	script, _ := runScript(st[verify])
+	for _, flag := range []string{
+		`--repo "${REPO}"`,
+		"--signer-workflow divbast/ci/.github/workflows/app-publish.yml",
+		"--source-ref refs/heads/main",
+	} {
+		if !strings.Contains(script, flag) {
+			return fmt.Errorf("line %d verifies without %s", st[verify][0].n, flag)
+		}
+	}
+	if got := value(st[verify], "REPO"); got != "${{ github.repository }}" {
+		return fmt.Errorf("line %d verifies for %q, not ${{ github.repository }}", st[verify][0].n, got)
+	}
+	return nil
+}
+
+// TestPublishVerifiesWithRetries checks that app-publish.yml's
+// verification, run with bash and stand-ins for skopeo, gh and sleep,
+// fetches the index by digest and gives gh that file, an empty
+// DOCKER_CONFIG and the flags a user gives it, and tries three times, ten
+// seconds apart, before it fails. Against app-publish.yml as it is, then
+// with each broken, which the check must refuse.
+func TestPublishVerifiesWithRetries(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := verifiesWithRetries(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const tries = "verify || { sleep 10 && verify; } || { sleep 10 && verify; }"
+	for name, mutant := range map[string]string{
+		"one try":                    strings.Replace(publish, tries, "verify", 1),
+		"four tries":                 strings.Replace(publish, tries, tries+" || { sleep 10 && verify; }", 1),
+		"tries a second apart":       strings.Replace(publish, tries, strings.ReplaceAll(tries, "sleep 10", "sleep 1"), 1),
+		"the login given to gh":      strings.Replace(publish, `DOCKER_CONFIG="${empty}" gh attestation verify`, "gh attestation verify", 1),
+		"the index fetched by a tag": replaceAfter(publish, verifyName, `"docker://${IMAGE}@${DIGEST}"`, `"docker://${IMAGE}:${DIGEST#sha256:}-staging"`),
+		"another file verified":      replaceAfter(publish, verifyName, "gh attestation verify /tmp/index-manifest.json", "gh attestation verify /tmp/index.json"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if verifiesWithRetries(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// verifiesWithRetries returns an error unless the publish job's one step
+// that runs gh attestation verify, its /tmp moved into a temporary
+// directory, fetches the index by digest once, and then calls gh once
+// when gh succeeds, three times with ten seconds' sleep between when the
+// first two fail, and three times before it fails when all three do.
+func verifiesWithRetries(t *testing.T, workflow string) error {
+	t.Helper()
+	st := publishSteps(workflow)
+	found := stepsWhere(st, contains("gh attestation verify"))
+	if len(found) != 1 {
+		return fmt.Errorf("%d steps run gh attestation verify, want one", len(found))
+	}
+	script, err := runScript(st[found[0]])
+	if err != nil {
+		return err
+	}
+	const (
+		image  = "ghcr.io/divbast/app"
+		digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	)
+	for _, tt := range []struct {
+		fails, calls int
+		ok           bool
+		slept        string
+	}{
+		{fails: 0, calls: 1, ok: true},
+		{fails: 2, calls: 3, ok: true, slept: "10 10 "},
+		{fails: 3, calls: 3, slept: "10 10 "},
+	} {
+		dir := t.TempDir()
+		bin, login := filepath.Join(dir, "bin"), filepath.Join(dir, "login")
+		for _, d := range []string{bin, login} {
+			if err := os.Mkdir(d, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writeFile(t, dir, "login/config.json", "{}\n")
+		writeFile(t, dir, "bin/skopeo", "#!/usr/bin/env bash\nprintf 'skopeo %s\\n' \"$*\" >> \"${CALLS}\"\necho '{}'\n")
+		writeFile(t, dir, "bin/gh", "#!/usr/bin/env bash\nprintf 'gh %s\\n' \"$*\" >> \"${CALLS}\"\n"+
+			"[ -z \"$(ls -A \"${DOCKER_CONFIG:?}\")\" ] || exit 3\n"+
+			"[ \"$(grep -c '^gh ' \"${CALLS}\")\" -gt \"${FAILS}\" ] || exit 1\n"+
+			"echo '[{\"verificationResult\":{\"signature\":{\"certificate\":{\"buildSignerURI\":\"signer\"}}}}]'\n")
+		writeFile(t, dir, "bin/sleep", "#!/usr/bin/env bash\nprintf '%s ' \"$*\" >> \"${SLEPT}\"\n")
+		calls, slept := filepath.Join(dir, "calls"), filepath.Join(dir, "slept")
+		writeFile(t, dir, "slept", "")
+		res := runStep(t, dir, strings.ReplaceAll(script, "/tmp/", dir+"/"),
+			"PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+dir, "DOCKER_CONFIG="+login,
+			"IMAGE="+image, "DIGEST="+digest, "REPO=divbast/app",
+			"CALLS="+calls, "SLEPT="+slept, "FAILS="+strconv.Itoa(tt.fails))
+		got, err := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
+		if err != nil {
+			return fmt.Errorf("with %d failures, nothing ran: %w", tt.fails, err)
+		}
+		gh := "gh attestation verify " + dir + "/index-manifest.json --repo divbast/app" +
+			" --signer-workflow divbast/ci/.github/workflows/app-publish.yml --source-ref refs/heads/main --format json\n"
+		want := "skopeo inspect --raw docker://" + image + "@" + digest + "\n" + strings.Repeat(gh, tt.calls)
+		if string(got) != want {
+			return fmt.Errorf("with %d failures, runs\n%s\nwant\n%s", tt.fails, got, want)
+		}
+		if s, _ := os.ReadFile(slept); string(s) != tt.slept { //nolint:gosec // G304: the test's own temporary directory
+			return fmt.Errorf("with %d failures, sleeps %q, want %q", tt.fails, s, tt.slept)
+		}
+		if (res.Code == 0) != tt.ok {
+			return fmt.Errorf("with %d failures, the script exits %d: %s", tt.fails, res.Code, res.Stderr)
+		}
+	}
+	return nil
+}
+
+// TestPublishPromotesOnlyTheAttestedDigest checks that app-publish.yml's
+// promotion, run with bash and a stand-in for docker, dry-runs the same
+// imagetools create it runs, and runs it only when the bytes the dry run
+// prints, less its newline, hash to the digest attested. Against
+// app-publish.yml as it is, then with each broken, which the check must
+// refuse.
+func TestPublishPromotesOnlyTheAttestedDigest(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := promotesOnlyTheDigest(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const dry = `          docker buildx imagetools create --dry-run "${args[@]}" > /tmp/promoted.json` + "\n"
+	for name, mutant := range map[string]string{
+		"no comparison":           strings.Replace(publish, `if [ "sha256:${would%% *}" != "${DIGEST}" ]; then`, "if false; then", 1),
+		"the newline hashed too":  strings.Replace(publish, "head -c -1 /tmp/promoted.json", "cat /tmp/promoted.json", 1),
+		"tags moved before":       strings.Replace(publish, dry, `          docker buildx imagetools create "${args[@]}"`+"\n"+dry, 1),
+		"a dry run of the source": strings.Replace(publish, dry, `          docker buildx imagetools create --dry-run "${IMAGE}@${DIGEST}" > /tmp/promoted.json`+"\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if promotesOnlyTheDigest(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// promotesOnlyTheDigest returns an error unless the publish job's step
+// with id promote, its /tmp moved into a temporary directory, runs
+// docker buildx imagetools create --dry-run and then the same command
+// without it when the dry run prints the attested index, and the dry run
+// alone, then fails, when it prints another.
+func promotesOnlyTheDigest(t *testing.T, workflow string) error {
+	t.Helper()
+	st := publishSteps(workflow)
+	found := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: promote" })
+	if len(found) != 1 {
+		return fmt.Errorf("%d steps have id promote, want one", len(found))
+	}
+	script, err := runScript(st[found[0]])
+	if err != nil {
+		return err
+	}
+	const (
+		image = "ghcr.io/divbast/app"
+		index = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`
+	)
+	sum := sha256.Sum256([]byte(index))
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	args := "-t " + image + ":1.2.3 -t " + image + ":latest " + image + "@" + digest
+	for _, tt := range []struct {
+		name, would, calls string
+		ok                 bool
+	}{
+		{
+			name: "the index attested", would: index, ok: true,
+			calls: "buildx imagetools create --dry-run " + args + "\nbuildx imagetools create " + args + "\n",
+		},
+		{name: "another index", would: index + " ", calls: "buildx imagetools create --dry-run " + args + "\n"},
+	} {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "bin"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, dir, "would", tt.would)
+		writeFile(t, dir, "bin/docker", "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"${CALLS}\"\n"+
+			"case \" $* \" in *\" --dry-run \"*) cat \"${WOULD}\"; echo ;; esac\n")
+		calls := filepath.Join(dir, "calls")
+		res := runStep(t, dir, strings.ReplaceAll(script, "/tmp/", dir+"/"),
+			"PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"),
+			"IMAGE="+image, "VERSION=1.2.3", "DIGEST="+digest, "CALLS="+calls, "WOULD="+filepath.Join(dir, "would"))
+		got, err := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
+		if err != nil {
+			return fmt.Errorf("when the dry run prints %s, docker never runs: %w", tt.name, err)
+		}
+		if string(got) != tt.calls {
+			return fmt.Errorf("when the dry run prints %s, runs\n%s\nwant\n%s", tt.name, got, tt.calls)
+		}
+		if (res.Code == 0) != tt.ok {
+			return fmt.Errorf("when the dry run prints %s, the script exits %d: %s", tt.name, res.Code, res.Stderr)
+		}
+	}
+	return nil
+}
+
+// TestPublishSaysWhenRerunningPublishes checks that app-publish.yml, when
+// a step fails after the decision and the promotion never ran, says in an
+// error that the version's tag and latest did not move, and when
+// re-running the failed job publishes. Against app-publish.yml as it is,
+// then with each broken, which the check must refuse.
+func TestPublishSaysWhenRerunningPublishes(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := saysWhenRerunningPublishes(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const cond = "        if: failure() && " + gate + " && steps.promote.outcome == 'skipped'\n"
+	for name, mutant := range map[string]string{
+		"said after a promotion that failed": strings.Replace(publish, cond, "        if: failure() && "+gate+"\n", 1),
+		"said when nothing failed":           strings.Replace(publish, cond, "        if: "+gate+" && steps.promote.outcome == 'skipped'\n", 1),
+		"said before the promotion":          moveStep(publish, movedName, promoteName),
+		"no tags named":                      strings.Replace(publish, "::error::the public tags :${VERSION:-<version>} and :latest did not move.", "::error::no public tag moved.", 1),
+		"no word on when":                    strings.Replace(publish, `"Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \`+"\n", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if saysWhenRerunningPublishes(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// saysWhenRerunningPublishes returns an error unless the publish job's
+// one step that says the public tags did not move comes after the
+// promotion, runs on a failure once the decision was to publish and the
+// promotion was skipped, and, run with bash, prints one error naming the
+// version's tag and latest and saying a re-run of the failed job publishes
+// for a day after the build.
+func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
+	t.Helper()
+	st := publishSteps(workflow)
+	found := stepsWhere(st, contains("::error::"))
+	promote := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: promote" })
+	if len(found) != 1 || len(promote) != 1 {
+		return fmt.Errorf("%d steps print an error and %d have id promote, want one of each", len(found), len(promote))
+	}
+	s := st[found[0]]
+	if found[0] < promote[0] {
+		return fmt.Errorf("line %d says the tags did not move before the promotion, which then runs", s[0].n)
+	}
+	want := unquote("failure() && " + gate + " && steps.promote.outcome == 'skipped'")
+	if cond := value(s, "if"); cond != want {
+		return fmt.Errorf("line %d says the tags did not move on %q, not %q", s[0].n, cond, want)
+	}
+	script, err := runScript(s)
+	if err != nil {
+		return err
+	}
+	res := runStep(t, t.TempDir(), script, "VERSION=1.2.3")
+	out := string(res.Stdout)
+	if res.Code != 0 || strings.Count(out, "\n") != 1 ||
+		!strings.HasPrefix(out, "::error::the public tags :1.2.3 and :latest did not move. ") ||
+		!strings.Contains(out, "Re-running the failed job publishes for a day after this run built its images") {
+		return fmt.Errorf("with VERSION=1.2.3, the script exits %d and prints %q", res.Code, out)
+	}
+	return nil
+}
+
+// TestPublishInstallsGoAlone checks that app-publish.yml's job, which can
+// push the image and sign its attestation, installs Go alone from the
+// caller's mise.toml, as "core:go", with auto-install off: README.md tells
+// callers so. Against app-publish.yml as it is, then with each broken,
+// which the check must refuse.
+func TestPublishInstallsGoAlone(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := installsGoAlone(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	for name, mutant := range map[string]string{
+		"another tool too": strings.Replace(publish, "install_args: core:go\n", "install_args: core:go aqua:skopeo\n", 1),
+		"auto-install on":  strings.Replace(publish, "      MISE_AUTO_INSTALL: \"false\"\n", "      MISE_AUTO_INSTALL: \"true\"\n", 1),
+		"no mise step":     strings.Replace(publish, "uses: jdx/mise-action@", "uses: jdx/mise-actions@", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if installsGoAlone(mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// installsGoAlone returns an error unless the publish job has a
+// jdx/mise-action step, each such step's install_args is core:go, and the
+// job's env sets MISE_AUTO_INSTALL to false.
+func installsGoAlone(workflow string) error {
+	job := jobsOf(linesOf(workflow))["publish"]
+	st := steps(job)
+	mise := stepsWhere(st, isUses("jdx/mise-action"))
+	if len(mise) == 0 {
+		return errors.New("the publish job has no jdx/mise-action step")
+	}
+	for _, i := range mise {
+		if got := value(st[i], "install_args"); got != "core:go" {
+			return fmt.Errorf("line %d installs %q, not core:go", st[i][0].n, got)
+		}
+	}
+	if got := unquote(jobEnv(job)["MISE_AUTO_INSTALL"]); got != "false" {
+		return fmt.Errorf("the publish job sets MISE_AUTO_INSTALL to %q, not false", got)
+	}
+	return nil
+}
+
+// publishSteps returns the steps of a workflow's publish job.
+func publishSteps(workflow string) [][]line {
+	return steps(jobsOf(linesOf(workflow))["publish"])
+}
+
+// stepsWhere returns the index of each step with a line f is true of.
+func stepsWhere(st [][]line, f func(line) bool) []int {
+	var out []int
+	for i, s := range st {
+		if slices.ContainsFunc(s, f) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// contains is true of a line that holds s.
+func contains(s string) func(line) bool {
+	return func(l line) bool { return strings.Contains(l.text, s) }
+}
+
+// isUses is true of a step's uses: line for action, at any ref.
+func isUses(action string) func(line) bool {
+	return func(l line) bool {
+		return strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), "uses: "+action+"@")
+	}
+}
+
+// value returns the value of a step's first key: line, unquoted, or ""
+// when it has none.
+func value(step []line, key string) string {
+	for _, l := range step {
+		if v, ok := strings.CutPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), key+":"); ok {
+			return unquote(v)
+		}
+	}
+	return ""
+}
+
+// replaceAfter returns s with the first old after the first marker
+// replaced by replacement, or s as it is when either is missing.
+func replaceAfter(s, marker, old, replacement string) string {
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return s
+	}
+	head, tail := s[:i+len(marker)], s[i+len(marker):]
+	return head + strings.Replace(tail, old, replacement, 1)
+}
+
+// moveStep returns workflow with the step that starts with the text what
+// moved to just before the one that starts with before, or workflow as it
+// is when either is missing. A step runs from its first line to the next
+// line at its indent, a step's or a comment's, so the comments above each
+// stay where they were.
+func moveStep(workflow, what, before string) string {
+	i := strings.Index(workflow, what)
+	if i < 0 {
+		return workflow
+	}
+	end := len(workflow)
+	for _, next := range []string{"\n      - ", "\n      #"} {
+		if j := strings.Index(workflow[i+len(what):], next); j >= 0 {
+			end = min(end, i+len(what)+j+1)
+		}
+	}
+	step, rest := workflow[i:end], workflow[:i]+workflow[end:]
+	k := strings.Index(rest, before)
+	if k < 0 {
+		return workflow
+	}
+	return rest[:k] + step + rest[k:]
+}
+
 // runScript returns a step's run: script, from a block scalar or a plain
 // value. Blank lines and comments are already gone.
 func runScript(step []line) (string, error) {
@@ -490,37 +1083,48 @@ func runScript(step []line) (string, error) {
 	return "", fmt.Errorf("line %d: the step has no run: script", step[0].n)
 }
 
-// runStall runs script as GitHub Actions runs a step's, with bash -e from
-// the workspace, there with a .ci/bin/divbast-stall that prints each of its
-// arguments in brackets, and returns what it printed.
+// runStall runs script as runStep does, with a .ci/bin/divbast-stall that
+// prints each of its arguments in brackets, and returns what it printed.
 func runStall(t *testing.T, script, check, gated string) (string, error) {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".ci", "bin"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	writeFile(t, dir, ".ci/bin/divbast-stall", "#!/usr/bin/env bash\nprintf '[%s]' \"$@\"\n")
+	res := runStep(t, dir, script, "CHECK="+check, "CONTENT_GATED="+gated)
+	if res.Code != 0 {
+		return "", fmt.Errorf("with CHECK=%s and CONTENT_GATED=%s, the script exits %d: %s", check, gated, res.Code, res.Stderr)
+	}
+	return string(res.Stdout), nil
+}
+
+// runStep runs script as GitHub Actions runs a step's, with bash -e from
+// dir, the workspace, and env on top of the test's environment. BASH_ENV
+// is empty, as on a runner, so that no startup file moves PATH out from
+// under a stand-in.
+func runStep(t *testing.T, dir, script string, env ...string) execx.Result {
+	t.Helper()
+	writeFile(t, dir, "step.sh", script)
+	run := execx.OS{Env: append([]string{"BASH_ENV="}, env...)}
+	res, err := run.Run(t.Context(), "bash", "-c", `cd -- "$1" && bash -e ./step.sh`, "bash", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// writeFile writes an executable file at name inside dir.
+func writeFile(t *testing.T, dir, name, body string) {
+	t.Helper()
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	for name, body := range map[string]string{
-		".ci/bin/divbast-stall": "#!/usr/bin/env bash\nprintf '[%s]' \"$@\"\n",
-		"step.sh":               script,
-	} {
-		if err = root.WriteFile(name, []byte(body), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	run := execx.OS{Env: []string{"CHECK=" + check, "CONTENT_GATED=" + gated}}
-	res, err := run.Run(t.Context(), "bash", "-c", `cd -- "$1" && bash -e ./step.sh`, "bash", dir)
-	if err != nil {
+	if err := root.WriteFile(name, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if res.Code != 0 {
-		return "", fmt.Errorf("with CHECK=%s and CONTENT_GATED=%s, the script exits %d: %s", check, gated, res.Code, res.Stderr)
-	}
-	return string(res.Stdout), nil
 }
 
 // line is one line of a workflow and its 1-based number in the file.

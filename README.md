@@ -507,12 +507,32 @@ or when run by hand, and never replaces `:latest` with an image of an
 older commit. When it publishes, it:
 
 1. pushes each architecture as `<image>:<version>-<arch>`;
-2. merges them into one index, tagged `<image>:<version>` and
-   `<image>:latest`, annotated with the version, the commit, the commit's
-   time and the description;
+2. merges them into one index, annotated with the version, the commit, the
+   commit's time and the description, and tags it
+   `<image>:<version>-staging` alone;
 3. attests the index, and pushes the attestation to the registry;
-4. checks that `<image>:latest`, as an anonymous client pulls it, is that
-   index, and fails if it is not: a private package fails here.
+4. verifies that attestation as a user would, with `gh attestation verify`
+   for the calling repository, this workflow and `refs/heads/main`, against
+   the index's bytes fetched by digest, trying three times, ten seconds
+   apart;
+5. only then tags the index `<image>:<version>` and `<image>:latest`, once
+   a dry run of that `imagetools create` shows it would push the index
+   attested, byte for byte;
+6. checks that both tags, as an anonymous client pulls them, are that
+   index, and fails if they are not: a private package fails here.
+
+The staging tag is where the index waits while it is attested and
+verified. Like each architecture's tag, it sits in the package as any tag
+does, but it is not for pulling, and the next publish overwrites it.
+Neither `<image>:<version>` nor `<image>:latest` ever names an index whose
+attestation has not verified. When a step after the decision fails before
+those two move, the job says so in an error: the public tags
+`:<version>` and `:latest` did not move. Re-running the failed job then
+publishes, since the decision still reads the last index published, but
+only within a day of the build: it downloads the images `app-check.yml`
+built, whose artifacts are kept for a day. A newer image published in the
+meantime keeps `:latest`, and once the artifacts are gone the next daily
+slot or a manual run publishes.
 
 Publishes queue one at a time in the calling repository's `publish`
 concurrency group, so the calling job needs no group of its own.
@@ -678,7 +698,8 @@ just ci-tools && .ci/bin/divbast-verify-frankenphp
 ### Published images
 
 `app-publish.yml` signs each image's attestation itself, for the app's
-repository and its main branch. To verify an image:
+repository and its main branch, and moves the image's version tag and
+`:latest` only once that attestation verifies. To verify an image:
 
 ```sh
 gh attestation verify oci://ghcr.io/divbast/librespeed:latest \
