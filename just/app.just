@@ -29,9 +29,12 @@ REPORT := ARCHIVE + ".report.json"
 SARIF := ARCHIVE + ".sarif"
 BASELINE := ARCHIVE + ".published.json"
 
+# Podman builds in Docker's format, as the harness's Build does: Podman's
+# default, OCI, has no place for a HEALTHCHECK, and drops the image's.
+
 # Build the image. CI first verifies the FrankenPHP binary's attestation; this does not
 build:
-    {{ ENGINE }} build -t {{ IMAGE }} -f Containerfile .
+    {{ ENGINE }} build {{ if ENGINE == "podman" { "--format docker " } else { "" } }}-t {{ IMAGE }} -f Containerfile .
 
 # Run the acceptance suite against the image. go test exits 0 when every
 # test skipped, so its events go through divbast-testcount, which prints

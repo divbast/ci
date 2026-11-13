@@ -216,6 +216,37 @@ func TestAcceptancePipesThroughTestcount(t *testing.T) {
 	}
 }
 
+// TestBuildFormat checks app.just's build under each engine. Podman builds
+// in OCI's format by default, which has no place for a HEALTHCHECK and
+// drops the image's, so the image a local `ENGINE=podman just test` built
+// would fail the contract's healthcheck-config check however right its
+// Containerfile was. Docker has only its own format.
+func TestBuildFormat(t *testing.T) {
+	t.Parallel()
+	needJustAndMise(t)
+	ci, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := appJustfile(t, ci, `["mise", "exec", "--", "bash", "-euo", "pipefail", "-c"]`)
+	for _, tt := range []struct{ engine, want string }{
+		{engine: "docker", want: "docker build -t localhost/app:dev -f Containerfile ."},
+		{engine: "podman", want: "podman build --format docker -t localhost/app:dev -f Containerfile ."},
+	} {
+		t.Run(tt.engine, func(t *testing.T) {
+			t.Parallel()
+			cmd := exec.CommandContext(t.Context(), "just", "--justfile", app, "--dry-run", "ENGINE="+tt.engine, "build") //nolint:gosec // G204: the arguments are this test's own
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("just --dry-run ENGINE=%s build: %v\n%s", tt.engine, err, out)
+			}
+			if got := strings.TrimSpace(string(out)); got != tt.want {
+				t.Errorf("ENGINE=%s just build runs\n%s\nwant\n%s", tt.engine, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestCIFresh runs common.just's ci-fresh in a repository set up as a
 // caller's, whose workflows pin one commit while .ci holds another, as
 // after a git pull that moved the pin without a `just setup`, or the same

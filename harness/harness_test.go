@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,6 +26,10 @@ import (
 
 	"github.com/divbast/ci/internal/execx"
 )
+
+// ownLabel is the label the harness gives everything it makes in ci's own
+// tests, whose binaries are built in ci's module.
+const ownLabel = "divbast.harness=github.com/divbast/ci"
 
 // contractFlags is what every container run under the contract carries, in
 // this order, and exactly once.
@@ -91,10 +97,10 @@ func TestArgvContract(t *testing.T) {
 			}
 
 			// A spec that asks for no confinement gets none of it.
-			loose := e.Argv(&RunSpec{Image: "img"})
+			loose := e.Argv(&RunSpec{Image: "img", Confine: Unconfined()})
 			for _, flag := range []string{"--cap-drop", "--read-only", "--user", "--tmpfs"} {
 				if slices.Contains(loose, flag) {
-					t.Errorf("Argv(no confinement) = %q, holds %s", loose, flag)
+					t.Errorf("Argv(Unconfined()) = %q, holds %s", loose, flag)
 				}
 			}
 		})
@@ -142,7 +148,7 @@ func TestArgv(t *testing.T) {
 		Extra:      []string{"--init"},
 	}
 	head := []string{
-		"run", "-d", "--label", "divbast.harness=1", "--name", "ctr",
+		"run", "-d", "--label", ownLabel, "--name", "ctr",
 		"--cap-drop", "ALL", "--read-only", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m",
 		"--network", "net", "--ip", "10.89.66.200",
 		"-e", "A=1 2", "-e", "B=2",
@@ -193,7 +199,7 @@ func TestStart(t *testing.T) {
 func TestStartNamesTheContainer(t *testing.T) {
 	t.Parallel()
 
-	spec := &RunSpec{Image: "img"}
+	spec := &RunSpec{Image: "img", Confine: Contract("16m")}
 	var ran []string
 	e := newEngine("docker", runFunc(func(argv []string) execx.Result {
 		ran = append(ran, strings.Join(argv, " "))
@@ -215,46 +221,179 @@ func TestStartNamesTheContainer(t *testing.T) {
 	}
 }
 
-func TestStartNeverStarted(t *testing.T) {
+// TestNeverStartedOnlyForNeverStarted runs Start into each way a run can
+// fail, in the words Docker 29 and Podman print. ErrNeverStarted is for a
+// container the engine made and could not start; a run it refused before
+// making one, for a flag, an image it could not pull or a name already in
+// use, is ErrRefused instead. A container Start did not make is not its
+// to remove: on a name in use, its cleanup issues no rm, which the Fake,
+// having none scripted, would fail.
+func TestNeverStartedOnlyForNeverStarted(t *testing.T) {
 	t.Parallel()
 
-	spec := &RunSpec{Image: "img", Name: "ctr", Entrypoint: []string{"/nonexistent"}}
-	e := newEngine("podman", nil)
-	fake := execx.NewFake(t,
-		execx.Call{Argv: slices.Concat([]string{"podman"}, e.Argv(spec)), Result: execx.Result{
-			Code:   127,
-			Stderr: []byte(`Error: crun: executable file "/nonexistent" not found in $PATH`),
-		}},
-		// The container may have been created before its process failed,
-		// so it is removed all the same, and a missing one is no failure.
-		execx.Call{Argv: []string{"podman", "rm", "-f", "-v", "ctr"}, Result: execx.Result{
-			Code:   1,
-			Stderr: []byte(`Error: no container with name or ID "ctr" found: no such container`),
-		}},
-	)
-	e.run = fake
-
-	_, err := e.Start(t.Context(), t, spec)
-	if !errors.Is(err, ErrNeverStarted) {
-		t.Fatalf("Start() error = %v, want ErrNeverStarted", err)
+	spec := &RunSpec{Image: "img", Name: "ctr", Confine: Contract("16m")}
+	// whether the engine made ctr, as its container inspect says
+	made := func(engine string) execx.Call {
+		return execx.Call{Argv: []string{engine, "container", "inspect", "--format", "{{.Id}}", "ctr"}, Result: execx.Result{Stdout: []byte("abc123\n")}}
 	}
-	if !strings.Contains(err.Error(), "/nonexistent") {
-		t.Errorf("Start() error = %q, want the engine's own words", err)
+	notMade := func(engine string, code int, stderr string) execx.Call {
+		return execx.Call{Argv: []string{engine, "container", "inspect", "--format", "{{.Id}}", "ctr"}, Result: execx.Result{Code: code, Stderr: []byte(stderr)}}
+	}
+	tests := []struct {
+		name, engine string
+		run          execx.Result
+		inspect      []execx.Call // none for a refusal the engine's words already settle
+		othersName   bool         // the name is another container's, which no cleanup may remove
+		want         error        // nil for neither
+		wantText     string
+	}{
+		{
+			// Docker prints the ID of the container it made, then fails
+			name:   "docker-entrypoint-missing",
+			engine: "docker",
+			run: execx.Result{Code: 127, Stdout: []byte("64ca16a5b644\n"), Stderr: []byte(`docker: Error response from daemon: failed to create task for container: ` +
+				`failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: ` +
+				`error during container init: exec: "/nonexistent": stat /nonexistent: no such file or directory`)},
+			inspect:  []execx.Call{made("docker")},
+			want:     ErrNeverStarted,
+			wantText: "/nonexistent",
+		},
+		{
+			name:     "podman-entrypoint-missing",
+			engine:   "podman",
+			run:      execx.Result{Code: 127, Stderr: []byte("Error: crun: executable file `/nonexistent` not found in $PATH: No such file or directory: OCI runtime attempted to invoke a command that was not found")},
+			inspect:  []execx.Call{made("podman")},
+			want:     ErrNeverStarted,
+			wantText: "/nonexistent",
+		},
+		{
+			// A mount the runtime refused as it started the container,
+			// which Docker made first: the process never ran either.
+			name:   "docker-mount-refused-at-start",
+			engine: "docker",
+			run: execx.Result{Code: 125, Stdout: []byte("186a882cf7c6\n"), Stderr: []byte(`docker: Error response from daemon: failed to create task for container: ` +
+				`error mounting "tmpfs" to rootfs at "/tmp": invalid argument`)},
+			inspect:  []execx.Call{made("docker")},
+			want:     ErrNeverStarted,
+			wantText: "invalid argument",
+		},
+		{
+			// Made, then refused a port another holds: "already in use",
+			// but of an address, not a name, and the container exists.
+			name:     "podman-port-in-use-at-start",
+			engine:   "podman",
+			run:      execx.Result{Code: 126, Stderr: []byte("Error: rootlessport listen tcp 127.0.0.1:18290: bind: address already in use")},
+			inspect:  []execx.Call{made("podman")},
+			want:     ErrNeverStarted,
+			wantText: "address already in use",
+		},
+		{
+			name:     "docker-bad-flag",
+			engine:   "docker",
+			run:      execx.Result{Code: 125, Stderr: []byte("unknown flag: --bogus\n\nUsage:  docker run [OPTIONS] IMAGE [COMMAND] [ARG...]")},
+			inspect:  []execx.Call{notMade("docker", 1, "Error response from daemon: No such container: ctr")},
+			want:     ErrRefused,
+			wantText: "unknown flag: --bogus",
+		},
+		{
+			name:     "podman-bad-flag",
+			engine:   "podman",
+			run:      execx.Result{Code: 125, Stderr: []byte("Error: unknown flag: --bogus\nSee 'podman run --help'")},
+			inspect:  []execx.Call{notMade("podman", 125, "Error: no such container ctr")},
+			want:     ErrRefused,
+			wantText: "unknown flag: --bogus",
+		},
+		{
+			name:   "docker-pull-fails",
+			engine: "docker",
+			run: execx.Result{Code: 125, Stderr: []byte("Unable to find image 'localhost:1/none:missing' locally\n" +
+				`docker: Error response from daemon: failed to resolve reference "localhost:1/none:missing": connect: connection refused`)},
+			inspect:  []execx.Call{notMade("docker", 1, "Error response from daemon: No such container: ctr")},
+			want:     ErrRefused,
+			wantText: "connection refused",
+		},
+		{
+			name:   "podman-pull-fails",
+			engine: "podman",
+			run: execx.Result{Code: 125, Stderr: []byte("Trying to pull localhost:1/none:missing...\n" +
+				`Error: initializing source docker://localhost:1/none:missing: pinging container registry localhost:1: connect: connection refused`)},
+			inspect:  []execx.Call{notMade("podman", 125, "Error: no such container ctr")},
+			want:     ErrRefused,
+			wantText: "connection refused",
+		},
+		{
+			// The container of that name is another's, so its state says
+			// nothing of this run: it is never asked about, nor removed.
+			name:       "docker-name-in-use",
+			engine:     "docker",
+			othersName: true,
+			run: execx.Result{Code: 125, Stderr: []byte(`docker: Error response from daemon: Conflict. The container name "/ctr" is already in use by container "3f82dc47df74". ` +
+				`You have to remove (or rename) that container to be able to reuse that name.`)},
+			want:     ErrRefused,
+			wantText: "already in use",
+		},
+		{
+			name:       "podman-name-in-use",
+			engine:     "podman",
+			othersName: true,
+			run: execx.Result{Code: 125, Stderr: []byte(`Error: creating container storage: the container name "ctr" is already in use by 3f82dc47df74. ` +
+				`You have to remove that container to be able to reuse that name: that name is already in use`)},
+			want:     ErrRefused,
+			wantText: "already in use",
+		},
+		{
+			// An engine that cannot say whether it made the container gets
+			// neither error, and both of its failures are in the one given.
+			name:     "engine-gone",
+			engine:   "docker",
+			run:      execx.Result{Code: 125, Stderr: []byte("docker: Cannot connect to the Docker daemon at unix:///var/run/docker.sock.")},
+			inspect:  []execx.Call{notMade("docker", 1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")},
+			wantText: "Is the docker daemon running?",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := newEngine(tt.engine, nil)
+			calls := slices.Concat(
+				[]execx.Call{{Argv: slices.Concat([]string{tt.engine}, e.Argv(spec)), Result: tt.run}},
+				tt.inspect,
+			)
+			if !tt.othersName {
+				// Removed all the same, and a missing one is no failure
+				calls = append(calls, execx.Call{Argv: []string{tt.engine, "rm", "-f", "-v", "ctr"}, Result: execx.Result{
+					Code: 1, Stderr: []byte("Error: no such container ctr"),
+				}})
+			}
+			e.run = execx.NewFake(t, calls...)
+
+			_, err := e.Start(t.Context(), t, spec)
+			if err == nil || !strings.Contains(err.Error(), tt.wantText) {
+				t.Fatalf("Start() error = %v, want one with the engine's own words, %q", err, tt.wantText)
+			}
+			for _, sentinel := range []error{ErrNeverStarted, ErrRefused} {
+				if got, want := errors.Is(err, sentinel), errors.Is(tt.want, sentinel); got != want {
+					t.Errorf("Start() error = %v; errors.Is(err, %q) = %t, want %t", err, sentinel, got, want)
+				}
+			}
+		})
 	}
 }
 
 func TestStartRejects(t *testing.T) {
 	t.Parallel()
 
+	confine := Contract("16m")
 	tests := []struct {
 		name string
 		spec RunSpec
 	}{
-		{name: "no-image", spec: RunSpec{}},
-		{name: "volume-named-like-a-path", spec: RunSpec{Image: "img", Mounts: []Mount{{Source: "/srv", Target: "/data", Volume: true}}}},
-		{name: "bind-not-absolute", spec: RunSpec{Image: "img", Mounts: []Mount{{Source: "data", Target: "/data"}}}},
-		{name: "colon-in-source", spec: RunSpec{Image: "img", Mounts: []Mount{{Source: "a:b", Target: "/data", Volume: true}}}},
-		{name: "target-not-absolute", spec: RunSpec{Image: "img", Mounts: []Mount{{Source: "vol", Target: "data", Volume: true}}}},
+		{name: "no-image", spec: RunSpec{Confine: confine}},
+		{name: "volume-named-like-a-path", spec: RunSpec{Image: "img", Confine: confine, Mounts: []Mount{{Source: "/srv", Target: "/data", Volume: true}}}},
+		{name: "bind-not-absolute", spec: RunSpec{Image: "img", Confine: confine, Mounts: []Mount{{Source: "data", Target: "/data"}}}},
+		{name: "colon-in-source", spec: RunSpec{Image: "img", Confine: confine, Mounts: []Mount{{Source: "a:b", Target: "/data", Volume: true}}}},
+		{name: "target-not-absolute", spec: RunSpec{Image: "img", Confine: confine, Mounts: []Mount{{Source: "vol", Target: "data", Volume: true}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -269,10 +408,57 @@ func TestStartRejects(t *testing.T) {
 	}
 }
 
+// TestZeroConfinementRefused shows Start and Run refusing a spec that
+// leaves Confine unset, which would run under the engine's defaults: as
+// root, writable, with the default capabilities. Unconfined is how a test
+// asks for that on purpose.
+func TestZeroConfinementRefused(t *testing.T) {
+	t.Parallel()
+
+	if Unconfined() == (Confinement{}) {
+		t.Fatal("Unconfined() is the zero Confinement, which Start and Run refuse")
+	}
+	if f := Unconfined().flags(); len(f) != 0 {
+		t.Errorf("Unconfined() runs with %q, want no confinement flags at all", f)
+	}
+
+	t.Run("zero-refused", func(t *testing.T) {
+		t.Parallel()
+
+		// A Fake with no calls: nothing may run.
+		e := newEngine("docker", execx.NewFake(t))
+		spec := &RunSpec{Image: "img"}
+		if _, err := e.Start(t.Context(), t, spec); err == nil || !strings.Contains(err.Error(), "Unconfined") {
+			t.Errorf("Start(zero Confine) error = %v, want a refusal naming Unconfined", err)
+		}
+		if _, err := e.Run(t.Context(), t, spec); err == nil || !strings.Contains(err.Error(), "Unconfined") {
+			t.Errorf("Run(zero Confine) error = %v, want a refusal naming Unconfined", err)
+		}
+	})
+
+	t.Run("unconfined-runs", func(t *testing.T) {
+		t.Parallel()
+
+		spec := &RunSpec{Image: "img", Name: "ctr", Confine: Unconfined()}
+		e := newEngine("docker", execx.NewFake(t,
+			execx.Call{Argv: []string{"docker", "run", "-d", "--label", ownLabel, "--name", "ctr", "img"}, Result: execx.Result{Stdout: []byte("abc123\n")}},
+			execx.Call{Argv: []string{"docker", "run", "--rm", "--label", ownLabel, "--name", "ctr", "img"}},
+			execx.Call{Argv: []string{"docker", "rm", "-f", "-v", "ctr"}},
+			execx.Call{Argv: []string{"docker", "rm", "-f", "-v", "ctr"}},
+		))
+		if _, err := e.Start(t.Context(), t, spec); err != nil {
+			t.Errorf("Start(Unconfined()) error = %v", err)
+		}
+		if _, err := e.Run(t.Context(), t, spec); err != nil {
+			t.Errorf("Run(Unconfined()) error = %v", err)
+		}
+	})
+}
+
 func TestNetwork(t *testing.T) {
 	t.Parallel()
 
-	create := []string{"docker", "network", "create", "--label", "divbast.harness=1", "--subnet", "10.89.66.0/24", "--internal", "net"}
+	create := []string{"docker", "network", "create", "--label", ownLabel, "--subnet", "10.89.66.0/24", "--internal", "net"}
 	inspect := []string{"docker", "network", "inspect", "--format", "{{.Internal}}", "net"}
 	remove := []string{"docker", "network", "rm", "net"}
 
@@ -338,7 +524,7 @@ func TestVolume(t *testing.T) {
 	t.Parallel()
 
 	e := newEngine("podman", execx.NewFake(t,
-		execx.Call{Argv: []string{"podman", "volume", "create", "--label", "divbast.harness=1", "vol"}, Result: execx.Result{Stdout: []byte("vol\n")}},
+		execx.Call{Argv: []string{"podman", "volume", "create", "--label", ownLabel, "vol"}, Result: execx.Result{Stdout: []byte("vol\n")}},
 		execx.Call{Argv: []string{"podman", "volume", "rm", "vol"}},
 	))
 	if got, err := e.Volume(t.Context(), t, "vol"); err != nil || got != "vol" {
@@ -349,8 +535,10 @@ func TestVolume(t *testing.T) {
 func TestSweepCommands(t *testing.T) {
 	t.Parallel()
 
-	filter := []string{"--filter", "label=divbast.harness=1"}
+	// The module's label only: the key alone would match every module's.
+	filter := []string{"--filter", "label=" + ownLabel}
 	ps := slices.Concat([]string{"docker", "ps", "-a", "-q"}, filter)
+	images := slices.Concat([]string{"docker", "image", "ls", "-q"}, filter)
 	nets := slices.Concat([]string{"docker", "network", "ls", "-q"}, filter)
 	vols := slices.Concat([]string{"docker", "volume", "ls", "-q"}, filter)
 
@@ -360,10 +548,14 @@ func TestSweepCommands(t *testing.T) {
 		wantErr []string
 	}{
 		{
-			name: "removes-containers-then-networks-and-volumes",
+			// An image is listed once for each of its tags, and removed
+			// once, after the containers that may run it.
+			name: "removes-containers-then-images-networks-and-volumes",
 			calls: []execx.Call{
 				{Argv: ps, Result: execx.Result{Stdout: []byte("c1\nc2\n")}},
 				{Argv: []string{"docker", "rm", "-f", "-v", "c1", "c2"}},
+				{Argv: images, Result: execx.Result{Stdout: []byte("i1\ni2\ni1\n")}},
+				{Argv: []string{"docker", "image", "rm", "-f", "i1", "i2"}},
 				{Argv: nets, Result: execx.Result{Stdout: []byte("n1\n")}},
 				{Argv: []string{"docker", "network", "rm", "n1"}},
 				{Argv: vols, Result: execx.Result{Stdout: []byte("v1\nv2\n")}},
@@ -374,6 +566,7 @@ func TestSweepCommands(t *testing.T) {
 			name: "nothing-left-behind",
 			calls: []execx.Call{
 				{Argv: ps},
+				{Argv: images},
 				{Argv: nets},
 				{Argv: vols},
 			},
@@ -383,6 +576,7 @@ func TestSweepCommands(t *testing.T) {
 			name: "errors-surface",
 			calls: []execx.Call{
 				{Argv: ps, Result: execx.Result{Code: 1, Stderr: []byte("Cannot connect to the Docker daemon")}},
+				{Argv: images},
 				{Argv: nets, Result: execx.Result{Stdout: []byte("n1\n")}},
 				{Argv: []string{"docker", "network", "rm", "n1"}, Result: execx.Result{Code: 1, Stderr: []byte("network n1 has active endpoints")}},
 				{Argv: vols, Result: execx.Result{Stdout: []byte("v1\n")}},
@@ -408,6 +602,90 @@ func TestSweepCommands(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestLabelIsTheMainModules reads the label in ci's own test binary, whose
+// main module go test makes ci's.
+func TestLabelIsTheMainModules(t *testing.T) {
+	t.Parallel()
+
+	if got := newEngine("docker", nil).Label(); got != ownLabel {
+		t.Errorf("Label() = %q, want %q", got, ownLabel)
+	}
+	e, err := EngineFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Label(); got != ownLabel {
+		t.Errorf("EngineFromEnv().Label() = %q, want %q", got, ownLabel)
+	}
+}
+
+// TestLabelInAnotherModule is the case the label is for. An app's
+// acceptance suite is a test binary of the app's own module, which reaches
+// the harness through a replace, and its label must be the app's: were it
+// the harness's own module, every app's would be the same, and two suites
+// on one host would sweep each other's containers. It builds such a test
+// in a module of its own, laid out as LibreSpeed's is, and has it print
+// its label.
+func TestLabelInAnotherModule(t *testing.T) {
+	t.Parallel()
+
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("no go on PATH to build another module's test with: %v", err)
+	}
+	ci, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.27.0\n\n" +
+			"require github.com/divbast/ci v0.0.0-00010101000000-000000000000\n\n" +
+			"replace github.com/divbast/ci => " + ci + "\n",
+		"label_test.go": "package app\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/divbast/ci/harness\"\n)\n\n" +
+			"func TestLabel(t *testing.T) {\n\te, err := harness.EngineFromEnv()\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n" +
+			"\tfmt.Println(\"label:\", e.Label())\n}\n",
+	} {
+		if err = os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cmd := exec.CommandContext(t.Context(), goBin, "test", "-count=1", "-v", "-run", "^TestLabel$", ".") //nolint:gosec // G204: the go on PATH, with this test's own arguments
+	cmd.Dir = dir
+	// Nothing to download, no workspace of the caller's, and no flags of
+	// the run around this one
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off", "GOFLAGS=", "ENGINE=docker")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go test in example.com/app: %v\n%s", err, out)
+	}
+	if want := "label: divbast.harness=example.com/app\n"; !strings.Contains(string(out), want) {
+		t.Errorf("go test in example.com/app printed\n%s\nwant the line %q", out, want)
+	}
+}
+
+// TestLabelWithoutAModule covers a binary that records no main module, as
+// a test of files named on go test's command line does. Its label is its
+// own process's, so its Sweep could never remove another's.
+func TestLabelWithoutAModule(t *testing.T) {
+	t.Parallel()
+
+	if got := labelFor(&debug.BuildInfo{Main: debug.Module{Path: "example.com/app"}}, true); got != "divbast.harness=example.com/app" {
+		t.Errorf("labelFor(example.com/app) = %q, want divbast.harness=example.com/app", got)
+	}
+	noPath := labelFor(&debug.BuildInfo{}, true)
+	noInfo := labelFor(nil, false)
+	for _, got := range []string{noPath, noInfo} {
+		if !strings.HasPrefix(got, "divbast.harness=divbast-") || len(got) <= len("divbast.harness=divbast-") {
+			t.Errorf("labelFor(no main module) = %q, want divbast.harness= and a unique name", got)
+		}
+	}
+	if noPath == noInfo {
+		t.Errorf("labelFor(no main module) gave %q twice, want each its own", noPath)
 	}
 }
 
@@ -531,6 +809,61 @@ func TestInspectPodmanHostConfig(t *testing.T) {
 	}
 }
 
+// TestInspectPorts reads the host address each published port is bound
+// to. Docker 29 printed NetworkSettings.Ports as the docker case has it,
+// for a container run with -p 127.0.0.1::8080 -p 8081 whose image exposes
+// 8080 and 8081: one binding for an address given, one per address family
+// for none, and null for a port exposed but not published.
+//
+// The podman case is the shape of Podman's define.InspectHostPort
+// (libpod/define/container_inspect.go, v6.2.0), whose HostIp is "" for a
+// port bound on every address. Podman 4.9 printed it so, since its
+// makeInspectPorts (libpod/util.go) copied the address as given; from 5.0
+// on Podman writes 0.0.0.0 there, as Docker does. An exposed port gets a
+// nil binding (addInspectPortsExpose). Podman is not installed where this
+// was written, so the shape is from the source, not a run.
+func TestInspectPorts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, engine, ports string
+		want                map[string]string
+	}{
+		{
+			name:   "docker",
+			engine: "docker",
+			ports: `{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"32768"}],` +
+				`"8081/tcp":[{"HostIp":"0.0.0.0","HostPort":"32769"},{"HostIp":"::","HostPort":"32769"}]}`,
+			want: map[string]string{"8080/tcp": "127.0.0.1:32768", "8081/tcp": "0.0.0.0:32769"},
+		},
+		{
+			name:   "podman",
+			engine: "podman",
+			ports:  `{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18290"}],"8081/tcp":[{"HostIp":"","HostPort":"18291"}],"9000/tcp":null}`,
+			want:   map[string]string{"8080/tcp": "127.0.0.1:18290", "8081/tcp": "0.0.0.0:18291"},
+		},
+		{name: "exposed-not-published", engine: "docker", ports: `{"8080/tcp":null,"8081/tcp":[]}`, want: map[string]string{}},
+		{name: "none-exposed", engine: "podman", ports: `{}`, want: map[string]string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := `[{"State": {"Status": "running", "Running": true}, "NetworkSettings": {"Ports": ` + tt.ports + `}}]`
+			c := &Container{ID: "abc", engine: newEngine(tt.engine, execx.NewFake(t,
+				execx.Call{Argv: []string{tt.engine, "container", "inspect", "abc"}, Result: execx.Result{Stdout: []byte(out)}},
+			))}
+			got, err := c.Inspect(t.Context())
+			if err != nil {
+				t.Fatalf("Inspect() error = %v", err)
+			}
+			if !maps.Equal(got.Ports, tt.want) {
+				t.Errorf("Inspect().Ports = %q, want %q", got.Ports, tt.want)
+			}
+		})
+	}
+}
+
 func TestRun(t *testing.T) {
 	t.Parallel()
 
@@ -549,7 +882,7 @@ func TestRun(t *testing.T) {
 	e.run = execx.NewFake(t,
 		execx.Call{
 			Argv: []string{
-				"docker", "run", "--rm", "--label", "divbast.harness=1", "--name", "ctr",
+				"docker", "run", "--rm", "--label", ownLabel, "--name", "ctr",
 				"--cap-drop", "ALL", "--read-only", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m",
 				"--network", "none", "--entrypoint", FrankenPHP, "img", "version",
 			},
@@ -673,10 +1006,14 @@ func TestEngineHealthy(t *testing.T) {
 			calls:  []execx.Call{{Argv: healthcheck}},
 		},
 		{
-			name:     "podman-check-fails",
-			engine:   "podman",
-			calls:    []execx.Call{{Argv: healthcheck, Result: execx.Result{Code: 1, Stdout: []byte("unhealthy\n")}}},
-			wantText: "unhealthy",
+			// It prints only "unhealthy", so why is read from the health log.
+			name:   "podman-check-fails",
+			engine: "podman",
+			calls: []execx.Call{
+				{Argv: healthcheck, Result: execx.Result{Code: 1, Stdout: []byte("unhealthy\n")}},
+				{Argv: []string{"podman", "container", "inspect", "abc"}, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "unhealthy")}},
+			},
+			wantText: "unhealthy; its checks:\n  exit 1: probe said no",
 		},
 		{
 			name:   "docker-healthy-once-started",
@@ -1026,6 +1363,42 @@ func TestInstallProbeRetries(t *testing.T) {
 	}
 }
 
+// TestProbeRetryCodes runs the install into each exit status once. Only
+// the engine's own, 125 to 128, are tried again: any other is the PHP the
+// exec ran, a fatal error's 255 among them, which another try would only
+// repeat.
+func TestProbeRetryCodes(t *testing.T) {
+	t.Parallel()
+
+	install := []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")}
+	inspect := []string{"docker", "container", "inspect", "abc"}
+	for _, code := range []int{1, 2, 124, 125, 126, 127, 128, 129, 137, 255} {
+		retried := code >= 125 && code <= 128
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				failed := execx.Result{Code: code, Stderr: []byte("exit " + strconv.Itoa(code))}
+				calls := []execx.Call{{Argv: install, Stdin: coreProbe, Result: failed}}
+				if retried {
+					calls = append(calls,
+						execx.Call{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
+						execx.Call{Argv: install, Stdin: coreProbe},
+					)
+				}
+				c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, calls...))}
+
+				_, err := InstallProbe(t.Context(), c, nil)
+				switch {
+				case retried && err != nil:
+					t.Errorf("InstallProbe() after exit status %d, then 0: error = %v, want it tried again and installed", code, err)
+				case !retried && (err == nil || !strings.Contains(err.Error(), fmt.Sprintf("exit status %d", code))):
+					t.Errorf("InstallProbe() after exit status %d: error = %v, want that status, not tried again", code, err)
+				}
+			})
+		})
+	}
+}
+
 func TestProbeRun(t *testing.T) {
 	t.Parallel()
 
@@ -1217,7 +1590,9 @@ func runPHP(t *testing.T, script string, args ...string) execx.Result {
 // taken from the LibreSpeed fixture under Docker, on an internal network,
 // where Docker's resolver keeps a TCP listener and a UDP socket at
 // 127.0.0.11 that no process in the container holds. proc-net-udp adds,
-// by hand, a UDP socket that one does hold, at port 5353.
+// by hand, a UDP socket that one does hold, at port 5353. The resolver's
+// UDP port, 60327, sorts after it, so only the whole of what the parser
+// printed shows it was left out.
 func TestListenersParser(t *testing.T) {
 	t.Parallel()
 
@@ -1229,7 +1604,11 @@ func TestListenersParser(t *testing.T) {
 	}{
 		{name: "held-udp-reported-resolver-ignored", tcp: "proc-net-tcp", udp: "proc-net-udp", want: "udp 5353\n"},
 		{name: "held-tcp-listeners", tcp: "proc-net-tcp6", udp: "proc-net-udp6", want: "tcp 8080\ntcp 8081\n"},
-		{name: "malformed-table", tcp: "proc-net-malformed", udp: "proc-net-udp6", wantCode: 1, want: "FAIL\tparse-listeners completed"},
+		{
+			name: "malformed-table", tcp: "proc-net-malformed", udp: "proc-net-udp6", wantCode: 1,
+			want: "FAIL\tparse-listeners completed\tno exception\t" +
+				"RuntimeException: testdata/proc-net-malformed has a line that is not a socket: this is not a socket\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1237,8 +1616,8 @@ func TestListenersParser(t *testing.T) {
 
 			res := runPHP(t, "probe/core.php", "parse-listeners",
 				filepath.Join("testdata", tt.tcp), filepath.Join("testdata", tt.udp), filepath.Join("testdata", "proc-net-fds"))
-			if res.Code != tt.wantCode || !strings.HasPrefix(string(res.Stdout), tt.want) {
-				t.Errorf("parse-listeners = exit %d, stdout %q, stderr %q; want exit %d, stdout starting %q",
+			if res.Code != tt.wantCode || string(res.Stdout) != tt.want {
+				t.Errorf("parse-listeners = exit %d, stdout %q, stderr %q; want exit %d, stdout %q",
 					res.Code, res.Stdout, res.Stderr, tt.wantCode, tt.want)
 			}
 		})

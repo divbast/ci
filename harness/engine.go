@@ -7,9 +7,13 @@
 // and never a looser one an SDK might set up instead. It also ships the
 // probe those checks run inside a container, as the container's own PHP.
 //
-// Every container, network and volume it makes carries the label
-// divbast.harness=1, and is removed when the test that made it ends.
-// [Engine.Sweep] removes whatever a run that died left behind.
+// Every container, image, network and volume it makes carries the label
+// divbast.harness=<module>, where <module> is the path of the main module
+// of the binary running it, and is removed when the test that made it
+// ends. An app's acceptance suite is a test binary of the app's own
+// module, so each repository's suite has a label of its own, and
+// [Engine.Sweep] removes whatever a run of it that died left behind, and
+// nothing another repository's suite on the same host made.
 package harness
 
 import (
@@ -20,16 +24,41 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
 )
 
-// Label is the label every container, network and volume the harness
-// makes carries, as key=value, and what [Engine.Sweep] removes by.
+// Label is the label the harness gave everything it made, whichever suite
+// ran it, before it labelled by module.
+//
+// Deprecated: nothing the harness makes carries Label, and Sweep does not
+// remove by it. [Engine.Label] returns the label it gives instead.
 const Label = "divbast.harness=1"
+
+// labelKey is the key of the label the harness gives everything it makes.
+const labelKey = "divbast.harness"
+
+// moduleLabel is the label this binary gives everything it makes,
+// worked out once.
+var moduleLabel = sync.OnceValue(func() string { return labelFor(debug.ReadBuildInfo()) })
+
+// labelFor returns the label for a binary whose build info is bi, which ok
+// says it records: labelKey, and the main module's path as its value. A
+// binary that records no main module, as a test of files named on go
+// test's command line does not, gets a unique value of its own instead, so
+// its Sweep can only ever remove what it made itself.
+func labelFor(bi *debug.BuildInfo, ok bool) string {
+	if ok && bi.Main.Path != "" {
+		return labelKey + "=" + bi.Main.Path
+	}
+	return labelKey + "=" + uniqueName()
+}
 
 // cleanupTimeout bounds each removal a test's cleanup runs. The test's own
 // context is done by then.
@@ -39,9 +68,12 @@ const cleanupTimeout = 2 * time.Minute
 type Engine struct {
 	name string
 	run  execx.StdinRunner
-	// label is [Label], except in the test of Sweep itself, which must not
-	// remove what tests running beside it made.
+	// label is the module's label, except in the test of Sweep itself,
+	// which must not remove what tests running beside it made.
 	label string
+	// configs holds the image configurations podman save has read. Every
+	// engine EngineFromEnv returns shares one.
+	configs *configCache
 }
 
 // EngineFromEnv returns the engine $ENGINE names: docker, the default when
@@ -49,28 +81,37 @@ type Engine struct {
 func EngineFromEnv() (Engine, error) {
 	switch name := cmp.Or(os.Getenv("ENGINE"), "docker"); name {
 	case "docker", "podman":
-		return newEngine(name, execx.OS{}), nil
+		e := newEngine(name, execx.OS{})
+		e.configs = sharedConfigs
+		return e, nil
 	default:
 		return Engine{}, fmt.Errorf("ENGINE is %q: it must be docker or podman", name)
 	}
 }
 
 func newEngine(name string, run execx.StdinRunner) Engine {
-	return Engine{name: name, run: run, label: Label}
+	return Engine{name: name, run: run, label: moduleLabel(), configs: newConfigCache()}
 }
 
 // Name returns the engine's command: docker or podman.
 func (e Engine) Name() string { return e.name }
 
-// Sweep removes every container, network and volume that carries the
-// harness's label: containers first, since a network or volume one still
-// uses cannot go. Every failure is returned, joined, and none stops the
-// rest. It removes another run's resources as readily as a dead one's, so
-// it belongs before a suite starts, never beside one running.
+// Label returns the label, as key=value, that everything e makes carries,
+// and that [Engine.Sweep] removes by: divbast.harness, and the path of the
+// running binary's main module as its value.
+func (e Engine) Label() string { return e.label }
+
+// Sweep removes every container, image, network and volume that carries
+// e's label: containers first, since an image, network or volume one still
+// uses cannot go. That label is the module's, so whatever another module's
+// suite made on the same host stays. Another run of this module's would
+// not, so Sweep belongs before a suite starts, never beside one running.
+// Every failure is returned, joined, and none stops the rest.
 func (e Engine) Sweep(ctx context.Context) error {
 	filter := []string{"--filter", "label=" + e.label}
 	kinds := []struct{ list, remove []string }{
 		{list: []string{"ps", "-a", "-q"}, remove: []string{"rm", "-f", "-v"}},
+		{list: []string{"image", "ls", "-q"}, remove: []string{"image", "rm", "-f"}},
 		{list: []string{"network", "ls", "-q"}, remove: []string{"network", "rm"}},
 		{list: []string{"volume", "ls", "-q"}, remove: []string{"volume", "rm"}},
 	}
@@ -82,7 +123,13 @@ func (e Engine) Sweep(ctx context.Context) error {
 			errs = append(errs, err)
 			continue
 		}
-		ids := strings.Fields(string(out))
+		// An image is listed once for each of its tags.
+		seen := make(map[string]bool)
+		ids := slices.DeleteFunc(strings.Fields(string(out)), func(id string) bool {
+			dup := seen[id]
+			seen[id] = true
+			return dup
+		})
 		if len(ids) == 0 {
 			continue
 		}

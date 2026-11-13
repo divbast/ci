@@ -6,7 +6,10 @@ package harness
 import (
 	"errors"
 	"net"
+	"net/http"
 	"os"
+	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -40,53 +43,86 @@ func integration(t *testing.T) Engine {
 	return e
 }
 
-func TestSweep(t *testing.T) {
+// TestSweepOnlyOwnLabel leaves behind, as three runs that died would, what
+// each made under its module's label, then sweeps one of them: everything
+// that one made goes, and nothing either of the others made does. One of
+// the others is a module whose path starts with the swept one's, which a
+// sweep matching a prefix, or the key alone, would take too.
+//
+// The modules are this test's own, under the harness's key: sweeping by
+// the label of ci's own module would remove the containers of every test
+// running beside it, in this package or the contract suite's.
+func TestSweepOnlyOwnLabel(t *testing.T) {
 	t.Parallel()
 	e := integration(t)
 	ctx := t.Context()
 
-	// A label of this test's own: sweeping the harness's would remove the
-	// containers of every test running beside it, in this package or any
-	// other.
-	e.label = "divbast.harness.sweep-test=" + strings.TrimPrefix(uniqueName(), "divbast-")
-	t.Cleanup(func() {
-		sweepCtx, cancel := cleanupContext(ctx)
-		defer cancel()
-		if err := e.Sweep(sweepCtx); err != nil {
-			t.Errorf("sweeping up after the test: %v", err)
-		}
-	})
+	module := "example.com/sweep-" + strings.TrimPrefix(uniqueName(), "divbast-")
+	swept, longer, other := e, e, e
+	swept.label = labelFor(&debug.BuildInfo{Main: debug.Module{Path: module}}, true)
+	longer.label = labelFor(&debug.BuildInfo{Main: debug.Module{Path: module + "/more"}}, true)
+	other.label = labelFor(&debug.BuildInfo{Main: debug.Module{Path: "example.com/other-" + strings.TrimPrefix(uniqueName(), "divbast-")}}, true)
+	engines := []Engine{swept, longer, other}
 
-	// Left behind as a run that died would leave them, made with no cleanup
-	// to remove them: a running container that holds a network and a
-	// volume, which cannot go before it does.
-	network, volume := uniqueName(), uniqueName()
-	for _, args := range [][]string{
-		{"network", "create", "--label", e.label, network},
-		{"volume", "create", "--label", e.label, volume},
-		e.Argv(&RunSpec{
-			Image:   testfixture.LibreSpeed,
-			Network: network,
-			Confine: Contract("16m"),
-			Mounts:  []Mount{{Source: volume, Target: "/data", Volume: true}},
-		}),
-	} {
-		if _, err := e.output(ctx, args...); err != nil {
-			t.Fatal(err)
-		}
+	// Each an image, and a running container of it that holds a network
+	// and a volume, none of which can go before it does. Only the images
+	// have cleanups of their own; the sweeps below are the rest's.
+	containerfile := filepath.Join(t.TempDir(), "Containerfile")
+	if err := os.WriteFile(containerfile, []byte("FROM "+testfixture.LibreSpeed+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := e.Sweep(ctx); err != nil {
-		t.Fatalf("Sweep() error = %v", err)
-	}
-
-	for _, list := range [][]string{{"ps", "-a", "-q"}, {"network", "ls", "-q"}, {"volume", "ls", "-q"}} {
-		out, err := e.output(ctx, append(list, "--filter", "label="+e.label)...)
+	images := make([]string, len(engines))
+	for i, eng := range engines {
+		image, err := eng.Build(ctx, t, containerfile, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if left := strings.Fields(string(out)); len(left) != 0 {
-			t.Errorf("after Sweep(), %s %s lists %q, want nothing", e.name, strings.Join(list, " "), left)
+		images[i] = image
+	}
+	t.Cleanup(func() {
+		sweepCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		for _, eng := range engines {
+			if err := eng.Sweep(sweepCtx); err != nil {
+				t.Errorf("sweeping up after the test: %v", err)
+			}
+		}
+	})
+	for i, eng := range engines {
+		network, volume := uniqueName(), uniqueName()
+		for _, args := range [][]string{
+			{"network", "create", "--label", eng.label, network},
+			{"volume", "create", "--label", eng.label, volume},
+			eng.Argv(&RunSpec{
+				Image:   images[i],
+				Network: network,
+				Confine: Contract("16m"),
+				Mounts:  []Mount{{Source: volume, Target: "/data", Volume: true}},
+			}),
+		} {
+			if _, err := eng.output(ctx, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if err := swept.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep() error = %v", err)
+	}
+
+	for _, eng := range engines {
+		for _, list := range [][]string{{"ps", "-a", "-q"}, {"image", "ls", "-q"}, {"network", "ls", "-q"}, {"volume", "ls", "-q"}} {
+			out, err := eng.output(ctx, append(list, "--filter", "label="+eng.label)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			left := strings.Fields(string(out))
+			switch {
+			case eng.label == swept.label && len(left) != 0:
+				t.Errorf("after Sweep(), %s %s for %s lists %q, want nothing", e.name, strings.Join(list, " "), eng.label, left)
+			case eng.label != swept.label && len(left) != 1:
+				t.Errorf("after the sweep of %s, %s %s for %s lists %q, want the one it made", swept.label, e.name, strings.Join(list, " "), eng.label, left)
+			}
 		}
 	}
 }
@@ -137,10 +173,110 @@ func TestWaitExitOnFixture(t *testing.T) {
 			Confine:    Contract("16m"),
 			Entrypoint: []string{"/nonexistent"},
 		})
-		if !errors.Is(err, ErrNeverStarted) {
-			t.Errorf("Start(entrypoint /nonexistent) error = %v, want ErrNeverStarted", err)
+		if !errors.Is(err, ErrNeverStarted) || errors.Is(err, ErrRefused) {
+			t.Errorf("Start(entrypoint /nonexistent) error = %v, want ErrNeverStarted alone", err)
 		}
 	})
+
+	// Runs the engine refuses before it makes a container at all, which
+	// are not containers that never started.
+	t.Run("refused", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+
+		taken, err := e.Start(ctx, t, &RunSpec{Image: testfixture.LibreSpeed, Confine: Contract("16m")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The container whose name a-name-in-use asks for is another's,
+		// which that run never made, so its cleanup must leave it be. This
+		// runs once every case below has ended and run its cleanups, and
+		// before taken's own cleanup removes it.
+		t.Cleanup(func() {
+			inspectCtx, cancel := cleanupContext(ctx)
+			defer cancel()
+			if ins, ierr := taken.Inspect(inspectCtx); ierr != nil || !ins.State.Running {
+				t.Errorf("container %s, whose name a refused run asked for: %+v, %v; want it still running", taken, ins.State, ierr)
+			}
+		})
+		for _, tt := range []struct {
+			name string
+			spec RunSpec
+		}{
+			{name: "a-flag", spec: RunSpec{Image: testfixture.LibreSpeed, Extra: []string{"--no-such-flag"}}},
+			// Nothing listens on port 1, so the pull fails at once.
+			{name: "an-image-it-cannot-pull", spec: RunSpec{Image: "localhost:1/divbast/none:missing"}},
+			{name: "a-name-in-use", spec: RunSpec{Image: testfixture.LibreSpeed, Name: taken.Name}},
+		} {
+			// Each a test of its own, whose cleanups run when it ends
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				tt.spec.Confine = Contract("16m")
+				_, err := e.Start(t.Context(), t, &tt.spec)
+				if !errors.Is(err, ErrRefused) || errors.Is(err, ErrNeverStarted) {
+					t.Errorf("Start() error = %v, want ErrRefused alone", err)
+				}
+			})
+		}
+	})
+}
+
+// TestInspectPortsOnFixture publishes the app port to a host port the
+// engine picks, and reads back where: the fixed host ports a suite would
+// otherwise choose collide with any other suite on the host using them.
+func TestInspectPortsOnFixture(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+
+	c, _ := startServed(t, e, &RunSpec{
+		Image:   testfixture.LibreSpeed,
+		Confine: Contract("16m"),
+		Publish: []string{"127.0.0.1::8080"},
+	})
+	ins, err := c.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ins.Ports["8080/tcp"]
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host != "127.0.0.1" || port == "" || port == "0" {
+		t.Fatalf("Inspect().Ports = %q, want 8080/tcp at 127.0.0.1 and the port the engine picked", ins.Ports)
+	}
+	if got, published := ins.Ports["8081/tcp"]; published {
+		t.Errorf("Inspect().Ports[8081/tcp] = %q, for a port the image exposes and the run did not publish", got)
+	}
+
+	// That address reaches the app from the host.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := HostClient().Do(req)
+	if err != nil {
+		t.Fatalf("GET / at %s, from the host: %v", addr, err)
+	}
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Error(cerr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET / at %s, from the host: status %d, want 200", addr, resp.StatusCode)
+	}
+
+	// A port published on every address reads as 0.0.0.0 on either engine,
+	// whatever address the engine itself wrote for it.
+	all, err := e.Start(ctx, t, &RunSpec{Image: testfixture.LibreSpeed, Confine: Contract("16m"), Publish: []string{"8080"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, err = all.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port, err = net.SplitHostPort(ins.Ports["8080/tcp"])
+	if err != nil || host != "0.0.0.0" || port == "" || port == "0" {
+		t.Errorf("Inspect().Ports = %q after -p 8080, want 8080/tcp at 0.0.0.0 and the port the engine picked", ins.Ports)
+	}
 }
 
 // startServed starts spec, installs the probe, and waits until both of the
@@ -237,6 +373,8 @@ func TestProbeNegative(t *testing.T) {
 		// tries is how many runs of sub may be needed to see fail FAIL,
 		// for a check whose one try can be inconclusive. Zero is one.
 		tries int
+		// asRoot is a command run beside the server, detached, as root.
+		asRoot []string
 	}{
 		{
 			// It reaches CapBnd alone: exec clears CapEff and CapPrm for
@@ -276,6 +414,17 @@ func TestProbeNegative(t *testing.T) {
 			ok:   []string{"UDP ports a process in the container holds a socket on"},
 		},
 		{
+			// A process of another user, which the probe, as the
+			// container's own and with no capabilities, may not look into:
+			// any socket it held would go uncounted.
+			name:   "a-process-the-probe-cannot-look-into",
+			spec:   &RunSpec{Confine: Contract("16m")},
+			asRoot: []string{FrankenPHP, "php-cli", "-r", "sleep(600);"},
+			sub:    []string{"assert-listeners", "8080", "8081"},
+			fail:   "processes in the container whose descriptors the probe cannot read",
+			ok:     []string{"TCP ports a process in the container listens on", "UDP ports a process in the container holds a socket on"},
+		},
+		{
 			// The engine's default network, which has a route out. One
 			// connect there can time out, through rootless slirp4netns
 			// under load, which shows nothing either way: the case passes
@@ -298,7 +447,12 @@ func TestProbeNegative(t *testing.T) {
 
 			spec := *tt.spec
 			spec.Image = testfixture.LibreSpeed
-			_, p := startServed(t, e, &spec)
+			c, p := startServed(t, e, &spec)
+			if tt.asRoot != nil {
+				if _, err := e.output(t.Context(), slices.Concat([]string{"exec", "-d", "-u", "0", c.ID}, tt.asRoot)...); err != nil {
+					t.Fatal(err)
+				}
+			}
 			tries := max(tt.tries, 1)
 			var records []Record
 			for try := 1; ; try++ {
@@ -358,6 +512,7 @@ func needEgress(t *testing.T) {
 func TestEngineUnhealthy(t *testing.T) {
 	t.Parallel()
 	e := integration(t)
+	ctx := t.Context()
 
 	// A shell-form health check, which the engine runs as /bin/sh -c, and
 	// which no image without /bin/sh can pass.
@@ -366,9 +521,43 @@ func TestEngineUnhealthy(t *testing.T) {
 		Confine: Contract("16m"),
 		Extra:   []string{"--health-cmd", "exit 0"},
 	})
-	err := c.EngineHealthy(t.Context(), 15*time.Second)
-	if err == nil {
+	unhealthy := c.EngineHealthy(ctx, 15*time.Second)
+	if unhealthy == nil {
 		t.Fatal("EngineHealthy() = nil, want an error for a shell-form health check in an image with no shell")
 	}
-	t.Logf("EngineHealthy() error, as it should be: %v", err)
+	t.Logf("EngineHealthy() error, as it should be: %v", unhealthy)
+
+	// Unhealthy for want of the shell, and for nothing else, or this shows
+	// nothing: the check the engine ran is the shell form, and the shell it
+	// runs that with cannot be executed.
+	ins, err := c.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hc := ins.Config.Healthcheck; hc == nil || len(hc.Test) == 0 || hc.Test[0] != "CMD-SHELL" {
+		t.Fatalf("the container's health check is %+v, want the shell form, CMD-SHELL", hc)
+	}
+	// Run by hand, what the engine runs for it fails in the runtime's own
+	// words. Podman's health log keeps only what a check printed, which is
+	// nothing for one whose shell could not be executed.
+	res, err := c.Exec(ctx, nil, "/bin/sh", "-c", "exit 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := combined(res); (res.Code != 126 && res.Code != 127) || !strings.Contains(out, "/bin/sh") {
+		t.Fatalf("/bin/sh -c 'exit 0' in the container: exit %d: %s; want 126 or 127, the runtime saying /bin/sh could not be executed", res.Code, out)
+	}
+	switch e.Name() {
+	case "docker":
+		// Docker's health log does keep the runtime's words, for each check.
+		if !strings.Contains(unhealthy.Error(), "/bin/sh") {
+			t.Fatalf("EngineHealthy() error = %v, want Docker's health log saying /bin/sh could not be run", unhealthy)
+		}
+	case "podman":
+		// The check ran and failed: podman healthcheck run exits 1 saying
+		// unhealthy, where an error of the engine's own exits 125.
+		if !strings.Contains(unhealthy.Error(), "exit status 1: unhealthy") {
+			t.Fatalf("EngineHealthy() error = %v, want podman healthcheck run's exit status 1 and its word unhealthy", unhealthy)
+		}
+	}
 }
