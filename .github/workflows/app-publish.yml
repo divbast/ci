@@ -278,10 +278,11 @@ jobs:
           create-storage-record: false
 
       # What a user runs before trusting the image, against the index's own
-      # bytes, fetched by digest: gh looks the attestation up by the file's
-      # digest, so it needs nothing from the registry, and an empty
-      # DOCKER_CONFIG keeps the login above from it. Off a terminal, gh
-      # prints nothing when it succeeds, so the JSON is what the log shows.
+      # bytes, fetched by digest and checked against it: gh looks the
+      # attestation up by the file's digest, so it needs nothing from the
+      # registry, and an empty DOCKER_CONFIG keeps the login above from it.
+      # Off a terminal, gh prints nothing when it succeeds, so the JSON is
+      # what the log shows.
       - name: Verify the index's attestation
         if: steps.decide.outputs.publish == 'true'
         env:
@@ -291,6 +292,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           skopeo inspect --raw "docker://${IMAGE}@${DIGEST}" > /tmp/index-manifest.json
+          fetched=$(shasum -a 256 < /tmp/index-manifest.json)
+          if [ "sha256:${fetched%% *}" != "${DIGEST}" ]; then
+            echo "${IMAGE}@${DIGEST} came back as bytes whose digest is sha256:${fetched%% *}" >&2
+            exit 1
+          fi
           empty=$(mktemp -d)
           verify() {
             DOCKER_CONFIG="${empty}" gh attestation verify /tmp/index-manifest.json \

@@ -1,0 +1,115 @@
+== Refuse anything but the daily slot or a manual run on main ==
+case "${EVENT}" in
+  schedule | workflow_dispatch) ;;
+  *)
+    echo "only the daily slot and a manual run publish, not a ${EVENT} run" >&2
+    exit 1
+    ;;
+esac
+if [ "${REF}" != refs/heads/main ]; then
+  echo "only main publishes, not ${REF}" >&2
+  exit 1
+fi
+== Decide whether to publish ==
+# actions/checkout points origin/main at the commit this run built,
+# not at main's tip, so a newer published commit would read as one
+# that is not on main. The repository is public; no credentials.
+git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")
+.ci/bin/divbast-publish-decision -event "${EVENT}" -built "${GITHUB_SHA}" -published "${published}"
+== Start the rehearsal's registry ==
+# renovate: registry
+docker run -d -p 127.0.0.1:5000:5000 registry:<version>@<digest>
+curl -fsS --retry 10 --retry-delay 1 --retry-all-errors -o /dev/null http://127.0.0.1:5000/v2/
+mkdir -p "${HOME}/.config/containers/registries.conf.d"
+printf '[[registry]]\nlocation = "localhost:5000"\ninsecure = true\n' \
+  > "${HOME}/.config/containers/registries.conf.d/rehearsal.conf"
+echo rehearsal | docker login --username rehearsal --password-stdin localhost:5000
+== Read the version from the Containerfile ==
+if [[ ! "${VERSION_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  echo "version-arg must name an ARG, not ${VERSION_ARG}" >&2
+  exit 1
+fi
+v=$(sed -n "s/^ARG ${VERSION_ARG}=//p" Containerfile)
+if [[ ! "${v}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+  echo "Containerfile has no one ARG ${VERSION_ARG}= line whose value can tag an image" >&2
+  exit 1
+fi
+echo "version=${v}" >> "${GITHUB_OUTPUT}"
+== Choose where to publish ==
+if [ "${REHEARSE}" = true ]; then
+  echo "image=localhost:5000/${IMAGE#*/}" >> "${GITHUB_OUTPUT}"
+else
+  echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+fi
+== Push each tested architecture ==
+for arch in amd64 arm64; do
+  skopeo copy --all \
+    --digestfile "/tmp/digest-${arch}" \
+    --dest-authfile "${HOME}/.docker/config.json" \
+    "oci-archive:/tmp/images/image-${arch}/image.tar" \
+    "docker://${IMAGE}:${VERSION}-${arch}"
+done
+== Merge the architectures into one index under a staging tag ==
+created=$(date -u -d "@$(git log -1 --pretty=%ct)" +%Y-%m-%dT%H:%M:%SZ)
+docker buildx imagetools create \
+  --metadata-file /tmp/index.json \
+  --annotation "index:org.opencontainers.image.version=${VERSION}" \
+  --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+  --annotation "index:org.opencontainers.image.created=${created}" \
+  --annotation "index:org.opencontainers.image.description=${DESCRIPTION}" \
+  -t "${IMAGE}:${VERSION}-staging" \
+  "${IMAGE}@$(cat /tmp/digest-amd64)" \
+  "${IMAGE}@$(cat /tmp/digest-arm64)"
+digest=$(jq -er '."containerimage.descriptor".digest' /tmp/index.json)
+echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+== Verify the index's attestation ==
+skopeo inspect --raw "docker://${IMAGE}@${DIGEST}" > /tmp/index-manifest.json
+fetched=$(shasum -a 256 < /tmp/index-manifest.json)
+if [ "sha256:${fetched%% *}" != "${DIGEST}" ]; then
+  echo "${IMAGE}@${DIGEST} came back as bytes whose digest is sha256:${fetched%% *}" >&2
+  exit 1
+fi
+empty=$(mktemp -d)
+verify() {
+  DOCKER_CONFIG="${empty}" gh attestation verify /tmp/index-manifest.json \
+    --repo "${REPO}" \
+    --signer-workflow divbast/ci/.github/workflows/app-publish.yml \
+    --source-ref refs/heads/main \
+    --format json > /tmp/verified.json
+}
+# Three tries, ten seconds apart, for an attestation made moments
+# ago that the API does not return yet
+verify || { sleep 10 && verify; } || { sleep 10 && verify; }
+# For the log alone: gh's exit status is the verdict
+signer=$(jq -r '(.[0].verificationResult.signature.certificate.buildSignerURI)? // "unknown"' /tmp/verified.json) ||
+  signer=unknown
+echo "${IMAGE}@${DIGEST} verifies, signed by ${signer}"
+== Tag the attested index with the version and latest ==
+args=(
+  -t "${IMAGE}:${VERSION}"
+  -t "${IMAGE}:latest"
+  "${IMAGE}@${DIGEST}"
+)
+docker buildx imagetools create --dry-run "${args[@]}" > /tmp/promoted.json
+size=$(wc -c < /tmp/promoted.json)
+would=$(head -c "$((size - 1))" /tmp/promoted.json | shasum -a 256)
+if [ "sha256:${would%% *}" != "${DIGEST}" ]; then
+  echo "imagetools would tag sha256:${would%% *}, not ${DIGEST}, the index attested" >&2
+  exit 1
+fi
+echo "moving=true" >> "${GITHUB_OUTPUT}"
+docker buildx imagetools create "${args[@]}"
+== Check both tags are the attested index to an anonymous client ==
+for tag in "${VERSION}" latest; do
+  if ! pulled=$(skopeo inspect --raw --no-creds "docker://${IMAGE}:${tag}" | shasum -a 256) ||
+    [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
+    echo "${IMAGE}:${tag} is not anonymously pullable as ${DIGEST}" >&2
+    exit 1
+  fi
+  echo "${IMAGE}:${tag} is ${DIGEST} to an anonymous client"
+done
+== Say that the public tags did not move ==
+echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
+  "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
+  "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."

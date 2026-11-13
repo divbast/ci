@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"io/fs"
 	"maps"
@@ -522,32 +523,38 @@ func TestPublishAttestsBeforePromote(t *testing.T) {
 		viaEnv      = "          " + from + ` "docker://${IMAGE}:${PUBLIC}"` + "\n"
 	)
 	for name, mutant := range map[string]string{
-		"the version tagged before attesting":   strings.Replace(publish, staging, `            -t "${IMAGE}:${VERSION}" \`+"\n", 1),
-		"latest tagged before attesting":        strings.Replace(publish, staging, staging+`            -t "${IMAGE}:latest" \`+"\n", 1),
-		"an arch pushed as latest":              strings.Replace(publish, `"docker://${IMAGE}:${VERSION}-${arch}"`, `"docker://${IMAGE}:latest"`, 1),
-		"the version pushed before attesting":   replaceAfter(publish, pushName, "          done\n", "          done\n          skopeo copy --all \"docker://${IMAGE}@$(cat /tmp/digest-amd64)\" \"docker://${IMAGE}:${VERSION}\"\n"),
-		"both tags pushed in a loop":            replaceAfter(publish, pushName, "          done\n", "          done\n"+loop),
-		"latest pushed through a variable":      replaceAfter(publish, pushName, "          done\n", "          done\n"+viaVariable),
-		"latest pushed through the env":         replaceAfter(replaceAfter(publish, pushName, "          done\n", "          done\n"+viaEnv), pushName, "        env:\n", "        env:\n          PUBLIC: latest\n"),
-		"the decision's read moved past a push": replaceAfter(publish, verifyName, "        run: |\n", "        run: |\n          published=$(.ci/bin/divbast-published-revision \"${IMAGE}:latest\")\n"),
-		"promoted before verifying":             moveStep(publish, promoteName, verifyName),
-		"promoted before attesting":             moveStep(publish, promoteName, attestStep),
-		"verified before attesting":             moveStep(publish, verifyName, attestStep),
-		"attested before staging":               moveStep(publish, attestStep, stageName),
-		"promoted whatever happened":            replaceAfter(publish, promoteName, onGate, "        if: always() && "+gate+"\n"),
-		"verified whatever happened":            replaceAfter(publish, verifyName, onGate, "        if: ${{ !cancelled() }}\n"),
-		"an attestation that may fail":          replaceAfter(publish, attestStep, onGate, onGate+goOn),
-		"a verification that may fail":          replaceAfter(publish, verifyName, onGate, onGate+goOn),
-		"never verified":                        replaceAfter(publish, verifyName, "gh attestation verify", "gh attestation download"),
-		"verified for any signer":               replaceAfter(publish, verifyName, signer, ""),
-		"verified from any ref":                 replaceAfter(publish, verifyName, " --source-ref refs/heads/main", ""),
-		"verified for any repository":           replaceAfter(publish, verifyName, "          REPO: ${{ github.repository }}\n", "          REPO: divbast/oci-image-template\n"),
-		"another digest attested":               strings.Replace(publish, "subject-digest: ${{ steps.merge.outputs.digest }}", "subject-digest: ${{ steps.merge.outputs.amd64 }}", 1),
-		"another digest verified":               replaceAfter(publish, verifyName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
-		"another digest promoted":               replaceAfter(publish, promoteName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
-		"another source promoted":               strings.Replace(publish, `            "${IMAGE}@${DIGEST}"`+"\n", `            "${IMAGE}@$(cat /tmp/digest-amd64)"`+"\n", 1),
-		"latest left out of the promotion":      strings.Replace(publish, version+latest, version, 1),
-		"the version left out of the promotion": strings.Replace(publish, version+latest, latest, 1),
+		"the version tagged before attesting":                  strings.Replace(publish, staging, `            -t "${IMAGE}:${VERSION}" \`+"\n", 1),
+		"latest tagged before attesting":                       strings.Replace(publish, staging, staging+`            -t "${IMAGE}:latest" \`+"\n", 1),
+		"an arch pushed as latest":                             strings.Replace(publish, `"docker://${IMAGE}:${VERSION}-${arch}"`, `"docker://${IMAGE}:latest"`, 1),
+		"the version pushed before attesting":                  replaceAfter(publish, pushName, "          done\n", "          done\n          skopeo copy --all \"docker://${IMAGE}@$(cat /tmp/digest-amd64)\" \"docker://${IMAGE}:${VERSION}\"\n"),
+		"both tags pushed in a loop":                           replaceAfter(publish, pushName, "          done\n", "          done\n"+loop),
+		"latest pushed through a variable":                     replaceAfter(publish, pushName, "          done\n", "          done\n"+viaVariable),
+		"latest pushed through the env":                        replaceAfter(replaceAfter(publish, pushName, "          done\n", "          done\n"+viaEnv), pushName, "        env:\n", "        env:\n          PUBLIC: latest\n"),
+		"latest pushed unquoted":                               replaceAfter(publish, pushName, "          done\n", "          done\n          skopeo copy --all docker://${IMAGE}@$(cat /tmp/digest-amd64) docker://${IMAGE}:latest\n"),
+		"the version pushed unbraced":                          replaceAfter(publish, pushName, "          done\n", "          done\n          "+from+` "docker://${IMAGE}:$VERSION"`+"\n"),
+		"latest pushed to ghcr.io by name":                     replaceAfter(publish, pushName, "          done\n", "          done\n          "+from+` "docker://ghcr.io/divbast/librespeed:latest"`+"\n"),
+		"a write appended to the decision's read":              strings.Replace(publish, notReferences["decide"]+"\n", notReferences["decide"]+"; "+from+` "docker://${IMAGE}:latest"`+"\n", 1),
+		"another tool's write appended to the decision's read": strings.Replace(publish, notReferences["decide"]+"\n", notReferences["decide"]+`; crane copy "${IMAGE}@${published}" "${IMAGE}:latest"`+"\n", 1),
+		"a write appended to the choice of image":              strings.Replace(publish, notReferences["target"]+"\n", notReferences["target"]+"; "+from+` "docker://${IMAGE}:latest"`+"\n", 1),
+		"the decision's read moved past a push":                replaceAfter(publish, verifyName, "        run: |\n", "        run: |\n          published=$(.ci/bin/divbast-published-revision \"${IMAGE}:latest\")\n"),
+		"promoted before verifying":                            moveStep(publish, promoteName, verifyName),
+		"promoted before attesting":                            moveStep(publish, promoteName, attestStep),
+		"verified before attesting":                            moveStep(publish, verifyName, attestStep),
+		"attested before staging":                              moveStep(publish, attestStep, stageName),
+		"promoted whatever happened":                           replaceAfter(publish, promoteName, onGate, "        if: always() && "+gate+"\n"),
+		"verified whatever happened":                           replaceAfter(publish, verifyName, onGate, "        if: ${{ !cancelled() }}\n"),
+		"an attestation that may fail":                         replaceAfter(publish, attestStep, onGate, onGate+goOn),
+		"a verification that may fail":                         replaceAfter(publish, verifyName, onGate, onGate+goOn),
+		"never verified":                                       replaceAfter(publish, verifyName, "gh attestation verify", "gh attestation download"),
+		"verified for any signer":                              replaceAfter(publish, verifyName, signer, ""),
+		"verified from any ref":                                replaceAfter(publish, verifyName, " --source-ref refs/heads/main", ""),
+		"verified for any repository":                          replaceAfter(publish, verifyName, "          REPO: ${{ github.repository }}\n", "          REPO: divbast/oci-image-template\n"),
+		"another digest attested":                              strings.Replace(publish, "subject-digest: ${{ steps.merge.outputs.digest }}", "subject-digest: ${{ steps.merge.outputs.amd64 }}", 1),
+		"another digest verified":                              replaceAfter(publish, verifyName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
+		"another digest promoted":                              replaceAfter(publish, promoteName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
+		"another source promoted":                              strings.Replace(publish, `            "${IMAGE}@${DIGEST}"`+"\n", `            "${IMAGE}@$(cat /tmp/digest-amd64)"`+"\n", 1),
+		"latest left out of the promotion":                     strings.Replace(publish, version+latest, version, 1),
+		"the version left out of the promotion":                strings.Replace(publish, version+latest, latest, 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -744,12 +751,14 @@ func TestPublishVerifiesWithRetries(t *testing.T) {
 	}
 	const tries = "verify || { sleep 10 && verify; } || { sleep 10 && verify; }"
 	for name, mutant := range map[string]string{
-		"one try":                    strings.Replace(publish, tries, "verify", 1),
-		"four tries":                 strings.Replace(publish, tries, tries+" || { sleep 10 && verify; }", 1),
-		"tries a second apart":       strings.Replace(publish, tries, strings.ReplaceAll(tries, "sleep 10", "sleep 1"), 1),
-		"the login given to gh":      strings.Replace(publish, `DOCKER_CONFIG="${empty}" gh attestation verify`, "gh attestation verify", 1),
-		"the index fetched by a tag": replaceAfter(publish, verifyName, `"docker://${IMAGE}@${DIGEST}"`, `"docker://${IMAGE}:${DIGEST#sha256:}-staging"`),
-		"another file verified":      replaceAfter(publish, verifyName, "gh attestation verify /tmp/index-manifest.json", "gh attestation verify /tmp/index.json"),
+		"one try":                       strings.Replace(publish, tries, "verify", 1),
+		"four tries":                    strings.Replace(publish, tries, tries+" || { sleep 10 && verify; }", 1),
+		"tries a second apart":          strings.Replace(publish, tries, strings.ReplaceAll(tries, "sleep 10", "sleep 1"), 1),
+		"the login given to gh":         strings.Replace(publish, `DOCKER_CONFIG="${empty}" gh attestation verify`, "gh attestation verify", 1),
+		"the index fetched by a tag":    replaceAfter(publish, verifyName, `"docker://${IMAGE}@${DIGEST}"`, `"docker://${IMAGE}:${DIGEST#sha256:}-staging"`),
+		"another file verified":         replaceAfter(publish, verifyName, "gh attestation verify /tmp/index-manifest.json", "gh attestation verify /tmp/index.json"),
+		"the third failure let through": strings.Replace(publish, tries, tries+" || true", 1),
+		"the fetched bytes let through": replaceAfter(publish, verifyName, "            exit 1\n", ""),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -780,13 +789,15 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 		return err
 	}
 	const (
-		image  = "ghcr.io/divbast/app"
-		digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		image = "ghcr.io/divbast/app"
+		index = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`
 	)
+	sum := sha256.Sum256([]byte(index))
+	digest := "sha256:" + hex.EncodeToString(sum[:])
 	for _, tt := range []struct {
-		fails, calls         int
-		ok                   bool
-		slept, shape, signer string
+		fails, calls                int
+		ok                          bool
+		slept, shape, signer, bytes string
 	}{
 		{fails: 0, calls: 1, ok: true, shape: "array", signer: "signer"},
 		{fails: 2, calls: 3, ok: true, slept: "10 10 ", shape: "array", signer: "signer"},
@@ -794,6 +805,7 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 		{fails: 0, calls: 1, ok: true, shape: "object", signer: "unknown"},
 		{fails: 0, calls: 1, ok: true, shape: "empty", signer: "unknown"},
 		{fails: 0, calls: 1, ok: true, shape: "text", signer: "unknown"},
+		{fails: 0, calls: 0, shape: "array", bytes: index + " "},
 	} {
 		dir := t.TempDir()
 		bin, login := filepath.Join(dir, "bin"), filepath.Join(dir, "login")
@@ -803,7 +815,11 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 			}
 		}
 		writeFile(t, dir, "login/config.json", "{}\n")
-		writeFile(t, dir, "bin/skopeo", "#!/usr/bin/env bash\nprintf 'skopeo %s\\n' \"$*\" >> \"${CALLS}\"\necho '{}'\n")
+		if tt.bytes == "" {
+			tt.bytes = index
+		}
+		writeFile(t, dir, "fetched", tt.bytes)
+		writeFile(t, dir, "bin/skopeo", "#!/usr/bin/env bash\nprintf 'skopeo %s\\n' \"$*\" >> \"${CALLS}\"\ncat \"${FETCHED}\"\n")
 		writeFile(t, dir, "bin/gh", "#!/usr/bin/env bash\nprintf 'gh %s\\n' \"$*\" >> \"${CALLS}\"\n"+
 			"[ -z \"$(ls -A \"${DOCKER_CONFIG:?}\")\" ] || exit 3\n"+
 			"[ \"$(grep -c '^gh ' \"${CALLS}\")\" -gt \"${FAILS}\" ] || exit 1\n"+
@@ -818,7 +834,8 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 		res := runStep(t, dir, strings.ReplaceAll(script, "/tmp/", dir+"/"),
 			"PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+dir, "DOCKER_CONFIG="+login,
 			"IMAGE="+image, "DIGEST="+digest, "REPO=divbast/app",
-			"CALLS="+calls, "SLEPT="+slept, "FAILS="+strconv.Itoa(tt.fails), "SHAPE="+tt.shape)
+			"CALLS="+calls, "SLEPT="+slept, "FAILS="+strconv.Itoa(tt.fails), "SHAPE="+tt.shape,
+			"FETCHED="+filepath.Join(dir, "fetched"))
 		got, err := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
 		if err != nil {
 			return fmt.Errorf("with %d failures, nothing ran: %w", tt.fails, err)
@@ -828,6 +845,11 @@ func verifiesWithRetries(t *testing.T, workflow string) error {
 		want := "skopeo inspect --raw docker://" + image + "@" + digest + "\n" + strings.Repeat(gh, tt.calls)
 		if string(got) != want {
 			return fmt.Errorf("with %d failures, runs\n%s\nwant\n%s", tt.fails, got, want)
+		}
+		if tt.calls > 0 {
+			if f, _ := os.ReadFile(filepath.Join(dir, "index-manifest.json")); string(f) != tt.bytes { //nolint:gosec // G304: the test's own temporary directory
+				return fmt.Errorf("gh verifies %q, not the bytes fetched", f)
+			}
 		}
 		if s, _ := os.ReadFile(slept); string(s) != tt.slept { //nolint:gosec // G304: the test's own temporary directory
 			return fmt.Errorf("with %d failures, sleeps %q, want %q", tt.fails, s, tt.slept)
@@ -869,6 +891,7 @@ func TestPublishPromotesOnlyTheAttestedDigest(t *testing.T) {
 		"moving never said":              strings.Replace(publish, moving, "", 1),
 		"moving said after":              strings.Replace(publish, moving+create, create+moving, 1),
 		"moving said before the dry run": strings.Replace(strings.Replace(publish, moving, "", 1), dry, moving+dry, 1),
+		"a mismatch let through":         replaceAfter(publish, promoteName, "            exit 1\n", ""),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1021,6 +1044,216 @@ func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
 		return fmt.Errorf("with VERSION=1.2.3, the script exits %d and prints %q", res.Code, out)
 	}
 	return nil
+}
+
+// update rewrites testdata/app-publish-shell.golden.txt from
+// app-publish.yml, for a change to the publish job's shell that is meant:
+//
+//	go test ./internal/workflows -run TestPublishShellPinned -update
+var update = flag.Bool("update", false, "rewrite testdata/app-publish-shell.golden.txt from app-publish.yml")
+
+// shellGolden is where the publish job's pinned shell is kept.
+const shellGolden = "app-publish-shell.golden.txt"
+
+// TestPublishShellPinned checks that every run: script app-publish.yml's
+// publish job runs from the gate on, but for the steps before the decision
+// that publish nothing, is exactly the script testdata keeps: the shell
+// that pushes, stages, verifies, promotes and checks is pinned, not
+// matched against patterns. The registry's pin is left to Renovate. A
+// change to that shell fails here with a diff until the golden file is
+// rewritten on purpose with -update. Against app-publish.yml as it is,
+// then with each change below, and with each exit 1 in the job taken out,
+// which the check must refuse.
+func TestPublishShellPinned(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	root, err := os.OpenRoot("testdata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	if *update {
+		got, shellErr := publishShell(publish)
+		if shellErr != nil {
+			t.Fatal(shellErr)
+		}
+		if err = root.WriteFile(shellGolden, []byte(got), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	golden, err := root.ReadFile(shellGolden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shellPinned(publish, string(golden)); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const from = `skopeo copy --all "docker://${IMAGE}@$(cat /tmp/digest-amd64)"`
+	mutants := map[string]string{
+		"a write through a loop variable": replaceAfter(publish, pushName, "          done\n",
+			"          done\n          for t in \"${VERSION}\" latest; do "+from+" \"docker://${IMAGE}:${t}\"; done\n"),
+		"a write through a variable": replaceAfter(publish, pushName, "          done\n",
+			"          done\n          tag=latest; "+from+" \"docker://${IMAGE}:${tag}\"\n"),
+		"latest written unquoted": replaceAfter(publish, pushName, "          done\n",
+			"          done\n          skopeo copy --all docker://${IMAGE}@$(cat /tmp/digest-amd64) docker://${IMAGE}:latest\n"),
+		"the version unbraced": replaceAfter(publish, pushName, "          done\n",
+			"          done\n          "+from+" \"docker://${IMAGE}:$VERSION\"\n"),
+		"latest written to ghcr.io by name": replaceAfter(publish, pushName, "          done\n",
+			"          done\n          "+from+" \"docker://ghcr.io/divbast/librespeed:latest\"\n"),
+		"a write appended to the decision's read": strings.Replace(publish, notReferences["decide"]+"\n",
+			notReferences["decide"]+"; "+from+" \"docker://${IMAGE}:latest\"\n", 1),
+		"a write appended to the choice of image": strings.Replace(publish, notReferences["target"]+"\n",
+			notReferences["target"]+"; "+from+" \"docker://${IMAGE}:latest\"\n", 1),
+		"another version tag staged":  strings.Replace(publish, `-t "${IMAGE}:${VERSION}-staging"`, `-t "${IMAGE}:${VERSION}-stage"`, 1),
+		"the registry's wait changed": strings.Replace(publish, "--retry 10 --retry-delay 1", "--retry 3 --retry-delay 1", 1),
+	}
+	exits := 0
+	for i, l := range strings.SplitAfter(publish, "\n") {
+		if strings.TrimSpace(l) != "exit 1" {
+			continue
+		}
+		exits++
+		lines := strings.SplitAfter(publish, "\n")
+		mutants["exit 1 taken out of line "+strconv.Itoa(i+1)] = strings.Join(slices.Delete(lines, i, i+1), "")
+	}
+	if exits == 0 {
+		t.Fatal("app-publish.yml has no exit 1 to take out")
+	}
+	for name, mutant := range mutants {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if shellPinned(mutant, string(golden)) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+	t.Run("a pin Renovate moves", func(t *testing.T) {
+		t.Parallel()
+		moved := registryManager.ReplaceAllStringFunc(publish, func(m string) string {
+			return m[:strings.LastIndex(m, ":")+1] + strings.Repeat("0", 64)
+		})
+		if moved == publish {
+			t.Fatal("the change changed nothing")
+		}
+		if err := shellPinned(moved, string(golden)); err != nil {
+			t.Errorf("refuses app-publish.yml with the registry's digest moved: %v", err)
+		}
+	})
+}
+
+// shellPinned returns an error, with a diff, unless publishShell of the
+// workflow is golden.
+func shellPinned(workflow, golden string) error {
+	got, err := publishShell(workflow)
+	if err != nil {
+		return err
+	}
+	if got != golden {
+		return fmt.Errorf("the publish job's shell is not testdata/%s:\n%s"+
+			"if the change is meant, review it and rewrite the golden file:"+
+			" go test ./internal/workflows -run TestPublishShellPinned -update", shellGolden, lineDiff(golden, got))
+	}
+	return nil
+}
+
+// pinnedRegistry stands in, in the pinned shell, for the registry image's
+// version and digest, which Renovate moves.
+const pinnedRegistry = "registry:<version>@<digest>"
+
+// publishShell returns the run: scripts of the publish job's gate step and
+// of every step from the decision on, each under its name, as written, its
+// indent taken off. The registry image's version and digest are replaced
+// by pinnedRegistry.
+func publishShell(workflow string) (string, error) {
+	raw := strings.Split(workflow, "\n")
+	st := publishSteps(workflow)
+	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
+	gate := stepsWhere(st, contains("schedule | workflow_dispatch)"))
+	if len(decide) != 1 || len(gate) != 1 {
+		return "", fmt.Errorf("%d decide steps and %d gate steps, want one of each", len(decide), len(gate))
+	}
+	var b strings.Builder
+	for i, s := range st {
+		if i != gate[0] && i < decide[0] {
+			continue
+		}
+		at := slices.IndexFunc(s, func(l line) bool { return strings.HasPrefix(strings.TrimSpace(l.text), "run:") })
+		if at < 0 {
+			continue
+		}
+		name := value(s, "name")
+		if name == "" {
+			return "", fmt.Errorf("line %d runs a script in a step with no name", s[at].n)
+		}
+		b.WriteString("== " + name + " ==\n")
+		run := s[at]
+		if v := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(run.text), "run:")); v != "|" {
+			b.WriteString(v + "\n")
+			continue
+		}
+		var block []string
+		for _, r := range raw[run.n:] {
+			if strings.TrimSpace(r) != "" && indent(r) <= indent(run.text) {
+				break
+			}
+			block = append(block, r)
+		}
+		for len(block) > 0 && strings.TrimSpace(block[len(block)-1]) == "" {
+			block = block[:len(block)-1]
+		}
+		in := indent(run.text) + 2
+		for _, r := range block {
+			if len(r) >= in {
+				r = r[in:]
+			}
+			b.WriteString(r + "\n")
+		}
+	}
+	return registryPin.ReplaceAllString(b.String(), pinnedRegistry), nil
+}
+
+// registryPin is the registry image's version and digest as the shell
+// names them.
+var registryPin = regexp.MustCompile(`registry:[0-9.]+@sha256:[a-f0-9]{64}`)
+
+// lineDiff returns the lines that differ between want and got, each with
+// its number in want or got: "-" for a line only want has, "+" for one only
+// got has.
+func lineDiff(want, got string) string {
+	a, b := strings.Split(want, "\n"), strings.Split(got, "\n")
+	// common[i][j] is the length of the longest run of lines a[i:] and b[j:]
+	// share, in order.
+	common := make([][]int, len(a)+1)
+	for i := range common {
+		common[i] = make([]int, len(b)+1)
+	}
+	for i, v := range slices.Backward(a) {
+		for j := len(b) - 1; j >= 0; j-- {
+			if v == b[j] {
+				common[i][j] = common[i+1][j+1] + 1
+			} else {
+				common[i][j] = max(common[i+1][j], common[i][j+1])
+			}
+		}
+	}
+	var out strings.Builder
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		switch {
+		case i < len(a) && j < len(b) && a[i] == b[j]:
+			i, j = i+1, j+1
+		case j < len(b) && (i == len(a) || common[i][j+1] >= common[i+1][j]):
+			fmt.Fprintf(&out, "+%d: %s\n", j+1, b[j])
+			j++
+		default:
+			fmt.Fprintf(&out, "-%d: %s\n", i+1, a[i])
+			i++
+		}
+	}
+	return out.String()
 }
 
 // TestRehearseStillDecides checks that a rehearsal runs app-publish.yml's

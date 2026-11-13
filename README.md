@@ -513,8 +513,8 @@ older commit. When it publishes, it:
 3. attests the index, and pushes the attestation to the registry;
 4. verifies that attestation as a user would, with `gh attestation verify`
    for the calling repository, this workflow and `refs/heads/main`, against
-   the index's bytes fetched by digest, trying three times, ten seconds
-   apart;
+   the index's bytes, fetched by digest and checked against it, trying three
+   times, ten seconds apart;
 5. only then tags the index `<image>:<version>` and `<image>:latest`, once
    a dry run of that `imagetools create` shows it would push the index
    attested, byte for byte;
@@ -787,6 +787,15 @@ containers run only when `ENGINE` is `docker` or `podman`, so
 `ENGINE=docker just ci` runs them all. `self-ci.yml` runs them on amd64 and
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
 test. A merge to main that passes them is released.
+
+The shell `app-publish.yml`'s publish job runs, from its gate and its
+decision on, is pinned word for word in
+`internal/workflows/testdata/app-publish-shell.golden.txt`, so a change to
+it fails the tests with a diff until the file is rewritten on purpose:
+
+```sh
+go test ./internal/workflows -run TestPublishShellPinned -update
+```
 
 To see what the next release would be, from a clone with origin's tags:
 
