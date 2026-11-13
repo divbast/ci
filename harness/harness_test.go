@@ -723,6 +723,8 @@ var (
 	engineError = execx.Result{Code: 125, Stderr: []byte("Error: can only create exec sessions on running containers: container state improper\n")}
 	// Docker 29, for /bin/sh in an image without one.
 	notFound = execx.Result{Code: 127, Stderr: []byte(`OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/sh": stat /bin/sh: no such file or directory` + "\n")}
+	// Docker 29, for a file that is not executable.
+	notExecutable = execx.Result{Code: 126, Stderr: []byte(`OCI runtime exec failed: exec failed: unable to start container process: exec: "/etc/passwd": permission denied` + "\n")}
 	// FrankenPHP's PHP, for a fatal error, which exits 255 too.
 	phpFatal = execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Uncaught Error: Call to undefined function f() in Command line code:1\n")}
 )
@@ -804,6 +806,23 @@ func TestExecRetriesEngineFailure(t *testing.T) {
 			engine:   "docker",
 			attempts: []execx.Result{notFound, notFound, notFound},
 			wantCode: 127,
+			wantWait: 2 * time.Second,
+		},
+		{
+			name:     "126-three-times-is-a-result",
+			engine:   "docker",
+			attempts: []execx.Result{notExecutable, notExecutable, notExecutable},
+			wantCode: 126,
+			wantWait: 2 * time.Second,
+		},
+		{
+			// A runtime error that lasts is an error, as 125 and 128 are,
+			// never a Result of 255 a caller could take for PHP's
+			name:     "runtime-error-three-times",
+			engine:   "podman",
+			attempts: []execx.Result{runtimeError, runtimeError, runtimeError},
+			wantCode: 255,
+			wantErr:  "attempt 3 of 3 failed in the engine, as each before it did: exit status 255: Error: OCI runtime error: crun: setns",
 			wantWait: 2 * time.Second,
 		},
 	}

@@ -377,13 +377,18 @@ func (c *Container) String() string { return cmp.Or(c.Name, c.ID) }
 // again, up to three times in all, a second apart, for as long as ctx
 // allows: an engine can refuse an exec into a container that is starting
 // or has just restarted, and its runtime can fail one into a container
-// that runs. Each attempt is fed the whole of stdin, which Exec reads to
-// its end before the first. When the third attempt fails in the engine
-// too, the error names it, with the engine's words, and the Result is the
-// third's. A command the runtime could not execute or find, exit status
-// 126 or 127, is the one exception: it stays a Result, since a check that
-// an image has no /bin/sh asserts exactly that. A command's own non-zero
-// exit, a PHP fatal error's 255 among them, is never run again.
+// that runs. Exec tells the two apart by exit status alone. Any exit of
+// 125 to 128 is taken for the engine's, as is Podman's 255 with stderr
+// opening "Error: OCI runtime error:", so a command that itself exits 125
+// to 128 is run again too, side effects and all: a command run through
+// Exec should not exit that way. Each attempt is fed the whole of stdin,
+// which Exec reads to its end before the first. When the third attempt
+// fails in the engine too, the error names it, with the engine's words,
+// and the Result is the third's. A command the runtime could not execute
+// or find, exit status 126 or 127, is the one exception: it stays a
+// Result, since a check that an image has no /bin/sh asserts exactly
+// that. Any other non-zero exit, a PHP fatal error's 255 among them, is
+// the command's own, and is never run again.
 func (c *Container) Exec(ctx context.Context, stdin io.Reader, argv ...string) (Result, error) {
 	args := []string{"exec"}
 	var in []byte

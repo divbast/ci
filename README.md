@@ -387,15 +387,18 @@ Containers go first, since an image, network or volume one still uses
 cannot. CI runners start empty, and need none of this.
 
 `Container.Exec` runs an exec again when the engine, not the command,
-failed it: exit status 125 to 128, or Podman's 255 with stderr opening
-`Error: OCI runtime error:`. It makes three attempts in all, a second
-apart, and feeds each the same stdin, so `InstallProbe`, the probe's
-subcommands, the contract's health exec and a suite's own execs ride
-out an engine that refuses an exec into a container still starting. A
-command's own exit status is never retried. A third failure in the
-engine is an error naming that attempt, except for 126 and 127, a
-command the runtime could not execute or find, which stay a `Result`,
-as a check that an image has no `/bin/sh` needs.
+failed it, which it tells by exit status alone: 125 to 128, or Podman's
+255 with stderr opening `Error: OCI runtime error:`. It makes three
+attempts in all, a second apart, and feeds each the same stdin, so
+`InstallProbe`, the probe's subcommands, the contract's health exec and
+a suite's own execs ride out an engine that refuses an exec into a
+container still starting. A command that itself exits 125 to 128 is
+taken for the engine's, and so run again, so a command run through
+`Exec` should not exit that way. Any other exit status is the command's
+own, and is never retried. A third failure in the engine is an error
+naming that attempt, except for 126 and 127, a command the runtime could
+not execute or find, which stay a `Result`, as a check that an image has
+no `/bin/sh` needs.
 
 `Container.Restart` restarts a container in place, as `<engine> restart`
 does, and returns once the engine reports it running again. The
