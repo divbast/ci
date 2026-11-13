@@ -467,6 +467,11 @@ the mark, above, that makes the next release major:
   callers import through `.ci`, or what they do wherever an unchanged
   caller would see it: a new contract check that an image which passed
   before now fails, say, or a harness default a caller's suite relies on.
+- **The probe:** more asked of an image than the probe asks today. It
+  runs as the image's own PHP, `/usr/local/bin/frankenphp php-cli`, and
+  needs the `posix` extension, with which `no-shell` tells a path that is
+  absent from one it may not look up. An image without it fails
+  `no-shell`.
 - **Shared configuration:** `go/golangci.yml` or `.github/actionlint.yaml`
   changed so that a caller's unchanged code or workflows fail.
 

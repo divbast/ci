@@ -262,6 +262,14 @@ func TestImageConfigPodman(t *testing.T) {
 			want: Config{User: "65532:65532", Volumes: map[string]struct{}{"/data": {}}},
 		},
 		{
+			// Why the configuration could not be found, not merely that it
+			// was not
+			name: "config-missing", id: digest(configBlob),
+			archive: tarball(t, file{"l1.tar", "a layer"},
+				file{"manifest.json", `[{"Config":"` + digest(configBlob) + `.json","RepoTags":[],"Layers":["l1.tar"]}]`}),
+			wantErr: "which the archive does not hold",
+		},
+		{
 			// The image ID is the digest of its configuration, so a blob that
 			// hashes to anything else is some other image's.
 			name: "another-images-config", id: digest(noHealthcheck), archive: archive(configBlob),

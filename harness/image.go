@@ -29,11 +29,11 @@ import (
 // declares, as its own configuration holds them, pulling it first if it is
 // not here.
 //
-// Docker's image inspect reads both from that configuration. Podman's
-// reads a health check only from an image whose manifest is Docker's, and
-// never from one published as OCI, so on Podman they come from the
-// configuration blob itself, out of podman save, checked against the
-// image ID, which is that blob's digest.
+// Docker's image inspect reads all three from that configuration.
+// Podman's reads a health check only from an image whose manifest is
+// Docker's, and never from one published as OCI, so on Podman they come
+// from the configuration blob itself, out of podman save, checked against
+// the image ID, which is that blob's digest.
 func (e Engine) ImageConfig(ctx context.Context, tb testing.TB, image string) (Config, error) {
 	tb.Helper()
 	id, err := e.imageID(ctx, image)
@@ -208,11 +208,15 @@ func (e Engine) save(ctx context.Context, tb testing.TB, image, id string) (*sav
 	if _, err := e.output(ctx, argv...); err != nil {
 		return nil, err
 	}
-	blob, read, err := readSave(dir, "image.tar")
+	blob, blobErr, read, err := readSave(dir, "image.tar")
 	if err != nil {
 		return nil, fmt.Errorf("%s save of %s: %w", e.name, image, err)
 	}
-	if e.name == "podman" {
+	switch {
+	case e.name != "podman":
+	case blobErr != nil:
+		read.cfgErr = fmt.Errorf("%s save of %s: %w", e.name, image, blobErr)
+	default:
 		read.cfg, read.cfgErr = savedImageConfig(blob, image, id)
 	}
 	return read, nil
@@ -222,9 +226,6 @@ func (e Engine) save(ctx context.Context, tb testing.TB, image, id string) (*sav
 // image held, unless blob has some other digest than id, the image's ID
 // on Podman, or is not a configuration at all.
 func savedImageConfig(blob []byte, image, id string) (Config, error) {
-	if blob == nil {
-		return Config{}, fmt.Errorf("the save of %s holds no configuration", image)
-	}
 	sum := sha256.Sum256(blob)
 	if got, want := hex.EncodeToString(sum[:]), strings.TrimPrefix(id, "sha256:"); got != want {
 		return Config{}, fmt.Errorf("the save of %s holds a configuration whose digest, %s, is not its ID, %s", image, got, want)
@@ -239,33 +240,34 @@ func savedImageConfig(blob []byte, image, id string) (Config, error) {
 }
 
 // readSave reads the docker-archive file name, in dir, for its
-// configuration blob, nil if it holds none it can find, and the file
-// capabilities in its layers. It reads the file twice, since
+// configuration blob, unless blobErr says why it could not, and the file
+// capabilities in its layers. Only Podman's save is read for its
+// configuration: Docker 29 names its own with no .json, and readIndex
+// keeps none that lacks one. It reads the file twice, since
 // manifest.json, which names the rest, may come last, as Podman writes it.
-func readSave(dir, name string) (blob []byte, read *saveRead, err error) {
+func readSave(dir, name string) (blob []byte, blobErr error, read *saveRead, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { err = errors.Join(err, root.Close()) }()
 	f, err := root.Open(name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
 
 	idx, err := readIndex(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	// Docker 29 names its configuration with no .json, and it is not read
-	blob, _ = idx.configBlob()
+	blob, blobErr = idx.configBlob()
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	read = &saveRead{}
 	read.caps, read.capsErr = archiveCapabilities(f, idx.layers)
-	return blob, read, nil
+	return blob, blobErr, read, nil
 }
 
 // maxConfig bounds what readIndex keeps of any one file: an image's

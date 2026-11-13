@@ -354,13 +354,14 @@ func (s *suite) healthPortOnly(ctx context.Context, _ testing.TB) ([]harness.Rec
 // The records no-volume makes.
 const (
 	volumeRecord     = "the image declares no VOLUME"
-	mountsRecordWhat = "the engine mounts the tmpfs at /tmp and Config.Mounts, and nothing else (Mounts, HostConfig.Tmpfs)"
+	mountsRecordWhat = "the mounts the engine reports are exactly the tmpfs at /tmp and Config.Mounts (Mounts, HostConfig.Tmpfs)"
 )
 
 // noVolume checks the image declares no volume, which the engine would
-// mount writable whatever the run asked, and that the container under the
-// contract has no mount but the tmpfs the contract grants and the ones the
-// app's Config gave it.
+// mount writable whatever the run asked, and that the mounts the engine
+// reports for the container under the contract are exactly the tmpfs the
+// contract grants and the ones the app's Config gave it. Podman's
+// --read-only adds tmpfs mounts of its own, which it does not report.
 func (s *suite) noVolume(ctx context.Context, _ testing.TB) ([]harness.Record, error) {
 	if s.imageErr != nil {
 		return nil, s.imageErr
@@ -376,9 +377,9 @@ func (s *suite) noVolume(ctx context.Context, _ testing.TB) ([]harness.Record, e
 	return []harness.Record{declared, mountsRecord(s.mounts, &ins)}, nil
 }
 
-// mountsRecord checks the mounts ins reports are the contract's tmpfs at
-// /tmp and given, the mounts the app's Config gave the container, each
-// read-only if it was given so, and nothing else.
+// mountsRecord checks the mounts ins reports are exactly the contract's
+// tmpfs at /tmp and given, the mounts the app's Config gave the
+// container, each read-only if it was given so.
 func mountsRecord(given []harness.Mount, ins *harness.Inspect) harness.Record {
 	want := make([]string, 0, 1+len(given))
 	want = append(want, "tmpfs /tmp")

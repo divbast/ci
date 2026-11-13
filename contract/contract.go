@@ -17,9 +17,12 @@
 //   - caps: PID 1 holds no capability, in any of its five sets;
 //   - read-only: creating /.divbast-write-probe fails because the root is
 //     mounted read-only;
-//   - no-volume: the image declares no VOLUME, and the engine mounts
-//     nothing in the container but the tmpfs at /tmp and Config.Mounts;
-//   - pid1: PID 1's whole argv is Config.PID1;
+//   - no-volume: the image declares no VOLUME, and the mounts the engine
+//     reports (Mounts and HostConfig.Tmpfs) are exactly tmpfs /tmp plus
+//     Config.Mounts. Podman's --read-only adds writable tmpfs mounts of its
+//     own, /run and /var/tmp among them, which it does not report;
+//   - pid1: PID 1's comm is the file name of Config.PID1's first word, as
+//     the kernel cuts it to 15 bytes, and its whole argv is Config.PID1;
 //   - no-shell: nothing is at /bin/sh, /bin/bash or /bin/dash, and a path
 //     the probe may not look up counts as one that is there;
 //   - listeners: the processes in the container listen on Config.AppPort

@@ -1415,6 +1415,69 @@ func TestProbeRetryCodes(t *testing.T) {
 	}
 }
 
+// TestProbeRetryRuntimeError runs the install once into each failure on
+// Podman. Podman exits 255 itself when its runtime fails an exec, as crun
+// did on an arm64 runner with "setns `mnt`: Bad file descriptor" into a
+// running container, and says so with a prefix of its own on stderr,
+// which no PHP prints: that 255 is tried again, and a PHP fatal error's is
+// not.
+func TestProbeRetryRuntimeError(t *testing.T) {
+	t.Parallel()
+
+	install := []string{"podman", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")}
+	inspect := []string{"podman", "container", "inspect", "abc"}
+	tests := []struct {
+		name    string
+		failed  execx.Result
+		retried bool
+	}{
+		{
+			name: "runtime-error-255",
+			failed: execx.Result{Code: 255, Stderr: []byte("Error: OCI runtime error: crun: setns `mnt`: Bad file descriptor\n" +
+				"fail startup\n")},
+			retried: true,
+		},
+		{
+			name:   "php-fatal-255",
+			failed: execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Uncaught Error: Call to undefined function f() in Command line code:1\n")},
+		},
+		{
+			// The prefix must open stderr: PHP may print the words anywhere
+			// else in what it was given to say.
+			name:   "the-words-later-255",
+			failed: execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Error: OCI runtime error: in Command line code:1\n")},
+		},
+		{
+			name:    "cannot-execute-126",
+			failed:  execx.Result{Code: 126, Stderr: []byte("Error: crun: open executable: Operation not permitted: OCI permission denied\n")},
+			retried: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				calls := []execx.Call{{Argv: install, Stdin: coreProbe, Result: tt.failed}}
+				if tt.retried {
+					calls = append(calls,
+						execx.Call{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}},
+						execx.Call{Argv: install, Stdin: coreProbe},
+					)
+				}
+				c := &Container{ID: "abc", engine: newEngine("podman", execx.NewFake(t, calls...))}
+
+				_, err := InstallProbe(t.Context(), c, nil)
+				switch {
+				case tt.retried && err != nil:
+					t.Errorf("InstallProbe() after %q, then 0: error = %v, want it tried again and installed", tt.failed.Stderr, err)
+				case !tt.retried && (err == nil || !strings.Contains(err.Error(), "exit status 255")):
+					t.Errorf("InstallProbe() after %q: error = %v, want that failure, not tried again", tt.failed.Stderr, err)
+				}
+			})
+		})
+	}
+}
+
 func TestProbeRun(t *testing.T) {
 	t.Parallel()
 

@@ -5,7 +5,9 @@
 // through the docker or podman CLI, with the same flags a user would type,
 // so a check runs under exactly the confinement an image's contract claims
 // and never a looser one an SDK might set up instead. It also ships the
-// probe those checks run inside a container, as the container's own PHP.
+// probe those checks run inside a container, as the container's own PHP,
+// which needs the posix extension: no-shell asks it why a path could not
+// be looked up, to tell one that is absent from one it may not reach.
 //
 // Every container, image, network and volume it makes carries the label
 // divbast.harness=<module>, where <module> is the path of the main module

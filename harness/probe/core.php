@@ -8,7 +8,9 @@ declare(strict_types=1);
 /*
  * The probe divbast's harness runs inside a container, as that container's
  * own PHP: frankenphp php-cli core.php <subcommand> [arguments]. The images
- * have no shell, and this needs nothing but PHP itself.
+ * have no shell, and this needs nothing but PHP itself and its posix
+ * extension, with which presence() tells a path that is absent from one it
+ * may not look up.
  *
  * Output protocol: one tab-separated record per assertion,
  *
