@@ -43,6 +43,10 @@ func slotRuns(workflow string) []string {
 	}
 }
 
+func workflowAPI(workflow string) []string {
+	return []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/actions/workflows/" + workflow}
+}
+
 // ok is a command that printed out and exited 0.
 func ok(out string) execx.Result { return execx.Result{Stdout: []byte(out)} }
 
@@ -138,6 +142,8 @@ func TestRun(t *testing.T) {
 			wantStdout: "main " + revision + " is published\n",
 		},
 		{
+			// A repository six days old, whose slot workflow landed three
+			// hours ago: no slot has had time to be lost.
 			name: "slots-first-day",
 			args: []string{"slots"},
 			env:  map[string]string{"SLOT_WORKFLOW": "publish.yml"},
@@ -146,7 +152,8 @@ func TestRun(t *testing.T) {
 				{Argv: pkgAPI, Result: execx.Result{Stdout: []byte("HTTP/2.0 404 Not Found\n\r\n" + `{"message":"Package not found.","status":"404"}`), Code: 1}},
 				{Argv: mainAPI, Result: apiOK(`{"sha":"` + revision + `"}`)},
 				{Argv: slotRuns("publish.yml"), Result: ok("[]")},
-				{Argv: repoAPI, Result: apiOK(`{"created_at":"1999-12-31T21:00:00Z"}`)},
+				{Argv: repoAPI, Result: apiOK(`{"created_at":"1999-12-25T21:00:00Z"}`)},
+				{Argv: workflowAPI("publish.yml"), Result: apiOK(`{"created_at":"1999-12-31T21:00:00Z"}`)},
 			},
 			wantStdout: "main " + revision + " is ahead of :latest (absent), with 0 lost slot(s), under 2\n",
 		},
