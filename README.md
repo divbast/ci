@@ -811,7 +811,10 @@ calling repository like any other, and pushed to that registry. The
 registry takes no anonymous pulls, so the last check reads the tags with
 the job's login. Nothing reaches ghcr.io, and no package is made. Each
 rehearsal says so in a warning and on the run's summary:
-`rehearsal: nothing was published to ghcr.io`.
+`rehearsal: nothing was published to ghcr.io`. A rehearsal that fails
+before its promotion names the rehearsal registry's tags in its error,
+not the public ones, and says that re-running the failed job rehearses
+again while the images' artifacts last.
 
 Only `divbast/oci-image-template` rehearses, since it has no package. A
 repository made from it inherits `rehearse: true`, and its publish job

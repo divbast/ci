@@ -192,9 +192,16 @@ for tag in "${VERSION}" latest; do
   fi
   echo "${IMAGE}:${tag} is ${DIGEST} to ${who}"
 done
-== Say that the public tags did not move ==
+== Say that the tags did not move ==
 env: VERSION: ${{ steps.version.outputs.version }}
+env: REHEARSE: ${{ inputs.rehearse }}
 run:
-echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
-  "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
-  "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."
+if [ "${REHEARSE}" = true ]; then
+  echo "::error::the rehearsal registry's tags :${VERSION:-<version>} and :latest did not move, and a rehearsal publishes nothing outside its job." \
+    "Re-running the failed job rehearses again for a day after this run built its images, while their artifacts last;" \
+    "after that, the next daily slot or a manual run rehearses."
+else
+  echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
+    "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
+    "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."
+fi

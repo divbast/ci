@@ -425,12 +425,20 @@ jobs:
       # included, leaves them where they were. A re-run of the failed job
       # downloads this run's images again, which app-check keeps for a day,
       # and the decision reads :latest again, so it publishes unless a newer
-      # image has taken :latest since.
-      - name: Say that the public tags did not move
+      # image has taken :latest since. A rehearsal's tags are the registry's
+      # inside the job, which goes with it, and no public tag ever moves.
+      - name: Say that the tags did not move
         if: failure() && steps.decide.outputs.publish == 'true' && steps.promote.outputs.moving != 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          REHEARSE: ${{ inputs.rehearse }}
         run: |
-          echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
-            "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
-            "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."
+          if [ "${REHEARSE}" = true ]; then
+            echo "::error::the rehearsal registry's tags :${VERSION:-<version>} and :latest did not move, and a rehearsal publishes nothing outside its job." \
+              "Re-running the failed job rehearses again for a day after this run built its images, while their artifacts last;" \
+              "after that, the next daily slot or a manual run rehearses."
+          else
+            echo "::error::the public tags :${VERSION:-<version>} and :latest did not move." \
+              "Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \
+              "unless a newer image has been published since; after that, the next daily slot or a manual run publishes."
+          fi

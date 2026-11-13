@@ -701,7 +701,7 @@ const (
 	attestStep   = "      - uses: actions/attest@"
 	verifyName   = "      - name: Verify the index's attestation\n"
 	promoteName  = "      - name: Tag the attested index with the version and latest\n"
-	movedName    = "      - name: Say that the public tags did not move\n"
+	movedName    = "      - name: Say that the tags did not move\n"
 	targetName   = "      - name: Choose where to publish\n"
 	rehearseName = "      - name: Refuse a rehearsal outside the template\n"
 	gateName     = "      - name: Refuse anything but the daily slot or a manual run on main\n"
@@ -1222,6 +1222,11 @@ func TestPublishSaysWhenRerunningPublishes(t *testing.T) {
 		"said before the promotion":                moveStep(publish, movedName, promoteName),
 		"no tags named":                            strings.Replace(publish, "::error::the public tags :${VERSION:-<version>} and :latest did not move.", "::error::no public tag moved.", 1),
 		"no word on when":                          strings.Replace(publish, `"Re-running the failed job publishes for a day after this run built its images, while their artifacts last," \`+"\n", "", 1),
+		// A rehearsal moved no public tag (backlog CI-14)
+		"a rehearsal said as a publish": strings.Replace(publish, "          REHEARSE: ${{ inputs.rehearse }}\n        run: |\n          if [ \"${REHEARSE}\" = true ]; then\n            echo \"::error::the rehearsal",
+			"        run: |\n          if [ \"${REHEARSE}\" = true ]; then\n            echo \"::error::the rehearsal", 1),
+		"another input for a rehearsal": strings.Replace(publish, "          REHEARSE: ${{ inputs.rehearse }}\n        run: |\n          if [ \"${REHEARSE}\" = true ]; then\n            echo \"::error::the rehearsal",
+			"          REHEARSE: ${{ !inputs.rehearse }}\n        run: |\n          if [ \"${REHEARSE}\" = true ]; then\n            echo \"::error::the rehearsal", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1236,11 +1241,14 @@ func TestPublishSaysWhenRerunningPublishes(t *testing.T) {
 }
 
 // saysWhenRerunningPublishes returns an error unless the publish job's
-// one step that says the public tags did not move comes after the
-// promotion, runs on a failure once the decision was to publish and the
-// promotion had not begun to move the tags, and, run with bash, prints one
-// error naming the version's tag and latest and saying a re-run of the
-// failed job publishes for a day after the build.
+// one step that says the tags did not move comes after the promotion,
+// runs on a failure once the decision was to publish and the promotion had
+// not begun to move the tags, and, run with bash, prints one error naming
+// the version's tag and latest and saying a re-run of the failed job
+// publishes for a day after the build. In a rehearsal, given its rehearse
+// input, the error names the rehearsal registry's tags instead, says a
+// rehearsal publishes nothing outside its job, and that a re-run
+// rehearses again while the artifacts last (backlog CI-14).
 func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
 	t.Helper()
 	st := publishSteps(workflow)
@@ -1261,12 +1269,23 @@ func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
 	if err != nil {
 		return err
 	}
-	res := runStep(t, t.TempDir(), script, "VERSION=1.2.3")
-	out := string(res.Stdout)
-	if res.Code != 0 || strings.Count(out, "\n") != 1 ||
-		!strings.HasPrefix(out, "::error::the public tags :1.2.3 and :latest did not move. ") ||
-		!strings.Contains(out, "Re-running the failed job publishes for a day after this run built its images") {
-		return fmt.Errorf("with VERSION=1.2.3, the script exits %d and prints %q", res.Code, out)
+	if !setsEnv(s, "REHEARSE", "${{ inputs.rehearse }}") {
+		return fmt.Errorf("line %d says the tags did not move with no REHEARSE: ${{ inputs.rehearse }} in its env", s[0].n)
+	}
+	for _, rehearse := range []string{"false", "true"} {
+		res := runStep(t, t.TempDir(), script, "VERSION=1.2.3", "REHEARSE="+rehearse)
+		out := string(res.Stdout)
+		want := []string{"::error::the public tags :1.2.3 and :latest did not move. ", "Re-running the failed job publishes for a day after this run built its images"}
+		if rehearse == "true" {
+			want = []string{
+				"::error::the rehearsal registry's tags :1.2.3 and :latest did not move, and a rehearsal publishes nothing outside its job. ",
+				"Re-running the failed job rehearses again for a day after this run built its images, while their artifacts last",
+			}
+		}
+		if res.Code != 0 || strings.Count(out, "\n") != 1 || !strings.HasPrefix(out, want[0]) || !strings.Contains(out, want[1]) ||
+			(rehearse == "true" && strings.Contains(out, "public")) {
+			return fmt.Errorf("with VERSION=1.2.3 and REHEARSE=%s, the script exits %d and prints %q", rehearse, res.Code, out)
+		}
 	}
 	return nil
 }
