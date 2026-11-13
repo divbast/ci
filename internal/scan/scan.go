@@ -17,8 +17,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/divbast/ci/internal/execx"
 )
@@ -34,8 +36,21 @@ type Finding struct{ ID, Pkg, Version, Fixed, Severity, URL, Where string }
 // image lacks, New, and those it has, Old.
 type Split struct{ New, Old []Finding }
 
-// report is what the scan reads of a Trivy JSON report.
-type report struct {
+// Report is what a Trivy JSON report says: its findings, in Trivy's order;
+// how many packages it saw; the image's architecture; and what it
+// scanned, which is the image's first repository digest, naming exactly
+// what was compared, or the name Trivy was given when it has none. A
+// report that saw no packages is one whose scan never looked, whatever it
+// found; deciding that is the caller's.
+type Report struct {
+	Findings []Finding
+	Packages int
+	Arch     string
+	Ref      string
+}
+
+// trivyJSON is what the scan reads of a Trivy JSON report.
+type trivyJSON struct {
 	ArtifactName string
 	Metadata     struct {
 		ImageConfig struct {
@@ -53,35 +68,28 @@ type report struct {
 	}
 }
 
-func decode(r io.Reader) (report, error) {
+// ParseTrivy reads a report trivy image --format json wrote.
+func ParseTrivy(r io.Reader) (Report, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return report{}, fmt.Errorf("read the Trivy report: %w", err)
+		return Report{}, fmt.Errorf("read the Trivy report: %w", err)
 	}
-	var rep report
-	if err = json.Unmarshal(data, &rep); err != nil {
-		return report{}, fmt.Errorf("parse the Trivy report: %w", err)
+	var raw trivyJSON
+	if err = json.Unmarshal(data, &raw); err != nil {
+		return Report{}, fmt.Errorf("parse the Trivy report: %w", err)
 	}
-	return rep, nil
-}
-
-// ParseTrivy reads a report trivy image --format json wrote, and returns
-// its findings, in Trivy's order, how many packages it saw, and the
-// image's architecture. A report that saw no packages is one whose scan
-// never looked, whatever it found; deciding that is the caller's.
-func ParseTrivy(r io.Reader) (findings []Finding, packages int, arch string, err error) {
-	rep, err := decode(r)
-	if err != nil {
-		return nil, 0, "", err
+	rep := Report{Arch: raw.Metadata.ImageConfig.Architecture, Ref: raw.ArtifactName}
+	if len(raw.Metadata.RepoDigests) > 0 {
+		rep.Ref = raw.Metadata.RepoDigests[0]
 	}
-	for _, res := range rep.Results {
-		packages += len(res.Packages)
+	for _, res := range raw.Results {
+		rep.Packages += len(res.Packages)
 		where := res.Target
 		if res.Class == "os-pkgs" {
 			where = res.Type + " package"
 		}
 		for _, v := range res.Vulnerabilities {
-			findings = append(findings, Finding{
+			rep.Findings = append(rep.Findings, Finding{
 				ID:       v.VulnerabilityID,
 				Pkg:      v.PkgName,
 				Version:  v.InstalledVersion,
@@ -92,21 +100,7 @@ func ParseTrivy(r io.Reader) (findings []Finding, packages int, arch string, err
 			})
 		}
 	}
-	return findings, packages, rep.Metadata.ImageConfig.Architecture, nil
-}
-
-// ImageRef returns what a Trivy report says it scanned: the image's first
-// repository digest, which names exactly what was compared, or the name
-// Trivy was given when it has none.
-func ImageRef(r io.Reader) (string, error) {
-	rep, err := decode(r)
-	if err != nil {
-		return "", err
-	}
-	if len(rep.Metadata.RepoDigests) > 0 {
-		return rep.Metadata.RepoDigests[0], nil
-	}
-	return rep.ArtifactName, nil
+	return rep, nil
 }
 
 // key is what makes two findings the same one.
@@ -132,18 +126,51 @@ func Compare(candidate, published []Finding) Split {
 	return s
 }
 
-// refusal is how Trivy reports a registry declining to show an image: a
-// tag or a repository it does not have, or a pull it denies. ghcr.io
-// denies an anonymous pull of a package that does not exist and of one
-// that is private alike.
-var refusal = regexp.MustCompile(`: (MANIFEST_UNKNOWN|NAME_UNKNOWN|DENIED): `)
+// refusal is how Trivy reports a registry declining a request: the
+// request, then a tag or a repository the registry does not have, or a
+// pull it denies. ghcr.io denies an anonymous pull of a package that does
+// not exist and of one that is private alike.
+var refusal = regexp.MustCompile(`GET (\S+): (?:MANIFEST_UNKNOWN|NAME_UNKNOWN|DENIED): `)
 
 // Unpullable reports whether stderr, from a trivy image --image-src remote
-// that failed, says the registry declined to show the image, rather than
-// that it failed to answer. A rate limit, an outage or an unreachable
-// registry is never taken for an image nobody can pull.
-func Unpullable(stderr []byte) bool {
-	return refusal.Match(stderr)
+// of image that failed, says the registry declined to show image, rather
+// than that it failed to answer. Only a refusal of a request for image's
+// own repository counts: one of its manifests on its registry, or a pull
+// token for it. A rate limit, an outage, an unreachable registry, or a
+// refusal of any other request, is never taken for an image nobody can
+// pull.
+func Unpullable(image string, stderr []byte) bool {
+	host, repo, ok := repository(image)
+	if !ok {
+		return false
+	}
+	for _, m := range refusal.FindAllSubmatch(stderr, -1) {
+		u, err := url.Parse(string(m[1]))
+		if err != nil {
+			continue
+		}
+		manifest := u.Host == host && strings.HasPrefix(u.Path, "/v2/"+repo+"/manifests/")
+		token := u.Query().Get("scope") == "repository:"+repo+":pull"
+		if manifest || token {
+			return true
+		}
+	}
+	return false
+}
+
+// repository returns the registry host and the repository path of an
+// image reference, whatever tag or digest follows them.
+func repository(image string) (host, repo string, ok bool) {
+	host, repo, ok = strings.Cut(image, "/")
+	if !ok || host == "" {
+		return "", "", false
+	}
+	repo, _, _ = strings.Cut(repo, "@")
+	// A tag follows a colon in the path's last element
+	if colon := strings.LastIndexByte(repo, ':'); colon > strings.LastIndexByte(repo, '/') {
+		repo = repo[:colon]
+	}
+	return host, repo, repo != ""
 }
 
 // ErrUnpullable means the registry declined to show the published image to
@@ -152,6 +179,7 @@ var ErrUnpullable = errors.New("not anonymously pullable")
 
 // Trivy runs the scans the comparison needs.
 type Trivy struct {
+	// Run runs trivy.
 	Run execx.Runner
 	// VEX, when set, names an OpenVEX document both scans apply.
 	VEX string
@@ -195,7 +223,7 @@ func (t Trivy) Published(ctx context.Context, image, arch, report string) error 
 	if res.Code == 0 {
 		return nil
 	}
-	if Unpullable(res.Stderr) {
+	if Unpullable(image, res.Stderr) {
 		return fmt.Errorf("%s: %w", image, ErrUnpullable)
 	}
 	t.log(res.Stderr)

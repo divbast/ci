@@ -56,11 +56,11 @@ func parse(t *testing.T, name string) []scan.Finding {
 	if name == "" {
 		return nil
 	}
-	findings, _, _, err := scan.ParseTrivy(bytes.NewReader(readTestdata(t, name)))
+	rep, err := scan.ParseTrivy(bytes.NewReader(readTestdata(t, name)))
 	if err != nil {
 		t.Fatalf("ParseTrivy(%s): %v", name, err)
 	}
-	return findings
+	return rep.Findings
 }
 
 func TestParseTrivyCountsPackages(t *testing.T) {
@@ -128,18 +128,18 @@ func TestParseTrivyCountsPackages(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			findings, packages, arch, err := scan.ParseTrivy(bytes.NewReader(tt.report))
+			rep, err := scan.ParseTrivy(bytes.NewReader(tt.report))
 			if err != nil {
 				t.Fatalf("ParseTrivy() error = %v", err)
 			}
-			if !slices.Equal(findings, tt.wantFindings) {
-				t.Errorf("findings = %+v, want %+v", findings, tt.wantFindings)
+			if !slices.Equal(rep.Findings, tt.wantFindings) {
+				t.Errorf("findings = %+v, want %+v", rep.Findings, tt.wantFindings)
 			}
-			if packages != tt.wantPackages {
-				t.Errorf("packages = %d, want %d", packages, tt.wantPackages)
+			if rep.Packages != tt.wantPackages {
+				t.Errorf("packages = %d, want %d", rep.Packages, tt.wantPackages)
 			}
-			if arch != tt.wantArch {
-				t.Errorf("arch = %q, want %q", arch, tt.wantArch)
+			if rep.Arch != tt.wantArch {
+				t.Errorf("arch = %q, want %q", rep.Arch, tt.wantArch)
 			}
 		})
 	}
@@ -157,14 +157,16 @@ func TestParseTrivyRejects(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if _, _, _, err := scan.ParseTrivy(strings.NewReader(report)); err == nil {
+			if _, err := scan.ParseTrivy(strings.NewReader(report)); err == nil {
 				t.Errorf("ParseTrivy(%q) error = nil, want one", report)
 			}
 		})
 	}
 }
 
-func TestImageRef(t *testing.T) {
+// TestParseTrivyRef checks what a report says it scanned: the image's
+// first repository digest, or the name Trivy was given when it has none.
+func TestParseTrivyRef(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -190,22 +192,15 @@ func TestImageRef(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := scan.ImageRef(bytes.NewReader(tt.report))
+			rep, err := scan.ParseTrivy(bytes.NewReader(tt.report))
 			if err != nil {
-				t.Fatalf("ImageRef() error = %v", err)
+				t.Fatalf("ParseTrivy() error = %v", err)
 			}
-			if got != tt.want {
-				t.Errorf("ImageRef() = %q, want %q", got, tt.want)
+			if rep.Ref != tt.want {
+				t.Errorf("ParseTrivy().Ref = %q, want %q", rep.Ref, tt.want)
 			}
 		})
 	}
-
-	t.Run("not-json", func(t *testing.T) {
-		t.Parallel()
-		if _, err := scan.ImageRef(strings.NewReader("nope")); err == nil {
-			t.Error("ImageRef(nope) error = nil, want one")
-		}
-	})
 }
 
 func TestCompare(t *testing.T) {
@@ -359,34 +354,59 @@ func TestAdvisoryDetection(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		file string
-		want bool
+		file, image string
+		want        bool
 	}{
-		// What a published image nobody can pull anonymously looks like
-		{file: "trivy-no-such-tag.txt", want: true},
-		{file: "trivy-no-such-package.txt", want: true},
-		{file: "trivy-name-unknown.txt", want: true},
+		// What a published image nobody can pull anonymously looks like,
+		// for the image each was recorded against
+		{file: "trivy-no-such-tag.txt", image: "ghcr.io/divbast/librespeed:no-such-tag", want: true},
+		{file: "trivy-no-such-package.txt", image: "ghcr.io/divbast/no-such-package-t5:latest", want: true},
+		{file: "trivy-name-unknown.txt", image: "public.ecr.aws/divbast/no-such-repo-t5:latest", want: true},
+		// The repository is what counts, not the tag or digest asked for
+		{file: "trivy-no-such-tag.txt", image: latest, want: true},
+		{file: "trivy-no-such-tag.txt", image: fixtureDigest, want: true},
+		{file: "trivy-no-such-package.txt", image: "ghcr.io/divbast/no-such-package-t5@sha256:00", want: true},
+		// CI-25(a): a refusal of another repository's request, on the
+		// same registry or another, says nothing of this image's
+		{file: "trivy-no-such-package.txt", image: latest},
+		{file: "trivy-no-such-tag.txt", image: "ghcr.io/divbast/libre:latest"},
+		{file: "trivy-no-such-tag.txt", image: "ghcr.io/divbast/librespeed-dev:latest"},
+		{file: "trivy-no-such-tag.txt", image: "ghcr.io/other/divbast/librespeed:latest"},
+		{file: "trivy-name-unknown.txt", image: "ghcr.io/divbast/no-such-repo-t5:latest"},
 		// What a registry that failed to answer looks like, which must never
 		// pass for one with nothing published
-		{file: "trivy-unauthorized.txt"},
-		{file: "trivy-no-such-host.txt"},
-		{file: "trivy-manifest-429.txt"},
-		{file: "trivy-manifest-503.txt"},
+		{file: "trivy-unauthorized.txt", image: "quay.io/divbast/no-such-repo-t5:latest"},
+		{file: "trivy-no-such-host.txt", image: "no-such-host.invalid/divbast/librespeed:latest"},
+		{file: "trivy-manifest-429.txt", image: latest},
+		{file: "trivy-manifest-503.txt", image: latest},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.file, func(t *testing.T) {
+		t.Run(tt.file+"/"+tt.image, func(t *testing.T) {
 			t.Parallel()
-			if got := scan.Unpullable(readTestdata(t, tt.file)); got != tt.want {
-				t.Errorf("Unpullable(%s) = %t, want %t", tt.file, got, tt.want)
+			if got := scan.Unpullable(tt.image, readTestdata(t, tt.file)); got != tt.want {
+				t.Errorf("Unpullable(%s, %s) = %t, want %t", tt.image, tt.file, got, tt.want)
 			}
 		})
 	}
 
-	// The code alone, outside the shape Trivy prints it in, is not a refusal
-	for _, stderr := range []string{"", "DENIED", "MANIFEST_UNKNOWN: manifest unknown", "an image named ghcr.io/x/DENIED: 1"} {
-		if scan.Unpullable([]byte(stderr)) {
-			t.Errorf("Unpullable(%q) = true, want false", stderr)
+	// The code alone, outside the shape Trivy prints it in, is not a
+	// refusal, nor is a refusal of another request of the same registry's
+	for _, stderr := range []string{
+		"", "DENIED", "MANIFEST_UNKNOWN: manifest unknown", "an image named ghcr.io/x/DENIED: 1",
+		"remote error: GET https://ghcr.io/v2/divbast/librespeed: DENIED: 1",
+		"remote error: GET https://ghcr.io/v2/aquasecurity/trivy-java-db/manifests/1: DENIED: denied",
+		"remote error: GET https://ghcr.io/token?scope=repository%3Aaquasecurity%2Ftrivy-java-db%3Apull&service=ghcr.io: DENIED: denied",
+		"remote error: GET https://ghcr.io/token?scope=repository%3Adivbast%2Flibrespeed%3Apush&service=ghcr.io: DENIED: denied",
+	} {
+		if scan.Unpullable(latest, []byte(stderr)) {
+			t.Errorf("Unpullable(%s, %q) = true, want false", latest, stderr)
+		}
+	}
+	// Nor is anything for a reference that names no repository
+	for _, image := range []string{"", "librespeed", "ghcr.io/", "/divbast/librespeed"} {
+		if scan.Unpullable(image, readTestdata(t, "trivy-no-such-tag.txt")) {
+			t.Errorf("Unpullable(%q, trivy-no-such-tag.txt) = true, want false", image)
 		}
 	}
 }
@@ -462,12 +482,23 @@ func TestTrivy(t *testing.T) {
 		},
 		{
 			name: "published-unpullable",
-			call: execx.Call{Argv: publishedArgv("amd64"), Result: execx.Result{Stderr: readTestdata(t, "trivy-no-such-package.txt"), Code: 1}},
+			call: execx.Call{Argv: publishedArgv("amd64"), Result: execx.Result{Stderr: readTestdata(t, "trivy-no-such-tag.txt"), Code: 1}},
 			do: func(ctx context.Context, tr scan.Trivy) error {
 				return tr.Published(ctx, latest, "amd64", "/w/baseline.json")
 			},
 			wantErr: true,
 			wantIs:  scan.ErrUnpullable,
+		},
+		{
+			// CI-25(a): a refusal of another repository's request says
+			// nothing of the published image's
+			name: "published-another-repository-refused",
+			call: execx.Call{Argv: publishedArgv("amd64"), Result: execx.Result{Stderr: readTestdata(t, "trivy-no-such-package.txt"), Code: 1}},
+			do: func(ctx context.Context, tr scan.Trivy) error {
+				return tr.Published(ctx, latest, "amd64", "/w/baseline.json")
+			},
+			wantErr: true,
+			wantLog: readTestdata(t, "trivy-no-such-package.txt"),
 		},
 		{
 			name: "published-rate-limited",
