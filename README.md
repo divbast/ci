@@ -186,7 +186,7 @@ just IMAGE=ghcr.io/divbast/librespeed:latest acceptance
 | `acceptance` | `go test -json ./test/acceptance/...` against `IMAGE` under `ENGINE`, through `divbast-testcount` |
 | `test` | `build`, then `acceptance` |
 | `archive` | Writes `IMAGE` to `ARCHIVE` as an OCI archive |
-| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED` |
+| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED`, with `-vex openvex.json` when the app has one ([VEX](#vex)) |
 | `app-lint` | hadolint, and BuildKit's own `docker build --check`, over the Containerfile |
 
 `go test` exits 0 when every test skipped, and prints only `ok`, so an
@@ -558,6 +558,44 @@ the mark, above, that makes the next release major:
 When unsure whether a change breaks callers, mark it: a major release only
 waits for approval on each caller's Dependency Dashboard.
 
+v2.0.0 is such a release: it added a permission a calling job must grant,
+and made a run that passed fail. [Moving to v2](#moving-to-v2) says what
+a caller changes.
+
+### Moving to v2
+
+v2.0.0 breaks two things a v1 caller relies on.
+
+- **`app-check.yml` needs `packages: read`.** Its `scan` job asks GitHub
+  whether a published image the registry refuses is absent, private, or
+  public and failing, where v1 read Trivy's error text and took any
+  refusal for nothing published. So a registry refusing a public image
+  now fails the scan, where v1 made it advisory. A called job gets no
+  more than its caller grants, so a caller's `check` job that does not
+  grant it fails before any job starts. The `check` job's permissions
+  become:
+
+  ```yaml
+      permissions:
+        contents: read
+        attestations: read # verify the FrankenPHP binary
+        packages: read # the scan asks GitHub whether the published image is absent or private
+        security-events: write # code scanning, from main
+  ```
+
+  `divbast-scan`'s `-published` must name a ghcr.io image, as every
+  caller's does.
+- **`app-publish.yml` rehearses only in `divbast/oci-image-template`.**
+  Anywhere else, `rehearse: true` fails the publish job, where v1 warned
+  and went on. A repository made from the template sets `image` to its own
+  and removes `rehearse` before it moves to v2; the
+  [Rehearsal](#rehearsal) section says how.
+
+Nothing else changed for a caller. `lint.yml`, `renovate.yml` and
+`stall.yml` take the same inputs and permissions as in v1, so a repository
+that calls only those moves its pin and nothing more. An app may add an
+`openvex.json` ([VEX](#vex)); without one, `scan` runs as before.
+
 ## Workflows
 
 The caller grants each called job its permissions. A called job gets no
@@ -596,15 +634,15 @@ workflow runs on:
 - `test` loads each image into Docker and into rootless Podman and runs
   `just acceptance` against it, on both architectures.
 - `scan` runs `just scan` over each image, and on main uploads its
-  findings to code scanning.
+  findings to code scanning: [Scan](#scan), below.
 
 | Input | Type | Default | What |
 |---|---|---|---|
 | `php` | boolean | `true` | Install PHP 8.5 and Composer for the lint job, which runs PHPStan |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
 
-The calling job grants `contents: read`, `attestations: read` and
-`security-events: write`.
+The calling job grants `contents: read`, `attestations: read`,
+`packages: read` and `security-events: write`.
 
 `scan`, which can change code scanning alerts, installs only Go, just and
 Trivy from the caller's `mise.toml`, and turns mise's auto-install off. The
@@ -613,6 +651,45 @@ short `go` the same way), and just and Trivy as exactly
 `"aqua:casey/just"` and `"aqua:aquasecurity/trivy"`. mise would install a
 name that `mise.toml` does not declare at its latest version, so `scan`
 fails unless all three are there.
+
+#### Scan
+
+`divbast-scan` fails only on a HIGH or CRITICAL finding that the published
+image, `PUBLISHED`, lacks for the same architecture: the same
+vulnerability in the same package, at any version. A new advisory against
+something already shipped is reported, not blocked. Whether anything is
+published is the registry's to say, never Trivy's: the tool first reads
+`PUBLISHED` as an anonymous client, as users pull it, and when ghcr.io
+refuses, asks the GitHub API why, through gh and the job's token, which
+is what `packages: read` is for.
+
+| `PUBLISHED` is | The scan |
+|---|---|
+| readable | Compares with what Trivy finds in it, from the same vulnerability database. Any failure of that scan fails, whatever Trivy says about why |
+| not published yet | Advisory, with a warning: nothing is shipped to compare with |
+| private | Advisory, with a warning that it stays advisory until the package is public |
+| public, but refused | Fails: a registry failing to serve the image is not nothing published |
+| unreadable, or GitHub does not answer | Fails |
+
+Each warning is a GitHub Actions warning and a callout on the run's
+summary. Only gh gets the token: Trivy and skopeo run without it.
+
+Outside GitHub Actions the tool never asks GitHub, since the token a
+person gives the recipes, a fine-grained one, cannot read packages: the
+API answers it HTTP 403. A local `just scan`
+whose `PUBLISHED` the registry refuses is therefore advisory too, with a
+warning that only CI can tell what the refusal means; one the registry
+shows compares as CI does.
+
+#### VEX
+
+An app that argues a finding unreachable does it in an
+[OpenVEX](https://openvex.dev) document named `openvex.json` at its root,
+with an `openvex.json.license` sidecar for REUSE. `scan` passes it to both
+of Trivy's scans when it is there, and passes no `-vex` when it is not.
+Each statement names one advisory and the product, with its version, that
+it was argued against, so that a bump that moves the product brings the
+finding back, to be argued again.
 
 ### `app-publish.yml`
 
@@ -682,6 +759,7 @@ jobs:
     permissions:
       contents: read
       attestations: read # verify the FrankenPHP binary
+      packages: read # the scan asks GitHub whether the published image is absent or private
       security-events: write # code scanning, from main
 
   required:
@@ -729,15 +807,15 @@ the job's login. Nothing reaches ghcr.io, and no package is made. Each
 rehearsal says so in a warning and on the run's summary:
 `rehearsal: nothing was published to ghcr.io`.
 
-`divbast/oci-image-template` rehearses, since it has no package. A
-repository made from it inherits `rehearse: true`, and anywhere but the
-template the line goes on to say how to publish: `to publish, set image
+Only `divbast/oci-image-template` rehearses, since it has no package. A
+repository made from it inherits `rehearse: true`, and its publish job
+fails, before it logs in anywhere or pushes, until it makes the switch,
+saying in an error and on the run's summary how: `to publish, set image
 to this app's own and remove rehearse from the job that calls
 app-publish.yml`. That is the switch, in the calling job's `with:`: set
 `image` to the app's own `ghcr.io/divbast/<app>`, and remove
 `rehearse: true`. A job that drops `rehearse` but keeps the template's
-image fails before it logs in anywhere or pushes, and says to set image
-to the app's own name.
+image fails as early, and says to set image to the app's own name.
 
 ### `renovate.yml`
 
@@ -887,7 +965,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published image lacks | Nothing new, or advisory because nothing is pullable | A new finding, or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

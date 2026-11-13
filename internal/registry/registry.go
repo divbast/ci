@@ -10,7 +10,9 @@
 // published there yet; and anything else, an error. A revision that cannot
 // be read is never taken for one that is absent. Absent is what lets a
 // first publish through without a commit to compare with, and so what
-// would let a registry outage move :latest backwards.
+// would let a registry outage move :latest backwards. Presence tells the
+// same answers apart without the revision, for a caller that needs only
+// whether anything is published.
 package registry
 
 import (
@@ -37,8 +39,8 @@ const (
 	// Absent means nothing is published under the reference yet: no such
 	// package, or no such tag in a public one.
 	Absent State = iota + 1
-	// Published means the reference resolves, and names the commit it
-	// was built from.
+	// Published means the reference resolves for an anonymous client.
+	// Revision also requires it to name the commit it was built from.
 	Published
 )
 
@@ -57,6 +59,12 @@ func (s State) String() string {
 // ErrPrivate means the package exists but is not public, so an anonymous
 // client cannot read it, and no user can pull it.
 var ErrPrivate = errors.New("package is private")
+
+// ErrRefused means the registry refused to show an image to an anonymous
+// client, and a RegistryOnly Lookup asked GitHub nothing about why. That
+// can mean nothing is published there, a private package, or a registry
+// failing to serve a public one: only the GitHub API tells them apart.
+var ErrRefused = errors.New("refused, and GitHub not asked why")
 
 // host is the one registry Lookup reads. The GitHub API, which tells an
 // absent package from a private one, knows about no other.
@@ -97,6 +105,10 @@ type Lookup struct {
 	// that a registry that never answers fails the lookup rather than
 	// holding the job until the job's own timeout. Zero means a minute.
 	Timeout time.Duration
+	// RegistryOnly, when set, never asks the GitHub API, for a caller with
+	// no token that may read packages: a refusal is then an error wrapping
+	// [ErrRefused], never an answer.
+	RegistryOnly bool
 }
 
 // Revision returns the commit image, a ghcr.io reference such as
@@ -109,14 +121,47 @@ type Lookup struct {
 // its packages (packages: read).
 //
 // Anything else is an error, with the zero State: a private package
-// (wrapping [ErrPrivate]), a registry or API that fails to answer or takes
-// longer than its timeout, a 404 that does not say the package is not
-// found, a token the API refuses, and an image with no full commit SHA in
-// its revision annotation.
+// (wrapping [ErrPrivate]), a refusal a RegistryOnly Lookup did not ask
+// about (wrapping [ErrRefused]), a registry or API that fails to answer or
+// takes longer than its timeout, a 404 that does not say the package is
+// not found, a token the API refuses, and an image with no full commit SHA
+// in its revision annotation.
 func (l Lookup) Revision(ctx context.Context, image string) (string, State, error) {
+	manifest, state, err := l.inspect(ctx, image)
+	if err != nil || state != Published {
+		return "", state, err
+	}
+	var index struct {
+		Annotations map[string]string `json:"annotations"`
+	}
+	if err = json.Unmarshal(manifest, &index); err != nil {
+		return "", 0, unreadable(image, fmt.Errorf("its manifest is not JSON: %w", err))
+	}
+	revision := index.Annotations[annotation]
+	if !commit.MatchString(revision) {
+		return "", 0, fmt.Errorf("%s carries no revision annotation, only '%s', so nothing says which commit it was built from", image, revision)
+	}
+	return revision, Published, nil
+}
+
+// Presence says whether image, a ghcr.io reference, is published, decided
+// as [Lookup.Revision] decides it, but asking nothing of the image itself:
+// [Published] when an anonymous client can read it, as users pull it, and
+// [Absent] when nothing is published there yet. Anything else is an error,
+// with the zero State, as Revision's are.
+func (l Lookup) Presence(ctx context.Context, image string) (State, error) {
+	_, state, err := l.inspect(ctx, image)
+	return state, err
+}
+
+// inspect reads image's manifest as an anonymous client, and returns it
+// with [Published]. When the registry refuses to show image, it returns
+// [Absent] or an error, as the GitHub API says, or, for a RegistryOnly
+// Lookup, an error wrapping [ErrRefused].
+func (l Lookup) inspect(ctx context.Context, image string) ([]byte, State, error) {
 	owner, name, err := parse(image)
 	if err != nil {
-		return "", 0, err
+		return nil, 0, err
 	}
 
 	limit := l.Timeout
@@ -133,68 +178,61 @@ func (l Lookup) Revision(ctx context.Context, image string) (string, State, erro
 		if timedOut {
 			err = fmt.Errorf("skopeo inspect docker://%s gave up after %v: %w", image, limit, err)
 		}
-		return "", 0, unreadable(image, err)
+		return nil, 0, unreadable(image, err)
 	}
-	if res.Code != 0 {
-		stderr := bytes.TrimSpace(res.Stderr)
-		if !slices.ContainsFunc(refusals, func(r []byte) bool { return bytes.Contains(stderr, r) }) {
-			return "", 0, unreadable(image, fmt.Errorf("skopeo exit status %d: %s", res.Code, stderr))
-		}
-		return l.refused(ctx, image, owner, name, stderr)
+	if res.Code == 0 {
+		return res.Stdout, Published, nil
 	}
-
-	var index struct {
-		Annotations map[string]string `json:"annotations"`
+	stderr := bytes.TrimSpace(res.Stderr)
+	if !slices.ContainsFunc(refusals, func(r []byte) bool { return bytes.Contains(stderr, r) }) {
+		return nil, 0, unreadable(image, fmt.Errorf("skopeo exit status %d: %s", res.Code, stderr))
 	}
-	if err = json.Unmarshal(res.Stdout, &index); err != nil {
-		return "", 0, unreadable(image, fmt.Errorf("its manifest is not JSON: %w", err))
+	if l.RegistryOnly {
+		return nil, 0, fmt.Errorf("%w: %s refused to show %s: %s", ErrRefused, host, image, stderr)
 	}
-	revision := index.Annotations[annotation]
-	if !commit.MatchString(revision) {
-		return "", 0, fmt.Errorf("%s carries no revision annotation, only '%s', so nothing says which commit it was built from", image, revision)
-	}
-	return revision, Published, nil
+	state, err := l.refused(ctx, image, owner, name, stderr)
+	return nil, state, err
 }
 
 // refused decides, from the GitHub API, what a registry's refusal to show
 // image means. stderr is what skopeo said.
-func (l Lookup) refused(ctx context.Context, image, owner, name string, stderr []byte) (string, State, error) {
+func (l Lookup) refused(ctx context.Context, image, owner, name string, stderr []byte) (State, error) {
 	pkg := host + "/" + owner + "/" + name
 	var p struct {
 		Visibility string `json:"visibility"`
 	}
 	resp, err := l.GH.Get(ctx, "orgs/"+url.PathEscape(owner)+"/packages/container/"+url.PathEscape(name), &p)
 	if err != nil {
-		return "", 0, fmt.Errorf("%s refused to show %s, and the GitHub API could not say whether it is absent or private: %w", host, image, err)
+		return 0, fmt.Errorf("%s refused to show %s, and the GitHub API could not say whether it is absent or private: %w", host, image, err)
 	}
 
 	switch resp.Status {
 	case 404:
 		if resp.Message != notFound {
-			return "", 0, fmt.Errorf("%s refused to show %s, and GitHub answered HTTP 404 for package %s with %q, not %q, so nothing says it is absent",
+			return 0, fmt.Errorf("%s refused to show %s, and GitHub answered HTTP 404 for package %s with %q, not %q, so nothing says it is absent",
 				host, image, pkg, resp.Message, notFound)
 		}
-		return "", Absent, nil
+		return Absent, nil
 	case 200:
 		switch p.Visibility {
 		case "public":
 		case "":
-			return "", 0, fmt.Errorf("%s refused to show %s, and GitHub gives package %s no visibility, so nothing says whether it is absent or private", host, image, pkg)
+			return 0, fmt.Errorf("%s refused to show %s, and GitHub gives package %s no visibility, so nothing says whether it is absent or private", host, image, pkg)
 		default:
-			return "", 0, fmt.Errorf("%w: GitHub gives %s the visibility %q, so no anonymous client can read %s", ErrPrivate, pkg, p.Visibility, image)
+			return 0, fmt.Errorf("%w: GitHub gives %s the visibility %q, so no anonymous client can read %s", ErrPrivate, pkg, p.Visibility, image)
 		}
 		if bytes.Contains(stderr, []byte("manifest unknown")) {
 			// A public package without this tag: not published yet.
-			return "", Absent, nil
+			return Absent, nil
 		}
-		return "", 0, unreadable(image, fmt.Errorf("GitHub lists %s as public, but %s refused an anonymous read: %s", pkg, host, stderr))
+		return 0, unreadable(image, fmt.Errorf("GitHub lists %s as public, but %s refused an anonymous read: %s", pkg, host, stderr))
 	case 403:
 		// A token without packages: read gets a 403, and so does one that
 		// hit a rate limit or must authorise SSO first: GitHub's message
 		// says which.
-		return "", 0, fmt.Errorf("%s refused to show %s, and GitHub would not show package %s to this token: HTTP 403: %s", host, image, pkg, said(resp.Message))
+		return 0, fmt.Errorf("%s refused to show %s, and GitHub would not show package %s to this token: HTTP 403: %s", host, image, pkg, said(resp.Message))
 	default:
-		return "", 0, fmt.Errorf("%s refused to show %s, and GitHub answered HTTP %d for package %s: %s", host, image, resp.Status, pkg, said(resp.Message))
+		return 0, fmt.Errorf("%s refused to show %s, and GitHub answered HTTP %d for package %s: %s", host, image, resp.Status, pkg, said(resp.Message))
 	}
 }
 

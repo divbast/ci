@@ -22,7 +22,8 @@
 # With rehearse set, it decides against the image as any publish does, then
 # publishes into a registry it starts inside the job instead, attesting for
 # real, so that divbast/oci-image-template, which has no package, runs all
-# of it while nothing reaches ghcr.io.
+# of it while nothing reaches ghcr.io. A rehearsal in any other repository
+# fails.
 #
 # The caller's job grants contents: read, packages: write, id-token: write
 # and attestations: write, and runs only on schedule or workflow_dispatch
@@ -47,7 +48,7 @@ on:
         type: string
         required: true
       rehearse:
-        description: Decide against image as ever, then publish into a registry started inside the job rather than to image. For divbast/oci-image-template, which has no package; an app made from it sets image and removes this
+        description: Decide against image as ever, then publish into a registry started inside the job rather than to image. For divbast/oci-image-template alone, which has no package; anywhere else the job fails, and an app made from it sets image and removes this
         type: boolean
         required: false
         default: false
@@ -126,17 +127,22 @@ jobs:
             exit 1
           fi
 
-      # A repository made from divbast/oci-image-template inherits its
-      # rehearse: true, and publishes nothing until it drops it
-      - name: Say that this run rehearses
+      # A rehearsal is the template's alone, since it has no package. A
+      # repository made from divbast/oci-image-template inherits its
+      # rehearse: true, and fails here, before any login or push, until it
+      # sets image to its own and removes rehearse: a switch left half done
+      # never stays green. GITHUB_REPOSITORY is the calling repository's.
+      - name: Refuse a rehearsal outside the template
+        id: rehearse
         if: inputs.rehearse
-        env:
-          REPO: ${{ github.repository }}
         run: |
-          line="rehearsal: nothing was published to ghcr.io"
-          if [ "${REPO}" != divbast/oci-image-template ]; then
-            line="${line}; to publish, set image to this app's own and remove rehearse from the job that calls app-publish.yml"
+          if [ "${GITHUB_REPOSITORY}" != divbast/oci-image-template ]; then
+            line="only divbast/oci-image-template rehearses, not ${GITHUB_REPOSITORY}: to publish, set image to this app's own and remove rehearse from the job that calls app-publish.yml"
+            echo "::error::${line}"
+            echo "${line}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
           fi
+          line="rehearsal: nothing was published to ghcr.io"
           echo "::warning::${line}"
           echo "${line}" >> "${GITHUB_STEP_SUMMARY}"
 

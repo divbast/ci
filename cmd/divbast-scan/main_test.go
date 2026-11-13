@@ -101,8 +101,15 @@ func line(id string) string {
 	return "  " + id + " HIGH stdlib v1.27.3, no fix, usr/local/bin/frankenphp\n"
 }
 
-const warning = "The scan is advisory because " + published + " is not anonymously pullable: " +
-	"it is not published yet, or it is private. It stays advisory until " + published + " is public."
+// The warnings for a published image GitHub says is not there, and for one
+// the registry refused outside GitHub Actions, where nothing asks GitHub.
+const (
+	absentWarning = "The scan is advisory because " + published + " is not published yet: " +
+		"nothing is shipped to compare with. It blocks on new findings once " + published + " is published."
+	refusedWarning = "The scan is advisory because " + published + " was refused by ghcr.io: " +
+		"outside GitHub Actions nothing asks GitHub whether that means it is not published yet, is private, or is " +
+		"public and failing to serve: the token a person gives the recipes cannot read packages. CI's scan asks, and decides."
+)
 
 func TestRun(t *testing.T) {
 	t.Parallel()
@@ -110,10 +117,18 @@ func TestRun(t *testing.T) {
 	// What the runner already wrote to the summary, which must survive.
 	const before = "earlier\n"
 
+	// The registry showing the published image, or refusing to
+	index := &execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}
+	refused := &execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}
+
 	tests := []struct {
 		name string
 		// vex is the -vex flag's value, if any.
 		vex string
+		// skopeo is how the registry answers the read of the published
+		// image, and gh how GitHub answers about its package. A nil
+		// result means the call is never made.
+		skopeo, gh *execx.Result
 		// candidate and baseline are the reports the two scans write, and
 		// layoutResult, baselineResult and sarifResult what each call
 		// returns. A nil result means the call is never made.
@@ -132,6 +147,7 @@ func TestRun(t *testing.T) {
 	}{
 		{
 			name:           "nothing-new",
+			skopeo:         index,
 			candidate:      report(t, "amd64", "", 3, "CVE-1", "CVE-2"),
 			baseline:       report(t, "amd64", digest, 3, "CVE-2", "CVE-1"),
 			layoutResult:   &execx.Result{},
@@ -144,6 +160,7 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:           "new-blocks",
+			skopeo:         index,
 			candidate:      report(t, "arm64", "", 3, "CVE-1", "CVE-2", "CVE-3"),
 			baseline:       report(t, "arm64", digest, 3, "CVE-2"),
 			layoutResult:   &execx.Result{},
@@ -157,6 +174,7 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:           "new-blocks-with-vex",
+			skopeo:         index,
 			vex:            "baikal.openvex.json",
 			candidate:      report(t, "amd64", "", 3, "CVE-1"),
 			baseline:       report(t, "amd64", digest, 3),
@@ -169,33 +187,36 @@ func TestRun(t *testing.T) {
 			wantStderr: []string{"1 finding(s) the published image does not have. Move what carries them, or argue reachability in baikal.openvex.json.\n"},
 		},
 		{
-			name:           "advisory",
-			candidate:      report(t, "amd64", "", 3, "CVE-1", "CVE-2"),
-			layoutResult:   &execx.Result{},
-			sarifResult:    &execx.Result{},
-			baselineResult: &execx.Result{Stderr: recorded(t, "trivy-no-such-tag.txt"), Code: 1},
-			wantStdout: "compared with nothing, because " + published + " is not anonymously pullable\n" +
-				"2 advisory: nothing published yet:\n" + line("CVE-1") + line("CVE-2") +
+			// Outside GitHub Actions, nothing asks GitHub about a refusal
+			name:         "advisory",
+			skopeo:       refused,
+			candidate:    report(t, "amd64", "", 3, "CVE-1", "CVE-2"),
+			layoutResult: &execx.Result{},
+			sarifResult:  &execx.Result{},
+			wantStdout: "compared with nothing, because " + published + " was refused by ghcr.io\n" +
+				"2 advisory: nothing readable to compare with:\n" + line("CVE-1") + line("CVE-2") +
 				"0 already published, so advisory:\n" +
-				published + " is not anonymously pullable, so all 2 finding(s) are advisory\n",
-			wantStderr:   []string{"WARNING: " + warning + "\n"},
+				published + " was refused by ghcr.io, so all 2 finding(s) are advisory\n",
+			wantStderr:   []string{"WARNING: " + refusedWarning + "\n"},
 			notInStdout:  []string{"::warning"},
-			wantSummary:  []string{"> **Warning:** " + warning + "\n", "**Advisory: nothing published yet: 2**"},
+			wantSummary:  []string{"> **Warning:** " + refusedWarning + "\n", "**Advisory: nothing readable to compare with: 2**"},
 			wantBaseline: "{}\n",
 		},
 		{
-			name:           "advisory-in-actions",
-			candidate:      report(t, "amd64", "", 3, "CVE-1"),
-			layoutResult:   &execx.Result{},
-			sarifResult:    &execx.Result{},
-			baselineResult: &execx.Result{Stderr: recorded(t, "trivy-no-such-tag.txt"), Code: 1},
-			env:            map[string]string{"GITHUB_ACTIONS": "true"},
-			wantStdout: "::warning title=Scan is advisory::" + warning + "\n" +
-				"compared with nothing, because " + published + " is not anonymously pullable\n" +
+			name:         "advisory-in-actions",
+			skopeo:       refused,
+			gh:           new(status(404, "Package not found.")),
+			candidate:    report(t, "amd64", "", 3, "CVE-1"),
+			layoutResult: &execx.Result{},
+			sarifResult:  &execx.Result{},
+			env:          map[string]string{"GITHUB_ACTIONS": "true"},
+			wantStdout: "::warning title=Scan is advisory::" + absentWarning + "\n" +
+				"compared with nothing, because " + published + " is not published yet\n" +
 				"1 advisory: nothing published yet:\n" + line("CVE-1") +
 				"0 already published, so advisory:\n" +
-				published + " is not anonymously pullable, so all 1 finding(s) are advisory\n",
-			wantStderr:   []string{"WARNING: " + warning + "\n"},
+				published + " is not published yet, so all 1 finding(s) are advisory\n",
+			wantStderr:   []string{"WARNING: " + absentWarning + "\n"},
+			wantSummary:  []string{"> **Warning:** " + absentWarning + "\n", "**Advisory: nothing published yet: 1**"},
 			wantBaseline: "{}\n",
 		},
 		{
@@ -207,6 +228,7 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:           "nothing-to-scan-published",
+			skopeo:         index,
 			candidate:      report(t, "amd64", "", 3, "CVE-1"),
 			baseline:       report(t, "amd64", digest, 0),
 			layoutResult:   &execx.Result{},
@@ -217,6 +239,7 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:           "registry-failed",
+			skopeo:         index,
 			candidate:      report(t, "amd64", "", 3, "CVE-1"),
 			layoutResult:   &execx.Result{},
 			sarifResult:    &execx.Result{},
@@ -226,29 +249,6 @@ func TestRun(t *testing.T) {
 				"TOOMANYREQUESTS: retry-after: 1s",
 				"could not scan " + published + ", so no finding can be told apart from one already published",
 			},
-		},
-		{
-			// CI-25(a): the registry refused another repository, not the
-			// published one, so nothing says it is unpublished
-			name:           "another-repository-refused",
-			candidate:      report(t, "amd64", "", 3, "CVE-1"),
-			layoutResult:   &execx.Result{},
-			sarifResult:    &execx.Result{},
-			baselineResult: &execx.Result{Stderr: recorded(t, "trivy-no-such-package.txt"), Code: 1},
-			wantCode:       1,
-			wantStderr: []string{
-				"no-such-package-t5%3Apull&service=ghcr.io: DENIED",
-				"could not scan " + published + ", so no finding can be told apart from one already published",
-			},
-		},
-		{
-			name:           "registry-unauthorized",
-			candidate:      report(t, "amd64", "", 3, "CVE-1"),
-			layoutResult:   &execx.Result{},
-			sarifResult:    &execx.Result{},
-			baselineResult: &execx.Result{Stderr: recorded(t, "trivy-unauthorized.txt"), Code: 1},
-			wantCode:       1,
-			wantStderr:     []string{"could not scan " + published},
 		},
 		{
 			name:         "layout-scan-fails",
@@ -312,6 +312,12 @@ func TestRun(t *testing.T) {
 			if tt.sarifResult != nil {
 				argv := []string{"trivy", "convert", "--format", "sarif", "--output", paths["report.sarif"], paths["report.json"]}
 				calls = append(calls, execx.Call{Argv: argv, Result: *tt.sarifResult})
+			}
+			if tt.skopeo != nil {
+				calls = append(calls, execx.Call{Argv: skopeoArgv, Result: *tt.skopeo})
+			}
+			if tt.gh != nil {
+				calls = append(calls, execx.Call{Argv: ghArgv, Result: *tt.gh})
 			}
 			if tt.baselineResult != nil {
 				var c struct {
@@ -391,6 +397,269 @@ func TestRun(t *testing.T) {
 	}
 }
 
+// skopeoStderr returns a recording of skopeo's stderr from
+// internal/registry's testdata, where registry_test.go says how each was
+// made.
+func skopeoStderr(t *testing.T, name string) []byte {
+	t.Helper()
+	root, err := os.OpenRoot(filepath.Join("..", "..", "internal", "registry", "testdata"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// The calls that ask whether published is published: skopeo reading it as
+// an anonymous client, and gh asking GitHub about its package.
+var (
+	skopeoArgv = []string{"skopeo", "inspect", "--raw", "--no-creds", "docker://" + published}
+	ghArgv     = []string{"gh", "api", "-i", "orgs/divbast/packages/container/librespeed"}
+)
+
+// pkg is gh api -i answering 200 with a package of this visibility.
+func pkg(visibility string) execx.Result {
+	return execx.Result{Stdout: []byte("HTTP/2.0 200 OK\nContent-Type: application/json; charset=utf-8\r\n\r\n" +
+		`{"id":1,"name":"librespeed","package_type":"container","visibility":"` + visibility + `"}`)}
+}
+
+// status is gh api -i answering a status outside 2xx, which gh exits 1 on.
+func status(code int, text string) execx.Result {
+	return execx.Result{
+		Stdout: []byte("HTTP/2.0 " + strconv.Itoa(code) + " " + text + "\nContent-Type: application/json; charset=utf-8\r\n\r\n" +
+			`{"message":"` + text + `","status":"` + strconv.Itoa(code) + `"}`),
+		Stderr: []byte("gh: " + text + " (HTTP " + strconv.Itoa(code) + ")\n"),
+		Code:   1,
+	}
+}
+
+// TestPublishedPresenceFromRegistry checks that the scan asks the
+// registry, and GitHub when the registry refuses, whether the published
+// image is there, and never reads Trivy's stderr for it. Absent or
+// private makes every finding an advisory, with a warning that says
+// which; present compares with what Trivy finds in it, and any failure of
+// that scan fails, whatever Trivy said; a registry or a GitHub that does
+// not answer fails, as does a public package the registry refuses to
+// show. Outside GitHub Actions no token may read packages, so nothing
+// asks GitHub: a refusal is an advisory there, saying CI decides.
+func TestPublishedPresenceFromRegistry(t *testing.T) {
+	t.Parallel()
+
+	refused := execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}
+	index := execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}
+	tests := []struct {
+		name string
+		// actions is whether GITHUB_ACTIONS is true.
+		actions bool
+		// skopeo and gh answer the presence calls; a nil gh is never asked.
+		skopeo execx.Result
+		gh     *execx.Result
+		// trivy is what the published scan returns, nil when it never runs.
+		trivy *execx.Result
+		// baseline is the report that scan writes.
+		baseline   string
+		wantCode   int
+		wantStdout []string
+		wantStderr []string
+		// wantBaseline is what the baseline must hold, when not empty.
+		wantBaseline string
+	}{
+		{
+			name:         "absent",
+			actions:      true,
+			skopeo:       refused,
+			gh:           new(status(404, "Package not found.")),
+			wantStdout:   []string{"::warning title=Scan is advisory::", published + " is not published yet, so all 1 finding(s) are advisory\n"},
+			wantStderr:   []string{"WARNING: The scan is advisory because " + published + " is not published yet"},
+			wantBaseline: "{}\n",
+		},
+		{
+			name:         "private",
+			actions:      true,
+			skopeo:       refused,
+			gh:           new(pkg("private")),
+			wantStdout:   []string{"::warning title=Scan is advisory::", published + " is private, so all 1 finding(s) are advisory\n"},
+			wantStderr:   []string{"WARNING: The scan is advisory because " + published + " is private", "until " + published + " is public"},
+			wantBaseline: "{}\n",
+		},
+		{
+			name:       "present",
+			actions:    true,
+			skopeo:     index,
+			trivy:      &execx.Result{},
+			baseline:   report(t, "amd64", digest, 3),
+			wantCode:   1,
+			wantStdout: []string{"compared with " + digest + "\n1 new, so blocking:\n" + line("CVE-1")},
+			wantStderr: []string{"1 finding(s) the published image does not have"},
+		},
+		{
+			// Trivy's own words for an image nobody publishes, which once
+			// made the scan advisory: the registry has shown it, so this is
+			// a scan that failed
+			name:       "present-trivy-says-manifest-unknown",
+			actions:    true,
+			skopeo:     index,
+			trivy:      &execx.Result{Stderr: recorded(t, "trivy-no-such-tag.txt"), Code: 1},
+			wantCode:   1,
+			wantStderr: []string{"MANIFEST_UNKNOWN", "could not scan " + published + ", so no finding can be told apart from one already published"},
+		},
+		{
+			name:       "present-trivy-says-denied",
+			actions:    true,
+			skopeo:     index,
+			trivy:      &execx.Result{Stderr: recorded(t, "trivy-no-such-package.txt"), Code: 1},
+			wantCode:   1,
+			wantStderr: []string{"could not scan " + published},
+		},
+		{
+			name:       "registry-unreachable",
+			actions:    true,
+			skopeo:     execx.Result{Stderr: skopeoStderr(t, "skopeo-manifest-503.txt"), Code: 1},
+			wantCode:   1,
+			wantStderr: []string{"503 Service Unavailable", "could not tell whether " + published + " is published"},
+		},
+		{
+			name:       "github-unreachable",
+			actions:    true,
+			skopeo:     refused,
+			gh:         new(status(502, "Bad Gateway")),
+			wantCode:   1,
+			wantStderr: []string{"502", "could not tell whether " + published + " is published"},
+		},
+		{
+			// CI-25(b): a public image the registry will not show is a
+			// registry failing, not nothing published
+			name:       "refused-though-public",
+			actions:    true,
+			skopeo:     refused,
+			gh:         new(pkg("public")),
+			wantCode:   1,
+			wantStderr: []string{"public", "could not tell whether " + published + " is published"},
+		},
+		{
+			name:       "github-refuses-the-token",
+			actions:    true,
+			skopeo:     refused,
+			gh:         new(status(403, "You need at least read:packages scope to get a package.")),
+			wantCode:   1,
+			wantStderr: []string{"HTTP 403", "read:packages"},
+		},
+		{
+			name:         "outside-actions-refused",
+			skopeo:       refused,
+			wantStdout:   []string{published + " was refused by ghcr.io, so all 1 finding(s) are advisory\n"},
+			wantStderr:   []string{"WARNING: The scan is advisory because " + published + " was refused by ghcr.io", "outside GitHub Actions"},
+			wantBaseline: "{}\n",
+		},
+		{
+			name:       "outside-actions-present",
+			skopeo:     index,
+			trivy:      &execx.Result{},
+			baseline:   report(t, "amd64", digest, 3, "CVE-1"),
+			wantStdout: []string{"nothing new against what is published (1 advisory)\n"},
+		},
+		{
+			name:       "outside-actions-unreachable",
+			skopeo:     execx.Result{Stderr: skopeoStderr(t, "skopeo-manifest-503.txt"), Code: 1},
+			wantCode:   1,
+			wantStderr: []string{"503 Service Unavailable"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			layout, rep, base, sarif := filepath.Join(dir, "layout"), filepath.Join(dir, "r.json"), filepath.Join(dir, "b.json"), filepath.Join(dir, "r.sarif")
+			scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+			calls := []execx.Call{
+				{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
+				{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+				{Argv: skopeoArgv, Result: tt.skopeo},
+			}
+			if tt.gh != nil {
+				calls = append(calls, execx.Call{Argv: ghArgv, Result: *tt.gh})
+			}
+			if tt.trivy != nil {
+				calls = append(calls, execx.Call{
+					Argv: append(append([]string{
+						"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
+					}, scanArgs...), "--output", base, published),
+					Result: *tt.trivy,
+				})
+			}
+			runner := trivy{
+				fake:    execx.NewFake(t, calls...),
+				reports: map[string]string{rep: report(t, "amd64", "", 3, "CVE-1"), base: tt.baseline},
+			}
+			env := map[string]string{}
+			if tt.actions {
+				env["GITHUB_ACTIONS"] = "true"
+			}
+			getenv := func(key string) string { return env[key] }
+
+			var stdout, stderr bytes.Buffer
+			args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
+			code := run(t.Context(), args, runner, getenv, &stdout, &stderr)
+			if code != tt.wantCode {
+				t.Errorf("run() = %d, want %d; stderr: %s", code, tt.wantCode, stderr.String())
+			}
+			for _, want := range tt.wantStdout {
+				if !strings.Contains(stdout.String(), want) {
+					t.Errorf("stdout = %q, want it to contain %q", stdout.String(), want)
+				}
+			}
+			for _, want := range tt.wantStderr {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+				}
+			}
+			if tt.wantBaseline != "" {
+				got, err := os.ReadFile(base) //nolint:gosec // G304: the test's own temporary file
+				if err != nil || string(got) != tt.wantBaseline {
+					t.Errorf("baseline = %q (%v), want %q", got, err, tt.wantBaseline)
+				}
+			}
+		})
+	}
+}
+
+// TestOnlyGHGetsTheToken checks the runner the command runs with: gh gets
+// the token in GH_TOKEN and GITHUB_TOKEN, as the job gives it, and trivy
+// and skopeo get both empty, from stand-ins on PATH that print what they
+// were given.
+func TestOnlyGHGetsTheToken(t *testing.T) {
+	bin := t.TempDir()
+	for _, tool := range []string{"gh", "trivy", "skopeo"} {
+		script := "#!/bin/sh\nprintf '%s:%s' \"${GH_TOKEN-unset}\" \"${GITHUB_TOKEN-unset}\"\n"
+		if err := os.WriteFile(filepath.Join(bin, tool), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the stand-in must be executable, and only by its owner
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_TOKEN", "ghs_from_the_job")
+	t.Setenv("GITHUB_TOKEN", "ghs_also_from_the_job")
+
+	for tool, want := range map[string]string{
+		"gh":     "ghs_from_the_job:ghs_also_from_the_job",
+		"trivy":  ":",
+		"skopeo": ":",
+	} {
+		res, err := tokenOnlyForGH{}.Run(t.Context(), tool)
+		if err != nil || res.Code != 0 {
+			t.Fatalf("%s: %v, exit %d: %s", tool, err, res.Code, res.Stderr)
+		}
+		if got := string(res.Stdout); got != want {
+			t.Errorf("%s was given GH_TOKEN:GITHUB_TOKEN %q, want %q", tool, got, want)
+		}
+	}
+}
+
 // Every message, the verdict included, lands even when GitHub Actions has
 // named no summary, and nothing is written in its place.
 func TestRunOutsideActions(t *testing.T) {
@@ -403,6 +672,7 @@ func TestRunOutsideActions(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
 			}, scanArgs...), "--output", base, published)},
@@ -442,6 +712,7 @@ func TestRunUnwritableSummary(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoStderr(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
 			}, scanArgs...), "--output", base, published)},
@@ -486,12 +757,7 @@ func TestRunBaselineStaysInItsDirectory(t *testing.T) {
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
 			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
-			execx.Call{
-				Argv: append(append([]string{
-					"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
-				}, scanArgs...), "--output", base, published),
-				Result: execx.Result{Stderr: recorded(t, "trivy-no-such-tag.txt"), Code: 1},
-			},
+			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stderr: skopeoStderr(t, "skopeo-no-such-package.txt"), Code: 1}},
 		),
 		reports: map[string]string{rep: report(t, "amd64", "", 1)},
 	}

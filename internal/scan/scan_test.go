@@ -350,67 +350,6 @@ func TestListingGolden(t *testing.T) {
 	}
 }
 
-func TestAdvisoryDetection(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		file, image string
-		want        bool
-	}{
-		// What a published image nobody can pull anonymously looks like,
-		// for the image each was recorded against
-		{file: "trivy-no-such-tag.txt", image: "ghcr.io/divbast/librespeed:no-such-tag", want: true},
-		{file: "trivy-no-such-package.txt", image: "ghcr.io/divbast/no-such-package-t5:latest", want: true},
-		{file: "trivy-name-unknown.txt", image: "public.ecr.aws/divbast/no-such-repo-t5:latest", want: true},
-		// The repository is what counts, not the tag or digest asked for
-		{file: "trivy-no-such-tag.txt", image: latest, want: true},
-		{file: "trivy-no-such-tag.txt", image: fixtureDigest, want: true},
-		{file: "trivy-no-such-package.txt", image: "ghcr.io/divbast/no-such-package-t5@sha256:00", want: true},
-		// CI-25(a): a refusal of another repository's request, on the
-		// same registry or another, says nothing of this image's
-		{file: "trivy-no-such-package.txt", image: latest},
-		{file: "trivy-no-such-tag.txt", image: "ghcr.io/divbast/libre:latest"},
-		{file: "trivy-no-such-tag.txt", image: "ghcr.io/divbast/librespeed-dev:latest"},
-		{file: "trivy-no-such-tag.txt", image: "ghcr.io/other/divbast/librespeed:latest"},
-		{file: "trivy-name-unknown.txt", image: "ghcr.io/divbast/no-such-repo-t5:latest"},
-		// What a registry that failed to answer looks like, which must never
-		// pass for one with nothing published
-		{file: "trivy-unauthorized.txt", image: "quay.io/divbast/no-such-repo-t5:latest"},
-		{file: "trivy-no-such-host.txt", image: "no-such-host.invalid/divbast/librespeed:latest"},
-		{file: "trivy-manifest-429.txt", image: latest},
-		{file: "trivy-manifest-503.txt", image: latest},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.file+"/"+tt.image, func(t *testing.T) {
-			t.Parallel()
-			if got := scan.Unpullable(tt.image, readTestdata(t, tt.file)); got != tt.want {
-				t.Errorf("Unpullable(%s, %s) = %t, want %t", tt.image, tt.file, got, tt.want)
-			}
-		})
-	}
-
-	// The code alone, outside the shape Trivy prints it in, is not a
-	// refusal, nor is a refusal of another request of the same registry's
-	for _, stderr := range []string{
-		"", "DENIED", "MANIFEST_UNKNOWN: manifest unknown", "an image named ghcr.io/x/DENIED: 1",
-		"remote error: GET https://ghcr.io/v2/divbast/librespeed: DENIED: 1",
-		"remote error: GET https://ghcr.io/v2/aquasecurity/trivy-java-db/manifests/1: DENIED: denied",
-		"remote error: GET https://ghcr.io/token?scope=repository%3Aaquasecurity%2Ftrivy-java-db%3Apull&service=ghcr.io: DENIED: denied",
-		"remote error: GET https://ghcr.io/token?scope=repository%3Adivbast%2Flibrespeed%3Apush&service=ghcr.io: DENIED: denied",
-	} {
-		if scan.Unpullable(latest, []byte(stderr)) {
-			t.Errorf("Unpullable(%s, %q) = true, want false", latest, stderr)
-		}
-	}
-	// Nor is anything for a reference that names no repository
-	for _, image := range []string{"", "librespeed", "ghcr.io/", "/divbast/librespeed"} {
-		if scan.Unpullable(image, readTestdata(t, "trivy-no-such-tag.txt")) {
-			t.Errorf("Unpullable(%q, trivy-no-such-tag.txt) = true, want false", image)
-		}
-	}
-}
-
 func TestTrivy(t *testing.T) {
 	t.Parallel()
 
@@ -481,18 +420,18 @@ func TestTrivy(t *testing.T) {
 			},
 		},
 		{
-			name: "published-unpullable",
+			// Trivy saying the registry has no such image is a scan that
+			// failed like any other: the caller asked the registry first
+			name: "published-manifest-unknown",
 			call: execx.Call{Argv: publishedArgv("amd64"), Result: execx.Result{Stderr: readTestdata(t, "trivy-no-such-tag.txt"), Code: 1}},
 			do: func(ctx context.Context, tr scan.Trivy) error {
 				return tr.Published(ctx, latest, "amd64", "/w/baseline.json")
 			},
 			wantErr: true,
-			wantIs:  scan.ErrUnpullable,
+			wantLog: readTestdata(t, "trivy-no-such-tag.txt"),
 		},
 		{
-			// CI-25(a): a refusal of another repository's request says
-			// nothing of the published image's
-			name: "published-another-repository-refused",
+			name: "published-denied",
 			call: execx.Call{Argv: publishedArgv("amd64"), Result: execx.Result{Stderr: readTestdata(t, "trivy-no-such-package.txt"), Code: 1}},
 			do: func(ctx context.Context, tr scan.Trivy) error {
 				return tr.Published(ctx, latest, "amd64", "/w/baseline.json")
@@ -510,7 +449,7 @@ func TestTrivy(t *testing.T) {
 			wantLog: readTestdata(t, "trivy-manifest-429.txt"),
 		},
 		{
-			// A refusal Trivy printed but then exited 0 on is no refusal
+			// Trivy's messages on a scan that passed stay out of the way
 			name: "published-refusal-text-but-success",
 			call: execx.Call{Argv: publishedArgv("amd64"), Result: execx.Result{Stderr: readTestdata(t, "trivy-no-such-tag.txt")}},
 			do: func(ctx context.Context, tr scan.Trivy) error {
@@ -557,10 +496,6 @@ func TestTrivy(t *testing.T) {
 			}
 			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
 				t.Errorf("error = %v, want one wrapping %v", err, tt.wantIs)
-			}
-			// A failure that read as unpullable would pass for nothing published
-			if got, want := errors.Is(err, scan.ErrUnpullable), errors.Is(tt.wantIs, scan.ErrUnpullable); got != want {
-				t.Errorf("errors.Is(%v, ErrUnpullable) = %t, want %t", err, got, want)
 			}
 			if !bytes.Equal(log.Bytes(), tt.wantLog) {
 				t.Errorf("log = %q, want %q", log.Bytes(), tt.wantLog)

@@ -14,13 +14,9 @@ package scan
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net/url"
-	"regexp"
 	"slices"
-	"strings"
 
 	"github.com/divbast/ci/internal/execx"
 )
@@ -126,57 +122,6 @@ func Compare(candidate, published []Finding) Split {
 	return s
 }
 
-// refusal is how Trivy reports a registry declining a request: the
-// request, then a tag or a repository the registry does not have, or a
-// pull it denies. ghcr.io denies an anonymous pull of a package that does
-// not exist and of one that is private alike.
-var refusal = regexp.MustCompile(`GET (\S+): (?:MANIFEST_UNKNOWN|NAME_UNKNOWN|DENIED): `)
-
-// Unpullable reports whether stderr, from a trivy image --image-src remote
-// of image that failed, says the registry declined to show image, rather
-// than that it failed to answer. Only a refusal of a request for image's
-// own repository counts: one of its manifests on its registry, or a pull
-// token for it. A rate limit, an outage, an unreachable registry, or a
-// refusal of any other request, is never taken for an image nobody can
-// pull.
-func Unpullable(image string, stderr []byte) bool {
-	host, repo, ok := repository(image)
-	if !ok {
-		return false
-	}
-	for _, m := range refusal.FindAllSubmatch(stderr, -1) {
-		u, err := url.Parse(string(m[1]))
-		if err != nil {
-			continue
-		}
-		manifest := u.Host == host && strings.HasPrefix(u.Path, "/v2/"+repo+"/manifests/")
-		token := u.Query().Get("scope") == "repository:"+repo+":pull"
-		if manifest || token {
-			return true
-		}
-	}
-	return false
-}
-
-// repository returns the registry host and the repository path of an
-// image reference, whatever tag or digest follows them.
-func repository(image string) (host, repo string, ok bool) {
-	host, repo, ok = strings.Cut(image, "/")
-	if !ok || host == "" {
-		return "", "", false
-	}
-	repo, _, _ = strings.Cut(repo, "@")
-	// A tag follows a colon in the path's last element
-	if colon := strings.LastIndexByte(repo, ':'); colon > strings.LastIndexByte(repo, '/') {
-		repo = repo[:colon]
-	}
-	return host, repo, repo != ""
-}
-
-// ErrUnpullable means the registry declined to show the published image to
-// an anonymous client: nothing is published there yet, or it is private.
-var ErrUnpullable = errors.New("not anonymously pullable")
-
 // Trivy runs the scans the comparison needs.
 type Trivy struct {
 	// Run runs trivy.
@@ -184,8 +129,7 @@ type Trivy struct {
 	// VEX, when set, names an OpenVEX document both scans apply.
 	VEX string
 	// Log is where Trivy's own messages go, which Layout and SARIF always
-	// write there, and Published only when it fails other than by
-	// ErrUnpullable. Nil drops them.
+	// write there, and Published only when it fails. Nil drops them.
 	Log io.Writer
 }
 
@@ -209,8 +153,8 @@ func (t Trivy) Layout(ctx context.Context, layout, report string) error {
 // a newer database knows about would otherwise read as new. It reads the
 // registry, never the local engine, whose copy may be stale.
 //
-// When the registry declines to show image, the error wraps
-// [ErrUnpullable].
+// Whether image is published at all is the caller's to know first: any
+// failure here is a scan that failed, whatever Trivy says about why.
 func (t Trivy) Published(ctx context.Context, image, arch, report string) error {
 	args := slices.Concat(
 		[]string{"image", "--image-src", "remote", "--platform", "linux/" + arch, "--skip-db-update"},
@@ -222,9 +166,6 @@ func (t Trivy) Published(ctx context.Context, image, arch, report string) error 
 	}
 	if res.Code == 0 {
 		return nil
-	}
-	if Unpullable(image, res.Stderr) {
-		return fmt.Errorf("%s: %w", image, ErrUnpullable)
 	}
 	t.log(res.Stderr)
 	return fmt.Errorf("trivy exit status %d", res.Code)

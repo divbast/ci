@@ -390,6 +390,106 @@ func TestRevision(t *testing.T) {
 	}
 }
 
+// TestPresence checks Presence, which decides absent and private as
+// Revision does but asks nothing of the image's annotations, and a
+// RegistryOnly Lookup, which never asks GitHub: a refusal is ErrRefused
+// there, never an answer, and a registry that fails to answer is still a
+// plain error.
+func TestPresence(t *testing.T) {
+	t.Parallel()
+
+	tokenRefused := failed(t, "skopeo-no-such-package.txt", 1)
+	tests := []struct {
+		name         string
+		registryOnly bool
+		skopeo       execx.Result
+		// gh is GitHub's answer about the package, nil when it must not be
+		// asked.
+		gh          *execx.Result
+		wantState   registry.State
+		wantErr     []string
+		wantPrivate bool
+		wantRefused bool
+	}{
+		{name: "published", skopeo: execx.Result{Stdout: readTestdata(t, "skopeo-librespeed-latest.json")}, wantState: registry.Published},
+		{name: "published-without-a-revision", skopeo: index(`{"org.opencontainers.image.version":"6.3.1"}`), wantState: registry.Published},
+		{name: "absent", skopeo: tokenRefused, gh: new(status(404, "Package not found.")), wantState: registry.Absent},
+		{name: "missing-tag-public", skopeo: failed(t, "skopeo-no-such-tag.txt", 2), gh: new(pkg("public")), wantState: registry.Absent},
+		{name: "private", skopeo: tokenRefused, gh: new(pkg("private")), wantErr: []string{"package is private"}, wantPrivate: true},
+		{name: "refused-though-public", skopeo: tokenRefused, gh: new(pkg("public")), wantErr: []string{"public", "403 Forbidden"}},
+		{name: "api-5xx", skopeo: tokenRefused, gh: new(status(502, "Bad Gateway")), wantErr: []string{"502"}},
+		{name: "unreachable", skopeo: failed(t, "skopeo-manifest-503.txt", 1), wantErr: []string{"could not read " + latest, "503"}},
+		{
+			name: "registry-only-published", registryOnly: true,
+			skopeo: execx.Result{Stdout: readTestdata(t, "skopeo-librespeed-latest.json")}, wantState: registry.Published,
+		},
+		{
+			name: "registry-only-refused", registryOnly: true, skopeo: tokenRefused,
+			wantErr: []string{"ghcr.io refused to show " + latest, "403 Forbidden"}, wantRefused: true,
+		},
+		{
+			name: "registry-only-missing-tag", registryOnly: true, skopeo: failed(t, "skopeo-no-such-tag.txt", 2),
+			wantErr: []string{"manifest unknown"}, wantRefused: true,
+		},
+		{
+			name: "registry-only-unreachable", registryOnly: true, skopeo: failed(t, "skopeo-manifest-503.txt", 1),
+			wantErr: []string{"could not read " + latest, "503"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			calls := []execx.Call{{Argv: skopeoArgv(latest), Result: tt.skopeo}}
+			if tt.gh != nil {
+				calls = append(calls, execx.Call{Argv: []string{"gh", "api", "-i", librespeedAPI}, Result: *tt.gh})
+			}
+			run := execx.NewFake(t, calls...)
+			l := registry.Lookup{Run: run, GH: ghapi.Client{Run: run}, RegistryOnly: tt.registryOnly}
+
+			state, err := l.Presence(t.Context(), latest)
+			if tt.wantErr == nil {
+				if err != nil || state != tt.wantState {
+					t.Errorf("Presence() = %v, %v; want %v", state, err, tt.wantState)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Presence() = %v, nil; want an error containing %q", state, tt.wantErr)
+			}
+			// An error is never an answer
+			if state != 0 {
+				t.Errorf("Presence() = %v with error %v; want no state", state, err)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Presence() error = %q, want it to contain %q", err, want)
+				}
+			}
+			if got := errors.Is(err, registry.ErrPrivate); got != tt.wantPrivate {
+				t.Errorf("errors.Is(%v, ErrPrivate) = %t, want %t", err, got, tt.wantPrivate)
+			}
+			if got := errors.Is(err, registry.ErrRefused); got != tt.wantRefused {
+				t.Errorf("errors.Is(%v, ErrRefused) = %t, want %t", err, got, tt.wantRefused)
+			}
+		})
+	}
+}
+
+// TestRevisionRegistryOnly checks that Revision, too, takes no refusal to
+// GitHub when the Lookup is RegistryOnly.
+func TestRevisionRegistryOnly(t *testing.T) {
+	t.Parallel()
+
+	run := execx.NewFake(t, execx.Call{Argv: skopeoArgv(noPackage), Result: failed(t, "skopeo-no-such-package.txt", 1)})
+	l := registry.Lookup{Run: run, GH: ghapi.Client{Run: run}, RegistryOnly: true}
+	rev, state, err := l.Revision(t.Context(), noPackage)
+	if !errors.Is(err, registry.ErrRefused) || rev != "" || state != 0 {
+		t.Errorf("Revision() = %q, %v, %v; want an error wrapping ErrRefused", rev, state, err)
+	}
+}
+
 // TestRevisionPackage checks which package the GitHub API is asked about.
 // A refused token request sends every image there, and a 404 makes it
 // Absent.

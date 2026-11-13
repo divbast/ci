@@ -87,14 +87,11 @@ trivy image --image-src remote --platform linux/amd64 --skip-db-update \
 |---|---|---|
 | `trivy-no-such-tag.txt` | `ghcr.io/divbast/librespeed:no-such-tag` | `MANIFEST_UNKNOWN` |
 | `trivy-no-such-package.txt` | `ghcr.io/divbast/no-such-package-t5:latest` | `DENIED` |
-| `trivy-name-unknown.txt` | `public.ecr.aws/divbast/no-such-repo-t5:latest` | `NAME_UNKNOWN` |
-| `trivy-unauthorized.txt` | `quay.io/divbast/no-such-repo-t5:latest` | `UNAUTHORIZED` |
-| `trivy-no-such-host.txt` | `no-such-host.invalid/divbast/librespeed:latest` | a failed DNS lookup |
 | `trivy-manifest-429.txt` | a local stub registry answering every manifest 429 | `TOOMANYREQUESTS` |
-| `trivy-manifest-503.txt` | the same stub answering 503 | `503 Service Unavailable` |
 
-ghcr.io answers `DENIED` to an anonymous client for a package that does not
-exist and for one that is private alike, so the one recording stands for
-both. It never says `NAME_UNKNOWN`, which comes from public.ecr.aws here. Nor
-can it be made to answer 429 or 503 on demand, hence the stub, a Python
-`http.server` on 127.0.0.1 that answers `/v2/` with 200.
+The scan once read the first two as an image nobody publishes. It no
+longer reads Trivy's stderr at all: the registry, and GitHub, say whether
+the published image is there before Trivy scans it, so the tests replay
+these as what a scan that failed prints, which fails the scan whatever it
+says. ghcr.io cannot be made to answer 429 on demand, hence the stub, a
+Python `http.server` on 127.0.0.1 that answers `/v2/` with 200.

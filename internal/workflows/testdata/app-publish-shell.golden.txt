@@ -30,6 +30,17 @@ if [ "${IMAGE}" = ghcr.io/divbast/oci-image-template ] && [ "${REHEARSE}" != tru
   echo "image is ghcr.io/divbast/oci-image-template, the template's, which publishes only in a rehearsal: set image to your app's own name" >&2
   exit 1
 fi
+== Refuse a rehearsal outside the template ==
+run:
+if [ "${GITHUB_REPOSITORY}" != divbast/oci-image-template ]; then
+  line="only divbast/oci-image-template rehearses, not ${GITHUB_REPOSITORY}: to publish, set image to this app's own and remove rehearse from the job that calls app-publish.yml"
+  echo "::error::${line}"
+  echo "${line}" >> "${GITHUB_STEP_SUMMARY}"
+  exit 1
+fi
+line="rehearsal: nothing was published to ghcr.io"
+echo "::warning::${line}"
+echo "${line}" >> "${GITHUB_STEP_SUMMARY}"
 == Decide whether to publish ==
 env: EVENT: ${{ github.event_name }}
 env: IMAGE: ${{ inputs.image }}

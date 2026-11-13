@@ -247,6 +247,59 @@ func TestBuildFormat(t *testing.T) {
 	}
 }
 
+// TestScanPassesVEXWhenPresent checks app.just's scan in a justfile set up
+// as an app's: with an openvex.json beside the justfile, at the app's
+// root, it gives divbast-scan -vex openvex.json, which both scans then
+// apply; without one, no -vex at all, since trivy refuses a --vex file
+// that is not there. A file of that name anywhere else is not the app's.
+func TestScanPassesVEXWhenPresent(t *testing.T) {
+	t.Parallel()
+	needJustAndMise(t)
+	ci, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const scan = ".ci/bin/divbast-scan -layout /tmp/app-image.tar.layout -report /tmp/app-image.tar.report.json" +
+		" -published ghcr.io/divbast/app:latest -baseline /tmp/app-image.tar.published.json -sarif /tmp/app-image.tar.sarif"
+	for _, tt := range []struct {
+		name string
+		// vex is where an openvex.json is written, relative to the
+		// justfile's directory, or "" for none.
+		vex  string
+		want string
+	}{
+		{name: "present", vex: "openvex.json", want: scan + " -vex openvex.json"},
+		{name: "absent", want: scan},
+		{name: "elsewhere", vex: "test/openvex.json", want: scan},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			app := appJustfile(t, ci, `["mise", "exec", "--", "bash", "-euo", "pipefail", "-c"]`)
+			if tt.vex != "" {
+				vex := filepath.Join(filepath.Dir(app), tt.vex)
+				if err := os.MkdirAll(filepath.Dir(vex), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(vex, []byte("{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// From another directory, so that only the justfile's own
+			// directory can be where the recipe looks
+			cmd := exec.CommandContext(t.Context(), "just", "--justfile", app, "--dry-run", "scan") //nolint:gosec // G204: the arguments are this test's own
+			cmd.Dir = t.TempDir()
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("just --dry-run scan: %v\n%s", err, out)
+			}
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			if got := lines[len(lines)-1]; got != tt.want {
+				t.Errorf("just scan runs\n%s\nwant\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestActionsRecipesUseCIsPinactConfig (CI-38) checks that each recipe
 // that runs pinact gives it ci's configuration and nothing else: with -c,
 // so a caller's own .pinact.yaml or .github/pinact.yaml is never read, and

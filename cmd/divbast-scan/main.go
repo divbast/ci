@@ -26,19 +26,37 @@
 // It lists every finding on stdout and, when GitHub Actions sets it,
 // appends them as tables to $GITHUB_STEP_SUMMARY.
 //
-// While IMAGE is not anonymously pullable, because nothing is published
-// there yet or the package is private, nothing is already shipped to
-// compare with, and every finding is an advisory. A private package would
-// keep the scan advisory for as long as it stayed private, so that is
-// never quiet: it is a warning on stderr, a GitHub Actions warning under
-// GITHUB_ACTIONS=true, and a callout on the summary page.
+// Before it scans IMAGE, a ghcr.io image, it reads it as an anonymous
+// client with skopeo, as users pull it. When the registry refuses, it asks
+// the GitHub API why, through gh, whose token is GH_TOKEN, which must be
+// able to read packages (a job's packages: read). While nothing is
+// published there yet, or the package is private, nothing is already
+// shipped to compare with, and every finding is an advisory. A private
+// package would keep the scan advisory for as long as it stayed private,
+// so neither is ever quiet: each is a warning on stderr, a GitHub Actions
+// warning, and a callout on the summary page. A package GitHub lists as
+// public that the registry will not show is a registry failing, and fails
+// the scan, as does a registry or an API that does not answer. Trivy is
+// asked only to scan, and any failure of that scan fails it, whatever
+// Trivy says about why.
+//
+// Outside GitHub Actions, without GITHUB_ACTIONS=true, it never asks
+// GitHub: no token a person holds for divbast's recipes can read
+// packages. A refusal is then an advisory too, with a warning that only
+// CI can tell what it means.
+//
+// Only gh gets the token: trivy and skopeo run with GH_TOKEN and
+// GITHUB_TOKEN empty.
 //
 // Exit codes:
 //
-//	0  nothing IMAGE lacks, or every finding is an advisory because IMAGE
-//	   is not anonymously pullable
+//	0  nothing IMAGE lacks; or every finding is an advisory, because IMAGE
+//	   is not published yet or is private, or, outside GitHub Actions,
+//	   because the registry refused to show it
 //	1  a finding IMAGE lacks; a scan that failed or saw no packages; IMAGE
-//	   unreachable for any other reason; or the summary not written
+//	   not a ghcr.io image, unreadable, or refused though public; the
+//	   GitHub API not answering, or refusing the token; or the summary not
+//	   written
 //	2  the command line is wrong
 package main
 
@@ -55,6 +73,8 @@ import (
 	"syscall"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/ghapi"
+	"github.com/divbast/ci/internal/registry"
 	"github.com/divbast/ci/internal/scan"
 )
 
@@ -62,9 +82,23 @@ const name = "divbast-scan"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := run(ctx, os.Args[1:], execx.OS{}, os.Getenv, os.Stdout, os.Stderr)
+	code := run(ctx, os.Args[1:], tokenOnlyForGH{}, os.Getenv, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
+}
+
+// tokenOnlyForGH runs commands on the host, and only gh with the token
+// the environment holds: every other command, trivy and skopeo, gets
+// GH_TOKEN and GITHUB_TOKEN empty. They read registries anonymously, and
+// trivy parses whatever an image holds.
+type tokenOnlyForGH struct{}
+
+// Run implements [execx.Runner].
+func (tokenOnlyForGH) Run(ctx context.Context, name string, args ...string) (execx.Result, error) {
+	if name == "gh" {
+		return execx.OS{}.Run(ctx, name, args...)
+	}
+	return execx.OS{Env: []string{"GH_TOKEN=", "GITHUB_TOKEN="}}.Run(ctx, name, args...)
 }
 
 func run(ctx context.Context, args []string, r execx.Runner, getenv func(string) string, stdout, stderr io.Writer) int {
@@ -128,19 +162,47 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		return 1
 	}
 
+	inActions := getenv("GITHUB_ACTIONS") == "true"
+	lookup := registry.Lookup{Run: r, GH: ghapi.Client{Run: r}, RegistryOnly: !inActions}
+	state, err := lookup.Presence(ctx, *published)
+	var advisory *unshipped
+	switch {
+	case err == nil && state == registry.Published:
+	case err == nil && state == registry.Absent:
+		advisory = &unshipped{
+			reason: "is not published yet", heading: "nothing published yet",
+			more: "nothing is shipped to compare with. It blocks on new findings once " + *published + " is published.",
+		}
+	case errors.Is(err, registry.ErrPrivate):
+		advisory = &unshipped{
+			reason: "is private", heading: "nothing public yet",
+			more: "no user can pull it, and nothing is shipped to compare with. It stays advisory until " + *published + " is public.",
+		}
+	case errors.Is(err, registry.ErrRefused):
+		advisory = &unshipped{
+			reason: "was refused by ghcr.io", heading: "nothing readable to compare with",
+			more: "outside GitHub Actions nothing asks GitHub whether that means it is not published yet, is private, or is " +
+				"public and failing to serve: the token a person gives the recipes cannot read packages. CI's scan asks, and decides.",
+		}
+	default:
+		complain(stderr, "could not tell whether %s is published, so no finding can be told apart from one already published: %v", *published, err)
+		return 1
+	}
+
 	var (
 		shipped          []scan.Finding
 		against, warning string
-		unpullable       bool
 	)
-	err = trivy.Published(ctx, *published, arch, *baseline)
-	switch {
-	case err == nil:
+	if advisory == nil {
+		if err = trivy.Published(ctx, *published, arch, *baseline); err != nil {
+			complain(stderr, "could not scan %s, so no finding can be told apart from one already published: %v", *published, err)
+			return 1
+		}
 		if shipped, against, err = readBaseline(*baseline, *published); err != nil {
 			complain(stderr, "%v", err)
 			return 1
 		}
-	case errors.Is(err, scan.ErrUnpullable):
+	} else {
 		// With nothing published, nothing is already shipped, and a first
 		// image could never pass a scan that blocks on what it inherits
 		// from the FrankenPHP binary.
@@ -148,26 +210,21 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 			complain(stderr, "write the baseline: %v", err)
 			return 1
 		}
-		unpullable = true
-		against = "nothing, because " + *published + " is not anonymously pullable"
-		warning = "The scan is advisory because " + *published + " is not anonymously pullable: it is not published yet, " +
-			"or it is private. It stays advisory until " + *published + " is public."
+		against = "nothing, because " + *published + " " + advisory.reason
+		warning = "The scan is advisory because " + *published + " " + advisory.reason + ": " + advisory.more
 		complain(stderr, "WARNING: %s", warning)
-		if getenv("GITHUB_ACTIONS") == "true" {
+		if inActions {
 			if _, err = fmt.Fprintf(stdout, "::warning title=Scan is advisory::%s\n", warning); err != nil {
 				complain(stderr, "write the warning: %v", err)
 				return 1
 			}
 		}
-	default:
-		complain(stderr, "could not scan %s, so no finding can be told apart from one already published: %v", *published, err)
-		return 1
 	}
 
 	split := scan.Compare(candidate.Findings, shipped)
 	verdict, heading := "new, so blocking", "New, so blocking"
-	if unpullable {
-		verdict, heading = "advisory: nothing published yet", "Advisory: nothing published yet"
+	if advisory != nil {
+		verdict, heading = "advisory: "+advisory.heading, "Advisory: "+advisory.heading
 	}
 	if _, err = io.WriteString(stdout, scan.Listing(against, verdict, split)); err != nil {
 		complain(stderr, "write the findings: %v", err)
@@ -179,8 +236,8 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 	}
 
 	switch {
-	case unpullable:
-		_, err = fmt.Fprintf(stdout, "%s is not anonymously pullable, so all %d finding(s) are advisory\n", *published, len(split.New))
+	case advisory != nil:
+		_, err = fmt.Fprintf(stdout, "%s %s, so all %d finding(s) are advisory\n", *published, advisory.reason, len(split.New))
 	case len(split.New) > 0:
 		move := "Move what carries them"
 		if *vex != "" {
@@ -197,6 +254,11 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 	}
 	return 0
 }
+
+// unshipped says why nothing is shipped to compare with, so that every
+// finding is an advisory: reason follows the image's name, heading
+// follows "advisory: ", and more follows the reason in the warning.
+type unshipped struct{ reason, heading, more string }
 
 // readBaseline returns the findings in the report on the published image
 // at path, and the image it names.
