@@ -648,13 +648,14 @@ publishes, it starts the `registry` image inside the job, on
 `127.0.0.1:5000`, pinned by version and digest, which the org's Renovate
 preset moves. The registry asks for a throwaway login, which the job
 writes and gives Docker: actions/attest pushes only to a registry whose
-first answer is a challenge for one. The job runs every step after the
-decision there, under `localhost:5000/<path of image>`: it pushes,
-stages, attests, verifies, promotes and checks both tags. The attestation
-is real: signed for the calling repository like any other, and pushed to
-that registry. The registry takes no anonymous pulls, so the last check
-reads the tags with the job's login. Nothing reaches ghcr.io, and no
-package is made. Each rehearsal says so in a warning and on the run's summary:
+first answer is a 200 or a challenge for one, and one that asks no login
+answers 202. The job runs every step after the decision there, under
+`localhost:5000/<path of image>`: it pushes, stages, attests, verifies,
+promotes and checks both tags. The attestation is real: signed for the
+calling repository like any other, and pushed to that registry. The
+registry takes no anonymous pulls, so the last check reads the tags with
+the job's login. Nothing reaches ghcr.io, and no package is made. Each
+rehearsal says so in a warning and on the run's summary:
 `rehearsal: nothing was published to ghcr.io`.
 
 `divbast/oci-image-template` rehearses, since it has no package. A

@@ -1859,6 +1859,61 @@ func warnsOutsideTemplate(t *testing.T, workflow string) error {
 	return nil
 }
 
+// TestPublishPushesTheAttestation (ruling R90) checks that app-publish.yml's
+// actions/attest step pushes the attestation to the registry on every
+// run: push-to-registry is true, written as such, rehearsal or not. A
+// publish that stopped pushing it would leave the registry's copy behind
+// while every other check passed. Against app-publish.yml as it is, then
+// with each broken, which the check must refuse.
+func TestPublishPushesTheAttestation(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := pushesTheAttestation(publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const push = "          push-to-registry: true\n"
+	for name, mutant := range map[string]string{
+		"pushed only outside a rehearsal": strings.Replace(publish, push, "          push-to-registry: ${{ !inputs.rehearse }}\n", 1),
+		"pushed only in a rehearsal":      strings.Replace(publish, push, "          push-to-registry: ${{ inputs.rehearse }}\n", 1),
+		"never pushed":                    strings.Replace(publish, push, "          push-to-registry: false\n", 1),
+		"left to the action's default":    strings.Replace(publish, push, "", 1),
+		"set beside the step, not in it":  strings.Replace(strings.Replace(publish, push, "", 1), "          create-storage-record: false\n", "          create-storage-record: false\n        env:\n          push-to-registry: true\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if pushesTheAttestation(mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// pushesTheAttestation returns an error unless the publish job has one
+// actions/attest step, and its with: sets push-to-registry to true.
+func pushesTheAttestation(workflow string) error {
+	st := publishSteps(workflow)
+	attest := stepsWhere(st, isUses("actions/attest"))
+	if len(attest) != 1 {
+		return fmt.Errorf("%d steps run actions/attest, want one", len(attest))
+	}
+	with, err := stepMapping(st[attest[0]], "with")
+	if err != nil {
+		return err
+	}
+	for _, w := range with {
+		if v, ok := strings.CutPrefix(w, "push-to-registry:"); ok {
+			if unquote(v) != "true" {
+				return fmt.Errorf("the step from line %d sets push-to-registry to %q, not true", st[attest[0]][0].n, unquote(v))
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("the step from line %d sets no push-to-registry in its with:, so the action's default holds", st[attest[0]][0].n)
+}
+
 // refuseName is the step that refuses the template's image outside a
 // rehearsal, and templateFix what its error must tell the caller to do.
 const (
@@ -2060,8 +2115,9 @@ func registryPinned(workflow string) error {
 		return fmt.Errorf("line %d retries %s times, not between 1 and 30", l.n, m[1])
 	}
 	// actions/attest pushes only to a registry that answers its first
-	// request with a Basic or Bearer challenge, so the registry asks for the
-	// login the step writes and then gives Docker.
+	// request with a 200 or a Basic or Bearer challenge, and one that asks
+	// no login answers 202, so the registry asks for the login the step
+	// writes and then gives Docker.
 	mount := htpasswdMount.FindStringSubmatch(pinned[0])
 	if !strings.Contains(pinned[0], " -e REGISTRY_AUTH=htpasswd ") || mount == nil ||
 		!strings.Contains(pinned[0], " -e REGISTRY_AUTH_HTPASSWD_PATH="+mount[2]+" ") {
