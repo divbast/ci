@@ -681,11 +681,15 @@ func TestEngineUnhealthy(t *testing.T) {
 	ctx := t.Context()
 
 	// A shell-form health check, which the engine runs as /bin/sh -c, and
-	// which no image without /bin/sh can pass.
+	// which no image without /bin/sh can pass. It runs every 2 s, and one
+	// failure past the start period is enough: Podman's start period is
+	// none, so it reports the container unhealthy in seconds. Docker keeps
+	// the image's minute, so it is still starting when the wait, 15 s and
+	// three intervals, ends, with the checks it ran in its log.
 	c, _ := startServed(t, e, &RunSpec{
 		Image:   testfixture.LibreSpeed,
 		Confine: Contract("16m"),
-		Extra:   []string{"--health-cmd", "exit 0"},
+		Extra:   []string{"--health-cmd", "exit 0", "--health-interval", "2s", "--health-retries", "1"},
 	})
 	unhealthy := c.EngineHealthy(ctx, 15*time.Second)
 	if unhealthy == nil {
@@ -720,11 +724,82 @@ func TestEngineUnhealthy(t *testing.T) {
 			t.Fatalf("EngineHealthy() error = %v, want Docker's health log saying /bin/sh could not be run", unhealthy)
 		}
 	case "podman":
-		// The check ran and failed: podman healthcheck run exits 1 saying
-		// unhealthy, where an error of the engine's own exits 125.
-		if !strings.Contains(unhealthy.Error(), "exit status 1: unhealthy") {
-			t.Fatalf("EngineHealthy() error = %v, want podman healthcheck run's exit status 1 and its word unhealthy", unhealthy)
+		// Its timer ran the check, which failed, and Podman called the
+		// container unhealthy.
+		if !strings.Contains(unhealthy.Error(), "podman reports container "+c.String()+" unhealthy") {
+			t.Fatalf("EngineHealthy() error = %v, want Podman's own verdict, unhealthy", unhealthy)
 		}
+	}
+}
+
+// TestEngineHealthyWaitsForTimer has the engine judge two containers on
+// its own schedule, as their users' engines would: Docker runs the image's
+// HEALTHCHECK, and Podman the --health-cmd it was given, from the
+// transient systemd timer it sets up for it, which runs only in a user
+// session. Nothing here runs a check. The minimal fixture turns healthy
+// within its start period and three intervals, and the engine's log shows
+// the passing check it ran. The unhealthy mutant, whose probe exits 1 once
+// its server is up, turns unhealthy within the same wait, past the start
+// period in which no failure counts, and EngineHealthy says so as soon as
+// the engine does.
+func TestEngineHealthyWaitsForTimer(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+
+	fixture := minimalFixture(t, e, false)
+	unhealthy, err := e.Build(ctx, t, filepath.Join("..", "contract", "testdata", "mutants", "unhealthy", "Containerfile"),
+		map[string]string{"FIXTURE": fixture})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The wait is bounded by the image's own start period, as the contract
+	// bounds it.
+	cfg, err := e.ImageConfig(ctx, t, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Healthcheck == nil || cfg.Healthcheck.StartPeriod == 0 {
+		t.Fatalf("the minimal fixture's HEALTHCHECK is %+v, want one with a start period", cfg.Healthcheck)
+	}
+	startPeriod := cfg.Healthcheck.StartPeriod
+
+	for _, tt := range []struct {
+		name, image string
+		healthy     bool
+	}{
+		{name: "healthy", image: fixture, healthy: true},
+		{name: "unhealthy", image: unhealthy},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+
+			c, _ := startServed(t, e, &RunSpec{Image: tt.image, Confine: Contract("16m"), HealthCmd: minimalHealthCmd})
+			waitErr := c.EngineHealthy(ctx, startPeriod)
+			ins, err := c.Inspect(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := ins.State.Health
+			if h == nil {
+				t.Fatalf("EngineHealthy() error = %v, and %s reports no health check for the container", waitErr, e.Name())
+			}
+			t.Logf("EngineHealthy() error = %v; %s reports it %s, failing streak %d%s", waitErr, e.Name(), h.Status, h.FailingStreak, h.logText())
+			if tt.healthy {
+				if waitErr != nil || h.Status != "healthy" {
+					t.Fatalf("EngineHealthy() error = %v and the engine reports %s, want nil and healthy", waitErr, h.Status)
+				}
+				if !slices.ContainsFunc(h.Log, func(l HealthLog) bool { return l.ExitCode == 0 }) {
+					t.Errorf("the engine logged no passing check: %+v", h.Log)
+				}
+				return
+			}
+			want := e.Name() + " reports container " + c.String() + " unhealthy"
+			if waitErr == nil || !strings.Contains(waitErr.Error(), want) || h.Status != "unhealthy" {
+				t.Fatalf("EngineHealthy() error = %v and the engine reports %s, want an error saying %q, and unhealthy", waitErr, h.Status, want)
+			}
+		})
 	}
 }
 

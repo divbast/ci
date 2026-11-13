@@ -1253,76 +1253,135 @@ func TestWaitExitStates(t *testing.T) {
 	}
 }
 
+// TestEngineHealthy shows EngineHealthy reading the engine's own verdict,
+// on Podman as on Docker: it only ever inspects the container, and never
+// runs the check itself, as podman healthcheck run would, so a Podman
+// container is healthy only once the systemd timer that --health-cmd sets
+// up has run the check on its own schedule.
 func TestEngineHealthy(t *testing.T) {
 	t.Parallel()
 
-	inspect := []string{"docker", "container", "inspect", "abc"}
-	healthcheck := []string{"podman", "healthcheck", "run", "abc"}
+	for _, engine := range []string{"docker", "podman"} {
+		inspect := []string{engine, "container", "inspect", "abc"}
+		tests := []struct {
+			name     string
+			states   [][]byte
+			wantText string
+		}{
+			{
+				name: "healthy-once-the-engine-says-so",
+				states: [][]byte{
+					state("running", true, 0, startedAt, "starting"),
+					state("running", true, 0, startedAt, "starting"),
+					state("running", true, 0, startedAt, "healthy"),
+				},
+			},
+			{
+				// At once, with the checks the engine ran, rather than waiting
+				// out the rest of the window.
+				name:     "unhealthy-dumps-the-log",
+				states:   [][]byte{state("running", true, 0, startedAt, "unhealthy")},
+				wantText: engine + " reports container abc unhealthy; its checks:\n  exit 1: probe said no",
+			},
+			{
+				name:     "no-health-check",
+				states:   [][]byte{state("running", true, 0, startedAt, "")},
+				wantText: engine + " reports no health check for container abc",
+			},
+			{
+				// A container that stopped can never turn healthy.
+				name:     "stopped",
+				states:   [][]byte{state("exited", false, 3, startedAt, "starting")},
+				wantText: "exited, exit status 3, before " + engine + " reported it healthy",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(engine+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				synctest.Test(t, func(t *testing.T) {
+					calls := make([]execx.Call, 0, len(tt.states))
+					for _, s := range tt.states {
+						calls = append(calls, execx.Call{Argv: inspect, Result: execx.Result{Stdout: s}})
+					}
+					c := &Container{ID: "abc", started: time.Now(), engine: newEngine(engine, execx.NewFake(t, calls...))}
+
+					err := c.EngineHealthy(t.Context(), time.Second)
+					if tt.wantText == "" {
+						if err != nil {
+							t.Errorf("EngineHealthy() error = %v, want nil", err)
+						}
+						return
+					}
+					if err == nil || !strings.Contains(err.Error(), tt.wantText) {
+						t.Errorf("EngineHealthy() error = %v, want it to contain %q", err, tt.wantText)
+					}
+				})
+			})
+		}
+	}
+}
+
+// healthState is `container inspect` output for a running container whose
+// health check is status, run every interval as the engine says, or at
+// the engine's default when interval is zero and the field is left out.
+func healthState(status string, interval time.Duration) []byte {
+	hc := ""
+	if interval > 0 {
+		hc = `, "Config": {"Healthcheck": {"Test": ["CMD", "/x"], "Interval": ` + strconv.FormatInt(int64(interval), 10) + `}}`
+	}
+	return []byte(`[{"State": {"Status": "running", "Running": true, "StartedAt": "` + startedAt +
+		`", "Health": {"Status": "` + status + `", "Log": []}}` + hc + `}]`)
+}
+
+// TestEngineHealthyWindow shows how long EngineHealthy waits for a
+// container the engine still calls starting: the start period it is
+// given, counted from when the container started, and then three of the
+// intervals the engine runs the check at, as the container's inspection
+// gives them, or 30 s, both engines' default, when it gives none. By then
+// a check that had passed would have been seen, and one that kept failing
+// would have been retried as often as Docker's default and Podman's.
+func TestEngineHealthyWindow(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
-		name     string
-		engine   string
-		calls    []execx.Call
-		wantText string
+		engine      string
+		startPeriod time.Duration
+		interval    time.Duration // as inspect gives it; zero for none
+		want        time.Duration
 	}{
-		{
-			name:   "podman-runs-the-check",
-			engine: "podman",
-			calls:  []execx.Call{{Argv: healthcheck}},
-		},
-		{
-			// It prints only "unhealthy", so why is read from the health log.
-			name:   "podman-check-fails",
-			engine: "podman",
-			calls: []execx.Call{
-				{Argv: healthcheck, Result: execx.Result{Code: 1, Stdout: []byte("unhealthy\n")}},
-				{Argv: []string{"podman", "container", "inspect", "abc"}, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "unhealthy")}},
-			},
-			wantText: "unhealthy; its checks:\n  exit 1: probe said no",
-		},
-		{
-			name:   "docker-healthy-once-started",
-			engine: "docker",
-			calls: []execx.Call{
-				{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "starting")}},
-				{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "healthy")}},
-			},
-		},
-		{
-			name:     "docker-unhealthy-dumps-the-log",
-			engine:   "docker",
-			calls:    []execx.Call{{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "unhealthy")}}},
-			wantText: "probe said no",
-		},
-		{
-			name:   "docker-still-starting-past-the-start-period",
-			engine: "docker",
-			calls: slices.Repeat([]execx.Call{
-				{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "starting")}},
-			}, 3),
-			wantText: "still starting",
-		},
-		{
-			name:     "docker-no-health-check",
-			engine:   "docker",
-			calls:    []execx.Call{{Argv: inspect, Result: execx.Result{Stdout: state("running", true, 0, startedAt, "")}}},
-			wantText: "no health check",
-		},
+		{engine: "docker", startPeriod: time.Minute, interval: 30 * time.Second, want: 150 * time.Second},
+		{engine: "docker", startPeriod: 10 * time.Second, interval: 2 * time.Second, want: 16 * time.Second},
+		{engine: "podman", startPeriod: time.Minute, interval: 30 * time.Second, want: 150 * time.Second},
+		{engine: "podman", startPeriod: 0, interval: 5 * time.Second, want: 15 * time.Second},
+		{engine: "podman", startPeriod: 0, want: 90 * time.Second},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/%s+3x%s", tt.engine, tt.startPeriod, tt.interval), func(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
-				c := &Container{ID: "abc", started: time.Now(), engine: newEngine(tt.engine, execx.NewFake(t, tt.calls...))}
-
-				err := c.EngineHealthy(t.Context(), time.Second)
-				if tt.wantText == "" {
-					if err != nil {
-						t.Errorf("EngineHealthy() error = %v, want nil", err)
+				inspect := []string{tt.engine, "container", "inspect", "abc"}
+				var others []string
+				e := newEngine(tt.engine, runFunc(func(argv []string) execx.Result {
+					if !slices.Equal(argv, inspect) {
+						others = append(others, strings.Join(argv, " "))
+						return execx.Result{Code: 125, Stderr: []byte("not scripted")}
 					}
-					return
+					return execx.Result{Stdout: healthState("starting", tt.interval)}
+				}))
+				// Started a little before EngineHealthy is called, as a container
+				// is, and the window is counted from then.
+				c := &Container{ID: "abc", started: time.Now(), engine: e}
+				time.Sleep(3 * time.Second)
+
+				err := c.EngineHealthy(t.Context(), tt.startPeriod)
+				if waited := time.Since(c.started); waited != tt.want {
+					t.Errorf("EngineHealthy() gave up %s after the container started, want %s", waited, tt.want)
 				}
-				if err == nil || !strings.Contains(err.Error(), tt.wantText) {
-					t.Errorf("EngineHealthy() error = %v, want it to contain %q", err, tt.wantText)
+				if err == nil || !strings.Contains(err.Error(), "still starting") {
+					t.Errorf("EngineHealthy() error = %v, want one saying it is still starting", err)
+				}
+				if len(others) > 0 {
+					t.Errorf("EngineHealthy() ran %q, want nothing but %q", others, inspect)
 				}
 			})
 		})

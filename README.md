@@ -389,6 +389,21 @@ new, empty tmpfs on both engines, and the probe goes with it, so
 install it again. A host port the engine picked moves on Docker and
 stays on Podman, so read `Inspect` again for it.
 
+`Container.EngineHealthy` waits for the engine's own verdict, reached on
+the engine's own schedule, as a user's engine would reach it, and never
+runs a check itself. Docker runs the image's `HEALTHCHECK`. Podman runs
+the `--health-cmd` that a `RunSpec`'s `HealthCmd` gives it, from a
+transient systemd timer, which runs only in a systemd user session, such
+as the one `app-check.yml`'s Podman legs set up: without one, Podman
+schedules nothing, and the wait ends in an error. It waits for the start
+period it is given, the image's own, from when the container started or
+last restarted, then for three of the intervals the engine runs the
+check at, or 30 s each when the engine reports none. A check that keeps
+failing past the start period has by then failed as often as either
+engine retries by default, so the engine calls the container unhealthy,
+and `EngineHealthy` returns that at once, as it does a container that
+stopped.
+
 The harness also carries the helpers an app's suite needs to serve its
 image and check what it answers, so no suite carries its own copy:
 
@@ -936,8 +951,8 @@ first. The mutants under `contract/testdata/mutants` each break one thing
 in one of the two, and exactly the records for that one thing must fail.
 Renovate's dockerfile manager moves the digests every one of those
 Containerfiles pins, and `just lint` runs hadolint over them, and PHPStan
-over the fixture's PHP. The contract package's documentation says
-exactly what each check asserts.
+over the fixture's PHP and the mutants'. The contract package's
+documentation says exactly what each check asserts.
 
 The shell `app-publish.yml`'s publish job runs, from its gate and its
 decision on, is pinned word for word in

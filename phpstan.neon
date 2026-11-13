@@ -11,6 +11,7 @@ parameters:
     paths:
         - harness/probe
         # The minimal fixture's PHP, its health probe by name since it has
-        # no .php
+        # no .php, and the PHP its mutants put in its place
         - contract/testdata/minimal
         - contract/testdata/minimal/minimal-health
+        - contract/testdata/mutants

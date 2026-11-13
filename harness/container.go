@@ -434,8 +434,8 @@ const podmanRuntimeError = "Error: OCI runtime error:"
 // engine stops its process, as a stop would, and starts it again in the
 // same container, with the same ID, name, run flags and volumes. It
 // returns once the engine reports that container running again, not once
-// the server in it is serving. [Container.EngineHealthy] counts Docker's
-// start period from the restart.
+// the server in it is serving. [Container.EngineHealthy] counts its wait
+// from the restart.
 //
 // What a restart keeps, as measured on Docker 29 and Podman 5.7, and as
 // ci's TestRestartSameContainer asserts on each:
@@ -700,54 +700,68 @@ func (c *Container) WaitExit(ctx context.Context, within time.Duration) (int, er
 // the container is healthy, which is what proves an exec-form health check
 // runs in an image with no shell: a shell-form one fails every time.
 //
-// Podman is asked to run its check once, with podman healthcheck run, so
-// the container must already be serving. Docker is watched until its
-// health check settles, for up to startPeriod from when the container
-// started: pass the image's own start period. Anything but healthy is an
-// error, with Docker's log of the checks it ran.
+// It only watches: the engine runs the check on its own schedule, as it
+// would for a user. Docker runs the image's HEALTHCHECK. Podman runs the
+// --health-cmd it was given, as [RunSpec.HealthCmd] gives it, from the
+// transient systemd timer it sets up for the container, which needs a
+// systemd user session: without one, Podman schedules nothing. The wait
+// lasts startPeriod from when the container started, or was last
+// restarted, and then three of the intervals the engine runs the check
+// at, as it reports them, or 30 s, both engines' default: pass the
+// image's own start period. A check that kept failing past the start
+// period has by then failed as often as either engine's default retries,
+// so the engine has called the container unhealthy, which is an error at
+// once, as is a container that stopped. Every error but the engine's own
+// carries the engine's log of the checks it ran.
 func (c *Container) EngineHealthy(ctx context.Context, startPeriod time.Duration) error {
-	if c.engine.name == "podman" {
-		res, err := c.engine.run.RunStdin(ctx, nil, c.engine.name, "healthcheck", "run", c.ID)
-		if err != nil {
-			return err
-		}
-		if res.Code != 0 {
-			// It prints only the status it found. What the check said is in
-			// the container's health log.
-			failed := fmt.Errorf("podman healthcheck run %s: exit status %d: %s", c, res.Code, combined(res))
-			ins, err := c.Inspect(ctx)
-			if err != nil {
-				return fmt.Errorf("%w; and reading its health log: %w", failed, err)
-			}
-			if h := ins.State.Health; h != nil {
-				return fmt.Errorf("%w%s", failed, h.logText())
-			}
-			return failed
-		}
-		return nil
-	}
-
-	deadline := c.started.Add(startPeriod)
+	var interval time.Duration
 	for {
 		ins, err := c.Inspect(ctx)
 		if err != nil {
 			return err
 		}
+		if interval == 0 {
+			interval = defaultHealthInterval
+			if hc := ins.Config.Healthcheck; hc != nil && hc.Interval > 0 {
+				interval = hc.Interval
+			}
+		}
 		h := ins.State.Health
 		switch {
 		case h == nil:
-			return fmt.Errorf("%s reports no health check for container %s: its image declares no HEALTHCHECK, or it was turned off", c.engine.name, c)
+			return fmt.Errorf("%s reports no health check for container %s: %s", c.engine.name, c, c.noHealthCheck())
 		case h.Status == "healthy":
 			return nil
 		case h.Status == "unhealthy":
 			return fmt.Errorf("%s reports container %s unhealthy%s", c.engine.name, c, h.logText())
-		case !time.Now().Before(deadline):
-			return fmt.Errorf("container %s is still %s after the %s start period%s", c, h.Status, startPeriod, h.logText())
+		case !ins.State.Running:
+			return fmt.Errorf("container %s %s, exit status %d, before %s reported it healthy%s",
+				c, ins.State.Status, ins.State.ExitCode, c.engine.name, h.logText())
+		case !time.Now().Before(c.started.Add(startPeriod + healthIntervals*interval)):
+			return fmt.Errorf("%s reports container %s still %s %s after it started: its start period of %s and three intervals of %s%s",
+				c.engine.name, c, h.Status, time.Since(c.started).Round(time.Second), startPeriod, interval, h.logText())
 		}
 		if err := Pause(ctx, pollInterval); err != nil {
 			return err
 		}
 	}
+}
+
+// EngineHealthy waits for the start period it is given and then
+// healthIntervals of the engine's interval, or of defaultHealthInterval
+// when the engine reports none.
+const (
+	healthIntervals       = 3
+	defaultHealthInterval = 30 * time.Second
+)
+
+// noHealthCheck says why the engine may report no health check for c.
+func (c *Container) noHealthCheck() string {
+	if c.engine.name == "podman" {
+		return "it was started with no --health-cmd, which Podman needs for an image published as an OCI index, " +
+			"or Podman had no systemd user session to run its timer in"
+	}
+	return "its image declares no HEALTHCHECK, or it was turned off"
 }
 
 // logText returns the health checks' log, one run to a line, for an error.
