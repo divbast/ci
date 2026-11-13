@@ -186,7 +186,7 @@ just IMAGE=ghcr.io/divbast/librespeed:latest acceptance
 | `acceptance` | `go test -json ./test/acceptance/...` against `IMAGE` under `ENGINE`, through `divbast-testcount` |
 | `test` | `build`, then `acceptance` |
 | `archive` | Writes `IMAGE` to `ARCHIVE` as an OCI archive |
-| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED` |
+| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED`, with `-vex openvex.json` when the app has one ([VEX](#vex)) |
 | `app-lint` | hadolint, and BuildKit's own `docker build --check`, over the Containerfile |
 
 `go test` exits 0 when every test skipped, and prints only `ok`, so an
@@ -613,6 +613,16 @@ short `go` the same way), and just and Trivy as exactly
 `"aqua:casey/just"` and `"aqua:aquasecurity/trivy"`. mise would install a
 name that `mise.toml` does not declare at its latest version, so `scan`
 fails unless all three are there.
+
+#### VEX
+
+An app that argues a finding unreachable does it in an
+[OpenVEX](https://openvex.dev) document named `openvex.json` at its root,
+with an `openvex.json.license` sidecar for REUSE. `scan` passes it to both
+of Trivy's scans when it is there, and passes no `-vex` when it is not.
+Each statement names one advisory and the product, with its version, that
+it was argued against, so that a bump that moves the product brings the
+finding back, to be argued again.
 
 ### `app-publish.yml`
 
