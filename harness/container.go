@@ -333,9 +333,23 @@ func (e Engine) Run(ctx context.Context, tb testing.TB, spec *RunSpec) (Result, 
 		return Result{}, err
 	}
 	// --rm removes it once it exits. This removes one a cancelled run
-	// left behind.
-	e.removeOnCleanup(ctx, tb, "rm", "-f", "-v", s.Name)
-	return e.run.RunStdin(ctx, nil, e.name, e.argv(&s, "--rm")...)
+	// left behind, unless the name was already another container's: the
+	// engine then made nothing, and that other is not this run's to
+	// remove, as Start leaves it too.
+	othersName := false
+	tb.Cleanup(func() {
+		if othersName {
+			return
+		}
+		rmCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		e.remove(rmCtx, tb, "rm", "-f", "-v", s.Name)
+	})
+	res, err := e.run.RunStdin(ctx, nil, e.name, e.argv(&s, "--rm")...)
+	if err == nil && res.Code != 0 {
+		othersName = nameInUse(res.Stderr, s.Name)
+	}
+	return res, err
 }
 
 // Result is what a command left behind: its stdout, stderr and exit
