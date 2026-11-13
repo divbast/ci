@@ -585,10 +585,10 @@ v2.0.0 breaks two things a v1 caller relies on.
   whether a published image the registry refuses is absent, private, or
   public and failing, where v1 read Trivy's error text and took any
   refusal for nothing published. So a registry refusing a public image
-  now fails the scan, where v1 made it advisory. A called job gets no
-  more than its caller grants, so a caller's `check` job that does not
-  grant it fails before any job starts. The `check` job's permissions
-  become:
+  for any reason but a missing tag now fails the scan, where v1 made it
+  advisory. A called job gets no more than its caller grants, so a
+  caller's `check` job that does not grant it fails before any job
+  starts. The `check` job's permissions become:
 
   ```yaml
       permissions:
@@ -681,9 +681,9 @@ is what `packages: read` is for.
 | `PUBLISHED` is | The scan |
 |---|---|
 | readable | Compares with what Trivy finds in it, from the same vulnerability database. Any failure of that scan fails, whatever Trivy says about why |
-| not published yet | Advisory, with a warning: nothing is shipped to compare with |
+| not published yet: no such package, or no such tag in a public one | Advisory, with a warning: nothing is shipped to compare with |
 | private | Advisory, with a warning that it stays advisory until the package is public |
-| public, but refused | Fails: a registry failing to serve the image is not nothing published |
+| public, but refused for any other reason | Fails: a registry failing to serve the image is not nothing published |
 | unreadable, or GitHub does not answer | Fails |
 
 Each warning is a GitHub Actions warning and a callout on the run's
@@ -1006,7 +1006,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

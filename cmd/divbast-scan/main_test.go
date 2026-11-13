@@ -466,8 +466,9 @@ func status(code int, text string) execx.Result {
 // which; present compares with what Trivy finds in it, and any failure of
 // that scan fails, whatever Trivy said; a registry or a GitHub that does
 // not answer fails, as does a public package the registry refuses to
-// show. Outside GitHub Actions no token may read packages, so nothing
-// asks GitHub: a refusal is an advisory there, saying CI decides.
+// show for any reason but a missing tag. Outside GitHub Actions no token
+// may read packages, so nothing asks GitHub: a refusal is an advisory
+// there, saying CI decides.
 func TestPublishedPresenceFromRegistry(t *testing.T) {
 	t.Parallel()
 

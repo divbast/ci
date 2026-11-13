@@ -30,15 +30,16 @@
 // client with skopeo, as users pull it. When the registry refuses, it asks
 // the GitHub API why, through gh, whose token is GH_TOKEN, which must be
 // able to read packages (a job's packages: read). While nothing is
-// published there yet, or the package is private, nothing is already
+// published there yet, because there is no such package, or no such tag
+// in a public one, or while the package is private, nothing is already
 // shipped to compare with, and every finding is an advisory. A private
 // package would keep the scan advisory for as long as it stayed private,
 // so neither is ever quiet: each is a warning on stderr, a GitHub Actions
 // warning, and a callout on the summary page. A package GitHub lists as
-// public that the registry will not show is a registry failing, and fails
-// the scan, as does a registry or an API that does not answer. Trivy is
-// asked only to scan, and any failure of that scan fails it, whatever
-// Trivy says about why.
+// public that the registry refuses for any other reason is a registry
+// failing, and fails the scan, as does a registry or an API that does not
+// answer. Trivy is asked only to scan, and any failure of that scan fails
+// it, whatever Trivy says about why.
 //
 // Outside GitHub Actions, without GITHUB_ACTIONS=true, it never asks
 // GitHub: no token a person holds for divbast's recipes can read
@@ -54,9 +55,9 @@
 //	   is not published yet or is private, or, outside GitHub Actions,
 //	   because the registry refused to show it
 //	1  a finding IMAGE lacks; a scan that failed or saw no packages; IMAGE
-//	   not a ghcr.io image, unreadable, or refused though public; the
-//	   GitHub API not answering, or refusing the token; or the summary not
-//	   written
+//	   not a ghcr.io image, unreadable, or refused though public for any
+//	   reason but a missing tag; the GitHub API not answering, or refusing
+//	   the token; or the summary not written
 //	2  the command line is wrong
 package main
 
