@@ -1,0 +1,28 @@
+{"ImportPath":"example.com/fixtures/broken [example.com/fixtures/broken.test]","Action":"build-output","Output":"# example.com/fixtures/broken [example.com/fixtures/broken.test]\n"}
+{"ImportPath":"example.com/fixtures/broken [example.com/fixtures/broken.test]","Action":"build-output","Output":"broken/broken_test.go:6:14: cannot use \"not a number\" (untyped string constant) as int value in variable declaration\n"}
+{"ImportPath":"example.com/fixtures/broken [example.com/fixtures/broken.test]","Action":"build-fail"}
+{"Time":"2026-11-13T13:53:51.529358+11:00","Action":"start","Package":"example.com/fixtures/alpha"}
+{"Time":"2026-11-13T13:53:51.529451+11:00","Action":"start","Package":"example.com/fixtures/broken"}
+{"Time":"2026-11-13T13:53:51.529473+11:00","Action":"output","Package":"example.com/fixtures/broken","Output":"FAIL\texample.com/fixtures/broken [build failed]\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.529488+11:00","Action":"fail","Package":"example.com/fixtures/broken","Elapsed":0,"FailedBuild":"example.com/fixtures/broken [example.com/fixtures/broken.test]"}
+{"Time":"2026-11-13T13:53:51.533384+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes"}
+{"Time":"2026-11-13T13:53:51.533416+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"=== RUN   TestRoutes\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533425+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//"}
+{"Time":"2026-11-13T13:53:51.533428+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"=== RUN   TestRoutes//\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533434+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"    alpha_test.go:8: GET /\n"}
+{"Time":"2026-11-13T13:53:51.53344+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"--- PASS: TestRoutes// (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533444+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.533448+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz"}
+{"Time":"2026-11-13T13:53:51.533451+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"=== RUN   TestRoutes//healthz\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533455+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"    alpha_test.go:8: GET /healthz\n"}
+{"Time":"2026-11-13T13:53:51.53346+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"--- PASS: TestRoutes//healthz (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533464+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.533466+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"--- PASS: TestRoutes (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533468+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.53347+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestHeaders"}
+{"Time":"2026-11-13T13:53:51.533473+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"=== RUN   TestHeaders\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533478+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"--- PASS: TestHeaders (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.53348+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.533484+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.533739+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"ok  \texample.com/fixtures/alpha\t0.004s\n"}
+{"Time":"2026-11-13T13:53:51.533768+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Elapsed":0.004}

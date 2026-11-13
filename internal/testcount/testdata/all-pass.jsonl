@@ -1,0 +1,42 @@
+{"Time":"2026-11-13T13:53:51.76043+11:00","Action":"start","Package":"example.com/fixtures/alpha"}
+{"Time":"2026-11-13T13:53:51.764509+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes"}
+{"Time":"2026-11-13T13:53:51.764556+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"=== RUN   TestRoutes\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764596+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//"}
+{"Time":"2026-11-13T13:53:51.764599+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"=== RUN   TestRoutes//\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764607+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"    alpha_test.go:8: GET /\n"}
+{"Time":"2026-11-13T13:53:51.764615+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"--- PASS: TestRoutes// (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764618+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.764629+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz"}
+{"Time":"2026-11-13T13:53:51.764632+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"=== RUN   TestRoutes//healthz\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764637+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"    alpha_test.go:8: GET /healthz\n"}
+{"Time":"2026-11-13T13:53:51.764643+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"--- PASS: TestRoutes//healthz (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764647+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.76465+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"--- PASS: TestRoutes (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764653+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.764655+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestHeaders"}
+{"Time":"2026-11-13T13:53:51.764657+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"=== RUN   TestHeaders\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764662+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"--- PASS: TestHeaders (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764664+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.764667+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.764908+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"ok  \texample.com/fixtures/alpha\t0.004s\n"}
+{"Time":"2026-11-13T13:53:51.764926+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Elapsed":0.004}
+{"Time":"2026-11-13T13:53:51.77664+11:00","Action":"start","Package":"example.com/fixtures/beta"}
+{"Time":"2026-11-13T13:53:51.780002+11:00","Action":"run","Package":"example.com/fixtures/beta","Test":"TestContract"}
+{"Time":"2026-11-13T13:53:51.780034+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract","Output":"=== RUN   TestContract\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.78005+11:00","Action":"run","Package":"example.com/fixtures/beta","Test":"TestContract/read-only-root"}
+{"Time":"2026-11-13T13:53:51.780056+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract/read-only-root","Output":"=== RUN   TestContract/read-only-root\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780068+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract/read-only-root","Output":"--- PASS: TestContract/read-only-root (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780083+11:00","Action":"pass","Package":"example.com/fixtures/beta","Test":"TestContract/read-only-root","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.780088+11:00","Action":"run","Package":"example.com/fixtures/beta","Test":"TestContract/no-capabilities"}
+{"Time":"2026-11-13T13:53:51.78009+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract/no-capabilities","Output":"=== RUN   TestContract/no-capabilities\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780093+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract/no-capabilities","Output":"--- PASS: TestContract/no-capabilities (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780095+11:00","Action":"pass","Package":"example.com/fixtures/beta","Test":"TestContract/no-capabilities","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.780099+11:00","Action":"run","Package":"example.com/fixtures/beta","Test":"TestContract/non-root"}
+{"Time":"2026-11-13T13:53:51.7801+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract/non-root","Output":"=== RUN   TestContract/non-root\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780102+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract/non-root","Output":"--- PASS: TestContract/non-root (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780104+11:00","Action":"pass","Package":"example.com/fixtures/beta","Test":"TestContract/non-root","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.780106+11:00","Action":"output","Package":"example.com/fixtures/beta","Test":"TestContract","Output":"--- PASS: TestContract (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780108+11:00","Action":"pass","Package":"example.com/fixtures/beta","Test":"TestContract","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.780109+11:00","Action":"output","Package":"example.com/fixtures/beta","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.780285+11:00","Action":"output","Package":"example.com/fixtures/beta","Output":"ok  \texample.com/fixtures/beta\t0.004s\n"}
+{"Time":"2026-11-13T13:53:51.780298+11:00","Action":"pass","Package":"example.com/fixtures/beta","Elapsed":0.004}

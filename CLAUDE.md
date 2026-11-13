@@ -76,11 +76,19 @@ this project's one record of LLM involvement.
 - `just ci` runs every gate. Run it before committing; `just lint` is
   enough for a commit that changes only documentation. Both need
   `GITHUB_TOKEN` set (README.md, "Local GitHub token")
-- `just ci-tools` builds the commands into `bin/`
+- `just ci-tools` builds the commands into `bin/`. README.md's "Tools"
+  table is their inventory, with each one's exit codes: a new command
+  gets a row there
 
 The tests that build and run containers run only when `ENGINE` is
 `docker` or `podman`: run `ENGINE=docker just ci` before a change to
 `harness` or `contract`, or to what they use.
+
+`app.just`'s `acceptance` pipes `go test -json` into
+`divbast-testcount`, which fails a run unless a test passed and none
+failed or skipped: go test alone exits 0 when every test skipped. Keep
+that guard off `go-test`. An app's `lint` runs `go-test` with `IMAGE`
+unset, where its acceptance suite must still skip and pass.
 
 ## Gates
 

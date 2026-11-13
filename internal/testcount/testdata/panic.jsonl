@@ -1,0 +1,32 @@
+{"Time":"2026-11-13T13:53:51.883318+11:00","Action":"start","Package":"example.com/fixtures/alpha"}
+{"Time":"2026-11-13T13:53:51.887337+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes"}
+{"Time":"2026-11-13T13:53:51.887379+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"=== RUN   TestRoutes\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887413+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//"}
+{"Time":"2026-11-13T13:53:51.887416+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"=== RUN   TestRoutes//\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887421+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"    alpha_test.go:8: GET /\n"}
+{"Time":"2026-11-13T13:53:51.887429+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"--- PASS: TestRoutes// (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887432+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.887442+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz"}
+{"Time":"2026-11-13T13:53:51.887444+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"=== RUN   TestRoutes//healthz\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887449+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"    alpha_test.go:8: GET /healthz\n"}
+{"Time":"2026-11-13T13:53:51.887455+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"--- PASS: TestRoutes//healthz (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887458+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.88746+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"--- PASS: TestRoutes (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887463+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.887465+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestHeaders"}
+{"Time":"2026-11-13T13:53:51.887468+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"=== RUN   TestHeaders\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887476+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"--- PASS: TestHeaders (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887478+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.887481+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.887742+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"ok  \texample.com/fixtures/alpha\t0.004s\n"}
+{"Time":"2026-11-13T13:53:51.887761+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Elapsed":0.004}
+{"Time":"2026-11-13T13:53:51.897677+11:00","Action":"start","Package":"example.com/fixtures/boom"}
+{"Time":"2026-11-13T13:53:51.903314+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"panic: the engine is not reachable\n"}
+{"Time":"2026-11-13T13:53:51.903351+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"\n"}
+{"Time":"2026-11-13T13:53:51.903362+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"goroutine 1 [running]:\n"}
+{"Time":"2026-11-13T13:53:51.903387+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"example.com/fixtures/boom.TestMain(...)\n"}
+{"Time":"2026-11-13T13:53:51.903398+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"\t/src/fixtures/boom/boom_test.go:6\n"}
+{"Time":"2026-11-13T13:53:51.903422+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"main.main()\n"}
+{"Time":"2026-11-13T13:53:51.903426+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"\t_testmain.go:48 +0x94\n"}
+{"Time":"2026-11-13T13:53:51.903659+11:00","Action":"output","Package":"example.com/fixtures/boom","Output":"FAIL\texample.com/fixtures/boom\t0.006s\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.903677+11:00","Action":"fail","Package":"example.com/fixtures/boom","Elapsed":0.006}

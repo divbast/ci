@@ -1,0 +1,13 @@
+{"Time":"2026-11-13T13:53:51.652909+11:00","Action":"start","Package":"example.com/fixtures/partial"}
+{"Time":"2026-11-13T13:53:51.656762+11:00","Action":"run","Package":"example.com/fixtures/partial","Test":"TestHealth"}
+{"Time":"2026-11-13T13:53:51.656809+11:00","Action":"output","Package":"example.com/fixtures/partial","Test":"TestHealth","Output":"=== RUN   TestHealth\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.656839+11:00","Action":"output","Package":"example.com/fixtures/partial","Test":"TestHealth","Output":"--- PASS: TestHealth (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.656844+11:00","Action":"pass","Package":"example.com/fixtures/partial","Test":"TestHealth","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.656849+11:00","Action":"run","Package":"example.com/fixtures/partial","Test":"TestRootless"}
+{"Time":"2026-11-13T13:53:51.656852+11:00","Action":"output","Package":"example.com/fixtures/partial","Test":"TestRootless","Output":"=== RUN   TestRootless\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.656854+11:00","Action":"output","Package":"example.com/fixtures/partial","Test":"TestRootless","Output":"    partial_test.go:8: needs a rootless engine\n"}
+{"Time":"2026-11-13T13:53:51.65686+11:00","Action":"output","Package":"example.com/fixtures/partial","Test":"TestRootless","Output":"--- SKIP: TestRootless (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.656863+11:00","Action":"skip","Package":"example.com/fixtures/partial","Test":"TestRootless","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.656865+11:00","Action":"output","Package":"example.com/fixtures/partial","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.65712+11:00","Action":"output","Package":"example.com/fixtures/partial","Output":"ok  \texample.com/fixtures/partial\t0.004s\n"}
+{"Time":"2026-11-13T13:53:51.657139+11:00","Action":"pass","Package":"example.com/fixtures/partial","Elapsed":0.004}

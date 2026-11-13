@@ -31,9 +31,13 @@ BASELINE := ARCHIVE + ".published.json"
 build:
     {{ ENGINE }} build -t {{ IMAGE }} -f Containerfile .
 
-# Run the acceptance suite against the image
+# Run the acceptance suite against the image. go test exits 0 when every
+# test skipped, so its events go through divbast-testcount, which prints
+# every test's output and a count, and fails unless a test passed and none
+# failed or skipped. The shell's pipefail keeps go test's own exit status.
 acceptance:
-    ENGINE={{ ENGINE }} IMAGE={{ IMAGE }} go test -count=1 -timeout 90m ./test/acceptance/...
+    [ -x {{ ci_dir }}/bin/divbast-testcount ] || {{ just_executable() }} ci-tools
+    ENGINE={{ ENGINE }} IMAGE={{ IMAGE }} go test -json -count=1 -timeout 90m ./test/acceptance/... | {{ ci_dir }}/bin/divbast-testcount
 
 # Build the image, then run the acceptance suite against it
 test: build acceptance

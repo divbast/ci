@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
 // Package just_test runs the shared recipes in common.just through ci's own
-// justfile, which imports them as a caller's does.
+// justfile, which imports them as a caller's does, and reads app.just's
+// through a justfile set up as an app's.
 package just_test
 
 import (
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -100,6 +102,50 @@ func TestGitHubRecipesRefuseWithoutAGuardedToken(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestAcceptancePipesThroughTestcount reads the commands app.just's
+// acceptance recipe would run, in a justfile set up as an app's, without
+// running them. go test exits 0 when every test skipped, so the recipe must
+// pipe go test -json into divbast-testcount, which fails such a run, as
+// the pipeline's last command; and since a shared recipe is run from a
+// recipe's body, never named as a dependency, it builds ci's tools from its
+// own body when .ci/bin lacks that one.
+func TestAcceptancePipesThroughTestcount(t *testing.T) {
+	t.Parallel()
+	ci, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := filepath.Join(t.TempDir(), "justfile")
+	body := `set shell := ["mise", "exec", "--", "bash", "-euo", "pipefail", "-c"]
+
+ENGINE := "docker"
+IMAGE := "localhost/app:dev"
+ARCHIVE := "/tmp/app-image.tar"
+PUBLISHED := "ghcr.io/divbast/app:latest"
+
+import '` + filepath.Join(ci, "just", "common.just") + `'
+import '` + filepath.Join(ci, "just", "app.just") + `'
+`
+	if err = os.WriteFile(app, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// G204 objects to a subprocess whose arguments are variables. They are
+	// this test's own: the justfile it wrote and a recipe it names.
+	cmd := exec.CommandContext(t.Context(), "just", "--justfile", app, "--dry-run", "acceptance") //nolint:gosec // G204: the arguments are this test's own
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("just --dry-run acceptance: %v\n%s", err, out)
+	}
+	commands := strings.Split(strings.TrimSpace(string(out)), "\n")
+
+	build := regexp.MustCompile(`^\[ -x \.ci/bin/divbast-testcount \] \|\| \S*just ci-tools$`)
+	pipe := "ENGINE=docker IMAGE=localhost/app:dev go test -json -count=1 -timeout 90m ./test/acceptance/... | .ci/bin/divbast-testcount"
+	if len(commands) != 2 || !build.MatchString(commands[0]) || commands[1] != pipe {
+		t.Errorf("acceptance runs\n%s\nwant a line matching\n%s\nthen\n%s", out, build, pipe)
 	}
 }
 

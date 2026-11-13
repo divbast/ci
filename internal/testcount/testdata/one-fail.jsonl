@@ -1,0 +1,43 @@
+{"Time":"2026-11-13T13:53:51.421291+11:00","Action":"start","Package":"example.com/fixtures/alpha"}
+{"Time":"2026-11-13T13:53:51.4214+11:00","Action":"start","Package":"example.com/fixtures/flaky"}
+{"Time":"2026-11-13T13:53:51.425342+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes"}
+{"Time":"2026-11-13T13:53:51.425381+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"=== RUN   TestRoutes\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425417+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//"}
+{"Time":"2026-11-13T13:53:51.42542+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"=== RUN   TestRoutes//\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.42543+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"    alpha_test.go:8: GET /\n"}
+{"Time":"2026-11-13T13:53:51.425438+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Output":"--- PASS: TestRoutes// (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425442+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.425447+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz"}
+{"Time":"2026-11-13T13:53:51.425449+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"=== RUN   TestRoutes//healthz\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425474+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"    alpha_test.go:8: GET /healthz\n"}
+{"Time":"2026-11-13T13:53:51.42548+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Output":"--- PASS: TestRoutes//healthz (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425485+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes//healthz","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.425488+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Output":"--- PASS: TestRoutes (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425491+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestRoutes","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.425493+11:00","Action":"run","Package":"example.com/fixtures/alpha","Test":"TestHeaders"}
+{"Time":"2026-11-13T13:53:51.425496+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"=== RUN   TestHeaders\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425501+11:00","Action":"output","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Output":"--- PASS: TestHeaders (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425504+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Test":"TestHeaders","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.425506+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.425732+11:00","Action":"output","Package":"example.com/fixtures/alpha","Output":"ok  \texample.com/fixtures/alpha\t0.004s\n"}
+{"Time":"2026-11-13T13:53:51.425755+11:00","Action":"pass","Package":"example.com/fixtures/alpha","Elapsed":0.004}
+{"Time":"2026-11-13T13:53:51.42607+11:00","Action":"run","Package":"example.com/fixtures/flaky","Test":"TestHealth"}
+{"Time":"2026-11-13T13:53:51.42609+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestHealth","Output":"=== RUN   TestHealth\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426099+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestHealth","Output":"--- PASS: TestHealth (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426109+11:00","Action":"pass","Package":"example.com/fixtures/flaky","Test":"TestHealth","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.426115+11:00","Action":"run","Package":"example.com/fixtures/flaky","Test":"TestUploads"}
+{"Time":"2026-11-13T13:53:51.426129+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestUploads","Output":"=== RUN   TestUploads\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426132+11:00","Action":"run","Package":"example.com/fixtures/flaky","Test":"TestUploads/small"}
+{"Time":"2026-11-13T13:53:51.426134+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestUploads/small","Output":"=== RUN   TestUploads/small\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426137+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestUploads/small","Output":"--- PASS: TestUploads/small (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426149+11:00","Action":"pass","Package":"example.com/fixtures/flaky","Test":"TestUploads/small","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.426153+11:00","Action":"run","Package":"example.com/fixtures/flaky","Test":"TestUploads/large"}
+{"Time":"2026-11-13T13:53:51.426156+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestUploads/large","Output":"=== RUN   TestUploads/large\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426166+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestUploads/large","Output":"    flaky_test.go:10: POST /backend/empty.php: got 413, want 200\n","OutputType":"error"}
+{"Time":"2026-11-13T13:53:51.426171+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestUploads/large","Output":"--- FAIL: TestUploads/large (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426174+11:00","Action":"fail","Package":"example.com/fixtures/flaky","Test":"TestUploads/large","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.426176+11:00","Action":"output","Package":"example.com/fixtures/flaky","Test":"TestUploads","Output":"--- FAIL: TestUploads (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426179+11:00","Action":"fail","Package":"example.com/fixtures/flaky","Test":"TestUploads","Elapsed":0}
+{"Time":"2026-11-13T13:53:51.426181+11:00","Action":"output","Package":"example.com/fixtures/flaky","Output":"FAIL\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426419+11:00","Action":"output","Package":"example.com/fixtures/flaky","Output":"FAIL\texample.com/fixtures/flaky\t0.005s\n","OutputType":"frame"}
+{"Time":"2026-11-13T13:53:51.426441+11:00","Action":"fail","Package":"example.com/fixtures/flaky","Elapsed":0.005}
