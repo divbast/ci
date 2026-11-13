@@ -14,7 +14,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,8 +68,9 @@ type Config struct {
 }
 
 // ErrNoJob marks a slot run with jobs, none of them the one
-// [Config.SlotJob] names: a name written wrong, which would otherwise read
-// every run as lost, or none.
+// [Config.SlotJob] names, nor one whose unexpanded name stands for it: a
+// name written wrong, which would otherwise read every run as lost, or
+// none.
 var ErrNoJob = errors.New("no such job in the slot run")
 
 // Result is what a check found.
@@ -156,11 +159,10 @@ type Source interface {
 	// SlotRuns returns the newest scheduled runs of workflow on main,
 	// newest first.
 	SlotRuns(ctx context.Context, workflow string) ([]Run, error)
-	// JobConclusion returns the conclusion of the job called job in run,
-	// as GitHub puts it, and true; or false when the run has no jobs at
-	// all, as one that never started has none. A run with jobs, none of
-	// them called job, is an error wrapping [ErrNoJob].
-	JobConclusion(ctx context.Context, run *Run, job string) (conclusion string, hasJobs bool, err error)
+	// Jobs returns the jobs of run's latest attempt, each by its name as
+	// GitHub shows it in the run, with its conclusion. A run that never
+	// started has none.
+	Jobs(ctx context.Context, run *Run) ([]Job, error)
 	// MainSHA returns the commit main is at.
 	MainSHA(ctx context.Context) (string, error)
 	// Compare returns how head stands against base, as GitHub's compare
@@ -173,6 +175,18 @@ type Source interface {
 	// WorkflowCreated returns when the workflow in file, such as
 	// build.yml, was created.
 	WorkflowCreated(ctx context.Context, file string) (time.Time, error)
+}
+
+// Job is a job of a slot run.
+type Job struct {
+	// Name is the job's name as GitHub shows it in the run: a matrix
+	// job's expanded, such as "publish (baikal)", or, when GitHub skipped
+	// or cancelled the job before expanding its matrix, unexpanded, such
+	// as "publish (${{ matrix.app }})".
+	Name string
+	// Conclusion is how it ended, as GitHub puts it, such as "success" or
+	// "skipped".
+	Conclusion string
 }
 
 // Revisions reads the commit a published image was built from, as
@@ -267,7 +281,9 @@ func Renovate(ctx context.Context, s Source, c *Config) (Result, error) {
 // moved. One that failed, was cancelled or ended any other way is lost all
 // the same, and so is any run with nothing published yet, since then every
 // run publishes, gated or not. With c.SlotJob set, it is that job's
-// conclusion that counts, not the whole run's.
+// conclusion that counts, not the whole run's, and a run ahead whose jobs
+// name neither it nor an unexpanded matrix job standing for it is an
+// error.
 //
 // So is each day with no slot run at all, after 12 hours' grace, since
 // GitHub starts them hours late. Those days count from the newest slot
@@ -402,41 +418,81 @@ func against(status string) string {
 // content-gated or not: every such run publishes. With a commit published,
 // a run that built a commit ahead of it is, unless content-gated and the
 // run succeeded: the run as a whole, or with c.SlotJob set, that job in it.
+// What costs nothing to ask is asked first: the run's own conclusion,
+// then how its commit stands, then, only for a run ahead, its jobs.
 func isLost(ctx context.Context, s Source, c *Config, run *Run, state registry.State, revision string, since time.Time) (bool, error) {
 	if state == registry.Absent {
 		return run.Created.After(since), nil
 	}
-	if c.ContentGated {
-		conclusion, err := slotConclusion(ctx, s, c, run)
-		if err != nil {
-			return false, err
-		}
-		if conclusion == "success" {
-			return false, nil
-		}
+	if c.ContentGated && c.SlotJob == "" && run.Conclusion == "success" {
+		return false, nil
 	}
 	status, _, err := s.Compare(ctx, revision, run.HeadSHA)
 	if err != nil {
 		return false, fmt.Errorf("compare the slot run %s, which built %s, with %s: %w", run.URL, run.HeadSHA, revision, err)
 	}
-	return status == "ahead", nil
+	if status != "ahead" {
+		return false, nil
+	}
+	if c.ContentGated && c.SlotJob != "" {
+		conclusion, err := slotConclusion(ctx, s, c, run)
+		if err != nil {
+			return false, err
+		}
+		return conclusion != "success", nil
+	}
+	return true, nil
 }
 
 // slotConclusion returns how a slot run ended for the image: the
-// conclusion of its job c.SlotJob names, or the run's own when c names
-// none or the run has no jobs at all.
+// conclusion of its job c.SlotJob names, or the run's own when the run has
+// no jobs at all. A job whose name GitHub left unexpanded, because it
+// skipped or cancelled the job before expanding its matrix, stands for
+// every name it would have expanded to. A run with jobs, none of them the
+// one named or one standing for it, is an error wrapping [ErrNoJob], as is
+// one with two.
 func slotConclusion(ctx context.Context, s Source, c *Config, run *Run) (string, error) {
-	if c.SlotJob == "" {
-		return run.Conclusion, nil
-	}
-	conclusion, ok, err := s.JobConclusion(ctx, run, c.SlotJob)
+	jobs, err := s.Jobs(ctx, run)
 	if err != nil {
 		return "", fmt.Errorf("the slot run %s: %w", run.URL, err)
 	}
-	if !ok {
+	if len(jobs) == 0 {
 		return run.Conclusion, nil
 	}
-	return conclusion, nil
+	names := make([]string, 0, len(jobs))
+	var found []Job
+	for _, j := range jobs {
+		names = append(names, strconv.Quote(j.Name))
+		if j.Name == c.SlotJob || expandsTo(j.Name, c.SlotJob) {
+			found = append(found, j)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("%w: the slot run %s has no job called %q, nor one whose unexpanded name stands for it, only %s",
+			ErrNoJob, run.URL, c.SlotJob, strings.Join(names, ", "))
+	case 1:
+		return found[0].Conclusion, nil
+	default:
+		return "", fmt.Errorf("the slot run %s has %d jobs that are or stand for %q, so which one publishes is unknown", run.URL, len(found), c.SlotJob)
+	}
+}
+
+// expression is a ${{ }} expression in a job's name.
+var expression = regexp.MustCompile(`\$\{\{.*?\}\}`)
+
+// expandsTo reports whether name holds an unexpanded ${{ }} expression and
+// job is a name it could expand to: name's text around its expressions,
+// with any text in place of each.
+func expandsTo(name, job string) bool {
+	if !expression.MatchString(name) {
+		return false
+	}
+	parts := expression.Split(name, -1)
+	for i, p := range parts {
+		parts[i] = regexp.QuoteMeta(p)
+	}
+	return regexp.MustCompile("^" + strings.Join(parts, ".*") + "$").MatchString(job)
 }
 
 // line is how a pull request is listed: its number and title.

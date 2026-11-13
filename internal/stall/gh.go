@@ -193,39 +193,23 @@ func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 	return runs, nil
 }
 
-// JobConclusion implements [Source], from the jobs of run's latest
-// attempt, as gh run view lists them. Two jobs of the one name are an
-// error, since either could be the one meant.
-func (g GH) JobConclusion(ctx context.Context, run *Run, job string) (conclusion string, hasJobs bool, err error) {
+// Jobs implements [Source], from the latest attempt of run, as gh run view
+// lists its jobs.
+func (g GH) Jobs(ctx context.Context, run *Run) ([]Job, error) {
 	var raw struct {
 		Jobs []struct {
 			Name       string `json:"name"`
 			Conclusion string `json:"conclusion"`
 		} `json:"jobs"`
 	}
-	id := strconv.FormatInt(run.ID, 10)
-	if err := g.list(ctx, &raw, "run", "view", id, "--repo", g.Repo, "--json", "jobs"); err != nil {
-		return "", false, err
+	if err := g.list(ctx, &raw, "run", "view", strconv.FormatInt(run.ID, 10), "--repo", g.Repo, "--json", "jobs"); err != nil {
+		return nil, err
 	}
-	if len(raw.Jobs) == 0 {
-		return "", false, nil
-	}
-	names := make([]string, 0, len(raw.Jobs))
-	var found []string
+	jobs := make([]Job, 0, len(raw.Jobs))
 	for _, j := range raw.Jobs {
-		names = append(names, strconv.Quote(j.Name))
-		if j.Name == job {
-			found = append(found, j.Conclusion)
-		}
+		jobs = append(jobs, Job{Name: j.Name, Conclusion: j.Conclusion})
 	}
-	switch len(found) {
-	case 0:
-		return "", false, fmt.Errorf("%w: run %s has no job called %q, only %s", ErrNoJob, id, job, strings.Join(names, ", "))
-	case 1:
-		return found[0], true, nil
-	default:
-		return "", false, fmt.Errorf("run %s has %d jobs called %q, so which one publishes is unknown", id, len(found), job)
-	}
+	return jobs, nil
 }
 
 // MainSHA implements [Source].

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -96,22 +97,19 @@ func (s *source) SlotRuns(_ context.Context, workflow string) ([]stall.Run, erro
 	return s.runs, nil
 }
 
-func (s *source) JobConclusion(_ context.Context, run *stall.Run, job string) (conclusion string, hasJobs bool, err error) {
+func (s *source) Jobs(_ context.Context, run *stall.Run) ([]stall.Job, error) {
 	if s.err != nil {
-		return "", false, s.err
+		return nil, s.err
 	}
 	jobs, ok := s.jobs[run.ID]
 	if !ok {
-		return "", false, fmt.Errorf("asked for the jobs of run %d, which the test did not script", run.ID)
+		return nil, fmt.Errorf("asked for the jobs of run %d, which the test did not script", run.ID)
 	}
-	if len(jobs) == 0 {
-		return "", false, nil
+	out := make([]stall.Job, 0, len(jobs))
+	for _, name := range slices.Sorted(maps.Keys(jobs)) {
+		out = append(out, stall.Job{Name: name, Conclusion: jobs[name]})
 	}
-	conclusion, ok = jobs[job]
-	if !ok {
-		return "", false, fmt.Errorf("%w: run %d has no job %q", stall.ErrNoJob, run.ID, job)
-	}
-	return conclusion, true, nil
+	return out, nil
 }
 
 func (s *source) MainSHA(context.Context) (string, error) {
@@ -853,6 +851,69 @@ func TestSlots(t *testing.T) {
 			wantErr: stall.ErrNoJob,
 		},
 		{
+			// GitHub decides a job's if: before it expands the job's
+			// matrix, so a run whose publish matrix it skipped, its lint
+			// red say, lists the job once, under its unexpanded name. That
+			// stands for this image's job, which did not succeed, so the
+			// run is lost when ahead, as any other is.
+			name: "gated_job_matrix_skipped_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{ID: 2, HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "failure", URL: url2},
+					{ID: 1, HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "success", URL: url1},
+				},
+				jobs: map[int64]map[string]string{
+					2: {"lint / lint": "failure", "build (baikal, amd64)": "success", "publish (${{ matrix.app }})": "skipped"},
+					1: {"publish (baikal)": "success", "publish (librespeed)": "success"},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			job:   "publish (baikal)",
+			want:  stall.Result{Headline: "main " + head + " is ahead of :latest " + published + ", with 1 lost slot(s), under 2"},
+		},
+		{
+			// A run of a commit not ahead of :latest is not lost, whatever
+			// its job did, so its jobs are never read: the source here has
+			// none scripted, and fails if asked.
+			name: "gated_job_not_ahead_never_read",
+			src: source{
+				main: head,
+				runs: []stall.Run{{ID: 4, HeadSHA: older, Created: ago(20 * time.Hour), Completed: true, Conclusion: "failure", URL: url1}},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + older: {status: "behind"},
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			job:   "publish (baikal)",
+			want:  stall.Result{Headline: "main " + head + " is ahead of :latest " + published + ", with 0 lost slot(s), under 2"},
+		},
+		{
+			// An unexpanded name stands only for the names it would expand
+			// to: another job's, skipped, leaves a name written wrong an
+			// error.
+			name: "gated_job_other_matrix_skipped",
+			src: source{
+				main: head,
+				runs: []stall.Run{{ID: 2, HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "failure", URL: url2}},
+				jobs: map[int64]map[string]string{2: {"build (${{ matrix.app }}, ${{ matrix.arch }})": "skipped"}},
+				compares: map[string]comparison{
+					published + "..." + head: {status: "ahead", first: ago(3 * day)},
+				},
+			},
+			revs:    revisions{revision: published, state: registry.Published},
+			gated:   true,
+			job:     "publish (baikal)",
+			wantErr: stall.ErrNoJob,
+		},
+		{
 			// Main behind :latest, with no slot run and no commit to say
 			// when main stopped being what is published: as many days as
 			// make a stall.
@@ -942,6 +1003,59 @@ func TestSlots(t *testing.T) {
 					t.Fatal(err)
 				}
 				checkResult(t, got, tt.want)
+			})
+		})
+	}
+}
+
+// TestSlotJobErrors checks what a content-gated slot reading its own job
+// says when a run ahead of :latest has jobs and no one job that is the
+// one named or stands for it: every job the run has, so a name written
+// wrong is found, and how many matched when more than one did.
+func TestSlotJobErrors(t *testing.T) {
+	t.Parallel()
+	const url = "https://github.com/divbast/frankenphp/actions/runs/2"
+	for _, tt := range []struct {
+		name    string
+		jobs    map[string]string
+		wantErr error
+		want    []string
+	}{
+		{
+			name:    "written-wrong",
+			jobs:    map[string]string{"publish (baikal)": "success", "publish (librespeed)": "success"},
+			wantErr: stall.ErrNoJob,
+			want:    []string{url, `"publish (baikl)"`, `"publish (baikal)"`, `"publish (librespeed)"`},
+		},
+		{
+			name: "two",
+			jobs: map[string]string{"publish (baikl)": "success", "publish (${{ matrix.app }})": "skipped"},
+			want: []string{url, "2 jobs", `"publish (baikl)"`},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				c := config
+				c.ContentGated, c.SlotJob = true, "publish (baikl)"
+				src := &source{
+					main: head,
+					runs: []stall.Run{{ID: 2, HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "failure", URL: url}},
+					jobs: map[int64]map[string]string{2: tt.jobs},
+					compares: map[string]comparison{
+						published + "..." + head: {status: "ahead", first: ago(3 * day)},
+					},
+				}
+				_, err := stall.Slots(t.Context(), src, revisions{revision: published, state: registry.Published}, &c)
+				if err == nil || (tt.wantErr != nil && !errors.Is(err, tt.wantErr)) {
+					t.Fatalf("Slots() error = %v, want one wrapping %v", err, tt.wantErr)
+				}
+				for _, w := range tt.want {
+					if !strings.Contains(err.Error(), w) {
+						t.Errorf("Slots() error = %q, want it to say %q", err, w)
+					}
+				}
 			})
 		})
 	}

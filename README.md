@@ -911,10 +911,16 @@ job each. A run in which one image's build failed ends red as a whole,
 though the other image's publish job succeeded; read as a whole, that run
 would count as a lost slot for both. With `slot-job` naming the image's
 own job as the run lists it, such as `publish (baikal)` for a matrix job
-named `publish (${{ matrix.app }})`, only that job's conclusion counts. A
-run that never started, and so has no jobs, counts as the run ended. A
-name that matches no job in a run fails the check, as does `slot-job`
-without `content-gated`, the one slot check that reads a conclusion.
+named `publish (${{ matrix.app }})`, only that job's conclusion counts.
+GitHub decides a job's `if:` before it expands the job's matrix, so a run
+in which it skipped or cancelled the matrix, its lint red say, lists the
+job once, by its unexpanded name, which stands for every name it expands
+to: that job did not succeed. A run that never started, and so has no
+jobs, counts as the run ended. Only a run of a commit ahead of the
+published one has its jobs read, and one whose jobs include neither the
+name nor an unexpanded name standing for it fails the check, as does
+`slot-job` without `content-gated`, the one slot check that reads a
+conclusion.
 
 The calling job grants `contents: read`, `pull-requests: read`,
 `actions: read`, `checks: read`, `statuses: read` and `packages: read`.

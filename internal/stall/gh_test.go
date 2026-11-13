@@ -52,11 +52,15 @@ const (
 //	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
 //	gh-run-view-jobs-frankenphp.json   gh run view 43493850688 --repo divbast/frankenphp --json jobs
 //	gh-run-view-jobs-baikal-failed.json  gh run view 42310287997 --repo divbast/baikal-oci-image --json jobs
+//	gh-run-view-jobs-frankenphp-skipped.json  gh run view 43481642005 --repo divbast/frankenphp --json jobs
 //
 // The two slot lists hold the same runs as their recordings of the day
 // before, which lacked databaseId. The frankenphp run is a daily slot in
 // which every job succeeded; the Baikal one is the slot of 2026-11-06,
-// whose arm64 build failed and whose publish job was skipped.
+// whose arm64 build failed and whose publish job was skipped. The other
+// frankenphp run is a pull request's, on which the publish job's if: is
+// false, so GitHub skipped the job before expanding its matrix, and lists
+// it once, by its unexpanded name, as it does for a slot whose lint failed.
 //
 // From each gh api -i recording, the headers that describe the caller
 // rather than the response are taken out: the token's OAuth scopes and
@@ -454,9 +458,9 @@ func TestGHSlotRuns(t *testing.T) {
 	}
 }
 
-// TestGHJobConclusion reads the conclusion of one job of a slot run, by
-// the job's name as GitHub shows it in the run (backlog CI-7).
-func TestGHJobConclusion(t *testing.T) {
+// TestGHJobs reads the jobs of a slot run, each by its name as GitHub
+// shows it in the run, and its conclusion (backlog CI-7).
+func TestGHJobs(t *testing.T) {
 	t.Parallel()
 
 	const frankenphp = "divbast/frankenphp"
@@ -465,64 +469,52 @@ func TestGHJobConclusion(t *testing.T) {
 		repo   string
 		id     int64
 		result execx.Result
-		job    string
-		want   string
-		// wantJobs says whether the run has jobs at all.
-		wantJobs bool
-		wantErr  error
-		// wantText is what the error must say, when one is wanted.
-		wantText []string
+		// count is how many jobs the run has, and has one of them.
+		count   int
+		has     stall.Job
+		wantErr []string
 	}{
 		{
-			name: "frankenphp-baikal", repo: frankenphp, id: 43493850688,
+			name: "frankenphp", repo: frankenphp, id: 43493850688,
 			result: stdout(testdata(t, "gh-run-view-jobs-frankenphp.json")),
-			job:    "publish (baikal)", want: "success", wantJobs: true,
+			count:  8, has: stall.Job{Name: "publish (baikal)", Conclusion: "success"},
 		},
 		{
 			// The run failed in its arm64 build, and so never published.
 			name: "baikal-publish-skipped", repo: baikal, id: 42310287997,
 			result: stdout(testdata(t, "gh-run-view-jobs-baikal-failed.json")),
-			job:    "publish", want: "skipped", wantJobs: true,
+			count:  6, has: stall.Job{Name: "publish", Conclusion: "skipped"},
 		},
 		{
-			// A name written wrong names every job the run has.
-			name: "no-such-job", repo: frankenphp, id: 43493850688,
-			result:   stdout(testdata(t, "gh-run-view-jobs-frankenphp.json")),
-			job:      "publish (baikl)",
-			wantErr:  stall.ErrNoJob,
-			wantText: []string{`"publish (baikl)"`, "43493850688", `"publish (baikal)"`, `"publish (librespeed)"`},
+			// GitHub skipped the publish matrix before expanding it, and
+			// names the job as written
+			name: "frankenphp-matrix-skipped", repo: frankenphp, id: 43481642005,
+			result: stdout(testdata(t, "gh-run-view-jobs-frankenphp-skipped.json")),
+			count:  7, has: stall.Job{Name: "publish (${{ matrix.app }})", Conclusion: "skipped"},
 		},
 		{
-			// A run that never started has no jobs, and nothing to say.
+			// A run that never started has no jobs.
 			name: "no-jobs", repo: baikal, id: 7,
 			result: stdout([]byte(`{"jobs":[]}`)),
-			job:    "publish",
-		},
-		{
-			name: "two-jobs-one-name", repo: baikal, id: 7,
-			result:   stdout([]byte(`{"jobs":[{"name":"publish","conclusion":"success"},{"name":"publish","conclusion":"failure"}]}`)),
-			job:      "publish",
-			wantText: []string{"2 jobs", `"publish"`},
 		},
 		{
 			name: "gh-fails", repo: baikal, id: 7,
-			result:   ghFailed("HTTP 404: Not Found\n"),
-			job:      "publish",
-			wantText: []string{"gh run view", "Not Found"},
+			result:  ghFailed("HTTP 404: Not Found\n"),
+			wantErr: []string{"gh run view", "Not Found"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: runJobs(tt.repo, tt.id), Result: tt.result}), Repo: tt.repo}
-			got, jobs, err := gh.JobConclusion(t.Context(), &stall.Run{ID: tt.id}, tt.job)
-			if tt.wantErr != nil || tt.wantText != nil {
-				if err == nil || (tt.wantErr != nil && !errors.Is(err, tt.wantErr)) {
-					t.Fatalf("JobConclusion() = %q, %t, %v; want an error wrapping %v", got, jobs, err, tt.wantErr)
+			jobs, err := gh.Jobs(t.Context(), &stall.Run{ID: tt.id})
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("Jobs() = %q, want an error", jobs)
 				}
-				for _, want := range tt.wantText {
+				for _, want := range tt.wantErr {
 					if !strings.Contains(err.Error(), want) {
-						t.Errorf("JobConclusion() error = %q, want it to contain %q", err, want)
+						t.Errorf("Jobs() error = %q, want it to contain %q", err, want)
 					}
 				}
 				return
@@ -530,8 +522,8 @@ func TestGHJobConclusion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tt.want || jobs != tt.wantJobs {
-				t.Errorf("JobConclusion() = %q, %t; want %q, %t", got, jobs, tt.want, tt.wantJobs)
+			if len(jobs) != tt.count || (tt.count > 0 && !slices.Contains(jobs, tt.has)) {
+				t.Errorf("Jobs() = %q, want %d jobs, %+v among them", jobs, tt.count, tt.has)
 			}
 		})
 	}
