@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -396,6 +397,57 @@ func TestWriteFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReadsToTheEnd (backlog CI-1) has Count stop early, at a line that
+// is not an event and at a write that fails, with a long stream still to
+// come, and sees it read that stream to its end all the same. Count reads
+// go test -json through a pipe: stopping there would leave go test
+// writing to a pipe no one reads, and killed by SIGPIPE before its
+// cleanups, which remove the containers and images a suite made.
+func TestReadsToTheEnd(t *testing.T) {
+	t.Parallel()
+	good := event("start", alpha, "") + event("pass", alpha, "TestA")
+	// Far more than one buffered read takes, each line with output to
+	// write
+	output := `{"Action":"output","Package":"` + alpha + `","Test":"TestA","Output":"=== RUN   TestA\n"}` + "\n"
+	rest := strings.Repeat(output, 4096)
+	tests := []struct {
+		name   string
+		stream string
+		out    failingWriter
+		input  bool // whether the error must be an ErrInput
+	}{
+		{name: "a line that is not an event", stream: good + "ok  \texample.com/fixtures/alpha\n" + rest, input: true},
+		{name: "a write that fails", stream: rest, out: failingWriter{on: "=== RUN"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := &endReader{r: strings.NewReader(tt.stream)}
+			_, err := testcount.Count(r, tt.out, &bytes.Buffer{})
+			if err == nil || errors.Is(err, testcount.ErrInput) != tt.input {
+				t.Fatalf("err = %v, want one that is an ErrInput: %t", err, tt.input)
+			}
+			if !r.ended {
+				t.Error("Count stopped reading before the end of the stream")
+			}
+		})
+	}
+}
+
+// endReader is a reader that records whether it was read to its end.
+type endReader struct {
+	r     io.Reader
+	ended bool
+}
+
+func (e *endReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		e.ended = true
+	}
+	return n, err
 }
 
 // TestOutputPassesThrough checks that stdout is every event's Output, in
