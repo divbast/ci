@@ -182,6 +182,28 @@ func TestCheck(t *testing.T) {
 			guarded: true,
 		},
 		{
+			// GitHub reads the owner and repository in any case, and the
+			// value quoted or not (backlog CI-4)
+			name: "an App token minted under a quoted, mixed-case name",
+			change: func(w map[string]string) {
+				w["release.yml"] = "permissions: {}\n\njobs:\n  tag:\n    runs-on: ubuntu-26.04\n    permissions: {}\n" + bare +
+					strings.Replace(mint, "uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0",
+						`uses: "Actions/Create-GitHub-App-Token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510" # v3.3.0`, 1)
+			},
+			job:     "release.yml/tag",
+			guarded: true,
+		},
+		{
+			name: "an App token minted under a single-quoted name",
+			change: func(w map[string]string) {
+				w["release.yml"] = "permissions: {}\n\njobs:\n  tag:\n    runs-on: ubuntu-26.04\n    permissions: {}\n" + bare +
+					strings.Replace(mint, "uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0",
+						"uses: 'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510' # v3.3.0", 1)
+			},
+			job:     "release.yml/tag",
+			guarded: true,
+		},
+		{
 			name: "renovate gains a mise step",
 			change: func(w map[string]string) {
 				w["renovate.yml"] = strings.Replace(w["renovate.yml"], "    steps:\n", bare, 1)
@@ -465,10 +487,17 @@ func readsDependabotAlerts(workflow string) error {
 }
 
 // mintsAppToken reports whether l is a step's uses: line for
-// actions/create-github-app-token.
+// actions/create-github-app-token, read as GitHub reads it and as
+// pin.FromWorkflows reads a call to divbast/ci: the owner and repository
+// in any case, the value quoted or not, in block style or in a flow
+// mapping. A spelling read more narrowly than GitHub's would mint a token
+// in a job this guard never looked at (backlog CI-4).
 func mintsAppToken(l line) bool {
-	return strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), "uses: actions/create-github-app-token@")
+	return appTokenUses.MatchString(l.text)
 }
+
+// appTokenUses is a uses: key that calls actions/create-github-app-token.
+var appTokenUses = regexp.MustCompile(`(?:^\s*(?:-\s+)?|[{,]\s*)uses:\s*["']?(?i:actions/create-github-app-token)@`)
 
 // TestStallContentGated checks that stall.yml's content-gated input, off
 // unless a caller sets it, reaches divbast-stall as -content-gated in the
