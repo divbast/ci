@@ -519,8 +519,8 @@ in one pull request. A minor release merges itself once that repository's
 checks pass; a major one waits for approval on the Dependency Dashboard.
 
 The job acts as the divbast org's `divbast-renovate` GitHub App, whose key
-is in ci's `renovate` environment, which only main can deploy to: only a
-merged commit is ever released.
+is in ci's `renovate` environment, which only main can deploy to, so the
+job runs from main alone.
 
 ### What breaks a caller
 

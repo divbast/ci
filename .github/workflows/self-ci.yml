@@ -207,8 +207,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     # The App's key is this repository's `renovate` environment secret, and
-    # only main may deploy to that environment, so no branch's workflow can
-    # mint a tag. Not a deployment, or every merge would add one to the
+    # only main may deploy to that environment, so the job runs from main
+    # alone. Not a deployment, or every merge would add one to the
     # environment's history.
     environment:
       name: renovate
