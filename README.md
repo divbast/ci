@@ -519,7 +519,8 @@ older commit. When it publishes, it:
    a dry run of that `imagetools create` shows it would push the index
    attested, byte for byte;
 6. checks that both tags, as an anonymous client pulls them, are that
-   index, and fails if they are not: a private package fails here.
+   index, and fails if they are not: a private package fails here. A
+   rehearsal, below, checks with the job's login instead.
 
 The staging tag is where the index waits while it is attested and
 verified. Like each architecture's tag, it sits in the package as any tag
@@ -598,12 +599,15 @@ With `rehearse: true`, the job still runs only from the daily slot or the
 manual run on main, and still decides against `image` on ghcr.io. When it
 publishes, it starts the `registry` image inside the job, on
 `127.0.0.1:5000`, pinned by version and digest, which the org's Renovate
-preset moves. It logs in to it with throwaway credentials, and runs every
-step after the decision there, under `localhost:5000/<path of image>`: it
-pushes, stages, attests, verifies, promotes and checks both tags. The
-attestation is real: signed for the calling repository like any other,
-and pushed to that registry. Nothing reaches ghcr.io, and no package is
-made. Each rehearsal says so in a warning and on the run's summary:
+preset moves. The registry asks for a throwaway login, which the job
+writes and gives Docker: actions/attest pushes only to a registry whose
+first answer is a challenge for one. The job runs every step after the
+decision there, under `localhost:5000/<path of image>`: it pushes,
+stages, attests, verifies, promotes and checks both tags. The attestation
+is real: signed for the calling repository like any other, and pushed to
+that registry. The registry takes no anonymous pulls, so the last check
+reads the tags with the job's login. Nothing reaches ghcr.io, and no
+package is made. Each rehearsal says so in a warning and on the run's summary:
 `rehearsal: nothing was published to ghcr.io`.
 
 `divbast/oci-image-template` rehearses, since it has no package. A
