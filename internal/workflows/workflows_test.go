@@ -1135,8 +1135,8 @@ func TestPublishShellPinned(t *testing.T) {
 		"a run-first step on the gate tagging early": strings.Replace(publish, attestStep, sneakOnGate+attestStep, 1),
 		"a named step tagging latest early":          strings.Replace(publish, attestStep, sneakNamed+attestStep, 1),
 		"a step that neither runs nor uses":          strings.Replace(publish, attestStep, "      - name: Nothing at all\n        if: steps.decide.outputs.publish == 'true'\n"+attestStep, 1),
-		// Ruling R87: what bash reads before a line of the script runs,
-		// and how it is started
+		// What bash reads before a line of the script runs, and how it is
+		// started: an env entry or a defaults shell
 		"BASH_ENV in a pinned step's env":     replaceAfter(publish, "        id: decide\n", "        env:\n", "        env:\n          BASH_ENV: $(id >&2)\n"),
 		"BASH_ENV in the job's env":           strings.Replace(publish, "    env:\n      MISE_AUTO_INSTALL:", "    env:\n      BASH_ENV: $(id >&2)\n      MISE_AUTO_INSTALL:", 1),
 		"BASH_ENV in the workflow's env":      strings.Replace(publish, "\nenv:\n", "\nenv:\n  BASH_ENV: $(id >&2)\n", 1),
@@ -1220,8 +1220,8 @@ func TestPublishShellPinned(t *testing.T) {
 // under bash -e {0}, with no pipefail.
 const actionsBash = "bash --noprofile --norc -eo pipefail {0}"
 
-// TestPublishShellIsBashWithPipefail (ruling R87) checks that every step
-// of app-publish.yml's publish job runs under bash with -e and pipefail,
+// TestPublishShellIsBashWithPipefail checks that every step of
+// app-publish.yml's publish job runs under bash with -e and pipefail,
 // which the behaviour tests and the pinned shell assume: its own shell,
 // its job's defaults.run.shell or its workflow's, the first that is set,
 // is bash or actionsBash written out. Against app-publish.yml as it is,
@@ -1402,11 +1402,11 @@ func shellPinned(workflow, golden string) error {
 const pinnedRegistry = "registry:<version>@<digest>"
 
 // publishShell returns what bash runs in the publish job's pinned steps,
-// and everything that shapes how it runs (ruling R87): the names of the
-// workflow's env, whose one value Renovate moves; the workflow's
-// defaults; the publish job's env and defaults; and, under each pinned
-// step's name, its env, its own shell if it sets one, and its run: script
-// as written, its indent taken off. An env entry such as BASH_ENV, which
+// and everything that shapes how it runs: the names of the workflow's
+// env, whose one value Renovate moves; the workflow's defaults; the
+// publish job's env and defaults; and, under each pinned step's name, its
+// env, its own shell if it sets one, and its run: script as written, its
+// indent taken off. An env entry such as BASH_ENV, which
 // bash expands before the script, or PATH, and a defaults shell, can each
 // change what a script does without a line of it changing. The pinned
 // steps are the gate, the refusal of the template's image, and every step
@@ -1859,7 +1859,7 @@ func warnsOutsideTemplate(t *testing.T, workflow string) error {
 	return nil
 }
 
-// TestPublishPushesTheAttestation (ruling R90) checks that app-publish.yml's
+// TestPublishPushesTheAttestation checks that app-publish.yml's
 // actions/attest step pushes the attestation to the registry on every
 // run: push-to-registry is true, written as such, rehearsal or not. A
 // publish that stopped pushing it would leave the registry's copy behind
@@ -1921,16 +1921,15 @@ const (
 	templateFix = "set image to your app's own name"
 )
 
-// TestPublishRefusesTheTemplatesImage (ruling R88) checks that
-// app-publish.yml refuses ghcr.io/divbast/oci-image-template, the
-// template's image, unless rehearse is true: an app made from the
-// template that drops rehearse but keeps the image would make that
-// package from its own repository. The refusal runs on every run, before
-// any ghcr.io login or push, takes the image and rehearse from the
-// caller's inputs, and, run with bash, fails only on the template's image
-// outside a rehearsal, with an error that says what to set. Against
-// app-publish.yml as it is, then with each broken, which the check must
-// refuse.
+// TestPublishRefusesTheTemplatesImage checks that app-publish.yml refuses
+// ghcr.io/divbast/oci-image-template, the template's image, unless
+// rehearse is true: an app made from the template that drops rehearse but
+// keeps the image would make that package from its own repository. The
+// refusal runs on every run, before any ghcr.io login or push, takes the
+// image and rehearse from the caller's inputs, and, run with bash, fails
+// only on the template's image outside a rehearsal, with an error that
+// says what to set. Against app-publish.yml as it is, then with each
+// broken, which the check must refuse.
 func TestPublishRefusesTheTemplatesImage(t *testing.T) {
 	t.Parallel()
 	publish := readWorkflows(t)["app-publish.yml"]

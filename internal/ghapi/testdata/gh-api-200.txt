@@ -15,16 +15,7 @@ X-Accepted-Oauth-Scopes:
 X-Content-Type-Options: nosniff
 X-Frame-Options: deny
 X-Github-Api-Version-Selected: 2022-11-28
-X-Github-Edge-Region: australiaeast
 X-Github-Media-Type: github.v3; format=json
-X-Github-Request-Id: 63EF:D8BFB:17EE14:247685:6AF3C6DF
-X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
-X-Oauth-Scopes: admin:public_key, gist, read:org, repo
-X-Ratelimit-Limit: 5000
-X-Ratelimit-Remaining: 4703
-X-Ratelimit-Reset: 1794363273
-X-Ratelimit-Resource: core
-X-Ratelimit-Used: 297
 X-Xss-Protection: 0
 
 {"login":"divbast","id":327878364,"node_id":"O_kgDOE4sG3A","avatar_url":"https://avatars.githubusercontent.com/u/327878364?v=4","gravatar_id":"","url":"https://api.github.com/users/divbast","html_url":"https://github.com/divbast","followers_url":"https://api.github.com/users/divbast/followers","following_url":"https://api.github.com/users/divbast/following{/other_user}","gists_url":"https://api.github.com/users/divbast/gists{/gist_id}","starred_url":"https://api.github.com/users/divbast/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/divbast/subscriptions","organizations_url":"https://api.github.com/users/divbast/orgs","repos_url":"https://api.github.com/users/divbast/repos","events_url":"https://api.github.com/users/divbast/events{/privacy}","received_events_url":"https://api.github.com/users/divbast/received_events","type":"Organization","user_view_type":"public","site_admin":false,"name":"divbast","company":null,"blog":"","location":null,"email":null,"hireable":null,"bio":"Hardened container images of self-hosted open-source apps","twitter_username":null,"public_repos":7,"public_gists":0,"followers":0,"following":0,"created_at":"2026-09-11T08:29:35Z","updated_at":"2026-11-10T11:19:02Z"}
