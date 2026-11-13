@@ -598,17 +598,17 @@ const (
 // The publish job's step names that the mutants below move or change, and
 // the if: every step from the first push to the promotion runs on.
 const (
-	pushName    = "      - name: Push each tested architecture\n"
-	stageName   = "      - name: Merge the architectures into one index under a staging tag\n"
-	attestStep  = "      - uses: actions/attest@"
-	verifyName  = "      - name: Verify the index's attestation\n"
-	promoteName = "      - name: Tag the attested index with the version and latest\n"
-	movedName   = "      - name: Say that the public tags did not move\n"
-	targetName  = "      - name: Choose where to publish\n"
-	warnName    = "      - name: Say that this run rehearses\n"
-	gateName    = "      - name: Refuse anything but the daily slot or a manual run on main\n"
-	checkName   = "      - name: Check both tags are the attested index as users pull them\n"
-	gate        = "steps.decide.outputs.publish == 'true'"
+	pushName     = "      - name: Push each tested architecture\n"
+	stageName    = "      - name: Merge the architectures into one index under a staging tag\n"
+	attestStep   = "      - uses: actions/attest@"
+	verifyName   = "      - name: Verify the index's attestation\n"
+	promoteName  = "      - name: Tag the attested index with the version and latest\n"
+	movedName    = "      - name: Say that the public tags did not move\n"
+	targetName   = "      - name: Choose where to publish\n"
+	rehearseName = "      - name: Refuse a rehearsal outside the template\n"
+	gateName     = "      - name: Refuse anything but the daily slot or a manual run on main\n"
+	checkName    = "      - name: Check both tags are the attested index as users pull them\n"
+	gate         = "steps.decide.outputs.publish == 'true'"
 )
 
 // TestPublishAttestsBeforePromote checks that app-publish.yml moves no
@@ -1146,10 +1146,10 @@ func TestPublishSaysWhenRerunningPublishes(t *testing.T) {
 func saysWhenRerunningPublishes(t *testing.T, workflow string) error {
 	t.Helper()
 	st := publishSteps(workflow)
-	found := stepsWhere(st, contains("::error::"))
+	found := stepsWhere(st, contains("did not move"))
 	promote := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: promote" })
 	if len(found) != 1 || len(promote) != 1 {
-		return fmt.Errorf("%d steps print an error and %d have id promote, want one of each", len(found), len(promote))
+		return fmt.Errorf("%d steps say the public tags did not move and %d have id promote, want one of each", len(found), len(promote))
 	}
 	s := st[found[0]]
 	if found[0] < promote[0] {
@@ -1422,11 +1422,12 @@ func TestPublishShellReadsEveryForm(t *testing.T) {
 		steps = "    steps:\n" +
 			"      - name: Gate\n        run: |\n          case \"${EVENT}\" in\n            schedule | workflow_dispatch) ;;\n          esac\n" +
 			"      - name: Template\n        id: template\n        run: echo template\n" +
+			"      - name: Rehearse\n        id: rehearse\n        run: echo rehearse\n" +
 			"      - name: Decide\n        id: decide\n        run: echo decide\n"
 		none = "== workflow env names ==\n(none)\n== workflow defaults ==\n(none)\n" +
 			"== publish job env ==\n(none)\n== publish job defaults ==\n(none)\n"
 		gate = "== Gate ==\nrun:\ncase \"${EVENT}\" in\n  schedule | workflow_dispatch) ;;\nesac\n" +
-			"== Template ==\nrun:\necho template\n== Decide ==\nrun:\necho decide\n"
+			"== Template ==\nrun:\necho template\n== Rehearse ==\nrun:\necho rehearse\n== Decide ==\nrun:\necho decide\n"
 	)
 	tests := []struct {
 		name, workflow, want string
@@ -1511,8 +1512,8 @@ const pinnedRegistry = "registry:<version>@<digest>"
 // indent taken off. An env entry such as BASH_ENV, which
 // bash expands before the script, or PATH, and a defaults shell, can each
 // change what a script does without a line of it changing. The pinned
-// steps are the gate, the refusal of the template's image, and every step
-// from the decision on. The registry image's version and digest are
+// steps are the gate, the refusal of the template's image, the refusal of
+// a rehearsal outside the template, and every step from the decision on. The registry image's version and digest are
 // replaced by pinnedRegistry. A step in that range that neither runs a
 // script nor uses an action, a script in a step with no name, a block
 // scalar other than |, and an env or defaults written on one line are
@@ -1565,13 +1566,14 @@ func publishShell(workflow string) (string, error) {
 	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
 	gate := stepsWhere(st, contains("schedule | workflow_dispatch)"))
 	template := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: template" })
-	if len(decide) != 1 || len(gate) != 1 || len(template) != 1 {
-		return "", fmt.Errorf("%d decide steps, %d gate steps and %d steps with id template, want one of each",
-			len(decide), len(gate), len(template))
+	rehearse := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: rehearse" })
+	if len(decide) != 1 || len(gate) != 1 || len(template) != 1 || len(rehearse) != 1 {
+		return "", fmt.Errorf("%d decide steps, %d gate steps, %d steps with id template and %d with id rehearse, want one of each",
+			len(decide), len(gate), len(template), len(rehearse))
 	}
 	key := func(l line) string { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") }
 	for i, s := range st {
-		if i != gate[0] && i != template[0] && i < decide[0] {
+		if i != gate[0] && i != template[0] && i != rehearse[0] && i < decide[0] {
 			continue
 		}
 		at := slices.IndexFunc(s, func(l line) bool { return strings.HasPrefix(key(l), "run:") })
@@ -1868,48 +1870,59 @@ func publishesInside(t *testing.T, workflow string) error {
 	return nil
 }
 
-// TestRehearseWarnsOutsideTemplate checks that app-publish.yml's rehearse
-// input is off unless a caller sets it, and that a rehearsal says, as a
-// warning and on the run's summary, that nothing reached ghcr.io. In any
-// repository but divbast/oci-image-template, a copy made from it, the line
-// also says how to publish: set image and remove rehearse. Against
-// app-publish.yml as it is, then with each broken, which the check must
-// refuse.
-func TestRehearseWarnsOutsideTemplate(t *testing.T) {
+// TestRehearseOutsideTemplateFails (C18) checks that app-publish.yml's
+// rehearse input is off unless a caller sets it, and that a rehearsal
+// runs only in divbast/oci-image-template. There it says, as a warning and
+// on the run's summary, that nothing reached ghcr.io. In any other
+// repository, a copy made from the template, it fails, before the
+// decision and so before any login or push, saying on the summary and as
+// an error how to publish: set image and remove rehearse. A switch left
+// half done would otherwise stay green. Against app-publish.yml as it is,
+// then with each broken, which the check must refuse.
+func TestRehearseOutsideTemplateFails(t *testing.T) {
 	t.Parallel()
 	publish := readWorkflows(t)["app-publish.yml"]
-	if err := warnsOutsideTemplate(t, publish); err != nil {
+	if err := rehearsesOnlyInTemplate(t, publish); err != nil {
 		t.Errorf("app-publish.yml: %v", err)
 	}
-	const input = "      rehearse:\n"
+	const (
+		input   = "      rehearse:\n"
+		compare = `if [ "${GITHUB_REPOSITORY}" != divbast/oci-image-template ]; then`
+	)
 	for name, mutant := range map[string]string{
-		"the input taken out":              strings.Replace(publish, input, "      rehearse-not:\n", 1),
-		"on by default":                    replaceAfter(publish, input, "        default: false\n", "        default: true\n"),
-		"a warning without rehearse":       replaceAfter(publish, warnName, "        if: inputs.rehearse\n", "        if: always()\n"),
-		"no warning":                       strings.Replace(publish, `echo "::warning::${line}"`, `echo "${line}"`, 1),
-		"no summary":                       strings.Replace(publish, `echo "${line}" >> "${GITHUB_STEP_SUMMARY}"`, `echo "${line}" >&2`, 1),
-		"the switch named in the template": strings.Replace(publish, `[ "${REPO}" != divbast/oci-image-template ]`, `[ "${REPO}" != divbast/ci ]`, 1),
-		"the switch named nowhere":         strings.Replace(publish, `[ "${REPO}" != divbast/oci-image-template ]`, `false`, 1),
-		"the repository not given":         replaceAfter(publish, warnName, "          REPO: ${{ github.repository }}\n", "          REPO: divbast/oci-image-template\n"),
+		"the input taken out":            strings.Replace(publish, input, "      rehearse-not:\n", 1),
+		"on by default":                  replaceAfter(publish, input, "        default: false\n", "        default: true\n"),
+		"run without rehearse":           replaceAfter(publish, rehearseName, "        if: inputs.rehearse\n", "        if: always()\n"),
+		"a warning outside the template": replaceAfter(publish, rehearseName, "            exit 1\n", ""),
+		"no warning in the template":     strings.Replace(publish, `echo "::warning::${line}"`, `echo "${line}"`, 1),
+		"no summary in the template":     replaceAfter(publish, `echo "::warning::${line}"`, `echo "${line}" >> "${GITHUB_STEP_SUMMARY}"`, `echo "${line}" >&2`),
+		"no summary outside it":          replaceAfter(publish, rehearseName, `echo "${line}" >> "${GITHUB_STEP_SUMMARY}"`, `echo "${line}" >&2`),
+		"no error outside it":            strings.Replace(publish, `echo "::error::${line}"`, `echo "${line}"`, 1),
+		"the template named wrong":       strings.Replace(publish, compare, `if [ "${GITHUB_REPOSITORY}" != divbast/ci ]; then`, 1),
+		"the template named nowhere":     strings.Replace(publish, compare, `if false; then`, 1),
+		"the repository fixed":           strings.Replace(publish, compare, `if [ divbast/oci-image-template != divbast/oci-image-template ]; then`, 1),
+		"the repository overridden":      replaceAfter(publish, rehearseName, "        if: inputs.rehearse\n", "        if: inputs.rehearse\n        env:\n          GITHUB_REPOSITORY: divbast/oci-image-template\n"),
+		"the refusal after the decision": moveStep(publish, rehearseName, pushName),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			if mutant == publish {
 				t.Fatal("the change changed nothing")
 			}
-			if warnsOutsideTemplate(t, mutant) == nil {
+			if rehearsesOnlyInTemplate(t, mutant) == nil {
 				t.Error("passes app-publish.yml with " + name)
 			}
 		})
 	}
 }
 
-// warnsOutsideTemplate returns an error unless the workflow declares a
-// boolean rehearse input that defaults to false, and its one step that
-// says nothing was published runs on inputs.rehearse alone, takes REPO from
-// github.repository and, run with bash, prints the warning and writes the
-// summary line, naming the switch outside the template only.
-func warnsOutsideTemplate(t *testing.T, workflow string) error {
+// rehearsesOnlyInTemplate returns an error unless the workflow declares a
+// boolean rehearse input that defaults to false, and its one step with id
+// rehearse runs on inputs.rehearse alone, before the decision, sets no env,
+// so that it reads the GITHUB_REPOSITORY the runner sets, and, run with
+// bash, in the template warns and writes the summary line, and anywhere
+// else fails with an error and a summary line that name the switch.
+func rehearsesOnlyInTemplate(t *testing.T, workflow string) error {
 	t.Helper()
 	const said = "rehearsal: nothing was published to ghcr.io"
 	lines := linesOf(workflow)
@@ -1918,44 +1931,56 @@ func warnsOutsideTemplate(t *testing.T, workflow string) error {
 		return fmt.Errorf("declares rehearse as %q, not a boolean input that defaults to false", decl)
 	}
 	st := publishSteps(workflow)
-	found := stepsWhere(st, contains("nothing was published to ghcr.io"))
-	if len(found) != 1 {
-		return fmt.Errorf("%d steps say nothing was published, want one", len(found))
+	found := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: rehearse" })
+	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
+	if len(found) != 1 || len(decide) != 1 {
+		return fmt.Errorf("%d steps with id rehearse and %d with id decide, want one of each", len(found), len(decide))
 	}
 	s := st[found[0]]
-	if cond := value(s, "if"); cond != "inputs.rehearse" {
-		return fmt.Errorf("line %d warns on %q, not inputs.rehearse", s[0].n, cond)
+	if found[0] > decide[0] {
+		return fmt.Errorf("line %d refuses a rehearsal after the decision, at line %d", s[0].n, st[decide[0]][0].n)
 	}
-	if got := value(s, "REPO"); got != "${{ github.repository }}" {
-		return fmt.Errorf("line %d warns for %q, not ${{ github.repository }}", s[0].n, got)
+	if cond := value(s, "if"); cond != "inputs.rehearse" {
+		return fmt.Errorf("line %d runs on %q, not inputs.rehearse", s[0].n, cond)
+	}
+	env, err := stepMapping(s, "env")
+	if err != nil {
+		return err
+	}
+	if len(env) > 0 {
+		return fmt.Errorf("line %d sets env %q, where the runner's GITHUB_REPOSITORY alone says which repository runs", s[0].n, env)
 	}
 	script, err := runScript(s)
 	if err != nil {
 		return err
 	}
-	for _, repo := range []string{"divbast/oci-image-template", "divbast/new-app"} {
+	for _, repo := range []string{"divbast/oci-image-template", "divbast/other"} {
 		dir := t.TempDir()
 		summary := filepath.Join(dir, "summary")
-		res := runStep(t, dir, script, "REPO="+repo, "GITHUB_STEP_SUMMARY="+summary)
-		if res.Code != 0 {
-			return fmt.Errorf("with REPO=%s, the script exits %d: %s", repo, res.Code, res.Stderr)
-		}
+		res := runStep(t, dir, script, "GITHUB_REPOSITORY="+repo, "GITHUB_STEP_SUMMARY="+summary)
 		wrote, err := os.ReadFile(summary) //nolint:gosec // G304: the test's own temporary directory
 		if err != nil {
-			return fmt.Errorf("with REPO=%s, the script writes no summary: %w", repo, err)
+			return fmt.Errorf("with GITHUB_REPOSITORY=%s, the script writes no summary: %w", repo, err)
 		}
 		line := strings.TrimSuffix(string(wrote), "\n")
-		if string(res.Stdout) != "::warning::"+line+"\n" {
-			return fmt.Errorf("with REPO=%s, the script prints %q, not the warning ::warning::%s", repo, res.Stdout, line)
+		if repo == "divbast/oci-image-template" {
+			switch {
+			case res.Code != 0:
+				return fmt.Errorf("in the template, the script exits %d: %s", res.Code, res.Stderr)
+			case line != said:
+				return fmt.Errorf("in the template, the summary says %q, not %q", line, said)
+			case string(res.Stdout) != "::warning::"+line+"\n":
+				return fmt.Errorf("in the template, the script prints %q, not the warning ::warning::%s", res.Stdout, line)
+			}
+			continue
 		}
-		names := strings.Contains(line, "set image") && strings.Contains(line, "remove rehearse")
 		switch {
-		case !strings.HasPrefix(line, said):
-			return fmt.Errorf("with REPO=%s, the summary says %q, not %q", repo, line, said)
-		case repo == "divbast/oci-image-template" && line != said:
-			return fmt.Errorf("in the template, the summary says %q, not %q alone", line, said)
-		case repo != "divbast/oci-image-template" && !names:
-			return fmt.Errorf("with REPO=%s, the summary says %q, which does not say to set image and remove rehearse", repo, line)
+		case res.Code == 0:
+			return fmt.Errorf("with GITHUB_REPOSITORY=%s, the script exits 0, so a rehearsal there stays green", repo)
+		case !strings.Contains(line, "set image") || !strings.Contains(line, "remove rehearse"):
+			return fmt.Errorf("with GITHUB_REPOSITORY=%s, the summary says %q, which does not say to set image and remove rehearse", repo, line)
+		case string(res.Stdout) != "::error::"+line+"\n":
+			return fmt.Errorf("with GITHUB_REPOSITORY=%s, the script prints %q, not the error ::error::%s", repo, res.Stdout, line)
 		}
 	}
 	return nil

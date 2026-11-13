@@ -769,15 +769,15 @@ the job's login. Nothing reaches ghcr.io, and no package is made. Each
 rehearsal says so in a warning and on the run's summary:
 `rehearsal: nothing was published to ghcr.io`.
 
-`divbast/oci-image-template` rehearses, since it has no package. A
-repository made from it inherits `rehearse: true`, and anywhere but the
-template the line goes on to say how to publish: `to publish, set image
+Only `divbast/oci-image-template` rehearses, since it has no package. A
+repository made from it inherits `rehearse: true`, and its publish job
+fails, before it logs in anywhere or pushes, until it makes the switch,
+saying in an error and on the run's summary how: `to publish, set image
 to this app's own and remove rehearse from the job that calls
 app-publish.yml`. That is the switch, in the calling job's `with:`: set
 `image` to the app's own `ghcr.io/divbast/<app>`, and remove
 `rehearse: true`. A job that drops `rehearse` but keeps the template's
-image fails before it logs in anywhere or pushes, and says to set image
-to the app's own name.
+image fails as early, and says to set image to the app's own name.
 
 ### `renovate.yml`
 
