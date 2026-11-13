@@ -180,7 +180,7 @@ just IMAGE=ghcr.io/divbast/librespeed:latest acceptance
 
 | Recipe | What it does |
 |---|---|
-| `build` | `ENGINE build -t IMAGE -f Containerfile .` |
+| `build` | `ENGINE build -t IMAGE -f Containerfile .`, with `--format docker` under Podman, whose default, OCI, drops the HEALTHCHECK |
 | `acceptance` | `go test -json ./test/acceptance/...` against `IMAGE` under `ENGINE`, through `divbast-testcount` |
 | `test` | `build`, then `acceptance` |
 | `archive` | Writes `IMAGE` to `ARCHIVE` as an OCI archive |
