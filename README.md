@@ -579,16 +579,18 @@ a caller changes.
 
 ### Moving to v2
 
-v2.0.0 breaks two things a v1 caller relies on.
+v2.0.0 breaks three things a v1 caller relies on.
 
 - **`app-check.yml` needs `packages: read`.** Its `scan` job asks GitHub
   whether a published image the registry refuses is absent, private, or
   public and failing, where v1 read Trivy's error text and took any
   refusal for nothing published. So a registry refusing a public image
   for any reason but a missing tag now fails the scan, where v1 made it
-  advisory. A called job gets no more than its caller grants, so a
-  caller's `check` job that does not grant it fails before any job
-  starts. The `check` job's permissions become:
+  advisory. And for an image the registry refuses, even one never
+  published, such as the template's, the scan now fails when GitHub's
+  packages API does not answer. A called job gets no more than its
+  caller grants, so a caller's `check` job that does not grant it fails
+  before any job starts. The `check` job's permissions become:
 
   ```yaml
       permissions:
@@ -600,16 +602,21 @@ v2.0.0 breaks two things a v1 caller relies on.
 
   `divbast-scan`'s `-published` must name a ghcr.io image, as every
   caller's does.
+- **`divbast-scan` needs skopeo.** It runs `skopeo inspect` on
+  `PUBLISHED` before it scans, where v1 ran only Trivy, and no caller's
+  `mise.toml` installs skopeo. CI's runners carry it, so CI needs
+  nothing more, but a local `just scan`, and so `just ci`, fails until
+  `skopeo` is on the host's `PATH`.
 - **`app-publish.yml` rehearses only in `divbast/oci-image-template`.**
   Anywhere else, `rehearse: true` fails the publish job, where v1 warned
   and went on. A repository made from the template sets `image` to its own
   and removes `rehearse` before it moves to v2; the
   [Rehearsal](#rehearsal) section says how.
 
-Nothing else changed for a caller. `lint.yml`, `renovate.yml` and
-`stall.yml` take the same inputs and permissions as in v1, so a repository
-that calls only those moves its pin and nothing more. An app may add an
-`openvex.json` ([VEX](#vex)); without one, `scan` runs as before.
+`lint.yml`, `renovate.yml` and `stall.yml` take the same inputs and
+permissions as in v1, so a repository that calls only those moves its pin
+and nothing more. An app may add an `openvex.json` ([VEX](#vex)); without
+one, `scan` passes Trivy no VEX document.
 
 ## Workflows
 
@@ -676,7 +683,9 @@ something already shipped is reported, not blocked. Whether anything is
 published is the registry's to say, never Trivy's: the tool first reads
 `PUBLISHED` as an anonymous client, as users pull it, and when ghcr.io
 refuses, asks the GitHub API why, through gh and the job's token, which
-is what `packages: read` is for.
+is what `packages: read` is for. It reads `PUBLISHED` with `skopeo`, from
+`PATH`, which no `mise.toml` lists: CI's runners carry it, and a local
+`just scan` needs it installed on the host.
 
 | `PUBLISHED` is | The scan |
 |---|---|
