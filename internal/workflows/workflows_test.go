@@ -612,11 +612,13 @@ var unmovedRef = regexp.MustCompile(`^(?:docker://)?(?:\$\{IMAGE\}|\$IMAGE)` +
 
 // notReferences are the lines before the promotion that may name the image
 // otherwise than unmovedRef allows, each matched as the whole line, in the
-// step with that id alone: the decision's read of the commit latest was
+// step with that id alone: the refusal of the template's image, which
+// compares it with that name, the decision's read of the commit latest was
 // built from, and the choice of where to publish, which names the image
 // but no tag of it.
 var notReferences = map[string][]string{
-	"decide": {`published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")`},
+	"template": {`if [ "${IMAGE}" = ghcr.io/divbast/oci-image-template ] && [ "${REHEARSE}" != true ]; then`},
+	"decide":   {`published=$(.ci/bin/divbast-published-revision "${IMAGE}:latest")`},
 	"target": {
 		`echo "image=localhost:5000/${IMAGE#*/}" >> "${GITHUB_OUTPUT}"`,
 		`echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"`,
@@ -1317,10 +1319,12 @@ func TestPublishShellReadsEveryForm(t *testing.T) {
 		job   = "jobs:\n  publish:\n"
 		steps = "    steps:\n" +
 			"      - name: Gate\n        run: |\n          case \"${EVENT}\" in\n            schedule | workflow_dispatch) ;;\n          esac\n" +
+			"      - name: Template\n        id: template\n        run: echo template\n" +
 			"      - name: Decide\n        id: decide\n        run: echo decide\n"
 		none = "== workflow env names ==\n(none)\n== workflow defaults ==\n(none)\n" +
 			"== publish job env ==\n(none)\n== publish job defaults ==\n(none)\n"
-		gate = "== Gate ==\nrun:\ncase \"${EVENT}\" in\n  schedule | workflow_dispatch) ;;\nesac\n== Decide ==\nrun:\necho decide\n"
+		gate = "== Gate ==\nrun:\ncase \"${EVENT}\" in\n  schedule | workflow_dispatch) ;;\nesac\n" +
+			"== Template ==\nrun:\necho template\n== Decide ==\nrun:\necho decide\n"
 	)
 	tests := []struct {
 		name, workflow, want string
@@ -1405,11 +1409,12 @@ const pinnedRegistry = "registry:<version>@<digest>"
 // as written, its indent taken off. An env entry such as BASH_ENV, which
 // bash expands before the script, or PATH, and a defaults shell, can each
 // change what a script does without a line of it changing. The pinned
-// steps are the gate and every step from the decision on. The registry
-// image's version and digest are replaced by pinnedRegistry. A step in
-// that range that neither runs a script nor uses an action, a script in a
-// step with no name, a block scalar other than |, and an env or defaults
-// written on one line are errors, never skipped.
+// steps are the gate, the refusal of the template's image, and every step
+// from the decision on. The registry image's version and digest are
+// replaced by pinnedRegistry. A step in that range that neither runs a
+// script nor uses an action, a script in a step with no name, a block
+// scalar other than |, and an env or defaults written on one line are
+// errors, never skipped.
 func publishShell(workflow string) (string, error) {
 	raw := strings.Split(workflow, "\n")
 	lines := linesOf(workflow)
@@ -1457,12 +1462,14 @@ func publishShell(workflow string) (string, error) {
 	st := steps(job)
 	decide := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: decide" })
 	gate := stepsWhere(st, contains("schedule | workflow_dispatch)"))
-	if len(decide) != 1 || len(gate) != 1 {
-		return "", fmt.Errorf("%d decide steps and %d gate steps, want one of each", len(decide), len(gate))
+	template := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "id: template" })
+	if len(decide) != 1 || len(gate) != 1 || len(template) != 1 {
+		return "", fmt.Errorf("%d decide steps, %d gate steps and %d steps with id template, want one of each",
+			len(decide), len(gate), len(template))
 	}
 	key := func(l line) string { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") }
 	for i, s := range st {
-		if i != gate[0] && i < decide[0] {
+		if i != gate[0] && i != template[0] && i < decide[0] {
 			continue
 		}
 		at := slices.IndexFunc(s, func(l line) bool { return strings.HasPrefix(key(l), "run:") })
@@ -1847,6 +1854,112 @@ func warnsOutsideTemplate(t *testing.T, workflow string) error {
 			return fmt.Errorf("in the template, the summary says %q, not %q alone", line, said)
 		case repo != "divbast/oci-image-template" && !names:
 			return fmt.Errorf("with REPO=%s, the summary says %q, which does not say to set image and remove rehearse", repo, line)
+		}
+	}
+	return nil
+}
+
+// refuseName is the step that refuses the template's image outside a
+// rehearsal, and templateFix what its error must tell the caller to do.
+const (
+	refuseName  = "      - name: Refuse the template's image outside a rehearsal\n"
+	templateFix = "set image to your app's own name"
+)
+
+// TestPublishRefusesTheTemplatesImage (ruling R88) checks that
+// app-publish.yml refuses ghcr.io/divbast/oci-image-template, the
+// template's image, unless rehearse is true: an app made from the
+// template that drops rehearse but keeps the image would make that
+// package from its own repository. The refusal runs on every run, before
+// any ghcr.io login or push, takes the image and rehearse from the
+// caller's inputs, and, run with bash, fails only on the template's image
+// outside a rehearsal, with an error that says what to set. Against
+// app-publish.yml as it is, then with each broken, which the check must
+// refuse.
+func TestPublishRefusesTheTemplatesImage(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := refusesTheTemplatesImage(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const check = `if [ "${IMAGE}" = ghcr.io/divbast/oci-image-template ] && [ "${REHEARSE}" != true ]; then`
+	for name, mutant := range map[string]string{
+		"refused after the login":      moveStep(publish, refuseName, "      # A rehearsal publishes here instead"),
+		"refused after a push":         moveStep(publish, refuseName, "      - name: Merge the architectures"),
+		"refused only when publishing": strings.Replace(publish, refuseName, refuseName+"        if: steps.decide.outputs.publish == 'true'\n", 1),
+		"rehearse taken as true":       replaceAfter(publish, refuseName, "          REHEARSE: ${{ inputs.rehearse }}\n", "          REHEARSE: true\n"),
+		"another image checked":        replaceAfter(publish, refuseName, "          IMAGE: ${{ inputs.image }}\n", "          IMAGE: ${{ steps.target.outputs.image }}\n"),
+		"refused in a rehearsal too":   strings.Replace(publish, check, `if [ "${IMAGE}" = ghcr.io/divbast/oci-image-template ]; then`, 1),
+		"every image refused":          strings.Replace(publish, check, `if [ "${REHEARSE}" != true ]; then`, 1),
+		"refused without saying how":   strings.Replace(publish, templateFix, "fix it", 1),
+		"no refusal at all":            replaceAfter(publish, refuseName, "            exit 1\n", ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if refusesTheTemplatesImage(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// refusesTheTemplatesImage returns an error unless the publish job's one
+// step that tells the caller to set its own image has no if:, comes
+// before the ghcr.io login and every push, takes IMAGE and REHEARSE from
+// the caller's inputs, and, its script run with bash, exits 1 with that
+// error for the template's image with rehearse anything but true, and 0
+// in silence otherwise.
+func refusesTheTemplatesImage(t *testing.T, workflow string) error {
+	t.Helper()
+	st := publishSteps(workflow)
+	found := stepsWhere(st, contains(templateFix))
+	login := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "registry: ghcr.io" })
+	pushes := stepsWhere(st, func(l line) bool {
+		return strings.Contains(l.text, "skopeo copy") || strings.Contains(l.text, "imagetools create")
+	})
+	if len(found) != 1 || len(login) != 1 || len(pushes) == 0 {
+		return fmt.Errorf("%d steps refuse the template's image, %d log in to ghcr.io and %d push; want one, one and some",
+			len(found), len(login), len(pushes))
+	}
+	s := st[found[0]]
+	if found[0] > login[0] || found[0] > pushes[0] {
+		return fmt.Errorf("the step from line %d refuses the template's image after the ghcr.io login or a push", s[0].n)
+	}
+	if cond := value(s, "if"); cond != "" {
+		return fmt.Errorf("the step from line %d refuses only on %q, not on every run", s[0].n, cond)
+	}
+	for key, want := range map[string]string{"IMAGE": "${{ inputs.image }}", "REHEARSE": "${{ inputs.rehearse }}"} {
+		if got := value(s, key); got != want {
+			return fmt.Errorf("the step from line %d takes %s from %q, not %s", s[0].n, key, got, want)
+		}
+	}
+	script, err := runScript(s)
+	if err != nil {
+		return err
+	}
+	const template = "ghcr.io/divbast/oci-image-template"
+	for _, tt := range []struct {
+		image, rehearse string
+		refused         bool
+	}{
+		{image: template, rehearse: "false", refused: true},
+		{image: template, rehearse: "", refused: true},
+		{image: template, rehearse: "true"},
+		{image: "ghcr.io/divbast/librespeed", rehearse: "false"},
+		{image: "ghcr.io/divbast/librespeed", rehearse: "true"},
+	} {
+		res := runStep(t, t.TempDir(), script, "IMAGE="+tt.image, "REHEARSE="+tt.rehearse)
+		out := string(res.Stdout) + string(res.Stderr)
+		switch {
+		case tt.refused && (res.Code != 1 || !strings.Contains(out, templateFix)):
+			return fmt.Errorf("with IMAGE=%s and REHEARSE=%q, the script exits %d and says %q, want 1 and %q",
+				tt.image, tt.rehearse, res.Code, out, templateFix)
+		case !tt.refused && (res.Code != 0 || out != ""):
+			return fmt.Errorf("with IMAGE=%s and REHEARSE=%q, the script exits %d and says %q, want 0 and nothing",
+				tt.image, tt.rehearse, res.Code, out)
 		}
 	}
 	return nil

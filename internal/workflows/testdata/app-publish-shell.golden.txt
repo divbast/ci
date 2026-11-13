@@ -22,6 +22,14 @@ if [ "${REF}" != refs/heads/main ]; then
   echo "only main publishes, not ${REF}" >&2
   exit 1
 fi
+== Refuse the template's image outside a rehearsal ==
+env: IMAGE: ${{ inputs.image }}
+env: REHEARSE: ${{ inputs.rehearse }}
+run:
+if [ "${IMAGE}" = ghcr.io/divbast/oci-image-template ] && [ "${REHEARSE}" != true ]; then
+  echo "image is ghcr.io/divbast/oci-image-template, the template's, which publishes only in a rehearsal: set image to your app's own name" >&2
+  exit 1
+fi
 == Decide whether to publish ==
 env: EVENT: ${{ github.event_name }}
 env: IMAGE: ${{ inputs.image }}

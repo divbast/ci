@@ -663,7 +663,9 @@ template the line goes on to say how to publish: `to publish, set image
 to this app's own and remove rehearse from the job that calls
 app-publish.yml`. That is the switch, in the calling job's `with:`: set
 `image` to the app's own `ghcr.io/divbast/<app>`, and remove
-`rehearse: true`.
+`rehearse: true`. A job that drops `rehearse` but keeps the template's
+image fails before it logs in anywhere or pushes, and says to set image
+to the app's own name.
 
 ### `renovate.yml`
 

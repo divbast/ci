@@ -111,6 +111,21 @@ jobs:
             exit 1
           fi
 
+      # The template's image publishes only in a rehearsal, inside the job.
+      # An app made from the template that drops rehearse but keeps that
+      # image would make the template's package from its own repository, so
+      # it stops here, before any login or push.
+      - name: Refuse the template's image outside a rehearsal
+        id: template
+        env:
+          IMAGE: ${{ inputs.image }}
+          REHEARSE: ${{ inputs.rehearse }}
+        run: |
+          if [ "${IMAGE}" = ghcr.io/divbast/oci-image-template ] && [ "${REHEARSE}" != true ]; then
+            echo "image is ghcr.io/divbast/oci-image-template, the template's, which publishes only in a rehearsal: set image to your app's own name" >&2
+            exit 1
+          fi
+
       # A repository made from divbast/oci-image-template inherits its
       # rehearse: true, and publishes nothing until it drops it
       - name: Say that this run rehearses
