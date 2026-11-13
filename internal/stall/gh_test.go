@@ -727,7 +727,9 @@ func (hang) Run(ctx context.Context, name string, _ ...string) (execx.Result, er
 
 // TestGHTimeout checks that a gh that hangs is given up on after a minute,
 // or after GH's own Timeout, whether GH runs it to list or to call the API,
-// with an error that names the call and the limit.
+// with an error that names the call and the limit. A deadline of the
+// caller's that comes first is the caller's to report: the error then
+// says nothing of GH giving up (backlog CI-6).
 // The bubble's clock moves only when everything in it waits, so no test
 // waits a minute.
 func TestGHTimeout(t *testing.T) {
@@ -757,23 +759,37 @@ func TestGHTimeout(t *testing.T) {
 		for _, tt := range []struct {
 			name    string
 			timeout time.Duration
-			want    time.Duration
+			// caller is a deadline the caller's context sets; zero for
+			// none.
+			caller time.Duration
+			want   time.Duration
 		}{
 			{name: "default", want: time.Minute},
 			{name: "set", timeout: 4 * time.Second, want: 4 * time.Second},
+			{name: "caller-first", caller: 2 * time.Second, want: 2 * time.Second},
 		} {
 			t.Run(name+"-"+tt.name, func(t *testing.T) {
 				t.Parallel()
 				synctest.Test(t, func(t *testing.T) {
+					ctx := t.Context()
+					if tt.caller != 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, tt.caller)
+						defer cancel()
+					}
 					start := time.Now()
-					err := c.call(t.Context(), stall.GH{Run: hang{}, Repo: baikal, Timeout: tt.timeout})
+					err := c.call(ctx, stall.GH{Run: hang{}, Repo: baikal, Timeout: tt.timeout})
 					if !errors.Is(err, context.DeadlineExceeded) {
 						t.Fatalf("got %v, want an error wrapping %v", err, context.DeadlineExceeded)
 					}
 					if waited := time.Since(start); waited != tt.want {
 						t.Errorf("gave up after %v, want %v", waited, tt.want)
 					}
-					if want := fmt.Sprintf("%s gave up after %v: ", c.says, tt.want); !strings.Contains(err.Error(), want) {
+					want := fmt.Sprintf("%s gave up after %v: ", c.says, tt.want)
+					switch said := err.Error(); {
+					case tt.caller != 0 && strings.Contains(said, "gave up"):
+						t.Errorf("error = %q, want it not to say GH gave up on a deadline of the caller's", err)
+					case tt.caller == 0 && !strings.Contains(said, want):
 						t.Errorf("error = %q, want it to contain %q", err, want)
 					}
 				})

@@ -598,8 +598,10 @@ func hangs(t *testing.T, name string) execx.Runner {
 // TestRevisionTimeout checks that a skopeo or a gh that hangs is given up
 // on after a minute each, or after the timeout the Lookup or its Client
 // sets, and is an error rather than an answer, one that names the call and
-// its limit. The bubble's clock moves
-// only when everything in it waits, so no test waits a minute.
+// its limit. A deadline of the caller's that comes first is the caller's
+// to report: the error then says nothing of the Lookup giving up (backlog
+// CI-6; ghapi's own tests hold its Client to the same). The bubble's clock
+// moves only when everything in it waits, so no test waits a minute.
 func TestRevisionTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -608,8 +610,11 @@ func TestRevisionTimeout(t *testing.T) {
 		hung string
 		// skopeo and gh are the Lookup's and its Client's timeouts.
 		skopeo, gh time.Duration
-		want       time.Duration
+		// caller is a deadline the caller's context sets; zero for none.
+		caller time.Duration
+		want   time.Duration
 		// wantErr is what the error must say: the call and its limit.
+		// Empty means it must not say the call gave up.
 		wantErr string
 	}{
 		{
@@ -628,16 +633,23 @@ func TestRevisionTimeout(t *testing.T) {
 			name: "gh-set", hung: "gh", skopeo: 2 * time.Second, gh: 5 * time.Second, want: 5 * time.Second,
 			wantErr: "gh api " + noPackageAPI + " gave up after 5s: ",
 		},
+		{name: "skopeo-caller-first", hung: "skopeo", caller: 3 * time.Second, want: 3 * time.Second},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				if tt.caller != 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tt.caller)
+					defer cancel()
+				}
 				start := time.Now()
 				run := hangs(t, tt.hung)
 				l := registry.Lookup{Run: run, GH: ghapi.Client{Run: run, Timeout: tt.gh}, Timeout: tt.skopeo}
-				rev, state, err := l.Revision(t.Context(), noPackage)
+				rev, state, err := l.Revision(ctx, noPackage)
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("Revision() = %q, %v, %v; want an error wrapping %v", rev, state, err, context.DeadlineExceeded)
 				}
@@ -647,7 +659,10 @@ func TestRevisionTimeout(t *testing.T) {
 				if waited := time.Since(start); waited != tt.want {
 					t.Errorf("Revision() gave up after %v, want %v", waited, tt.want)
 				}
-				if !strings.Contains(err.Error(), tt.wantErr) {
+				switch said := err.Error(); {
+				case tt.wantErr == "" && strings.Contains(said, "gave up"):
+					t.Errorf("Revision() error = %q, want it not to say the call gave up on a deadline of the caller's", err)
+				case !strings.Contains(said, tt.wantErr):
 					t.Errorf("Revision() error = %q, want it to contain %q", err, tt.wantErr)
 				}
 			})
