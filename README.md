@@ -346,6 +346,19 @@ module, so `Engine.Sweep` in one repository's suite removes what a dead
 run of that suite left behind, and nothing another repository's suite
 on the same host made.
 
+On Podman, the harness never removes an image while a build is running.
+`podman image rm -f` also removes each parent image it leaves dangling
+and, being forced, every container still using one, Buildah's build
+containers among them, so a build that took a step from the removed
+image's cache would lose its container and fail. `Engine.Build` holds
+the image store shared, as other builds may, and the removal of an image,
+by a `Build`'s cleanup or by `Engine.Sweep`, holds it alone. Across the
+test binaries running at once, such as two packages', the hold is a
+`flock` of `divbast-harness-podman-store-<uid>.lock` in the temporary
+directory, which every process of the user's shares, as rootless Podman
+keeps one store for each user. Docker is never held: its builder keeps
+what a build uses out of `image rm`'s reach.
+
 Before that, every suite labelled what it made `divbast.harness=1`.
 Suites on this version no longer remove anything carrying that label.
 An interrupted run under an older pin can leave containers and networks

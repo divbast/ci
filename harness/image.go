@@ -451,7 +451,9 @@ func layerCapabilities(r io.Reader) (caps []string, err error) {
 //
 // Podman builds in Docker's format: its default, OCI, has no place for a
 // HEALTHCHECK, and drops the one the base image declares as well as any
-// of the Containerfile's own.
+// of the Containerfile's own. On Podman, a build shares the image store
+// with other builds, in this process and others, and no image is removed
+// while it runs, its cleanup's removal among them: see storeLock.
 //
 // A build that failed only in Buildah's look for a cached step is built
 // again, up to three times in all, a second apart. That look reads the
@@ -474,7 +476,16 @@ func (e Engine) Build(ctx context.Context, tb testing.TB, containerfile string, 
 
 	// Registered before the build, which may leave the tag behind although
 	// it failed.
-	e.removeOnCleanup(ctx, tb, "image", "rm", "-f", tag)
+	tb.Cleanup(func() {
+		rmCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		e.removeImage(rmCtx, tb, tag)
+	})
+	release, err := e.hold(ctx, false)
+	if err != nil {
+		return "", fmt.Errorf("%s build: waiting for an image's removal to end: %w", e.name, err)
+	}
+	defer release()
 	for attempt := 1; ; attempt++ {
 		res, err := e.run.RunStdin(ctx, nil, e.name, argv...)
 		if err != nil {
