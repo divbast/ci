@@ -123,7 +123,9 @@ That is an app's `lint`. A repository runs `go-lint` and `go-test` only
 when it has Go code, and `app-lint` only when it builds an image; one with
 neither runs the rest, as in
 [A repository that builds no image](#a-repository-that-builds-no-image).
-Every repository's `lint` runs `ci-fresh` first.
+Every repository that checks ci out at `.ci` runs `ci-fresh` first in its
+`lint`. ci's own `lint` does not: ci is its own checkout, with no pin to
+check.
 
 The imports are optional and the shared recipes are run from a recipe's
 body, never named as dependencies (`lint: actions-check`). just resolves

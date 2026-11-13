@@ -160,6 +160,12 @@ fail.
   `contents: read` saying what for.
 - Runners are `ubuntu-26.04` and `ubuntu-26.04-arm`.
 - Expressions reach `run:` scripts through `env:`, never inline.
+- app-publish.yml's publish shell, with the env and defaults bash reads,
+  is pinned by `internal/workflows/testdata/app-publish-shell.golden.txt`.
+  A change to it fails `TestPublishShellPinned` with a diff until the
+  golden is rewritten on purpose, with
+  `go test ./internal/workflows -run TestPublishShellPinned -update`;
+  read its diff, and commit it with the change.
 - A reusable workflow that needs ci's recipes or tools checks ci out at
   `job.workflow_sha` into `.ci`. One that runs the caller's own recipes or
   code also fails unless the caller's workflows pin that commit. Its

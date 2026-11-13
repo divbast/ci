@@ -542,7 +542,10 @@ func failed(records []Record, what string) bool {
 }
 
 // needEgress skips t on a runner that cannot reach the egress probe's
-// address itself, where no container could either.
+// address itself, where no container could either. It dials once, for at
+// most 3 seconds, before the positive control: that control shows the
+// probe sees a route out, which a container has only where its host does,
+// so a host without one skips it rather than failing it for the runner.
 func needEgress(t *testing.T) {
 	t.Helper()
 	d := net.Dialer{Timeout: 3 * time.Second}
