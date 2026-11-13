@@ -51,6 +51,11 @@ type Config struct {
 	// RenovateWorkflow is the workflow file that runs Renovate, such as
 	// renovate.yml.
 	RenovateWorkflow string
+	// ContentGated says the slot workflow publishes only when the image's
+	// content moved, as divbast-publish-decision's -content-gated does, so
+	// that once the image is published, a slot run can succeed and leave
+	// an older commit published.
+	ContentGated bool
 }
 
 // Result is what a check found.
@@ -121,7 +126,10 @@ type Run struct {
 	Created time.Time
 	// Completed says it has finished, however it ended.
 	Completed bool
-	URL       string
+	// Conclusion is how it ended, as GitHub puts it, such as "success",
+	// "failure" or "cancelled", and "" until it has finished.
+	Conclusion string
+	URL        string
 }
 
 // Source answers what the checks ask about a repository.
@@ -143,6 +151,9 @@ type Source interface {
 	Compare(ctx context.Context, base, head string) (status string, firstCommit time.Time, err error)
 	// RepoCreated returns when the repository was created.
 	RepoCreated(ctx context.Context) (time.Time, error)
+	// WorkflowCreated returns when the workflow in file, such as
+	// build.yml, was created.
+	WorkflowCreated(ctx context.Context, file string) (time.Time, error)
 }
 
 // Revisions reads the commit a published image was built from, as
@@ -232,11 +243,19 @@ func Renovate(ctx context.Context, s Source, c *Config) (Result, error) {
 // A finished slot run that built a commit ahead of the published one would
 // have published it, so each such run is a lost slot, whether it failed,
 // was cancelled or skipped; with nothing published, every finished run is.
+// Content-gated, once the image is published, a run that succeeded is
+// never lost: it published, or decided that nothing in the image had
+// moved. One that failed, was cancelled or ended any other way is lost all
+// the same, and so is any run with nothing published yet, since then every
+// run publishes, gated or not.
+//
 // So is each day with no slot run at all, after 12 hours' grace, since
-// GitHub starts them hours late. Those days count from the newest slot run
-// or from when main moved past the published commit, whichever is later,
-// or with nothing published, from the repository's creation. One lost
-// slot, an upstream outage say, already emails on its own as a red run.
+// GitHub starts them hours late. Those days count from the newest slot
+// run, finished or not, or from when main stopped being what is
+// published, whichever is later. With nothing published, main stopped
+// being published when the slot workflow could first have run: the later
+// of the repository's creation and the slot workflow's. One lost slot, an
+// upstream outage say, already emails on its own as a red run.
 //
 // A private c.Published is a stall: no user can pull it. Any other
 // failure to read it is an error.
@@ -263,24 +282,27 @@ func Slots(ctx context.Context, s Source, r Revisions, c *Config) (Result, error
 	if err != nil {
 		return Result{}, err
 	}
-	// When main stopped being what is published.
+	// When main stopped being what is published, and how it stands
+	// against what is.
 	var since time.Time
+	standing := "ahead"
 	if state == registry.Absent {
-		since, err = s.RepoCreated(ctx)
+		since, err = firstSlot(ctx, s, c.SlotWorkflow)
 	} else {
-		_, since, err = s.Compare(ctx, revision, head)
+		standing, since, err = s.Compare(ctx, revision, head)
 	}
 	if err != nil {
 		return Result{}, err
 	}
 
 	var details []string
-	for _, run := range runs {
+	for i := range runs {
+		run := &runs[i]
 		if !run.Completed {
 			continue
 		}
 		var lost bool
-		if lost, err = isLost(ctx, s, run, state, revision, since); err != nil {
+		if lost, err = isLost(ctx, s, c, run, state, revision, since); err != nil {
 			return Result{}, err
 		}
 		if lost {
@@ -318,15 +340,54 @@ func Slots(ctx context.Context, s Source, r Revisions, c *Config) (Result, error
 	if state == registry.Absent {
 		shown = "(absent)"
 	}
-	return Result{Headline: fmt.Sprintf("main %s is ahead of %s %s, with %d lost slot(s), under %d", head, tag, shown, lost+missed, c.LostSlots)}, nil
+	return Result{Headline: fmt.Sprintf("main %s %s %s %s, with %d lost slot(s), under %d", head, against(standing), tag, shown, lost+missed, c.LostSlots)}, nil
+}
+
+// firstSlot returns when the slot workflow could first have run: the later
+// of the repository's creation and the workflow's, since a repository can
+// be created long before its slot workflow lands, and no slot can run
+// before either.
+func firstSlot(ctx context.Context, s Source, workflow string) (time.Time, error) {
+	repo, err := s.RepoCreated(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	created, err := s.WorkflowCreated(ctx, workflow)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if created.After(repo) {
+		return created, nil
+	}
+	return repo, nil
+}
+
+// against says how main stands against the published commit, from
+// GitHub's compare status of main against it.
+func against(status string) string {
+	switch status {
+	case "behind":
+		return "is behind"
+	case "diverged":
+		return "has diverged from"
+	case "identical":
+		return "is identical to"
+	default:
+		return "is ahead of"
+	}
 }
 
 // isLost says whether a finished slot run should have published and did
-// not: with nothing published, any run since the repository was created;
-// otherwise a run that built a commit ahead of the published revision.
-func isLost(ctx context.Context, s Source, run Run, state registry.State, revision string, created time.Time) (bool, error) {
+// not. With nothing published, any run since the slot could first run is,
+// content-gated or not: every such run publishes. With a commit published,
+// a run that built a commit ahead of it is, unless content-gated and the
+// run succeeded.
+func isLost(ctx context.Context, s Source, c *Config, run *Run, state registry.State, revision string, since time.Time) (bool, error) {
 	if state == registry.Absent {
-		return run.Created.After(created), nil
+		return run.Created.After(since), nil
+	}
+	if c.ContentGated && run.Conclusion == "success" {
+		return false, nil
 	}
 	status, _, err := s.Compare(ctx, revision, run.HeadSHA)
 	if err != nil {

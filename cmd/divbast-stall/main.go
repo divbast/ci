@@ -8,6 +8,7 @@
 // Usage:
 //
 //	divbast-stall open|stuck|renovate|slots
+//	divbast-stall slots -content-gated
 //
 // The checks:
 //
@@ -20,6 +21,13 @@
 //	slots     LOST_SLOTS or more daily slots, the scheduled runs of
 //	          SLOT_WORKFLOW on main, that should have published main as
 //	          PUBLISHED and did not; or PUBLISHED private
+//
+// slots -content-gated is for a slot workflow that publishes only when the
+// image's content moved, as divbast-publish-decision -content-gated does:
+// once the image is published, a slot run that succeeded is never lost,
+// since it may have decided that nothing in the image had moved. With
+// nothing published, every slot run publishes, so one that succeeded and
+// left nothing published is lost all the same.
 //
 // It reads the repository's pull requests, runs and commits through gh,
 // and PUBLISHED as an anonymous client through skopeo. The environment:
@@ -75,25 +83,49 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, r execx.Runner, stdout, stderr io.Writer) int {
+	usage := func() {
+		// As for complain: nowhere better to report a failed write.
+		_, _ = fmt.Fprintf(stderr, "usage: %s open|stuck|renovate|slots\n       %s slots -content-gated\n", name, name)
+	}
+	// The check comes first, and its own flags after it.
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	flags.Usage = func() {
-		// As for complain: nowhere better to report a failed write.
-		_, _ = fmt.Fprintln(flags.Output(), "usage:", name, "open|stuck|renovate|slots")
-	}
+	flags.Usage = usage
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if flags.NArg() != 1 {
-		complain(stderr, "want one check, not %d arguments", flags.NArg())
-		flags.Usage()
+	if flags.NArg() == 0 {
+		complain(stderr, "want one check, not 0 arguments")
+		usage()
+		return 2
+	}
+	check := flags.Arg(0)
+	checkFlags := flag.NewFlagSet(name+" "+check, flag.ContinueOnError)
+	checkFlags.SetOutput(stderr)
+	// The usage, then the check's own flags, which only slots has.
+	checkFlags.Usage = func() {
+		usage()
+		checkFlags.PrintDefaults()
+	}
+	var gated *bool
+	if check == "slots" {
+		gated = checkFlags.Bool("content-gated", false, "once the image is published, never count a slot run that succeeded as lost")
+	}
+	if err := checkFlags.Parse(flags.Args()[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if checkFlags.NArg() > 0 {
+		complain(stderr, "want one check, not %d arguments", 1+checkFlags.NArg())
+		usage()
 		return 2
 	}
 
-	check := flags.Arg(0)
 	env := environment{getenv: getenv}
 	repo := env.required("GH_REPO")
 	src := stall.GH{Run: r, Repo: repo}
@@ -114,11 +146,12 @@ func run(ctx context.Context, args []string, getenv func(string) string, r execx
 		c.LostSlots = env.count("LOST_SLOTS")
 		c.Published = env.required("PUBLISHED")
 		c.SlotWorkflow = env.or("SLOT_WORKFLOW", "build.yml")
+		c.ContentGated = *gated
 		lookup := registry.Lookup{Run: r, GH: ghapi.Client{Run: r}}
 		do = func() (stall.Result, error) { return stall.Slots(ctx, src, lookup, &c) }
 	default:
 		complain(stderr, "no such check: %q", check)
-		flags.Usage()
+		usage()
 		return 2
 	}
 	if env.err != nil {

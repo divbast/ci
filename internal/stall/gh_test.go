@@ -4,11 +4,14 @@
 package stall_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
@@ -25,20 +28,24 @@ const (
 	baikalBase = "0f6bb73b0bc9f05e62bdb98540c6ee05fa1e8c30"
 )
 
-// testdata returns a recording from testdata, every one made with gh
-// 2.103.3 on 2026-11-11 by the owner's token, as GH would run it:
+// testdata returns a recording from testdata, every one made by the
+// owner's token as GH would run it: with gh 2.103.3 on 2026-11-11,
 //
 //	gh-pr-list-open-baikal.json        gh pr list --repo divbast/baikal-oci-image --author app/divbast-renovate --state open --limit 40 --json number,title,createdAt,commits,statusCheckRollup
 //	gh-pr-list-merged-librespeed.json  gh pr list --repo divbast/librespeed-oci-image --author app/divbast-renovate --state merged --limit 40 --json number,title,createdAt,commits,statusCheckRollup
 //	gh-pr-list-pending-baikal.json     gh pr list --repo divbast/baikal-oci-image --state all --search status:pending --limit 40 --json number,title,createdAt,commits,statusCheckRollup
 //	gh-run-list-renovate-librespeed.json  gh run list --repo divbast/librespeed-oci-image --workflow renovate.yml --status success --limit 1 --json createdAt
-//	gh-run-list-slots-baikal.json      gh run list --repo divbast/baikal-oci-image --workflow build.yml --event schedule --branch main --limit 10 --json headSha,createdAt,status,url
-//	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
 //	gh-api-commits-main-baikal.txt     gh api -i repos/divbast/baikal-oci-image/commits/main
 //	gh-api-compare-ahead-baikal.txt    gh api -i repos/divbast/baikal-oci-image/compare/<baikalBase>...<baikalMain>
 //	gh-api-compare-behind-baikal.txt   gh api -i repos/divbast/baikal-oci-image/compare/<baikalMain>...<baikalBase>
 //	gh-api-compare-404-baikal.txt      gh api -i repos/divbast/baikal-oci-image/compare/<40 zeros>...<baikalMain>
 //	gh-api-repo-baikal.txt             gh api -i repos/divbast/baikal-oci-image
+//
+// and with gh 2.104.0 on 2026-11-13,
+//
+//	gh-run-list-slots-baikal.json      gh run list --repo divbast/baikal-oci-image --workflow build.yml --event schedule --branch main --limit 10 --json headSha,createdAt,status,conclusion,url
+//	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
+//	gh-api-workflow-build-baikal.txt   gh api -i repos/divbast/baikal-oci-image/actions/workflows/build.yml
 //
 // No Renovate pull request was open in either repository, so the open
 // list is empty. The ones with checks to read are merged, or closed with
@@ -74,7 +81,7 @@ func successRuns(repo, workflow string) []string {
 func slotRuns(repo, workflow string) []string {
 	return []string{
 		"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", "10", "--json", "headSha,createdAt,status,url",
+		"--limit", "10", "--json", "headSha,createdAt,status,conclusion,url",
 	}
 }
 
@@ -326,31 +333,46 @@ func TestGHSlotRuns(t *testing.T) {
 		result  execx.Result
 		want    []stall.Run
 		wantLen int
-		wantErr string
+		// wantConclusions is every run's conclusion, in order, when set.
+		wantConclusions []string
+		wantErr         string
 	}{
 		{
+			// The seventh run, on 2026-11-06, failed.
 			name:    "baikal",
 			repo:    baikal,
 			result:  stdout(testdata(t, "gh-run-list-slots-baikal.json")),
 			wantLen: 10,
 			want: []stall.Run{
 				{
-					HeadSHA:   baikalMain,
-					Created:   rfc3339(t, "2026-11-10T23:25:56Z"),
-					Completed: true,
-					URL:       "https://github.com/divbast/baikal-oci-image/actions/runs/42923306213",
+					HeadSHA:    "f235a10b970004f0b16b700a76ea7fbf98908586",
+					Created:    rfc3339(t, "2026-11-12T23:40:15Z"),
+					Completed:  true,
+					Conclusion: "success",
+					URL:        "https://github.com/divbast/baikal-oci-image/actions/runs/43330795962",
+				},
+				{
+					HeadSHA:    baikalMain,
+					Created:    rfc3339(t, "2026-11-12T00:46:44Z"),
+					Completed:  true,
+					Conclusion: "success",
+					URL:        "https://github.com/divbast/baikal-oci-image/actions/runs/43129777907",
 				},
 			},
+			wantConclusions: []string{"success", "success", "success", "success", "success", "success", "failure", "success", "failure", "success"},
 		},
 		{
-			name:   "librespeed",
-			repo:   librespeed,
-			result: stdout(testdata(t, "gh-run-list-slots-librespeed.json")),
+			name:            "librespeed",
+			repo:            librespeed,
+			result:          stdout(testdata(t, "gh-run-list-slots-librespeed.json")),
+			wantLen:         2,
+			wantConclusions: []string{"success", "success"},
 		},
 		{
+			// A run still going has no conclusion yet, which gh prints as "".
 			name: "running",
 			repo: baikal,
-			result: stdout([]byte(`[{"createdAt":"2026-11-11T18:50:00Z","headSha":"` + baikalMain +
+			result: stdout([]byte(`[{"conclusion":"","createdAt":"2026-11-11T18:50:00Z","headSha":"` + baikalMain +
 				`","status":"in_progress","url":"https://github.com/divbast/baikal-oci-image/actions/runs/1"}]`)),
 			wantLen: 1,
 			want: []stall.Run{{
@@ -386,8 +408,17 @@ func TestGHSlotRuns(t *testing.T) {
 			}
 			for i, want := range tt.want {
 				if got := runs[i]; got.HeadSHA != want.HeadSHA || !got.Created.Equal(want.Created) ||
-					got.Completed != want.Completed || got.URL != want.URL {
+					got.Completed != want.Completed || got.Conclusion != want.Conclusion || got.URL != want.URL {
 					t.Errorf("run %d = %+v, want %+v", i, got, want)
+				}
+			}
+			if tt.wantConclusions != nil {
+				got := make([]string, 0, len(runs))
+				for _, r := range runs {
+					got = append(got, r.Conclusion)
+				}
+				if !slices.Equal(got, tt.wantConclusions) {
+					t.Errorf("conclusions = %q, want %q", got, tt.wantConclusions)
 				}
 			}
 			for i, r := range runs {
@@ -494,6 +525,46 @@ func TestGHCompare(t *testing.T) {
 			wantFirst:  "2026-11-01T00:00:00Z",
 		},
 		{
+			name:       "identical",
+			base:       baikalMain,
+			head:       baikalMain,
+			result:     stdout([]byte("HTTP/2.0 200 OK\r\n\r\n" + `{"status":"identical","commits":[]}`)),
+			wantStatus: "identical",
+		},
+		{
+			name: "diverged",
+			base: baikalBase,
+			head: baikalMain,
+			result: stdout([]byte("HTTP/2.0 200 OK\r\n\r\n" + `{"status":"diverged","commits":[` +
+				`{"sha":"` + baikalMain + `","parents":[{"sha":"` + strings.Repeat("a", 40) + `"}],"commit":{"committer":{"date":"2026-11-03T00:00:00Z"}}}]}`)),
+			wantStatus: "diverged",
+			wantFirst:  "2026-11-03T00:00:00Z",
+		},
+		{
+			// A status GitHub did not have when this was written is an
+			// error, not a guess at what it means.
+			name:    "unknown-status",
+			base:    baikalBase,
+			head:    baikalMain,
+			result:  stdout([]byte("HTTP/2.0 200 OK\r\n\r\n" + `{"status":"sideways","commits":[]}`)),
+			wantErr: `"sideways"`,
+		},
+		{
+			name:    "no-status",
+			base:    baikalBase,
+			head:    baikalMain,
+			result:  stdout([]byte("HTTP/2.0 200 OK\r\n\r\n" + `{"commits":[]}`)),
+			wantErr: `""`,
+		},
+		{
+			name: "unknown-status-with-commits",
+			base: baikalBase,
+			head: baikalMain,
+			result: stdout([]byte("HTTP/2.0 200 OK\r\n\r\n" + `{"status":"AHEAD","commits":[` +
+				`{"sha":"` + baikalMain + `","parents":[{"sha":"` + baikalBase + `"}],"commit":{"committer":{"date":"2026-11-03T00:00:00Z"}}}]}`)),
+			wantErr: `"AHEAD"`,
+		},
+		{
 			name:    "not-found",
 			base:    zeros,
 			head:    baikalMain,
@@ -567,5 +638,140 @@ func TestGHRepoCreated(t *testing.T) {
 	// it was created elsewhere.
 	if want := rfc3339(t, "2026-09-09T05:04:37Z"); !got.Equal(want) {
 		t.Errorf("RepoCreated() = %v, want %v", got, want)
+	}
+}
+
+func TestGHWorkflowCreated(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		workflow string
+		// argPath is the endpoint gh is expected to be given.
+		argPath string
+		result  execx.Result
+		want    string
+		wantErr string
+	}{
+		{
+			// GitHub writes the time in the owner's zone: 23:32:15+10:00.
+			name:     "baikal",
+			workflow: "build.yml",
+			argPath:  "repos/divbast/baikal-oci-image/actions/workflows/build.yml",
+			result:   stdout(testdata(t, "gh-api-workflow-build-baikal.txt")),
+			want:     "2026-09-09T13:32:15Z",
+		},
+		{
+			// The file name is one segment of the path, whatever it holds.
+			name:     "escaped",
+			workflow: "../x.yml",
+			argPath:  "repos/divbast/baikal-oci-image/actions/workflows/..%2Fx.yml",
+			result:   stdout([]byte("HTTP/2.0 200 OK\r\n\r\n" + `{"created_at":"2026-11-01T00:00:00Z"}`)),
+			want:     "2026-11-01T00:00:00Z",
+		},
+		{
+			name:     "no-such-workflow",
+			workflow: "publish.yml",
+			argPath:  "repos/divbast/baikal-oci-image/actions/workflows/publish.yml",
+			result: execx.Result{
+				Stdout: []byte("HTTP/2.0 404 Not Found\r\n\r\n" + `{"message":"Not Found","status":"404"}`),
+				Stderr: []byte("gh: Not Found (HTTP 404)\n"),
+				Code:   1,
+			},
+			wantErr: "HTTP 404",
+		},
+		{
+			name:     "no-creation-time",
+			workflow: "build.yml",
+			argPath:  "repos/divbast/baikal-oci-image/actions/workflows/build.yml",
+			result:   stdout([]byte("HTTP/2.0 200 OK\r\n\r\n" + `{"path":".github/workflows/build.yml"}`)),
+			wantErr:  "no creation time",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: api(tt.argPath), Result: tt.result}), Repo: baikal}
+			got, err := gh.WorkflowCreated(t.Context(), tt.workflow)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("WorkflowCreated(%q) = %v, %v; want an error containing %q", tt.workflow, got, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := rfc3339(t, tt.want); !got.Equal(want) {
+				t.Errorf("WorkflowCreated(%q) = %v, want %v", tt.workflow, got, want)
+			}
+		})
+	}
+}
+
+// hang is a Runner whose every command runs until its context ends, as a
+// gh that hangs would, and then fails as execx.OS does.
+type hang struct{}
+
+func (hang) Run(ctx context.Context, name string, _ ...string) (execx.Result, error) {
+	<-ctx.Done()
+	return execx.Result{}, fmt.Errorf("run %s: %w", name, ctx.Err())
+}
+
+// TestGHTimeout checks that a gh that hangs is given up on after a minute,
+// or after GH's own Timeout, whether GH runs it to list or to call the API,
+// with an error that names the call and the limit.
+// The bubble's clock moves only when everything in it waits, so no test
+// waits a minute.
+func TestGHTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Each call, and what its error names it.
+	calls := map[string]struct {
+		call func(ctx context.Context, gh stall.GH) error
+		says string
+	}{
+		"list": {
+			call: func(ctx context.Context, gh stall.GH) error {
+				_, err := gh.SlotRuns(ctx, "build.yml")
+				return err
+			},
+			says: "gh run list",
+		},
+		"api": {
+			call: func(ctx context.Context, gh stall.GH) error {
+				_, err := gh.MainSHA(ctx)
+				return err
+			},
+			says: "gh api repos/divbast/baikal-oci-image/commits/main",
+		},
+	}
+	for name, c := range calls {
+		for _, tt := range []struct {
+			name    string
+			timeout time.Duration
+			want    time.Duration
+		}{
+			{name: "default", want: time.Minute},
+			{name: "set", timeout: 4 * time.Second, want: 4 * time.Second},
+		} {
+			t.Run(name+"-"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				synctest.Test(t, func(t *testing.T) {
+					start := time.Now()
+					err := c.call(t.Context(), stall.GH{Run: hang{}, Repo: baikal, Timeout: tt.timeout})
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Fatalf("got %v, want an error wrapping %v", err, context.DeadlineExceeded)
+					}
+					if waited := time.Since(start); waited != tt.want {
+						t.Errorf("gave up after %v, want %v", waited, tt.want)
+					}
+					if want := fmt.Sprintf("%s gave up after %v: ", c.says, tt.want); !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %q, want it to contain %q", err, want)
+					}
+				})
+			})
+		}
 	}
 }

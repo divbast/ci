@@ -4,12 +4,15 @@
 package registry_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/divbast/ci/internal/execx"
 	"github.com/divbast/ci/internal/ghapi"
@@ -121,7 +124,9 @@ func TestRevision(t *testing.T) {
 		wantRev   string
 		wantState registry.State
 		// wantErr lists what the error must contain; nil means no error.
-		wantErr     []string
+		wantErr []string
+		// notErr lists what the error must not contain.
+		notErr      []string
 		wantPrivate bool
 	}{
 		{
@@ -251,7 +256,37 @@ func TestRevision(t *testing.T) {
 			skopeo:  failed(t, "skopeo-no-such-tag.txt", 2),
 			api:     librespeedAPI,
 			gh:      status(403, "You need at least read:packages scope to get a package."),
-			wantErr: []string{"packages: read"},
+			wantErr: []string{"HTTP 403", "You need at least read:packages scope to get a package."},
+		},
+		{
+			// A 403 is not always a missing scope: GitHub says which it is.
+			name:    "api-403-rate-limit",
+			image:   noTag,
+			skopeo:  failed(t, "skopeo-no-such-tag.txt", 2),
+			api:     librespeedAPI,
+			gh:      status(403, "API rate limit exceeded for installation ID 1."),
+			wantErr: []string{"HTTP 403", "API rate limit exceeded for installation ID 1."},
+			notErr:  []string{"needs packages: read"},
+		},
+		{
+			// Only GitHub's "Package not found." is a package that does not
+			// exist. Any other 404, a path that names nothing, is not.
+			name:    "api-404-generic",
+			image:   noPackage,
+			skopeo:  tokenRefused,
+			api:     noPackageAPI,
+			gh:      status(404, "Not Found"),
+			wantErr: []string{"HTTP 404", `"Not Found"`},
+		},
+		{
+			// GitHub giving a package no visibility says nothing of whether
+			// it is private.
+			name:    "visibility-empty",
+			image:   noPackage,
+			skopeo:  tokenRefused,
+			api:     noPackageAPI,
+			gh:      pkg(""),
+			wantErr: []string{"no visibility"},
 		},
 		{
 			name:    "api-5xx",
@@ -338,6 +373,11 @@ func TestRevision(t *testing.T) {
 			for _, want := range tt.wantErr {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("Revision(%q) error = %q, want it to contain %q", tt.image, err, want)
+				}
+			}
+			for _, not := range tt.notErr {
+				if strings.Contains(err.Error(), not) {
+					t.Errorf("Revision(%q) error = %q, want it not to contain %q", tt.image, err, not)
 				}
 			}
 			if got := errors.Is(err, registry.ErrPrivate); got != tt.wantPrivate {
@@ -430,5 +470,87 @@ func TestStateString(t *testing.T) {
 		if got := state.String(); got != want {
 			t.Errorf("State(%d).String() = %q, want %q", int(state), got, want)
 		}
+	}
+}
+
+// runFunc is a Runner that answers with a function.
+type runFunc func(ctx context.Context, name string, args ...string) (execx.Result, error)
+
+func (f runFunc) Run(ctx context.Context, name string, args ...string) (execx.Result, error) {
+	return f(ctx, name, args...)
+}
+
+// hangs returns a Runner on which the command name runs until its context
+// ends, as one that hangs would, and fails as execx.OS then does. Any
+// other command is refused a token, as ghcr.io refuses a missing package.
+func hangs(t *testing.T, name string) execx.Runner {
+	t.Helper()
+	refused := failed(t, "skopeo-no-such-package.txt", 1)
+	return runFunc(func(ctx context.Context, cmd string, _ ...string) (execx.Result, error) {
+		if cmd != name {
+			return refused, nil
+		}
+		<-ctx.Done()
+		return execx.Result{}, fmt.Errorf("run %s: %w", cmd, ctx.Err())
+	})
+}
+
+// TestRevisionTimeout checks that a skopeo or a gh that hangs is given up
+// on after a minute each, or after the timeout the Lookup or its Client
+// sets, and is an error rather than an answer, one that names the call and
+// its limit. The bubble's clock moves
+// only when everything in it waits, so no test waits a minute.
+func TestRevisionTimeout(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		hung string
+		// skopeo and gh are the Lookup's and its Client's timeouts.
+		skopeo, gh time.Duration
+		want       time.Duration
+		// wantErr is what the error must say: the call and its limit.
+		wantErr string
+	}{
+		{
+			name: "skopeo", hung: "skopeo", want: time.Minute,
+			wantErr: "skopeo inspect docker://" + noPackage + " gave up after 1m0s: ",
+		},
+		{
+			name: "skopeo-set", hung: "skopeo", skopeo: 2 * time.Second, gh: 5 * time.Second, want: 2 * time.Second,
+			wantErr: "skopeo inspect docker://" + noPackage + " gave up after 2s: ",
+		},
+		{
+			name: "gh", hung: "gh", want: time.Minute,
+			wantErr: "gh api " + noPackageAPI + " gave up after 1m0s: ",
+		},
+		{
+			name: "gh-set", hung: "gh", skopeo: 2 * time.Second, gh: 5 * time.Second, want: 5 * time.Second,
+			wantErr: "gh api " + noPackageAPI + " gave up after 5s: ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				run := hangs(t, tt.hung)
+				l := registry.Lookup{Run: run, GH: ghapi.Client{Run: run, Timeout: tt.gh}, Timeout: tt.skopeo}
+				rev, state, err := l.Revision(t.Context(), noPackage)
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Revision() = %q, %v, %v; want an error wrapping %v", rev, state, err, context.DeadlineExceeded)
+				}
+				if state != 0 || rev != "" {
+					t.Errorf("Revision() = %q, %v with error %v; want no revision and no state", rev, state, err)
+				}
+				if waited := time.Since(start); waited != tt.want {
+					t.Errorf("Revision() gave up after %v, want %v", waited, tt.want)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("Revision() error = %q, want it to contain %q", err, tt.wantErr)
+				}
+			})
+		})
 	}
 }

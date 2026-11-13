@@ -65,7 +65,8 @@ type source struct {
 	main     string
 	compares map[string]comparison // keyed by base...head
 	created  time.Time
-	err      error // returned by every call when set
+	workflow time.Time // when the slot workflow was created
+	err      error     // returned by every call when set
 }
 
 func (s *source) RenovatePRs(context.Context) ([]stall.PR, error) {
@@ -121,6 +122,19 @@ func (s *source) RepoCreated(context.Context) (time.Time, error) {
 		return time.Time{}, errors.New("asked when the repository was created, which the test did not script")
 	}
 	return s.created, nil
+}
+
+func (s *source) WorkflowCreated(_ context.Context, file string) (time.Time, error) {
+	if s.err != nil {
+		return time.Time{}, s.err
+	}
+	if file != config.SlotWorkflow {
+		return time.Time{}, fmt.Errorf("asked when workflow %q was created", file)
+	}
+	if s.workflow.IsZero() {
+		return time.Time{}, errors.New("asked when the slot workflow was created, which the test did not script")
+	}
+	return s.workflow, nil
 }
 
 // revisions is a [stall.Revisions] that answers for image alone.
@@ -434,14 +448,17 @@ func TestSlots(t *testing.T) {
 	errRegistry := errors.New("could not read " + image)
 	const url1 = "https://github.com/divbast/librespeed-oci-image/actions/runs/1"
 	const url2 = "https://github.com/divbast/librespeed-oci-image/actions/runs/2"
+	const url3 = "https://github.com/divbast/librespeed-oci-image/actions/runs/3"
 	ahead := comparison{status: "ahead"}
 	lost := func(url, sha string) string { return "lost slot: " + url + " built " + sha }
 	unpublished := "main " + head + " is unpublished, :latest is " + published + ", and 2 or more slots were lost:"
 
 	tests := []struct {
-		name    string
-		src     source
-		revs    revisions
+		name string
+		src  source
+		revs revisions
+		// gated is the check's content-gated.
+		gated   bool
 		want    stall.Result
 		wantErr error
 	}{
@@ -449,7 +466,7 @@ func TestSlots(t *testing.T) {
 			// Nothing published, no slot run yet, in a repository three
 			// hours old.
 			name: "first-day",
-			src:  source{main: head, created: ago(3 * time.Hour)},
+			src:  source{main: head, created: ago(3 * time.Hour), workflow: ago(3 * time.Hour)},
 			revs: revisions{state: registry.Absent},
 			want: stall.Result{Headline: "main " + head + " is ahead of :latest (absent), with 0 lost slot(s), under 2"},
 		},
@@ -457,7 +474,7 @@ func TestSlots(t *testing.T) {
 			// Nothing published three days after the repository was
 			// created, and no slot run since.
 			name: "absent-days",
-			src:  source{main: head, created: ago(3 * day)},
+			src:  source{main: head, created: ago(3 * day), workflow: ago(3 * day)},
 			revs: revisions{state: registry.Absent},
 			want: stall.Result{
 				Stalled:  true,
@@ -470,9 +487,10 @@ func TestSlots(t *testing.T) {
 			// published, so each is lost. One is under the limit.
 			name: "absent-one-lost",
 			src: source{
-				main:    head,
-				created: ago(2 * day),
-				runs:    []stall.Run{{HeadSHA: built, Created: ago(20 * time.Hour), Completed: true, URL: url1}},
+				main:     head,
+				created:  ago(2 * day),
+				workflow: ago(2 * day),
+				runs:     []stall.Run{{HeadSHA: built, Created: ago(20 * time.Hour), Completed: true, URL: url1}},
 			},
 			revs: revisions{state: registry.Absent},
 			want: stall.Result{Headline: "main " + head + " is ahead of :latest (absent), with 1 lost slot(s), under 2"},
@@ -480,8 +498,9 @@ func TestSlots(t *testing.T) {
 		{
 			name: "absent-two-lost",
 			src: source{
-				main:    head,
-				created: ago(3 * day),
+				main:     head,
+				created:  ago(3 * day),
+				workflow: ago(3 * day),
 				runs: []stall.Run{
 					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, URL: url2},
 					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, URL: url1},
@@ -594,6 +613,184 @@ func TestSlots(t *testing.T) {
 			},
 		},
 		{
+			// With nothing published, the days with no slot run count from
+			// the newest slot run, even one still going, when it is later
+			// than the slot workflow's first chance to run. It is not lost,
+			// since it has not finished.
+			name: "absent-running-newest",
+			src: source{
+				main:     head,
+				created:  ago(3 * day),
+				workflow: ago(3 * day),
+				runs:     []stall.Run{{HeadSHA: head, Created: ago(time.Hour), URL: url1}},
+			},
+			revs: revisions{state: registry.Absent},
+			want: stall.Result{Headline: "main " + head + " is ahead of :latest (absent), with 0 lost slot(s), under 2"},
+		},
+		{
+			// The slot workflow landed three days after the repository was
+			// created, a day and a half ago: one day without a slot run,
+			// counted from the workflow, not three from the repository.
+			name: "absent-workflow-later",
+			src:  source{main: head, created: ago(108 * time.Hour), workflow: ago(36 * time.Hour)},
+			revs: revisions{state: registry.Absent},
+			want: stall.Result{Headline: "main " + head + " is ahead of :latest (absent), with 1 lost slot(s), under 2"},
+		},
+		{
+			// And were GitHub to date the workflow before the repository,
+			// the days would still count from the repository.
+			name: "absent-repo-later",
+			src:  source{main: head, created: ago(36 * time.Hour), workflow: ago(108 * time.Hour)},
+			revs: revisions{state: registry.Absent},
+			want: stall.Result{Headline: "main " + head + " is ahead of :latest (absent), with 1 lost slot(s), under 2"},
+		},
+		{
+			// Content-gated, a slot run that succeeded worked, whether it
+			// published or decided that nothing in the image had moved.
+			name: "gated_success_not_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "success", URL: url2},
+					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "success", URL: url1},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			want:  stall.Result{Headline: "main " + head + " is ahead of :latest " + published + ", with 0 lost slot(s), under 2"},
+		},
+		{
+			// The same runs, not content-gated, are lost, as they always
+			// were: a run ahead of :latest that succeeded and left it
+			// there did not publish.
+			name: "ungated_success_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "success", URL: url2},
+					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "success", URL: url1},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs: revisions{revision: published, state: registry.Published},
+			want: stall.Result{Stalled: true, Headline: unpublished, Details: []string{lost(url2, head), lost(url1, built)}},
+		},
+		{
+			// Content-gated, a run that failed, was cancelled or ended any
+			// other way but success is lost as ever.
+			name: "gated_failure_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "failure", URL: url3},
+					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "cancelled", URL: url2},
+					{HeadSHA: built, Created: ago(68 * time.Hour), Completed: true, Conclusion: "timed_out", URL: url1},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(4 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			want:  stall.Result{Stalled: true, Headline: unpublished, Details: []string{lost(url3, head), lost(url2, built), lost(url1, built)}},
+		},
+		{
+			// With nothing published, every run publishes, gated or not,
+			// so a run that succeeded and left nothing published failed
+			// to publish, and is lost.
+			name: "gated_absent_success_lost",
+			src: source{
+				main:     head,
+				created:  ago(3 * day),
+				workflow: ago(3 * day),
+				runs: []stall.Run{
+					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "success", URL: url2},
+					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "success", URL: url1},
+				},
+			},
+			revs:  revisions{state: registry.Absent},
+			gated: true,
+			want: stall.Result{
+				Stalled:  true,
+				Headline: "main " + head + " is unpublished, :latest is absent, and 2 or more slots were lost:",
+				Details:  []string{lost(url2, head), lost(url1, built)},
+			},
+		},
+		{
+			// And so is each day with no slot run at all.
+			name: "gated_missed_days",
+			src: source{
+				main: head,
+				runs: []stall.Run{{HeadSHA: head, Created: ago(84 * time.Hour), Completed: true, Conclusion: "success", URL: url1}},
+				compares: map[string]comparison{
+					published + "..." + head: {status: "ahead", first: ago(5 * day)},
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			want: stall.Result{
+				Stalled:  true,
+				Headline: unpublished,
+				Details:  []string{"3 day(s) with no slot run since 1999-12-28T12:00:00Z"},
+			},
+		},
+		{
+			// Main behind :latest, with no slot run and no commit to say
+			// when main stopped being what is published: as many days as
+			// make a stall.
+			name: "published_behind_no_runs",
+			src: source{
+				main:     head,
+				compares: map[string]comparison{published + "..." + head: {status: "behind"}},
+			},
+			revs: revisions{revision: published, state: registry.Published},
+			want: stall.Result{
+				Stalled:  true,
+				Headline: unpublished,
+				Details:  []string{"2 day(s) with no slot run since ever"},
+			},
+		},
+		{
+			// The headline says how main stands against :latest.
+			name: "published-behind",
+			src: source{
+				main:     head,
+				runs:     []stall.Run{{HeadSHA: head, Created: ago(time.Hour), URL: url1}},
+				compares: map[string]comparison{published + "..." + head: {status: "behind"}},
+			},
+			revs: revisions{revision: published, state: registry.Published},
+			want: stall.Result{Headline: "main " + head + " is behind :latest " + published + ", with 0 lost slot(s), under 2"},
+		},
+		{
+			name: "published-diverged",
+			src: source{
+				main:     head,
+				runs:     []stall.Run{{HeadSHA: head, Created: ago(time.Hour), URL: url1}},
+				compares: map[string]comparison{published + "..." + head: {status: "diverged", first: ago(2 * time.Hour)}},
+			},
+			revs: revisions{revision: published, state: registry.Published},
+			want: stall.Result{Headline: "main " + head + " has diverged from :latest " + published + ", with 0 lost slot(s), under 2"},
+		},
+		{
+			// Never so for two full SHAs, but said as GitHub says it.
+			name: "published-identical",
+			src: source{
+				main:     head,
+				runs:     []stall.Run{{HeadSHA: head, Created: ago(time.Hour), URL: url1}},
+				compares: map[string]comparison{published + "..." + head: {status: "identical"}},
+			},
+			revs: revisions{revision: published, state: registry.Published},
+			want: stall.Result{Headline: "main " + head + " is identical to :latest " + published + ", with 0 lost slot(s), under 2"},
+		},
+		{
 			// Main is what :latest was built from: nothing else is asked.
 			name: "published-main",
 			src:  source{main: published},
@@ -621,7 +818,9 @@ func TestSlots(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				atEpoch(t)
-				got, err := stall.Slots(t.Context(), &tt.src, tt.revs, &config)
+				c := config
+				c.ContentGated = tt.gated
+				got, err := stall.Slots(t.Context(), &tt.src, tt.revs, &c)
 				if tt.wantErr != nil {
 					if !errors.Is(err, tt.wantErr) {
 						t.Fatalf("Slots() = %+v, %v; want an error wrapping %v", got, err, tt.wantErr)
@@ -646,11 +845,27 @@ func TestSlotsTag(t *testing.T) {
 		c := config
 		c.Published = "ghcr.io/divbast/frankenphp:baikal"
 		revs := revisionsFor{image: c.Published, state: registry.Absent}
-		got, err := stall.Slots(t.Context(), &source{main: head, created: ago(time.Hour)}, revs, &c)
+		got, err := stall.Slots(t.Context(), &source{main: head, created: ago(time.Hour), workflow: ago(time.Hour)}, revs, &c)
 		if err != nil {
 			t.Fatal(err)
 		}
 		checkResult(t, got, stall.Result{Headline: "main " + head + " is ahead of :baikal (absent), with 0 lost slot(s), under 2"})
+	})
+}
+
+// TestSlotsNothingToCheck checks that slots refuses to run without an
+// image to check, rather than taking none for one never published.
+func TestSlotsNothingToCheck(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		c := config
+		c.Published = ""
+		// Nothing scripted: nothing may be asked.
+		got, err := stall.Slots(t.Context(), &source{}, revisions{state: registry.Absent}, &c)
+		if err == nil || !strings.Contains(err.Error(), "no published image") {
+			t.Fatalf("Slots() = %+v, %v; want an error saying there is no published image", got, err)
+		}
 	})
 }
 

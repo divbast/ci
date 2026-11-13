@@ -5,9 +5,10 @@
 //
 // A run publishes when main moved since the commit the published image
 // was built from, when what goes into the image moved without a new
-// commit, or when someone asks by hand. It never moves the published
-// image backwards: a run that built an older commit would take back
-// whatever the newer image fixed.
+// commit, or when someone asks by hand. A caller can gate the first on
+// the second, so that main moving publishes only when the image's content
+// moved with it. It never moves the published image backwards: a run that
+// built an older commit would take back whatever the newer image fixed.
 package publish
 
 import (
@@ -63,15 +64,22 @@ var commit = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // Decide decides whether a run started by ev publishes built, the commit
 // it built, given published, the commit the published image was built
 // from, or "" when nothing is published yet. contentChange, when not
-// empty, says what moved in the image's content since it was published
-// without a commit to show for it, such as a library built from its
-// branch's head.
+// empty, says what moved in the image's content since it was published,
+// such as a library built from its branch's head.
+//
+// With main where it was published, a run publishes when contentChange
+// says the content moved, and a push or the daily slot skips otherwise.
+// With main moved past it, a run publishes whatever the content did,
+// unless gated: then a push or the daily slot publishes only when
+// contentChange says the content moved too, and skips a move of main that
+// changed nothing in the image. A run started by hand publishes either
+// way.
 //
 // Decide never publishes over a newer image, whatever moved. It returns an
 // error, and so no decision, for an event that does not publish, a commit
 // that is not a full SHA, a published commit that is not on main, a built
 // commit that has diverged from it, and when git cannot answer.
-func Decide(ctx context.Context, g Git, ev Event, built, published, contentChange string) (Decision, error) {
+func Decide(ctx context.Context, g Git, ev Event, built, published, contentChange string, gated bool) (Decision, error) {
 	switch ev {
 	case EventPush, EventSchedule, EventDispatch:
 	default:
@@ -117,7 +125,16 @@ func Decide(ctx context.Context, g Git, ev Event, built, published, contentChang
 		return Decision{}, fmt.Errorf("check that %s follows the published %s: %w", built, published, err)
 	}
 	if moved {
-		return publishing("main moved from %s to %s", published, built), nil
+		switch {
+		case !gated:
+			return publishing("main moved from %s to %s", published, built), nil
+		case contentChange != "":
+			return publishing("main moved from %s to %s; content moved: %s", published, built, contentChange), nil
+		case ev == EventDispatch:
+			return publishing("main moved from %s to %s", published, built), nil
+		default:
+			return skipping("main moved from %s to %s, and no architecture's manifest did", published, built), nil
+		}
 	}
 	older, err := g.IsAncestor(ctx, built, published)
 	if err != nil {

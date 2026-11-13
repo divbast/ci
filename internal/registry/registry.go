@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/divbast/ci/internal/execx"
 	"github.com/divbast/ci/internal/ghapi"
@@ -61,6 +62,14 @@ var ErrPrivate = errors.New("package is private")
 // absent package from a private one, knows about no other.
 const host = "ghcr.io"
 
+// timeout is how long the skopeo call may take when a Lookup sets no
+// Timeout of its own.
+const timeout = time.Minute
+
+// notFound is GitHub's message for a package that does not exist, which
+// alone among 404s says nothing is published there.
+const notFound = "Package not found."
+
 // annotation is the index annotation that names the commit.
 const annotation = "org.opencontainers.image.revision"
 
@@ -84,6 +93,10 @@ var refusals = [][]byte{
 type Lookup struct {
 	Run execx.Runner
 	GH  ghapi.Client
+	// Timeout bounds the skopeo call, as GH's own bounds each gh call, so
+	// that a registry that never answers fails the lookup rather than
+	// holding the job until the job's own timeout. Zero means a minute.
+	Timeout time.Duration
 }
 
 // Revision returns the commit image, a ghcr.io reference such as
@@ -91,22 +104,35 @@ type Lookup struct {
 //
 // It returns "" and [Absent] when nothing is published there yet: the
 // registry refuses to show the image, and the GitHub API says the package
-// does not exist, or that it is public and only this tag is missing. The
+// is not found, or that it is public and only this tag is missing. The
 // package's owner must be an organisation, and GH's token able to read
 // its packages (packages: read).
 //
 // Anything else is an error, with the zero State: a private package
-// (wrapping [ErrPrivate]), a registry or API that fails to answer, a token
-// the API refuses, and an image with no full commit SHA in its revision
-// annotation.
+// (wrapping [ErrPrivate]), a registry or API that fails to answer or takes
+// longer than its timeout, a 404 that does not say the package is not
+// found, a token the API refuses, and an image with no full commit SHA in
+// its revision annotation.
 func (l Lookup) Revision(ctx context.Context, image string) (string, State, error) {
 	owner, name, err := parse(image)
 	if err != nil {
 		return "", 0, err
 	}
 
-	res, err := l.Run.Run(ctx, "skopeo", "inspect", "--raw", "--no-creds", "docker://"+image)
+	limit := l.Timeout
+	if limit == 0 {
+		limit = timeout
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, limit)
+	res, err := l.Run.Run(inspectCtx, "skopeo", "inspect", "--raw", "--no-creds", "docker://"+image)
+	timedOut := ctx.Err() == nil && errors.Is(inspectCtx.Err(), context.DeadlineExceeded)
+	cancel()
 	if err != nil {
+		// Only the Lookup's own limit is the Lookup's to name: a deadline
+		// of the caller's, reached first, is the caller's to report.
+		if timedOut {
+			err = fmt.Errorf("skopeo inspect docker://%s gave up after %v: %w", image, limit, err)
+		}
 		return "", 0, unreadable(image, err)
 	}
 	if res.Code != 0 {
@@ -137,16 +163,24 @@ func (l Lookup) refused(ctx context.Context, image, owner, name string, stderr [
 	var p struct {
 		Visibility string `json:"visibility"`
 	}
-	status, err := l.GH.API(ctx, "orgs/"+url.PathEscape(owner)+"/packages/container/"+url.PathEscape(name), &p)
+	resp, err := l.GH.Get(ctx, "orgs/"+url.PathEscape(owner)+"/packages/container/"+url.PathEscape(name), &p)
 	if err != nil {
 		return "", 0, fmt.Errorf("%s refused to show %s, and the GitHub API could not say whether it is absent or private: %w", host, image, err)
 	}
 
-	switch status {
+	switch resp.Status {
 	case 404:
+		if resp.Message != notFound {
+			return "", 0, fmt.Errorf("%s refused to show %s, and GitHub answered HTTP 404 for package %s with %q, not %q, so nothing says it is absent",
+				host, image, pkg, resp.Message, notFound)
+		}
 		return "", Absent, nil
 	case 200:
-		if p.Visibility != "public" {
+		switch p.Visibility {
+		case "public":
+		case "":
+			return "", 0, fmt.Errorf("%s refused to show %s, and GitHub gives package %s no visibility, so nothing says whether it is absent or private", host, image, pkg)
+		default:
 			return "", 0, fmt.Errorf("%w: GitHub gives %s the visibility %q, so no anonymous client can read %s", ErrPrivate, pkg, p.Visibility, image)
 		}
 		if bytes.Contains(stderr, []byte("manifest unknown")) {
@@ -155,10 +189,21 @@ func (l Lookup) refused(ctx context.Context, image, owner, name string, stderr [
 		}
 		return "", 0, unreadable(image, fmt.Errorf("GitHub lists %s as public, but %s refused an anonymous read: %s", pkg, host, stderr))
 	case 403:
-		return "", 0, fmt.Errorf("%s refused to show %s, and GitHub would not show package %s to this token (HTTP 403): the token needs packages: read", host, image, pkg)
+		// A token without packages: read gets a 403, and so does one that
+		// hit a rate limit or must authorise SSO first: GitHub's message
+		// says which.
+		return "", 0, fmt.Errorf("%s refused to show %s, and GitHub would not show package %s to this token: HTTP 403: %s", host, image, pkg, said(resp.Message))
 	default:
-		return "", 0, fmt.Errorf("%s refused to show %s, and GitHub answered HTTP %d for package %s", host, image, status, pkg)
+		return "", 0, fmt.Errorf("%s refused to show %s, and GitHub answered HTTP %d for package %s: %s", host, image, resp.Status, pkg, said(resp.Message))
 	}
+}
+
+// said returns GitHub's message, or says it gave none.
+func said(message string) string {
+	if message == "" {
+		return "GitHub gave no message"
+	}
+	return message
 }
 
 // unreadable is the error for an image whose revision nothing can read.

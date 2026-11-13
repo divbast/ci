@@ -23,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/divbast/ci/internal/execx"
 )
 
 // mustGuard are jobs the derived set must hold, so that a parser
@@ -359,6 +361,166 @@ func readsDependabotAlerts(workflow string) error {
 // actions/create-github-app-token.
 func mintsAppToken(l line) bool {
 	return strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(l.text), "- "), "uses: actions/create-github-app-token@")
+}
+
+// TestStallContentGated checks that stall.yml's content-gated input, off
+// unless a caller sets it, reaches divbast-stall as -content-gated in the
+// slots job alone: a caller that leaves it unset sees the checks run as
+// they always have, and the other checks would refuse the flag. Against
+// stall.yml as it is, then with each link from the input to the command
+// broken, which the check must refuse.
+func TestStallContentGated(t *testing.T) {
+	t.Parallel()
+	stall := readWorkflows(t)["stall.yml"]
+	if err := passesContentGated(t, stall); err != nil {
+		t.Errorf("stall.yml: %v", err)
+	}
+	const (
+		input   = "      content-gated:\n"
+		boolean = "        type: boolean\n"
+		dflt    = "        default: false\n"
+		env     = "          CONTENT_GATED: ${{ inputs.content-gated }}\n"
+		test    = `[[ "${CHECK}" == slots && "${CONTENT_GATED}" == true ]]`
+	)
+	for name, mutant := range map[string]string{
+		"input taken out":          strings.Replace(stall, input, "      content-gated-not:\n", 1),
+		"on by default":            strings.Replace(stall, boolean+dflt, boolean+"        default: true\n", 1),
+		"not passed to the step":   strings.Replace(stall, env, "", 1),
+		"another input passed":     strings.Replace(stall, env, "          CONTENT_GATED: ${{ inputs.lost-slots }}\n", 1),
+		"passed to every check":    strings.Replace(stall, test, `[[ "${CONTENT_GATED}" == true ]]`, 1),
+		"passed whatever it says":  strings.Replace(stall, test, `[[ "${CHECK}" == slots ]]`, 1),
+		"never given to the check": strings.Replace(stall, " -content-gated\n", "\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == stall {
+				t.Fatal("the change changed nothing")
+			}
+			if passesContentGated(t, mutant) == nil {
+				t.Error("passes stall.yml with content-gated " + name)
+			}
+		})
+	}
+}
+
+// passesContentGated returns an error unless the workflow declares a
+// boolean content-gated input that defaults to false, its stall job's step
+// that runs divbast-stall maps the input to CONTENT_GATED, and that step's
+// script, run with bash and a stand-in for divbast-stall, passes
+// -content-gated to the slots check when CONTENT_GATED is true, and to no
+// check otherwise.
+func passesContentGated(t *testing.T, workflow string) error {
+	t.Helper()
+	lines := linesOf(workflow)
+
+	var decl []string
+	for i, l := range lines {
+		if l.text != "      content-gated:" {
+			continue
+		}
+		for _, d := range lines[i+1:] {
+			if indent(d.text) <= 6 {
+				break
+			}
+			decl = append(decl, strings.TrimSpace(d.text))
+		}
+	}
+	if !slices.Contains(decl, "type: boolean") || !slices.Contains(decl, "default: false") {
+		return fmt.Errorf("declares content-gated as %q, not a boolean input that defaults to false", decl)
+	}
+
+	var step []line
+	for _, st := range steps(jobsOf(lines)["stall"]) {
+		if slices.ContainsFunc(st, func(l line) bool { return strings.Contains(l.text, ".ci/bin/divbast-stall") }) {
+			step = st
+		}
+	}
+	if step == nil {
+		return errors.New("the stall job has no step that runs .ci/bin/divbast-stall")
+	}
+	if !slices.ContainsFunc(step, func(l line) bool {
+		k, v, ok := strings.Cut(strings.TrimSpace(l.text), ":")
+		return ok && k == "CONTENT_GATED" && unquote(v) == "${{ inputs.content-gated }}"
+	}) {
+		return fmt.Errorf("line %d runs divbast-stall with no CONTENT_GATED: ${{ inputs.content-gated }} in its env", step[0].n)
+	}
+
+	script, err := runScript(step)
+	if err != nil {
+		return err
+	}
+	for _, tt := range []struct{ check, gated, want string }{
+		{check: "slots", gated: "true", want: "[slots][-content-gated]"},
+		{check: "slots", gated: "false", want: "[slots]"},
+		{check: "open", gated: "true", want: "[open]"},
+		{check: "stuck", gated: "true", want: "[stuck]"},
+		{check: "renovate", gated: "false", want: "[renovate]"},
+	} {
+		got, err := runStall(t, script, tt.check, tt.gated)
+		if err != nil {
+			return err
+		}
+		if got != tt.want {
+			return fmt.Errorf("with CHECK=%s and CONTENT_GATED=%s, runs divbast-stall with %s, want %s", tt.check, tt.gated, got, tt.want)
+		}
+	}
+	return nil
+}
+
+// runScript returns a step's run: script, from a block scalar or a plain
+// value. Blank lines and comments are already gone.
+func runScript(step []line) (string, error) {
+	for i, l := range step {
+		v, ok := strings.CutPrefix(strings.TrimSpace(l.text), "run:")
+		if !ok {
+			continue
+		}
+		if v = strings.TrimSpace(v); v != "|" {
+			return v, nil
+		}
+		var b strings.Builder
+		for _, s := range step[i+1:] {
+			if indent(s.text) <= indent(l.text) {
+				break
+			}
+			b.WriteString(strings.TrimSpace(s.text) + "\n")
+		}
+		return b.String(), nil
+	}
+	return "", fmt.Errorf("line %d: the step has no run: script", step[0].n)
+}
+
+// runStall runs script as GitHub Actions runs a step's, with bash -e from
+// the workspace, there with a .ci/bin/divbast-stall that prints each of its
+// arguments in brackets, and returns what it printed.
+func runStall(t *testing.T, script, check, gated string) (string, error) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".ci", "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	for name, body := range map[string]string{
+		".ci/bin/divbast-stall": "#!/usr/bin/env bash\nprintf '[%s]' \"$@\"\n",
+		"step.sh":               script,
+	} {
+		if err = root.WriteFile(name, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := execx.OS{Env: []string{"CHECK=" + check, "CONTENT_GATED=" + gated}}
+	res, err := run.Run(t.Context(), "bash", "-c", `cd -- "$1" && bash -e ./step.sh`, "bash", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != 0 {
+		return "", fmt.Errorf("with CHECK=%s and CONTENT_GATED=%s, the script exits %d: %s", check, gated, res.Code, res.Stderr)
+	}
+	return string(res.Stdout), nil
 }
 
 // line is one line of a workflow and its 1-based number in the file.

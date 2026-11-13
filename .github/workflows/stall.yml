@@ -47,6 +47,10 @@ on:
         description: Lost daily slots that make a stall
         type: number
         default: 2
+      content-gated:
+        description: The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -100,4 +104,13 @@ jobs:
           PUBLISHED: ${{ inputs.published }}
           SLOT_WORKFLOW: ${{ inputs.slot-workflow }}
           RENOVATE_WORKFLOW: ${{ inputs.renovate-workflow }}
-        run: .ci/bin/divbast-stall "${CHECK}"
+          CONTENT_GATED: ${{ inputs.content-gated }}
+        # -content-gated is a flag of slots alone, and given only when the
+        # caller sets content-gated, so that a caller who does not runs
+        # every check as it always has.
+        run: |
+          if [[ "${CHECK}" == slots && "${CONTENT_GATED}" == true ]]; then
+            .ci/bin/divbast-stall slots -content-gated
+          else
+            .ci/bin/divbast-stall "${CHECK}"
+          fi

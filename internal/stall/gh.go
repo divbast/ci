@@ -7,9 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +35,14 @@ const prLimit = 40
 // than enough to see the lost slots that matter.
 const slotLimit = 10
 
+// timeout is how long one gh call may take when GH sets no Timeout of its
+// own.
+const timeout = time.Minute
+
+// statuses are the ways GitHub's compare API says head stands against
+// base.
+var statuses = []string{"ahead", "behind", "identical", "diverged"}
+
 // fullSHA is a commit as GitHub names one.
 var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -42,6 +53,10 @@ type GH struct {
 	Run execx.Runner
 	// Repo is the repository, as owner/name.
 	Repo string
+	// Timeout bounds each call to gh, so that a gh that hangs fails the
+	// check rather than holding the job until the job's own timeout. Zero
+	// means a minute.
+	Timeout time.Duration
 }
 
 // RenovatePRs implements [Source]. It fails, rather than read part of the
@@ -152,19 +167,26 @@ func (g GH) LastSuccess(ctx context.Context, workflow string) (time.Time, bool, 
 // SlotRuns implements [Source].
 func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 	var raw []struct {
-		HeadSHA   string    `json:"headSha"`
-		CreatedAt time.Time `json:"createdAt"`
-		Status    string    `json:"status"`
-		URL       string    `json:"url"`
+		HeadSHA    string    `json:"headSha"`
+		CreatedAt  time.Time `json:"createdAt"`
+		Status     string    `json:"status"`
+		Conclusion string    `json:"conclusion"`
+		URL        string    `json:"url"`
 	}
 	err := g.list(ctx, &raw, "run", "list", "--repo", g.Repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", strconv.Itoa(slotLimit), "--json", "headSha,createdAt,status,url")
+		"--limit", strconv.Itoa(slotLimit), "--json", "headSha,createdAt,status,conclusion,url")
 	if err != nil {
 		return nil, err
 	}
 	runs := make([]Run, 0, len(raw))
 	for _, r := range raw {
-		runs = append(runs, Run{HeadSHA: r.HeadSHA, Created: r.CreatedAt, Completed: r.Status == "completed", URL: r.URL})
+		runs = append(runs, Run{
+			HeadSHA:    r.HeadSHA,
+			Created:    r.CreatedAt,
+			Completed:  r.Status == "completed",
+			Conclusion: r.Conclusion,
+			URL:        r.URL,
+		})
 	}
 	return runs, nil
 }
@@ -188,7 +210,8 @@ func (g GH) MainSHA(ctx context.Context) (string, error) {
 // days older than it. So the first commit on head's line is found by
 // following first parents back from head to the commit after base, and
 // only when head is not among those listed, as when GitHub cuts a long
-// list short, is it the oldest listed.
+// list short, is it the oldest listed. A status GitHub did not have when
+// this was written is an error rather than a guess.
 func (g GH) Compare(ctx context.Context, base, head string) (string, time.Time, error) {
 	for _, sha := range []string{base, head} {
 		if !fullSHA.MatchString(sha) {
@@ -211,6 +234,10 @@ func (g GH) Compare(ctx context.Context, base, head string) (string, time.Time, 
 	}
 	if err := g.api(ctx, "repos/{owner}/{repo}/compare/"+base+"..."+head, &c); err != nil {
 		return "", time.Time{}, err
+	}
+	if !slices.Contains(statuses, c.Status) {
+		return "", time.Time{}, fmt.Errorf("compare %s...%s: GitHub gives the status %q, which is none of %s",
+			base, head, c.Status, strings.Join(statuses, ", "))
 	}
 	if len(c.Commits) == 0 {
 		return c.Status, time.Time{}, nil
@@ -254,11 +281,36 @@ func (g GH) RepoCreated(ctx context.Context) (time.Time, error) {
 	return r.CreatedAt, nil
 }
 
+// WorkflowCreated implements [Source].
+func (g GH) WorkflowCreated(ctx context.Context, file string) (time.Time, error) {
+	var w struct {
+		CreatedAt time.Time `json:"created_at"`
+	}
+	if err := g.api(ctx, "repos/{owner}/{repo}/actions/workflows/"+url.PathEscape(file), &w); err != nil {
+		return time.Time{}, err
+	}
+	if w.CreatedAt.IsZero() {
+		return time.Time{}, fmt.Errorf("GitHub gives no creation time for %s's workflow %s", g.Repo, file)
+	}
+	return w.CreatedAt, nil
+}
+
 // list runs gh with args, which ask for JSON, and decodes what it prints
 // into v.
 func (g GH) list(ctx context.Context, v any, args ...string) error {
-	res, err := g.Run.Run(ctx, "gh", args...)
+	limit := g.Timeout
+	if limit == 0 {
+		limit = timeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	res, err := g.Run.Run(callCtx, "gh", args...)
 	if err != nil {
+		// Only GH's own limit is GH's to name: a deadline of the caller's,
+		// reached first, is the caller's to report.
+		if ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("gh %s %s gave up after %v: %w", args[0], args[1], limit, err)
+		}
 		return fmt.Errorf("gh %s %s: %w", args[0], args[1], err)
 	}
 	if res.Code != 0 {
@@ -273,7 +325,7 @@ func (g GH) list(ctx context.Context, v any, args ...string) error {
 // api GETs path from the GitHub API into v, and fails on anything but
 // 200.
 func (g GH) api(ctx context.Context, path string, v any) error {
-	status, err := ghapi.Client{Run: g.Run, Repo: g.Repo}.API(ctx, path, v)
+	status, err := ghapi.Client{Run: g.Run, Repo: g.Repo, Timeout: g.Timeout}.API(ctx, path, v)
 	if err != nil {
 		return err
 	}
