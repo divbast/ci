@@ -35,8 +35,6 @@ const (
 //	gh-pr-list-merged-librespeed.json  gh pr list --repo divbast/librespeed-oci-image --author app/divbast-renovate --state merged --limit 40 --json number,title,createdAt,commits,statusCheckRollup
 //	gh-pr-list-pending-baikal.json     gh pr list --repo divbast/baikal-oci-image --state all --search status:pending --limit 40 --json number,title,createdAt,commits,statusCheckRollup
 //	gh-run-list-renovate-librespeed.json  gh run list --repo divbast/librespeed-oci-image --workflow renovate.yml --status success --limit 1 --json createdAt
-//	gh-run-list-slots-baikal.json      gh run list --repo divbast/baikal-oci-image --workflow build.yml --event schedule --branch main --limit 10 --json headSha,createdAt,status,url
-//	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
 //	gh-api-commits-main-baikal.txt     gh api -i repos/divbast/baikal-oci-image/commits/main
 //	gh-api-compare-ahead-baikal.txt    gh api -i repos/divbast/baikal-oci-image/compare/<baikalBase>...<baikalMain>
 //	gh-api-compare-behind-baikal.txt   gh api -i repos/divbast/baikal-oci-image/compare/<baikalMain>...<baikalBase>
@@ -45,6 +43,8 @@ const (
 //
 // and with gh 2.104.0 on 2026-11-13,
 //
+//	gh-run-list-slots-baikal.json      gh run list --repo divbast/baikal-oci-image --workflow build.yml --event schedule --branch main --limit 10 --json headSha,createdAt,status,conclusion,url
+//	gh-run-list-slots-librespeed.json  the same for divbast/librespeed-oci-image
 //	gh-api-workflow-build-baikal.txt   gh api -i repos/divbast/baikal-oci-image/actions/workflows/build.yml
 //
 // No Renovate pull request was open in either repository, so the open
@@ -81,7 +81,7 @@ func successRuns(repo, workflow string) []string {
 func slotRuns(repo, workflow string) []string {
 	return []string{
 		"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", "10", "--json", "headSha,createdAt,status,url",
+		"--limit", "10", "--json", "headSha,createdAt,status,conclusion,url",
 	}
 }
 
@@ -333,31 +333,46 @@ func TestGHSlotRuns(t *testing.T) {
 		result  execx.Result
 		want    []stall.Run
 		wantLen int
-		wantErr string
+		// wantConclusions is every run's conclusion, in order, when set.
+		wantConclusions []string
+		wantErr         string
 	}{
 		{
+			// The seventh run, on 2026-11-06, failed.
 			name:    "baikal",
 			repo:    baikal,
 			result:  stdout(testdata(t, "gh-run-list-slots-baikal.json")),
 			wantLen: 10,
 			want: []stall.Run{
 				{
-					HeadSHA:   baikalMain,
-					Created:   rfc3339(t, "2026-11-10T23:25:56Z"),
-					Completed: true,
-					URL:       "https://github.com/divbast/baikal-oci-image/actions/runs/42923306213",
+					HeadSHA:    "f235a10b970004f0b16b700a76ea7fbf98908586",
+					Created:    rfc3339(t, "2026-11-12T23:40:15Z"),
+					Completed:  true,
+					Conclusion: "success",
+					URL:        "https://github.com/divbast/baikal-oci-image/actions/runs/43330795962",
+				},
+				{
+					HeadSHA:    baikalMain,
+					Created:    rfc3339(t, "2026-11-12T00:46:44Z"),
+					Completed:  true,
+					Conclusion: "success",
+					URL:        "https://github.com/divbast/baikal-oci-image/actions/runs/43129777907",
 				},
 			},
+			wantConclusions: []string{"success", "success", "success", "success", "success", "success", "failure", "success", "failure", "success"},
 		},
 		{
-			name:   "librespeed",
-			repo:   librespeed,
-			result: stdout(testdata(t, "gh-run-list-slots-librespeed.json")),
+			name:            "librespeed",
+			repo:            librespeed,
+			result:          stdout(testdata(t, "gh-run-list-slots-librespeed.json")),
+			wantLen:         2,
+			wantConclusions: []string{"success", "success"},
 		},
 		{
+			// A run still going has no conclusion yet, which gh prints as "".
 			name: "running",
 			repo: baikal,
-			result: stdout([]byte(`[{"createdAt":"2026-11-11T18:50:00Z","headSha":"` + baikalMain +
+			result: stdout([]byte(`[{"conclusion":"","createdAt":"2026-11-11T18:50:00Z","headSha":"` + baikalMain +
 				`","status":"in_progress","url":"https://github.com/divbast/baikal-oci-image/actions/runs/1"}]`)),
 			wantLen: 1,
 			want: []stall.Run{{
@@ -393,8 +408,17 @@ func TestGHSlotRuns(t *testing.T) {
 			}
 			for i, want := range tt.want {
 				if got := runs[i]; got.HeadSHA != want.HeadSHA || !got.Created.Equal(want.Created) ||
-					got.Completed != want.Completed || got.URL != want.URL {
+					got.Completed != want.Completed || got.Conclusion != want.Conclusion || got.URL != want.URL {
 					t.Errorf("run %d = %+v, want %+v", i, got, want)
+				}
+			}
+			if tt.wantConclusions != nil {
+				got := make([]string, 0, len(runs))
+				for _, r := range runs {
+					got = append(got, r.Conclusion)
+				}
+				if !slices.Equal(got, tt.wantConclusions) {
+					t.Errorf("conclusions = %q, want %q", got, tt.wantConclusions)
 				}
 			}
 			for i, r := range runs {

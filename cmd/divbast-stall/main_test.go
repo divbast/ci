@@ -17,6 +17,8 @@ const (
 	repo     = "divbast/librespeed-oci-image"
 	image    = "ghcr.io/divbast/librespeed:latest"
 	revision = "24e63e21ef880cd22c26964ee987fa593f5e92fc"
+	// head is main, one commit past revision.
+	head = "12db81211d107c96a4d7c84f01b7afe2bac3174f"
 )
 
 var (
@@ -28,6 +30,7 @@ var (
 	pkgAPI   = []string{"gh", "api", "-i", "orgs/divbast/packages/container/librespeed"}
 	mainAPI  = []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/commits/main"}
 	repoAPI  = []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image"}
+	moveAPI  = []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/compare/" + revision + "..." + head}
 	refused  = execx.Result{Stderr: []byte("Requesting bearer token: received unexpected HTTP status: 403 Forbidden"), Code: 1}
 	indexOut = execx.Result{Stdout: []byte(`{"annotations":{"org.opencontainers.image.revision":"` + revision + `"}}`)}
 )
@@ -39,13 +42,19 @@ func successRuns(workflow string) []string {
 func slotRuns(workflow string) []string {
 	return []string{
 		"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", "10", "--json", "headSha,createdAt,status,url",
+		"--limit", "10", "--json", "headSha,createdAt,status,conclusion,url",
 	}
 }
 
 func workflowAPI(workflow string) []string {
 	return []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/actions/workflows/" + workflow}
 }
+
+// slotsSucceeded is two daily slot runs that built head and succeeded, the
+// newest twenty hours before the bubble's clock.
+const slotsSucceeded = `[` +
+	`{"conclusion":"success","createdAt":"1999-12-31T04:00:00Z","headSha":"` + head + `","status":"completed","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/2"},` +
+	`{"conclusion":"success","createdAt":"1999-12-30T04:00:00Z","headSha":"` + head + `","status":"completed","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/1"}]`
 
 // ok is a command that printed out and exited 0.
 func ok(out string) execx.Result { return execx.Result{Stdout: []byte(out)} }
@@ -156,6 +165,61 @@ func TestRun(t *testing.T) {
 				{Argv: workflowAPI("publish.yml"), Result: apiOK(`{"created_at":"1999-12-31T21:00:00Z"}`)},
 			},
 			wantStdout: "main " + revision + " is ahead of :latest (absent), with 0 lost slot(s), under 2\n",
+		},
+		{
+			// Two slot runs that succeeded and left :latest behind main
+			// lost their slots.
+			name: "slots-ungated",
+			args: []string{"slots"},
+			calls: []execx.Call{
+				{Argv: inspect, Result: indexOut},
+				{Argv: mainAPI, Result: apiOK(`{"sha":"` + head + `"}`)},
+				{Argv: slotRuns("build.yml"), Result: ok(slotsSucceeded)},
+				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
+				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
+				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
+			},
+			wantCode: 1,
+			wantStdout: "main " + head + " is unpublished, :latest is " + revision + ", and 2 or more slots were lost:\n" +
+				"  lost slot: https://github.com/divbast/librespeed-oci-image/actions/runs/2 built " + head + "\n" +
+				"  lost slot: https://github.com/divbast/librespeed-oci-image/actions/runs/1 built " + head + "\n",
+		},
+		{
+			// Content-gated, the same runs worked: each decided that no
+			// architecture's manifest had moved.
+			name: "slots-content-gated",
+			args: []string{"slots", "-content-gated"},
+			calls: []execx.Call{
+				{Argv: inspect, Result: indexOut},
+				{Argv: mainAPI, Result: apiOK(`{"sha":"` + head + `"}`)},
+				{Argv: slotRuns("build.yml"), Result: ok(slotsSucceeded)},
+				{Argv: moveAPI, Result: apiOK(`{"status":"ahead","commits":[{"sha":"` + head + `","parents":[{"sha":"` + revision + `"}],"commit":{"committer":{"date":"1999-12-29T00:00:00Z"}}}]}`)},
+			},
+			wantStdout: "main " + head + " is ahead of :latest " + revision + ", with 0 lost slot(s), under 2\n",
+		},
+		{
+			name:       "content-gated-not-slots",
+			args:       []string{"open", "-content-gated"},
+			wantCode:   2,
+			wantStderr: []string{"-content-gated"},
+		},
+		{
+			// The flag follows the check it belongs to.
+			name:       "content-gated-first",
+			args:       []string{"-content-gated", "slots"},
+			wantCode:   2,
+			wantStderr: []string{"-content-gated"},
+		},
+		{
+			name:       "slots-content-gated-extra",
+			args:       []string{"slots", "-content-gated", "open"},
+			wantCode:   2,
+			wantStderr: []string{"want one check, not 2 arguments"},
+		},
+		{
+			name:       "slots-help",
+			args:       []string{"slots", "-h"},
+			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots", "slots -content-gated"},
 		},
 		{
 			name: "slots-private",

@@ -166,19 +166,26 @@ func (g GH) LastSuccess(ctx context.Context, workflow string) (time.Time, bool, 
 // SlotRuns implements [Source].
 func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 	var raw []struct {
-		HeadSHA   string    `json:"headSha"`
-		CreatedAt time.Time `json:"createdAt"`
-		Status    string    `json:"status"`
-		URL       string    `json:"url"`
+		HeadSHA    string    `json:"headSha"`
+		CreatedAt  time.Time `json:"createdAt"`
+		Status     string    `json:"status"`
+		Conclusion string    `json:"conclusion"`
+		URL        string    `json:"url"`
 	}
 	err := g.list(ctx, &raw, "run", "list", "--repo", g.Repo, "--workflow", workflow, "--event", "schedule", "--branch", "main",
-		"--limit", strconv.Itoa(slotLimit), "--json", "headSha,createdAt,status,url")
+		"--limit", strconv.Itoa(slotLimit), "--json", "headSha,createdAt,status,conclusion,url")
 	if err != nil {
 		return nil, err
 	}
 	runs := make([]Run, 0, len(raw))
 	for _, r := range raw {
-		runs = append(runs, Run{HeadSHA: r.HeadSHA, Created: r.CreatedAt, Completed: r.Status == "completed", URL: r.URL})
+		runs = append(runs, Run{
+			HeadSHA:    r.HeadSHA,
+			Created:    r.CreatedAt,
+			Completed:  r.Status == "completed",
+			Conclusion: r.Conclusion,
+			URL:        r.URL,
+		})
 	}
 	return runs, nil
 }

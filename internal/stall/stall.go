@@ -51,6 +51,10 @@ type Config struct {
 	// RenovateWorkflow is the workflow file that runs Renovate, such as
 	// renovate.yml.
 	RenovateWorkflow string
+	// ContentGated says the slot workflow publishes only when the image's
+	// content moved, as divbast-publish-decision's -content-gated does, so
+	// that a slot run can succeed and leave an older commit published.
+	ContentGated bool
 }
 
 // Result is what a check found.
@@ -121,7 +125,10 @@ type Run struct {
 	Created time.Time
 	// Completed says it has finished, however it ended.
 	Completed bool
-	URL       string
+	// Conclusion is how it ended, as GitHub puts it, such as "success",
+	// "failure" or "cancelled", and "" until it has finished.
+	Conclusion string
+	URL        string
 }
 
 // Source answers what the checks ask about a repository.
@@ -235,6 +242,10 @@ func Renovate(ctx context.Context, s Source, c *Config) (Result, error) {
 // A finished slot run that built a commit ahead of the published one would
 // have published it, so each such run is a lost slot, whether it failed,
 // was cancelled or skipped; with nothing published, every finished run is.
+// Content-gated, a run that succeeded is never lost: it published, or
+// decided that nothing in the image had moved. One that failed, was
+// cancelled or ended any other way is lost all the same.
+//
 // So is each day with no slot run at all, after 12 hours' grace, since
 // GitHub starts them hours late. Those days count from the newest slot
 // run, finished or not, or from when main stopped being what is
@@ -288,7 +299,7 @@ func Slots(ctx context.Context, s Source, r Revisions, c *Config) (Result, error
 			continue
 		}
 		var lost bool
-		if lost, err = isLost(ctx, s, run, state, revision, since); err != nil {
+		if lost, err = isLost(ctx, s, c, run, state, revision, since); err != nil {
 			return Result{}, err
 		}
 		if lost {
@@ -364,9 +375,13 @@ func against(status string) string {
 }
 
 // isLost says whether a finished slot run should have published and did
-// not: with nothing published, any run since the slot could first run;
-// otherwise a run that built a commit ahead of the published revision.
-func isLost(ctx context.Context, s Source, run *Run, state registry.State, revision string, since time.Time) (bool, error) {
+// not. Content-gated, a run that succeeded never is. Otherwise, with
+// nothing published, any run since the slot could first run is; with a
+// commit published, a run that built a commit ahead of it.
+func isLost(ctx context.Context, s Source, c *Config, run *Run, state registry.State, revision string, since time.Time) (bool, error) {
+	if c.ContentGated && run.Conclusion == "success" {
+		return false, nil
+	}
 	if state == registry.Absent {
 		return run.Created.After(since), nil
 	}

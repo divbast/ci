@@ -453,9 +453,11 @@ func TestSlots(t *testing.T) {
 	unpublished := "main " + head + " is unpublished, :latest is " + published + ", and 2 or more slots were lost:"
 
 	tests := []struct {
-		name    string
-		src     source
-		revs    revisions
+		name string
+		src  source
+		revs revisions
+		// gated is the check's content-gated.
+		gated   bool
 		want    stall.Result
 		wantErr error
 	}{
@@ -641,6 +643,81 @@ func TestSlots(t *testing.T) {
 			want: stall.Result{Headline: "main " + head + " is ahead of :latest (absent), with 1 lost slot(s), under 2"},
 		},
 		{
+			// Content-gated, a slot run that succeeded worked, whether it
+			// published or decided that nothing in the image had moved.
+			name: "gated_success_not_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "success", URL: url2},
+					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "success", URL: url1},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			want:  stall.Result{Headline: "main " + head + " is ahead of :latest " + published + ", with 0 lost slot(s), under 2"},
+		},
+		{
+			// The same runs, not content-gated, are lost, as they always
+			// were: a run ahead of :latest that succeeded and left it
+			// there did not publish.
+			name: "ungated_success_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "success", URL: url2},
+					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "success", URL: url1},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs: revisions{revision: published, state: registry.Published},
+			want: stall.Result{Stalled: true, Headline: unpublished, Details: []string{lost(url2, head), lost(url1, built)}},
+		},
+		{
+			// Content-gated, a run that failed or was cancelled is lost
+			// as ever.
+			name: "gated_failure_lost",
+			src: source{
+				main: head,
+				runs: []stall.Run{
+					{HeadSHA: head, Created: ago(20 * time.Hour), Completed: true, Conclusion: "failure", URL: url2},
+					{HeadSHA: built, Created: ago(44 * time.Hour), Completed: true, Conclusion: "cancelled", URL: url1},
+				},
+				compares: map[string]comparison{
+					published + "..." + head:  {status: "ahead", first: ago(3 * day)},
+					published + "..." + built: ahead,
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			want:  stall.Result{Stalled: true, Headline: unpublished, Details: []string{lost(url2, head), lost(url1, built)}},
+		},
+		{
+			// And so is each day with no slot run at all.
+			name: "gated_missed_days",
+			src: source{
+				main: head,
+				runs: []stall.Run{{HeadSHA: head, Created: ago(84 * time.Hour), Completed: true, Conclusion: "success", URL: url1}},
+				compares: map[string]comparison{
+					published + "..." + head: {status: "ahead", first: ago(5 * day)},
+				},
+			},
+			revs:  revisions{revision: published, state: registry.Published},
+			gated: true,
+			want: stall.Result{
+				Stalled:  true,
+				Headline: unpublished,
+				Details:  []string{"3 day(s) with no slot run since 1999-12-28T12:00:00Z"},
+			},
+		},
+		{
 			// Main behind :latest, with no slot run and no commit to say
 			// when main stopped being what is published: as many days as
 			// make a stall.
@@ -716,7 +793,9 @@ func TestSlots(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				atEpoch(t)
-				got, err := stall.Slots(t.Context(), &tt.src, tt.revs, &config)
+				c := config
+				c.ContentGated = tt.gated
+				got, err := stall.Slots(t.Context(), &tt.src, tt.revs, &c)
 				if tt.wantErr != nil {
 					if !errors.Is(err, tt.wantErr) {
 						t.Fatalf("Slots() = %+v, %v; want an error wrapping %v", got, err, tt.wantErr)
