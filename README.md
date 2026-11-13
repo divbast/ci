@@ -357,8 +357,8 @@ test binaries running at once, such as two packages', the hold is a
 `flock` of `divbast-harness-podman-store-<uid>.lock`, which every process
 of the user's shares, as rootless Podman keeps one store for each user.
 It is in `$XDG_RUNTIME_DIR` when that is set, the user's own directory,
-and otherwise in the temporary directory. Docker is never held: its builder keeps
-what a build uses out of `image rm`'s reach.
+and otherwise in the temporary directory. Docker is never held: its
+builder keeps what a build uses out of `image rm`'s reach.
 
 Before that, every suite labelled what it made `divbast.harness=1`.
 Suites on this version no longer remove anything carrying that label.
@@ -935,10 +935,13 @@ named `publish (${{ matrix.app }})`, only that job's conclusion counts.
 GitHub decides a job's `if:` before it expands the job's matrix, so a run
 in which it skipped or cancelled the matrix, its lint red say, lists the
 job once, by its unexpanded name, which stands for every name it expands
-to: that job did not succeed. A run that never started, and so has no
-jobs, counts as the run ended. Only a run of a commit ahead of the
-published one has its jobs read, and one whose jobs include neither the
-name nor an unexpanded name standing for it fails the check, as does
+to: that job did not succeed. So give a matrix publish job a `name:`
+that holds its matrix expression, as that one does: a matrix job with
+no `name:` is listed by its bare id when skipped that way, as `publish`
+alone, which stands for no other name. A run that never started, and so
+has no jobs, counts as the run ended. Only a run of a commit ahead of
+the published one has its jobs read, and one whose jobs include neither
+the name nor an unexpanded name standing for it fails the check, as does
 `slot-job` without `content-gated`, the one slot check that reads a
 conclusion.
 
