@@ -1081,12 +1081,13 @@ containers run only when `ENGINE` is `docker` or `podman`, so
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
 test. A merge to main that passes them is released.
 
-The contract suite runs against two images. One is the published
-LibreSpeed image `internal/testfixture` pins. The other is the minimal
-fixture in `contract/testdata/minimal`, which the tests build from the
+The contract suite runs against three images. Two are the published
+LibreSpeed and Baikal images `internal/testfixture` pins, Baikal's with
+a volume and an admin password as its own suite gives it. The third is
+the minimal fixture in `contract/testdata/minimal`, which the tests build from the
 distroless runtime and the FrankenPHP binary the template copies: an app
 with no bootstrap and no volume, and nothing in it the contract does not
-need. A contract change that would fail either kind of app fails here
+need. A contract change that would fail any of the three kinds of app fails here
 first. The mutants under `contract/testdata/mutants` each break one thing
 in one of the two, and exactly the records for that one thing must fail.
 Renovate's dockerfile manager moves the digests every one of those
