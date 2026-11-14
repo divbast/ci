@@ -623,6 +623,27 @@ func TestLabelIsTheMainModules(t *testing.T) {
 	}
 }
 
+// goDirective returns the go line of the go.mod at path, as written there.
+// The scratch module a test builds takes it from ci's own, because a main
+// module whose go line is below a dependency's needs a go.mod update, which
+// -mod=readonly refuses: a line written in the test would break on every
+// bump of ci's.
+func goDirective(t *testing.T, path string) string {
+	t.Helper()
+
+	body, err := os.ReadFile(path) //nolint:gosec // G304: ci's own go.mod, named by this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.Lines(string(body)) {
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "go" {
+			return "go " + f[1]
+		}
+	}
+	t.Fatalf("%s has no go directive", path)
+	return ""
+}
+
 // TestLabelInAnotherModule is the case the label is for. An app's
 // acceptance suite is a test binary of the app's own module, which reaches
 // the harness through a replace, and its label must be the app's: were it
@@ -641,9 +662,10 @@ func TestLabelInAnotherModule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	goLine := goDirective(t, filepath.Join(ci, "go.mod"))
 	dir := t.TempDir()
 	for name, body := range map[string]string{
-		"go.mod": "module example.com/app\n\ngo 1.27.0\n\n" +
+		"go.mod": "module example.com/app\n\n" + goLine + "\n\n" +
 			"require github.com/divbast/ci v0.0.0-00010101000000-000000000000\n\n" +
 			"replace github.com/divbast/ci => " + ci + "\n",
 		"label_test.go": "package app\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/divbast/ci/harness\"\n)\n\n" +
