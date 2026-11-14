@@ -48,6 +48,46 @@ func libreSpeed(image string) Config {
 	}
 }
 
+// baikalHealthCmd is Baikal's health probe, as its HEALTHCHECK runs it and
+// as a Podman user passes it.
+var baikalHealthCmd = []string{"/usr/local/bin/frankenphp", "php-cli", "/usr/local/bin/baikal-health"}
+
+// baikal is Baikal's contract, as its Containerfile and README state it,
+// for image. It asks no more of the image than the core probe does: Baikal's
+// own suite adds a probe that asks DAV itself, and that stays there.
+func baikal(tb testing.TB, e harness.Engine, image string) Config {
+	tb.Helper()
+	volume, err := e.Volume(tb.Context(), tb, "")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return Config{
+		Image:      image,
+		AppPort:    8080,
+		HealthPort: 8081,
+		TmpfsSize:  "512m",
+		// What its bootstrap hands over to: pcntl_exec(SERVER_BIN, ['run',
+		// '--config', CADDYFILE])
+		PID1:      []string{"/usr/local/bin/frankenphp", "run", "--config", "/etc/caddy/Caddyfile"},
+		HealthCmd: baikalHealthCmd,
+		Healthcheck: Healthcheck{
+			Test:        slices.Concat([]string{"CMD"}, baikalHealthCmd),
+			Interval:    30 * time.Second,
+			Timeout:     10 * time.Second,
+			StartPeriod: 60 * time.Second,
+			Retries:     3,
+		},
+		// A first start on an empty volume refuses without the password
+		Env: map[string]string{"BAIKAL_ADMIN_PASSWORD": "fixture-admin-password"},
+		Mounts: func(testing.TB) []harness.Mount {
+			return []harness.Mount{{Source: volume, Target: "/data", Volume: true}}
+		},
+		// The health port's root, and DAV's own entry point: neither may
+		// answer there
+		HealthOnly404: []string{"/", "/dav.php"},
+	}
+}
+
 // integration returns the engine $ENGINE names, and skips t when it is
 // unset.
 func integration(t *testing.T) harness.Engine {
@@ -84,72 +124,96 @@ func checkNames(results []Result) []string {
 }
 
 // TestContractOnFixture runs the whole contract against the published
-// LibreSpeed image, which keeps it, as LibreSpeed's suite will: in the
-// scenario its bash suite named "telemetry off".
+// image of each app ci keeps one for. LibreSpeed's keeps it, as its suite
+// will, in the scenario its bash suite named "telemetry off".
 func TestContractOnFixture(t *testing.T) {
 	t.Parallel()
-	integration(t)
+	e := integration(t)
 
-	cfg := libreSpeed(testfixture.LibreSpeed)
-	cfg.Scenario = "telemetry off"
-	results := Check(t.Context(), t, &cfg)
-	want := make([]string, len(allChecks))
-	for i, name := range allChecks {
-		want[i] = "telemetry off: " + name
-	}
-	if got := checkNames(results); !slices.Equal(got, want) {
-		t.Fatalf("Check() ran %q, want %q", got, want)
-	}
+	t.Run("librespeed", func(t *testing.T) {
+		t.Parallel()
+		cfg := libreSpeed(testfixture.LibreSpeed)
+		cfg.Scenario = "telemetry off"
+		results := Check(t.Context(), t, &cfg)
+		want := make([]string, len(allChecks))
+		for i, name := range allChecks {
+			want[i] = "telemetry off: " + name
+		}
+		if got := checkNames(results); !slices.Equal(got, want) {
+			t.Fatalf("Check() ran %q, want %q", got, want)
+		}
 
-	made := make(map[string]bool)
-	for _, r := range results {
-		for _, rec := range r.Records {
-			made[rec.What] = true
-			t.Logf("%s: ok=%t %s (expected %q, found %q)", r.Check, rec.OK, rec.What, rec.Expected, rec.Found)
+		made := make(map[string]bool)
+		for _, r := range results {
+			for _, rec := range r.Records {
+				made[rec.What] = true
+				t.Logf("%s: ok=%t %s (expected %q, found %q)", r.Check, rec.OK, rec.What, rec.Expected, rec.Found)
+			}
+			if !r.OK || len(r.Records) == 0 {
+				t.Errorf("%s: OK = %t with %d records, want OK: %s", r.Check, r.OK, len(r.Records), r.Detail)
+			}
+			if c := crashed(r.Records); len(c) > 0 {
+				t.Errorf("%s: a probe crashed: %+v", r.Check, c)
+			}
 		}
-		if !r.OK || len(r.Records) == 0 {
-			t.Errorf("%s: OK = %t with %d records, want OK: %s", r.Check, r.OK, len(r.Records), r.Detail)
-		}
-		if c := crashed(r.Records); len(c) > 0 {
-			t.Errorf("%s: a probe crashed: %+v", r.Check, c)
-		}
-	}
 
-	// The names LibreSpeed's bash suite gave these checks in its sections
-	// 2, 3, 17 and 19, which its Go suite must keep making: section 17
-	// named its health checks for the scenario, and nothing else. Beside
-	// them are the records the contract adds, and the three it names for
-	// what they show, engine-healthy's the same on both engines.
-	for _, what := range []string{
-		"the image runs as uid/gid 65532 by default",
-		"PID 1's real, effective, saved and filesystem uids",
-		"PID 1's real, effective, saved and filesystem gids",
-		"/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no effective file capability",
-		xattrRecord,
-		"CapEff, every capability bit clear",
-		"CapPrm, every capability bit clear",
-		"PID 1 comm",
-		volumeRecord,
-		mountsRecordWhat,
-		"/bin/sh is absent from the image",
-		"/bin/bash is absent from the image",
-		"/bin/dash is absent from the image",
-		"TCP ports a process in the container listens on",
-		"test network really is internal",
-		"outbound TCP to 9.9.9.9:443 is refused",
-		"the image's HEALTHCHECK: the probe in exec form, with no shell, at the timings Config.Healthcheck states",
-		"telemetry off: /usr/local/bin/librespeed-health exits 0",
-		"telemetry off: /usr/local/bin/librespeed-health prints nothing",
-		"telemetry off: the engine reports the container healthy within the start period and three intervals",
-		"GET :8081/",
-		"GET :8081/backend/getIP.php",
-		"GET :8081/index.php",
-		"GET :8080/healthz",
-	} {
-		if !made[what] {
-			t.Errorf("no record named %q", what)
+		// The names LibreSpeed's bash suite gave these checks in its sections
+		// 2, 3, 17 and 19, which its Go suite must keep making: section 17
+		// named its health checks for the scenario, and nothing else. Beside
+		// them are the records the contract adds, and the three it names for
+		// what they show, engine-healthy's the same on both engines.
+		for _, what := range []string{
+			"the image runs as uid/gid 65532 by default",
+			"PID 1's real, effective, saved and filesystem uids",
+			"PID 1's real, effective, saved and filesystem gids",
+			"/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no effective file capability",
+			xattrRecord,
+			"CapEff, every capability bit clear",
+			"CapPrm, every capability bit clear",
+			"PID 1 comm",
+			volumeRecord,
+			mountsRecordWhat,
+			"/bin/sh is absent from the image",
+			"/bin/bash is absent from the image",
+			"/bin/dash is absent from the image",
+			"TCP ports a process in the container listens on",
+			"test network really is internal",
+			"outbound TCP to 9.9.9.9:443 is refused",
+			"the image's HEALTHCHECK: the probe in exec form, with no shell, at the timings Config.Healthcheck states",
+			"telemetry off: /usr/local/bin/librespeed-health exits 0",
+			"telemetry off: /usr/local/bin/librespeed-health prints nothing",
+			"telemetry off: the engine reports the container healthy within the start period and three intervals",
+			"GET :8081/",
+			"GET :8081/backend/getIP.php",
+			"GET :8081/index.php",
+			"GET :8080/healthz",
+		} {
+			if !made[what] {
+				t.Errorf("no record named %q", what)
+			}
 		}
-	}
+	})
+
+	t.Run("baikal", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := baikal(t, e, testfixture.Baikal)
+		results := Check(t.Context(), t, &cfg)
+		if got := checkNames(results); !slices.Equal(got, allChecks) {
+			t.Fatalf("Check() ran %q, want %q", got, allChecks)
+		}
+		for _, r := range results {
+			for _, rec := range r.Records {
+				t.Logf("%s: ok=%t %s (expected %q, found %q)", r.Check, rec.OK, rec.What, rec.Expected, rec.Found)
+			}
+			if !r.OK || len(r.Records) == 0 {
+				t.Errorf("%s: OK = %t with %d records, want OK: %s", r.Check, r.OK, len(r.Records), r.Detail)
+			}
+			if c := crashed(r.Records); len(c) > 0 {
+				t.Errorf("%s: a probe crashed: %+v", r.Check, c)
+			}
+		}
+	})
 }
 
 func TestValidate(t *testing.T) {

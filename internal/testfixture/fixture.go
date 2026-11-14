@@ -11,3 +11,8 @@ package testfixture
 // index digest so it can never move under a test. The index holds amd64
 // and arm64, the arches ci's tests run on.
 const LibreSpeed = "ghcr.io/divbast/librespeed@sha256:d9ea226a05957bd70876b6b3eb81ca454fefc4365902f061dba82515efb12909"
+
+// Baikal is a published ghcr.io/divbast/baikal, pinned by its index
+// digest: 0.13.0, the first image Baikal published from ci's shared
+// pipeline. The index holds amd64 and arm64.
+const Baikal = "ghcr.io/divbast/baikal@sha256:2836207715a11602263e2cd6f3ceccd63ae5c44a10b895460cf42a00bb0a7727"
