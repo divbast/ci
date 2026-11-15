@@ -339,6 +339,38 @@ replace github.com/divbast/ci => ./.ci
 The shared Renovate preset tells Renovate's gomod manager to leave
 `github.com/divbast/ci` alone.
 
+The probe the contract's checks run inside a container is a static Go
+binary, `harness/probe/core`, so it needs nothing in the image: no PHP,
+no shell, no tool of any kind. A container started with `RunSpec.Probe`
+set has it mounted read-only at `/divbast/probe`, and `AttachProbe`
+returns the `Probe` that runs it. The harness builds it once per test
+process, from the `github.com/divbast/ci` module the caller's `go.mod`
+replaces with `./.ci`, for the image's architecture, so it is always the
+pinned commit's and nothing is fetched. It puts it in an image holding
+nothing else, fills a named volume from that image, by the engine's copy
+of an image's files into an empty volume on first mount, and mounts the
+volume. The volume lives with the engine, so the probe works the same on
+CI, Docker Desktop, podman machine or a remote engine.
+
+An app adds subcommands of its own beside the core ones in either of two
+ways, each named on the `ProbeSpec` that asks for the probe:
+
+- a Go app probe, `AppPackage`: a main package of the app's own module,
+  such as `./test/probe`, built and mounted beside the core probe at
+  `/divbast/probe/app`. `harness/probekit` writes its records and sends
+  its requests, so no app reimplements the format. `Probe.RunApp` runs
+  it;
+- a PHP app probe, `PHP`: the app's `app.php` and the PHP it runs under,
+  such as FrankenPHP's `/usr/local/bin/frankenphp`, for subcommands that
+  must run as the app's own PHP: reading its ini, querying its schema,
+  seeding its users. `AttachProbe` writes it, with the PHP probe's own
+  `probe.php`, into the container's `/tmp`, and `Probe.RunPHP` runs it.
+
+The probe volume carries the harness's label and outlives the test that
+made it, since every later test of the process mounts it. A suite's
+`TestMain` removes it with `Engine.RemoveProbeVolumes` once `m.Run` has
+returned, or else the next run's `Engine.Sweep` does.
+
 The harness labels every container, image, network and volume it makes
 `divbast.harness=<module>`, the path of the main module of the test
 binary running it. A repository's acceptance suite is a test of its own
@@ -390,7 +422,7 @@ cannot. CI runners start empty, and need none of this.
 failed it, which it tells by exit status alone: 125 to 128, or Podman's
 255 with stderr opening `Error: OCI runtime error:`. It makes three
 attempts in all, a second apart, and feeds each the same stdin, so
-`InstallProbe`, the probe's subcommands, the contract's health exec and
+`AttachProbe`'s writes, the probe's subcommands, the contract's health exec and
 a suite's own execs ride out an engine that refuses an exec into a
 container still starting. A command that itself exits 125 to 128 is
 taken for the engine's, and so run again, so a command run through
@@ -403,8 +435,8 @@ no `/bin/sh` needs.
 `Container.Restart` restarts a container in place, as `<engine> restart`
 does, and returns once the engine reports it running again. The
 container keeps its ID and what its volumes hold. `/tmp` comes back a
-new, empty tmpfs on both engines, and the probe goes with it, so
-install it again. A host port the engine picked moves on Docker and
+new, empty tmpfs on both engines, and a PHP probe written there goes
+with it, so attach the probe again; the probe volume stays mounted. A host port the engine picked moves on Docker and
 stays on Podman, so read `Inspect` again for it.
 
 `Container.EngineHealthy` waits for the engine's own verdict, reached on
@@ -438,13 +470,14 @@ image and check what it answers, so no suite carries its own copy:
   two suites on one host collide. A spec with no network gets one of
   its own. `Serve` then asks for `ReadyPath`, `/` by default, from the
   host until any status comes back, for up to `ServeWithin`, a minute,
-  and installs the probe, with the app's `ProbeApp` beside it. A
+  and attaches the probe: the core probe always, and the app's own
+  beside it, as `ServeSpec.Probe` asks. A
   container that stops first, or never answers, is an error carrying
   its log. `Engine.StartServing` starts one without waiting.
 - `Serving` is the container, its `Probe`, and `Base` and `HealthBase`,
   where its ports are from the host. `Serving.Wait` waits for a path of
   its own, as `Serve` does. `Serving.Restart` restarts the container in
-  place, reads its ports again, waits, and installs the probe again.
+  place, reads its ports again, waits, and attaches the probe again.
 - `Serving.Get` and `Serving.Do` send a request from the host to `Base`
   exactly as it is written, as `curl --path-as-is` sends it, with each
   header name in the case it was given, and return a `Response`.
@@ -456,12 +489,15 @@ image and check what it answers, so no suite carries its own copy:
 - Each assertion is a named check, through `Checks`: `StatusIs` and
   `Answers` for an exact status, `Contains` and `Lacks` for text,
   `LogContains` and `LogLacks` for a container's log, `IsFile` for a
-  path present or absent, `RunRecords` for a probe subcommand's
-  records, and `Refuses` for a container that must exit with exactly
-  the status given within `ServeWithin`, and say why in its log.
-- `PHPIn` runs PHP in a container, `WithLog` adds a container's log to
-  an error, `Pause` waits, or stops when the context ends, and `Clip`
-  quotes a text for a check's detail, cut short past 600 bytes.
+  path present or absent, which the core probe looks up, `RunRecords`,
+  `RunAppRecords` and `RunPHPRecords` for the records of a core, Go app
+  or PHP app subcommand, and `Refuses` for a container that must exit
+  with exactly the status given within `ServeWithin`, and say why in its
+  log.
+- `PHPIn` runs PHP in a container, through the PHP binary given,
+  `WithLog` adds a container's log to an error, `Pause` waits, or stops
+  when the context ends, and `Clip` quotes a text for a check's detail,
+  cut short past 600 bytes.
 
 ### ci's tools in `.ci/bin`
 
@@ -565,15 +601,17 @@ the mark, above, that makes the next release major:
   `ARCHIVE` and `PUBLISHED`. Any other new name is checked against every
   caller's justfile first: frankenphp's, for one, defines `test` and
   `build-app`.
-- **Go:** the exported API of `harness` and `contract`, the two packages
-  callers import through `.ci`, or what they do wherever an unchanged
-  caller would see it: a new contract check that an image which passed
-  before now fails, say, or a harness default a caller's suite relies on.
-- **The probe:** more asked of an image than the probe asks today. It
-  runs as the image's own PHP, `/usr/local/bin/frankenphp php-cli`, and
-  needs the `posix` extension, with which `no-shell` tells a path that is
-  absent from one it may not look up. An image without it fails
-  `no-shell`.
+- **Go:** the exported API of `harness`, `harness/probekit` and
+  `contract`, the packages callers import through `.ci`, or what they do
+  wherever an unchanged caller would see it: a new contract check that an
+  image which passed before now fails, say, or a harness default a
+  caller's suite relies on.
+- **The probe:** more asked of an image, or of the engine, than the
+  probe asks today. The core probe is a static Go binary on a read-only
+  volume, so it asks nothing of the image, and of the engine only that it
+  copies an image's files into an empty named volume on first mount, as
+  Docker and Podman both do. A PHP app's own probe runs as the PHP binary
+  its `Config.PHP` names.
 - **Shared configuration:** `go/golangci.yml`, `.github/actionlint.yaml`
   or `.github/pinact.yaml` changed so that a caller's unchanged code or
   workflows fail.
@@ -583,7 +621,7 @@ waits for approval on each caller's Dependency Dashboard.
 
 v2.0.0 is such a release: it added a permission a calling job must grant,
 and made a run that passed fail. [Moving to v2](#moving-to-v2) says what
-a caller changes.
+a caller changes. v3.0.0 is another: [Moving to v3](#moving-to-v3).
 
 ### Moving to v2
 
@@ -626,6 +664,55 @@ permissions as in v1, so a repository that calls only those moves its pin
 and nothing more. An app may add an `openvex.json` ([VEX](#vex)); without
 one, `scan` passes Trivy no VEX document.
 
+### Moving to v3
+
+v3.0.0 makes the pipeline language-neutral: every check runs through a
+probe that needs nothing in the image, so an image with no PHP goes
+through the same lint, build, contract, scan and publish. A v2 caller
+changes these.
+
+- **`contract.Config`.** `ProbeApp` is gone: a PHP app sets
+  `PHP: &contract.PHP{Binary: "/usr/local/bin/frankenphp", Probe: probe.App}`.
+  `Exec` is required, the argv `file-capability` runs, which for a
+  FrankenPHP app is `[]string{"/usr/local/bin/frankenphp", "version"}`, so
+  its record reads as it did. `ExtraTCPPorts`, further ports
+  `listeners` allows, and `AppProbe`, a Go app probe's main package, are
+  new. A `ReadyProbe` that asks the app through its own subcommands runs
+  them with `p.RunPHP`.
+- **The harness.** `InstallProbe`, `ProbeDir` and `FrankenPHP` are gone. A
+  test that starts its own container sets `RunSpec.Probe` and calls
+  `AttachProbe`; `ServeSpec.ProbeApp` is `ServeSpec.Probe`, a
+  `harness.ProbeSpec` with `PHP` for a PHP app. `Probe.Run` and
+  `RunRecords` run the core probe only: an app's own subcommands run
+  through `RunPHP` and `RunPHPRecords`, or `RunApp` and `RunAppRecords`.
+  `IsFile` takes the `*Probe` in place of the container, and `PHPIn`
+  takes the PHP binary. A suite's `TestMain` may call
+  `Engine.RemoveProbeVolumes` after `m.Run`.
+- **The confinement.** `harness.Contract` adds
+  `--security-opt no-new-privileges`, mounts `/tmp` as
+  `size=<n>,noexec,nosuid,nodev`, and on Podman adds
+  `--read-only-tmpfs=false`, so Podman's own tmpfs mounts at `/run` and
+  `/var/tmp` are gone. An app that runs what it writes to `/tmp`, or
+  writes anywhere on Podman but `/tmp` and its declared mounts, fails.
+  The README and Quadlet examples gain the same flags:
+  `--security-opt no-new-privileges` (`NoNewPrivileges=true`), the tmpfs
+  options, and on Podman `--read-only-tmpfs=false` (`ReadOnlyTmpfs=false`).
+- **Four new checks**, `no-new-privs`, `seccomp`, `writable-mounts` and
+  `no-package-manager`, and two new records, the probe volume's in
+  `no-volume` and no-new-privileges' in `host-config`, join the check log.
+  Every v2 check and record keeps its name.
+- **`app-check.yml`.** `php` defaults to `false`: a PHP app passes
+  `php: true` on its `check` job. The build job runs
+  `divbast-verify-images` in place of `divbast-verify-frankenphp`
+  ([Verified inputs](#verified-inputs)), which refuses any image not
+  pinned as `<name>:<tag>@sha256:<digest>`, and needs cosign in the
+  caller's `mise.toml` as `"aqua:sigstore/cosign"`. The comment on the
+  `attestations: read` grant changes to say it verifies the attestations
+  of the images the Containerfile builds from.
+
+`lint.yml`, `app-publish.yml`, `renovate.yml` and `stall.yml` take the
+same inputs and permissions as in v2.
+
 ## Workflows
 
 The caller grants each called job its permissions. A called job gets no
@@ -653,8 +740,8 @@ workflow runs on:
 - `lint` repeats `lint.yml`'s steps. Only its pin check's skip differs:
   it names divbast/ci, which never calls `app-check.yml`, so an app's pin
   is always checked.
-- `build` verifies the FrankenPHP binary's attestation
-  ([below](#the-frankenphp-binary)), then builds the image for amd64 and
+- `build` verifies every image the Containerfile builds from
+  ([below](#verified-inputs)), then builds the image for amd64 and
   arm64 with BuildKit's provenance and SBOM, as an OCI archive. A pull
   request or push reuses the build cache. The daily slot and a manual run,
   the two that publish, never restore it, and build on the builder that
@@ -668,11 +755,13 @@ workflow runs on:
 
 | Input | Type | Default | What |
 |---|---|---|---|
-| `php` | boolean | `true` | Install PHP 8.5 and Composer for the lint job, which runs PHPStan |
+| `php` | boolean | `false` | Install PHP 8.5 and Composer for the lint job, for a lint that runs PHPStan: a PHP app passes `true` |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
 
 The calling job grants `contents: read`, `attestations: read`,
-`packages: read` and `security-events: write`.
+`packages: read` and `security-events: write`. `build` installs the
+caller's whole `mise.toml`, which declares cosign as
+`"aqua:sigstore/cosign"` for `divbast-verify-images`.
 
 `scan`, which can change code scanning alerts, installs only Go, just and
 Trivy from the caller's `mise.toml`, and turns mise's auto-install off. The
@@ -948,41 +1037,50 @@ conclusion.
 The calling job grants `contents: read`, `pull-requests: read`,
 `actions: read`, `checks: read`, `statuses: read` and `packages: read`.
 
-## Attestations
+## Verified inputs
 
-### The FrankenPHP binary
-
-An app takes its FrankenPHP binary from `ghcr.io/divbast/frankenphp` with
-one `COPY`, naming the image by tag and digest:
+Every image a Containerfile builds from is pinned, and every one whose
+publisher signs it is verified as theirs, before `app-check.yml` builds
+anything. `divbast-verify-images` reads each image a `FROM`, a
+`COPY --from=` or a `RUN --mount from=` takes, a `FROM`'s build argument
+resolved to its default:
 
 ```dockerfile
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:<digest>
+FROM ${RUNTIME_IMAGE}
 COPY --from=ghcr.io/divbast/frankenphp:librespeed@sha256:<digest> --chmod=0755 /frankenphp /usr/local/bin/frankenphp
 ```
 
-Before `app-check.yml` builds anything, `divbast-verify-frankenphp` finds
-that line and has gh verify the digest:
+Each must be `<name>:<tag>@sha256:<digest>`, written out in full, so that
+Renovate can follow the tag and move the digest. A tag with no digest, a
+`COPY --from=` built from a variable, or a `FROM` built from a build
+argument with no default before the first `FROM`, fails the build. Then
+each image in its table is verified:
+
+| Image | Verified by |
+|---|---|
+| `ghcr.io/divbast/frankenphp` | Its attestation, by divbast/frankenphp's build workflow from main, named once: `gh attestation verify oci://ghcr.io/divbast/frankenphp@sha256:<digest> --repo divbast/frankenphp --signer-workflow divbast/frankenphp/.github/workflows/build.yml@refs/heads/main --source-ref refs/heads/main` |
+| `gcr.io/distroless/*` | Its keyless signature, by the distroless project: `cosign verify gcr.io/distroless/<image>@sha256:<digest> --certificate-identity keyless@distroless.iam.gserviceaccount.com --certificate-oidc-issuer https://accounts.google.com` |
+
+So only a FrankenPHP binary that divbast/frankenphp's build made from its
+main branch, and only a distroless base the distroless project signed,
+is built into an app. A divbast image the table does not name is
+refused, and an image in it may stand only in a `FROM`, a `COPY --from=`
+or the default of a build argument a `FROM` uses: named anywhere else, a
+`LABEL` or a `RUN` among them, it is a way in no verification sees. Any
+other image, such as `golang` or `debian`, passes once it is pinned: its
+publisher signs it against no fixed identity, so the digest Renovate
+moves is what holds it.
+
+A local `just build` verifies nothing. It builds from whatever digests
+the Containerfile names. To check a Containerfile by hand, with gh
+2.102.0 or newer logged in and cosign from `mise.toml`:
 
 ```sh
-gh attestation verify oci://ghcr.io/divbast/frankenphp@sha256:<digest> \
-    --repo divbast/frankenphp \
-    --signer-workflow divbast/frankenphp/.github/workflows/build.yml@refs/heads/main \
-    --source-ref refs/heads/main
+just ci-tools && .ci/bin/divbast-verify-images
 ```
 
-So only a binary that divbast/frankenphp's build workflow made from its
-main branch is built into an app: not a pull request's build, and not
-another repository's image. The Containerfile must name the image exactly
-once, as `<tag>@sha256:<digest>`, so that Renovate can move it; a tag with
-no digest, a `--from=` built from a variable, or one that takes from a
-stage whose image holds an unresolved build argument, fails the build.
-
-A local `just build` does not verify the attestation. It builds from
-whatever digest the Containerfile names. To check a Containerfile by hand,
-with gh 2.102.0 or newer logged in:
-
-```sh
-just ci-tools && .ci/bin/divbast-verify-frankenphp
-```
+## Attestations
 
 ### Published images
 
@@ -1031,7 +1129,7 @@ the token was found.
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
-| `divbast-verify-frankenphp [-containerfile FILE]` | Refuses a FrankenPHP binary frankenphp's main build did not attest | Verified | Not verified, or the Containerfile names the image other than once in full |
+| `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old, or a verification failed |
 | `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
 ## Shared configuration
@@ -1081,13 +1179,16 @@ containers run only when `ENGINE` is `docker` or `podman`, so
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
 test. A merge to main that passes them is released.
 
-The contract suite runs against three images. Two are the published
+The contract suite runs against four images. Two are the published
 LibreSpeed and Baikal images `internal/testfixture` pins, Baikal's with
 a volume and an admin password as its own suite gives it. The third is
 the minimal fixture in `contract/testdata/minimal`, which the tests build from the
 distroless runtime and the FrankenPHP binary the template copies: an app
 with no bootstrap and no volume, and nothing in it the contract does not
-need. A contract change that would fail any of the three kinds of app fails here
+need. The fourth is the Go fixture in `contract/testdata/minimal-go`, a
+static stdlib server on static-debian13 with no PHP and no shell at all,
+and a Go app probe of its own, `contract/internal/minimalgoprobe`. A
+contract change that would fail any of those kinds of app fails here
 first. The mutants under `contract/testdata/mutants` each break one thing
 in one of the two, and exactly the records for that one thing must fail.
 Renovate's dockerfile manager moves the digests every one of those
