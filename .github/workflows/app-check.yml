@@ -12,10 +12,12 @@
 # uploads each as the artifact image-<arch>.
 #
 # The caller's job grants contents: read, attestations: read,
-# packages: read and security-events: write. Of the caller's mise.toml,
-# the scan job installs only Go, just and Trivy, each declared at one
-# version: Go as "core:go" (mise reads the short "go" the same way), and
-# just and Trivy as exactly "aqua:casey/just" and
+# packages: read and security-events: write. The build job installs the
+# caller's whole mise.toml, which must declare cosign as
+# "aqua:sigstore/cosign", for divbast-verify-images. Of the caller's
+# mise.toml, the scan job installs only Go, just and Trivy, each declared
+# at one version: Go as "core:go" (mise reads the short "go" the same
+# way), and just and Trivy as exactly "aqua:casey/just" and
 # "aqua:aquasecurity/trivy".
 name: app-check
 
@@ -25,7 +27,7 @@ on:
       php:
         description: Install PHP 8.5 and Composer, for a lint that runs PHPStan
         type: boolean
-        default: true
+        default: false
       no-cache-filters:
         description: >-
           No effect. The daily slot and a manual run already build every
@@ -111,7 +113,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      attestations: read # verify the FrankenPHP binary's attestation
+      attestations: read # verify the attestations of the images the Containerfile builds from
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,10 +146,12 @@ jobs:
           go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
           .ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
 
-      # Before anything is built from it: the binary must come from
-      # divbast/frankenphp's own build on main, by the digest the
-      # Containerfile names. A local `just build` skips this.
-      - name: Verify the FrankenPHP binary's attestation
+      # Before anything is built from them: every image the Containerfile
+      # names must be pinned by digest, and each whose publisher signs it
+      # verified as theirs, divbast/frankenphp by its main build's
+      # attestation and distroless by its cosign signature. A local
+      # `just build` skips this.
+      - name: Verify the images the Containerfile builds from
         env:
           GH_TOKEN: ${{ github.token }}
         run: .ci/bin/divbast-verify-images

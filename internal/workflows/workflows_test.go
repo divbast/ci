@@ -59,7 +59,7 @@ func TestWriteScopedJobsInstallOnlyWhatTheyName(t *testing.T) {
 func TestCheck(t *testing.T) {
 	t.Parallel()
 	const bare = "    steps:\n      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7\n"
-	const scope = "      attestations: read # verify the FrankenPHP binary's attestation\n"
+	const scope = "      attestations: read # verify the attestations of the images the Containerfile builds from\n"
 	const mint = "      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0\n"
 	tests := []struct {
 		name    string
@@ -347,7 +347,7 @@ func TestScanReadsPackages(t *testing.T) {
 		grant = "      packages: read # ask GitHub whether a published image the registry refuses is absent or private\n"
 		token = "          GH_TOKEN: ${{ github.token }}\n"
 		scan  = "      - name: Vulnerability scan\n"
-		build = "      attestations: read # verify the FrankenPHP binary's attestation\n"
+		build = "      attestations: read # verify the attestations of the images the Containerfile builds from\n"
 	)
 	for name, mutant := range map[string]string{
 		"no grant":                   strings.Replace(check, grant, "", 1),
@@ -371,6 +371,61 @@ func TestScanReadsPackages(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAppCheckVerifiesImages checks that app-check.yml's build job runs
+// divbast-verify-images before it sets up the builder, so no image the
+// Containerfile names is pulled into a build before it is verified, and
+// that the php input defaults to false: an app that is not PHP's gets no
+// PHP. Against app-check.yml as it is, then with each broken.
+func TestAppCheckVerifiesImages(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := verifiesImagesFirst(check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		verify = "      - name: Verify the images the Containerfile builds from\n"
+		buildx = "      - uses: docker/setup-buildx-action@"
+	)
+	for name, mutant := range map[string]string{
+		"verified after the builder": moveStep(check, buildx, verify),
+		"the old verifier":           strings.Replace(check, "run: .ci/bin/divbast-verify-images", "run: .ci/bin/divbast-verify-frankenphp", 1),
+		"no verifier":                strings.Replace(check, "run: .ci/bin/divbast-verify-images", "run: true", 1),
+		"php by default":             replaceAfter(check, "      php:\n", "        default: false\n", "        default: true\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if verifiesImagesFirst(mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// verifiesImagesFirst returns an error unless the build job runs
+// .ci/bin/divbast-verify-images in a step before its first
+// docker/setup-buildx-action, and the php input defaults to false.
+func verifiesImagesFirst(workflow string) error {
+	lines := linesOf(workflow)
+	if !slices.Contains(declaration(lines, "php"), "default: false") {
+		return errors.New("the php input does not default to false")
+	}
+	build := steps(jobsOf(lines)["build"])
+	verify := stepsWhere(build, func(l line) bool { return strings.TrimSpace(l.text) == "run: .ci/bin/divbast-verify-images" })
+	buildx := stepsWhere(build, isUses("docker/setup-buildx-action"))
+	switch {
+	case len(verify) != 1:
+		return fmt.Errorf("the build job runs .ci/bin/divbast-verify-images in %d steps, want one", len(verify))
+	case len(buildx) == 0:
+		return errors.New("the build job sets up no builder")
+	case verify[0] > buildx[0]:
+		return fmt.Errorf("the build job verifies the images in step %d, after it sets up the builder in step %d", verify[0]+1, buildx[0]+1)
+	}
+	return nil
 }
 
 // scanReadsPackages returns an error unless the workflow's scan job grants
