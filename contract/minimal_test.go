@@ -8,13 +8,11 @@ import (
 	"slices"
 	"testing"
 	"time"
-
-	"github.com/divbast/ci/harness"
 )
 
 // minimalHealthCmd is the minimal fixture's health probe, as its
 // HEALTHCHECK runs it and as a Podman user passes it.
-var minimalHealthCmd = []string{harness.FrankenPHP, "php-cli", "/usr/local/bin/minimal-health"}
+var minimalHealthCmd = []string{frankenPHP, "php-cli", "/usr/local/bin/minimal-health"}
 
 // minimal is the contract of the minimal fixture, testdata/minimal, for
 // image: an app with no bootstrap, whose server is PID 1 straight from its
@@ -25,7 +23,7 @@ func minimal(image string) Config {
 		AppPort:    8080,
 		HealthPort: 8081,
 		TmpfsSize:  "16m",
-		PID1:       []string{harness.FrankenPHP, "run", "--config", "/etc/frankenphp/Caddyfile"},
+		PID1:       []string{frankenPHP, "run", "--config", "/etc/frankenphp/Caddyfile"},
 		HealthCmd:  minimalHealthCmd,
 		Healthcheck: Healthcheck{
 			Test:        slices.Concat([]string{"CMD"}, minimalHealthCmd),

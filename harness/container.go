@@ -109,6 +109,11 @@ type RunSpec struct {
 	// Extra holds raw flags, placed just before the image, for a negative
 	// test to loosen what the fields above set.
 	Extra []string
+	// Probe, when set, has [Engine.Start] mount the probe volume for the
+	// image's architecture read-only at ProbeMount, after Mounts, so that
+	// [AttachProbe] can run the probe in the container. [Engine.Run]
+	// refuses it.
+	Probe *ProbeSpec
 }
 
 // validate refuses a spec the engine would read differently from what it
@@ -225,11 +230,18 @@ func (e Engine) Start(ctx context.Context, tb testing.TB, spec *RunSpec) (*Conta
 	if s.Name == "" {
 		s.Name = uniqueName()
 	}
+	if s.Probe != nil {
+		probe, err := e.probeMount(ctx, tb, &s)
+		if err != nil {
+			return nil, err
+		}
+		s.Mounts = append(slices.Clone(s.Mounts), probe)
+	}
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
 
-	c := &Container{Name: s.Name, engine: e, network: s.Network}
+	c := &Container{Name: s.Name, engine: e, network: s.Network, probe: s.Probe}
 	// Registered before the run: a container can be created and then fail
 	// to start, and it is removed all the same. One whose name was already
 	// another container's made nothing, and that other is not its to remove.
@@ -329,6 +341,9 @@ func (e Engine) Run(ctx context.Context, tb testing.TB, spec *RunSpec) (Result, 
 	if s.Name == "" {
 		s.Name = uniqueName()
 	}
+	if s.Probe != nil {
+		return Result{}, errors.New("the run spec asks for the probe, which only a container Start started can have")
+	}
 	if err := s.validate(); err != nil {
 		return Result{}, err
 	}
@@ -364,6 +379,23 @@ type Container struct {
 	engine  Engine
 	network string
 	started time.Time
+	// probe is the probe the container was started with, nil for none.
+	probe *ProbeSpec
+}
+
+// probeMount returns the read-only mount of the probe volume for s's
+// image, making the volume on first use.
+func (e Engine) probeMount(ctx context.Context, tb testing.TB, s *RunSpec) (Mount, error) {
+	tb.Helper()
+	arch, err := e.probeArch(ctx, tb, s.Image)
+	if err != nil {
+		return Mount{}, err
+	}
+	volume, err := e.probeVolume(ctx, tb, arch, s.Probe.AppPackage)
+	if err != nil {
+		return Mount{}, err
+	}
+	return Mount{Source: volume, Target: ProbeMount, Volume: true, ReadOnly: true}, nil
 }
 
 // String returns the container's name, or its ID if it has none.
@@ -460,8 +492,8 @@ const podmanRuntimeError = "Error: OCI runtime error:"
 // ci's TestRestartSameContainer asserts on each:
 //
 //   - A volume keeps what was written to it.
-//   - The tmpfs at /tmp is a new, empty one on both engines. A probe
-//     [InstallProbe] put there is gone: install it again.
+//   - The tmpfs at /tmp is a new, empty one on both engines. A PHP probe
+//     [AttachProbe] wrote there is gone: attach it again.
 //   - A host port the engine picked, as -p 127.0.0.1::8080 asks it to, is
 //     picked again by Docker, which binds another port, and kept by
 //     Podman, which picked it once, when it made the container. Read
@@ -574,6 +606,9 @@ type HealthLog struct {
 // Config is the configuration a container runs with, or the one an image
 // declares, as [Engine.ImageConfig] reads it.
 type Config struct {
+	// Architecture is an image's, as its configuration names it: amd64 or
+	// arm64. [Engine.ImageConfig] sets it; a container's is empty.
+	Architecture string `json:"-"`
 	// User is the uid:gid it runs as: --user, or else the image's own.
 	User string
 	// Healthcheck is the health check the engine runs, or the image's

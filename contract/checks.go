@@ -70,11 +70,12 @@ func (s *suite) start(ctx context.Context, tb testing.TB, loosen []string) error
 		Mounts:    mounts,
 		HealthCmd: s.cfg.HealthCmd,
 		Extra:     loosen,
+		Probe:     s.probeSpec(),
 	})
 	if err != nil {
 		return err
 	}
-	p, err := harness.InstallProbe(ctx, c, s.cfg.ProbeApp)
+	p, err := harness.AttachProbe(ctx, c)
 	if err != nil {
 		return stopped(ctx, c, fmt.Errorf("installing the probe: %w", err))
 	}
@@ -88,6 +89,16 @@ func (s *suite) start(ctx context.Context, tb testing.TB, loosen []string) error
 	}
 	s.ctr, s.probe = c, p
 	return nil
+}
+
+// probeSpec is the probe the container under test is started with: the
+// core probe, and the app's own subcommands beside it.
+func (s *suite) probeSpec() *harness.ProbeSpec {
+	spec := &harness.ProbeSpec{}
+	if len(s.cfg.ProbeApp) > 0 {
+		spec.PHP = &harness.PHPProbe{Binary: frankenPHP, Probe: s.cfg.ProbeApp}
+	}
+	return spec
 }
 
 // awaitReady returns once the app's own Ready or ReadyProbe says the app
@@ -203,7 +214,11 @@ func runtimeUserRecords(user, out string) ([]harness.Record, error) {
 // fileCapabilityRecord is the record file-capability makes. It names what
 // the exec shows: a capability with no effective bit runs as any binary
 // does, and only no-file-capability-xattr's scan sees it.
-const fileCapabilityRecord = harness.FrankenPHP + " runs under --cap-drop ALL, so it carries no effective file capability"
+// frankenPHP is the binary file-capability runs, and the PHP a ProbeApp
+// runs under.
+const frankenPHP = "/usr/local/bin/frankenphp"
+
+const fileCapabilityRecord = frankenPHP + " runs under --cap-drop ALL, so it carries no effective file capability"
 
 // fileCapability runs the FrankenPHP binary under the contract. A binary
 // carrying a file capability with the effective bit, which --cap-drop ALL
@@ -216,7 +231,7 @@ func (s *suite) fileCapability(ctx context.Context, tb testing.TB) ([]harness.Re
 		Image:      s.cfg.Image,
 		Network:    "none",
 		Confine:    harness.Contract(s.cfg.TmpfsSize),
-		Entrypoint: []string{harness.FrankenPHP},
+		Entrypoint: []string{frankenPHP},
 		Args:       []string{"version"},
 	})
 	if err != nil {
@@ -243,7 +258,7 @@ func (s *suite) fileCapability(ctx context.Context, tb testing.TB) ([]harness.Re
 // /usr/local/bin/frankenphp: operation not permitted", or crun's "exec
 // container process `/usr/local/bin/frankenphp`: Operation not permitted".
 func execRefused(out string) bool {
-	return strings.Contains(strings.ToLower(out), "operation not permitted") && strings.Contains(out, harness.FrankenPHP)
+	return strings.Contains(strings.ToLower(out), "operation not permitted") && strings.Contains(out, frankenPHP)
 }
 
 // xattrRecord is the record no-file-capability-xattr makes.
@@ -444,7 +459,9 @@ func (s *suite) noVolume(ctx context.Context, _ testing.TB) ([]harness.Record, e
 
 // mountsRecord checks the mounts ins reports are exactly the contract's
 // tmpfs at /tmp and given, the mounts the app's Config gave the
-// container, each read-only if it was given so.
+// container, each read-only if it was given so. The probe's own volume,
+// read-only at harness.ProbeMount, is set aside, once: the harness
+// mounts it to run the checks, and nothing ships with it.
 func mountsRecord(given []harness.Mount, ins *harness.Inspect) harness.Record {
 	want := make([]string, 0, 1+len(given))
 	want = append(want, "tmpfs /tmp")
@@ -459,7 +476,12 @@ func mountsRecord(given []harness.Mount, ins *harness.Inspect) harness.Record {
 	for dest := range ins.HostConfig.Tmpfs {
 		found = append(found, mountName("tmpfs", dest, true))
 	}
+	probe := false
 	for _, m := range ins.Mounts {
+		if !probe && m.Type == "volume" && m.Destination == harness.ProbeMount && !m.RW {
+			probe = true
+			continue
+		}
 		found = append(found, mountName(m.Type, m.Destination, m.RW))
 	}
 	slices.Sort(want)

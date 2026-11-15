@@ -154,7 +154,7 @@ func TestStartServingPublishes(t *testing.T) {
 			t.Parallel()
 			sc := &script{inspect: [][]byte{tt.inspect}}
 
-			s, err := newEngine("docker", sc).StartServing(t.Context(), t, &tt.sp)
+			s, err := probedEngine(sc).StartServing(t.Context(), t, &tt.sp)
 			if err != nil {
 				t.Fatalf("StartServing() error = %v", err)
 			}
@@ -208,7 +208,7 @@ func TestStartServingRefuses(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			sc := &script{}
-			s, err := newEngine("docker", sc).StartServing(t.Context(), t, &tt.sp)
+			s, err := probedEngine(sc).StartServing(t.Context(), t, &tt.sp)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("StartServing() = %+v, %v; want an error containing %q", s, err, tt.wantErr)
 			}
@@ -246,7 +246,7 @@ func TestStartServingPortsMissing(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			sc := &script{inspect: [][]byte{tt.inspect}, logs: "refusing: on purpose\n"}
-			s, err := newEngine("docker", sc).StartServing(t.Context(), t, &sp)
+			s, err := probedEngine(sc).StartServing(t.Context(), t, &sp)
 			for _, want := range tt.wantText {
 				if err == nil || !strings.Contains(err.Error(), want) {
 					t.Errorf("StartServing() = %+v, %v; want an error containing %q", s, err, want)
@@ -300,16 +300,32 @@ func replying(replies ...any) (rt http.RoundTripper, urls func() []string) {
 	}
 }
 
-// installCalls is what InstallProbe runs in container abc for app.
+// installCalls is what AttachProbe runs in container abc for a PHP app
+// probe app: nothing for none, since the core probe is on its volume.
 func installCalls(app []byte) []execx.Call {
-	install := func(file string) []string {
-		return []string{"docker", "exec", "-i", "abc", FrankenPHP, "php-cli", "-r", installCode(file)}
+	if len(app) == 0 {
+		return nil
 	}
-	calls := []execx.Call{{Argv: install("/tmp/divbast-probe/core.php"), Stdin: coreProbe}}
-	if len(app) > 0 {
-		calls = append(calls, execx.Call{Argv: install("/tmp/divbast-probe/app.php"), Stdin: app})
+	return []execx.Call{
+		{Argv: installArgv(frankenphp, "/tmp/divbast-probe/probe.php"), Stdin: phpProbe},
+		{Argv: installArgv(frankenphp, "/tmp/divbast-probe/app.php"), Stdin: app},
 	}
-	return calls
+}
+
+// probeFor is the probe a Serving started for a PHP app probe app has.
+func probeFor(app []byte) *ProbeSpec {
+	if len(app) == 0 {
+		return &ProbeSpec{}
+	}
+	return &ProbeSpec{PHP: &PHPProbe{Binary: frankenphp, Probe: app}}
+}
+
+// probedEngine is a docker engine over run whose probe volume for img is
+// made already.
+func probedEngine(run execx.StdinRunner) Engine {
+	e := newEngine("docker", run)
+	probed(e, "", "probe-vol")
+	return e
 }
 
 // TestServingWait waits for a container to serve: any status from the
@@ -388,9 +404,8 @@ func TestServingWait(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				rt, _ := replying(tt.replies...)
 				s := &Serving{
-					C:         &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))},
+					C:         &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...)), probe: probeFor(tt.app)},
 					Base:      "http://127.0.0.1:40001",
-					probeApp:  tt.app,
 					transport: rt,
 				}
 
@@ -464,14 +479,13 @@ func TestServingRestartSteps(t *testing.T) {
 				rt, urls := replying(tt.replies...)
 				old := &Probe{}
 				s := &Serving{
-					C:          &Container{ID: "abc", Name: "ctr", engine: newEngine("docker", execx.NewFake(t, tt.calls...))},
+					C:          &Container{ID: "abc", Name: "ctr", engine: newEngine("docker", execx.NewFake(t, tt.calls...)), probe: probeFor(app)},
 					Probe:      old,
 					Base:       "http://127.0.0.1:40001",
 					HealthBase: "http://127.0.0.1:40002",
 					appPort:    8080,
 					healthPort: 8081,
 					readyPath:  "/ready",
-					probeApp:   app,
 					transport:  rt,
 				}
 
@@ -783,7 +797,7 @@ func TestServingHealthAcrossRestart(t *testing.T) {
 				ctx := t.Context()
 				rt, urls := replying(http.StatusOK)
 				s := &Serving{
-					C:          &Container{ID: "abc", Name: "ctr", engine: newEngine("docker", execx.NewFake(t, slices.Concat([]execx.Call{restart, moved, moved}, installCalls(nil))...))},
+					C:          &Container{ID: "abc", Name: "ctr", engine: newEngine("docker", execx.NewFake(t, slices.Concat([]execx.Call{restart, moved, moved}, installCalls(nil))...)), probe: probeFor(nil)},
 					Base:       "http://127.0.0.1:40001",
 					HealthBase: "http://127.0.0.1:40002",
 					appPort:    8080,
@@ -827,7 +841,7 @@ func TestServingHealthWait(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rt, urls := replying(http.StatusOK)
 		s := &Serving{
-			C:          &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, installCalls(nil)...))},
+			C:          &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, installCalls(nil)...)), probe: probeFor(nil)},
 			Base:       "http://127.0.0.1:40001",
 			HealthBase: "http://127.0.0.1:40002",
 			transport:  rt,
@@ -868,7 +882,7 @@ func TestServingGetUnfollowed(t *testing.T) {
 func TestPHPIn(t *testing.T) {
 	t.Parallel()
 
-	run := []string{"docker", "exec", "abc", FrankenPHP, "php-cli", "-r", "echo 1;"}
+	run := []string{"docker", "exec", "abc", frankenphp, "php-cli", "-r", "echo 1;"}
 	tests := []struct {
 		name    string
 		res     execx.Result

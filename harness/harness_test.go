@@ -747,7 +747,7 @@ var (
 	notFound = execx.Result{Code: 127, Stderr: []byte(`OCI runtime exec failed: exec failed: unable to start container process: exec: "/bin/sh": stat /bin/sh: no such file or directory` + "\n")}
 	// Docker 29, for a file that is not executable.
 	notExecutable = execx.Result{Code: 126, Stderr: []byte(`OCI runtime exec failed: exec failed: unable to start container process: exec: "/etc/passwd": permission denied` + "\n")}
-	// FrankenPHP's PHP, for a fatal error, which exits 255 too.
+	// frankenphp's PHP, for a fatal error, which exits 255 too.
 	phpFatal = execx.Result{Code: 255, Stderr: []byte("PHP Fatal error:  Uncaught Error: Call to undefined function f() in Command line code:1\n")}
 )
 
@@ -761,7 +761,7 @@ var (
 func TestExecRetriesEngineFailure(t *testing.T) {
 	t.Parallel()
 
-	argv := []string{FrankenPHP, "php-cli", "-r", "echo 1;"}
+	argv := []string{frankenphp, "php-cli", "-r", "echo 1;"}
 	tests := []struct {
 		name   string
 		engine string
@@ -1180,7 +1180,7 @@ func TestRun(t *testing.T) {
 		Name:       "ctr",
 		Network:    "none",
 		Confine:    Contract("16m"),
-		Entrypoint: []string{FrankenPHP},
+		Entrypoint: []string{frankenphp},
 		Args:       []string{"version"},
 	}
 	// What Docker 29 printed for a binary carrying a file capability: the
@@ -1192,7 +1192,7 @@ func TestRun(t *testing.T) {
 			Argv: []string{
 				"docker", "run", "--rm", "--label", ownLabel, "--name", "ctr",
 				"--cap-drop", "ALL", "--read-only", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m",
-				"--network", "none", "--entrypoint", FrankenPHP, "img", "version",
+				"--network", "none", "--entrypoint", frankenphp, "img", "version",
 			},
 			Result: refused,
 		},
@@ -1672,154 +1672,6 @@ func TestChecksLogUnwritable(t *testing.T) {
 	}
 }
 
-// probeArgv is how the harness runs one probe subcommand in container abc.
-func probeArgv(args ...string) []string {
-	return slices.Concat([]string{"docker", "exec", "abc", "/usr/local/bin/frankenphp", "php-cli", "/tmp/divbast-probe/core.php"}, args)
-}
-
-func TestInstallProbe(t *testing.T) {
-	t.Parallel()
-
-	install := func(file string) []string {
-		return []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode(file)}
-	}
-	app := []byte("<?php return [];\n")
-	tests := []struct {
-		name    string
-		app     []byte
-		calls   []execx.Call
-		wantErr string
-	}{
-		{
-			name:  "core-only",
-			calls: []execx.Call{{Argv: install("/tmp/divbast-probe/core.php"), Stdin: coreProbe}},
-		},
-		{
-			name: "core-and-app",
-			app:  app,
-			calls: []execx.Call{
-				{Argv: install("/tmp/divbast-probe/core.php"), Stdin: coreProbe},
-				{Argv: install("/tmp/divbast-probe/app.php"), Stdin: app},
-			},
-		},
-		{
-			name: "write-fails",
-			calls: []execx.Call{{Argv: install("/tmp/divbast-probe/core.php"), Stdin: coreProbe, Result: execx.Result{
-				Code: 1, Stderr: []byte("cannot write /tmp/divbast-probe/core.php: No space left on device\n"),
-			}}},
-			wantErr: "No space left on device",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))}
-			p, err := InstallProbe(t.Context(), c, tt.app)
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Errorf("InstallProbe() = %v, %v; want an error containing %q", p, err, tt.wantErr)
-				}
-				return
-			}
-			if err != nil || p == nil {
-				t.Errorf("InstallProbe() = %v, %v; want a probe", p, err)
-			}
-		})
-	}
-}
-
-// TestInstallProbeRetries installs the probe through an engine that
-// refuses the exec, as Docker once did to a container still starting: the
-// install rides on Exec's retry, which feeds the file again, and once the
-// third attempt is refused too, the error says what was being installed.
-func TestInstallProbeRetries(t *testing.T) {
-	t.Parallel()
-
-	install := execx.Call{
-		Argv:  []string{"docker", "exec", "-i", "abc", "/usr/local/bin/frankenphp", "php-cli", "-r", installCode("/tmp/divbast-probe/core.php")},
-		Stdin: coreProbe,
-	}
-	refused := install
-	refused.Result = stoppedRefusal
-	tests := []struct {
-		name     string
-		calls    []execx.Call
-		wantText []string
-	}{
-		{
-			name:  "engine-refused-then-installed",
-			calls: []execx.Call{refused, install},
-		},
-		{
-			name:     "engine-refuses-every-time",
-			calls:    []execx.Call{refused, refused, refused},
-			wantText: []string{"installing /tmp/divbast-probe/core.php", "attempt 3 of 3", "cannot exec in a stopped container"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			synctest.Test(t, func(t *testing.T) {
-				c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))}
-				p, err := InstallProbe(t.Context(), c, nil)
-				if len(tt.wantText) == 0 {
-					if err != nil || p == nil {
-						t.Errorf("InstallProbe() = %v, %v; want a probe", p, err)
-					}
-					return
-				}
-				for _, want := range tt.wantText {
-					if err == nil || !strings.Contains(err.Error(), want) {
-						t.Errorf("InstallProbe() = %v, %v; want an error containing %q", p, err, want)
-					}
-				}
-			})
-		})
-	}
-}
-
-func TestProbeRun(t *testing.T) {
-	t.Parallel()
-
-	okRecord := "ok\tCapEff, every capability bit clear\t0\t0\n"
-	failRecord := "FAIL\tCapBnd, every capability bit clear\t0\t2000\n"
-	tests := []struct {
-		name     string
-		res      execx.Result
-		want     int
-		wantText string
-	}{
-		{name: "all-ok", res: execx.Result{Stdout: []byte(okRecord + okRecord)}, want: 2},
-		// A FAIL is the caller's to report, not an error.
-		{name: "a-fail", res: execx.Result{Code: 1, Stdout: []byte(okRecord + failRecord)}, want: 2},
-		{name: "fail-but-exit-0", res: execx.Result{Stdout: []byte(failRecord)}, wantText: "disagrees"},
-		{name: "exit-1-but-all-ok", res: execx.Result{Code: 1, Stdout: []byte(okRecord)}, wantText: "disagrees"},
-		{name: "usage", res: execx.Result{Code: 2, Stderr: []byte("unknown subcommand 'assert-caps'\n")}, wantText: "unknown subcommand"},
-		{name: "no-records", res: execx.Result{Code: 1, Stderr: []byte("Error response from daemon: container abc is not running\n")}, wantText: "not running"},
-		{name: "not-records", res: execx.Result{Stdout: []byte(okRecord + "Warning: something\n")}, wantText: "not a record"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			p := &Probe{c: &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t,
-				execx.Call{Argv: probeArgv("assert-caps"), Result: tt.res},
-			))}}
-			got, err := p.Run(t.Context(), "assert-caps")
-			if tt.wantText != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantText) {
-					t.Errorf("Run() = %+v, %v; want an error containing %q", got, err, tt.wantText)
-				}
-				return
-			}
-			if err != nil || len(got) != tt.want {
-				t.Errorf("Run() = %+v, %v; want %d records", got, err, tt.want)
-			}
-		})
-	}
-}
-
 func TestParseHTTP(t *testing.T) {
 	t.Parallel()
 
@@ -1937,145 +1789,5 @@ func TestHostClient(t *testing.T) {
 	// The redirect is the answer: following it would turn a 302 into a 200.
 	if resp.StatusCode != http.StatusFound {
 		t.Errorf("GET / status = %d, want 302, unfollowed", resp.StatusCode)
-	}
-}
-
-// php returns the host's php, skipping t without one: the probe runs as
-// the container's PHP in the integration tests, and here as the host's.
-func php(t *testing.T) string {
-	t.Helper()
-	bin, err := exec.LookPath("php")
-	switch {
-	case err == nil:
-	case os.Getenv("GITHUB_ACTIONS") == "true":
-		// CI sets PHP up, and a skip there would leave the probe untested.
-		t.Fatalf("no php on PATH, which CI provides: %v", err)
-	default:
-		t.Skip("no php on PATH to run the probe with")
-	}
-	return bin
-}
-
-// runPHP runs the probe script with php and arguments.
-func runPHP(t *testing.T, script string, args ...string) execx.Result {
-	t.Helper()
-	res, err := execx.OS{}.Run(t.Context(), php(t), append([]string{script}, args...)...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return res
-}
-
-// TestListenersParser runs the probe's own socket parsing over tables
-// taken from the LibreSpeed fixture under Docker, on an internal network,
-// where Docker's resolver keeps a TCP listener and a UDP socket at
-// 127.0.0.11 that no process in the container holds. proc-net-udp adds,
-// by hand, a UDP socket that one does hold, at port 5353. The resolver's
-// UDP port, 60327, sorts after it, so only the whole of what the parser
-// printed shows it was left out.
-func TestListenersParser(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		tcp, udp string
-		wantCode int
-		want     string
-	}{
-		{name: "held-udp-reported-resolver-ignored", tcp: "proc-net-tcp", udp: "proc-net-udp", want: "udp 5353\n"},
-		{name: "held-tcp-listeners", tcp: "proc-net-tcp6", udp: "proc-net-udp6", want: "tcp 8080\ntcp 8081\n"},
-		{
-			name: "malformed-table", tcp: "proc-net-malformed", udp: "proc-net-udp6", wantCode: 1,
-			want: "FAIL\tparse-listeners completed\tno exception\t" +
-				"RuntimeException: testdata/proc-net-malformed has a line that is not a socket: this is not a socket\n",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			res := runPHP(t, "probe/core.php", "parse-listeners",
-				filepath.Join("testdata", tt.tcp), filepath.Join("testdata", tt.udp), filepath.Join("testdata", "proc-net-fds"))
-			if res.Code != tt.wantCode || string(res.Stdout) != tt.want {
-				t.Errorf("parse-listeners = exit %d, stdout %q, stderr %q; want exit %d, stdout %q",
-					res.Code, res.Stdout, res.Stderr, tt.wantCode, tt.want)
-			}
-		})
-	}
-}
-
-func TestProbeDispatch(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		app      string // app.php beside core.php; none when empty
-		args     []string
-		wantCode int
-		want     string // the start of stdout, or of stderr when wantCode is 2
-	}{
-		{name: "no-subcommand", wantCode: 2, want: "no subcommand given"},
-		{name: "unknown", args: []string{"assert-everything"}, wantCode: 2, want: "unknown subcommand 'assert-everything'"},
-		{name: "variadic-needs-one", args: []string{"assert-pid1"}, wantCode: 2, want: "assert-pid1 takes <argv>..., got 0"},
-		{name: "fixed-arity", args: []string{"probe-egress", "extra"}, wantCode: 2, want: "probe-egress takes no arguments, got 1"},
-		{name: "user-takes-nothing", args: []string{"user", "65532"}, wantCode: 2, want: "user takes no arguments, got 1"},
-		{
-			name:     "a-port-that-is-not",
-			args:     []string{"assert-listeners", "80a"},
-			wantCode: 1,
-			want:     "FAIL\tassert-listeners completed\tno exception\tInvalidArgumentException: '80a' is not a TCP port",
-		},
-		{
-			name: "app-subcommand",
-			app:  `<?php return ['app-echo' => static function (array $operands): void { Assertions::equals('app operands', 'a b', implode(' ', $operands)); }];`,
-			args: []string{"app-echo", "a", "b"},
-			want: "ok\tapp operands\ta b\ta b\n",
-		},
-		{
-			name:     "app-clashes-with-core",
-			app:      `<?php return ['assert-caps' => static function (array $operands): void {}];`,
-			args:     []string{"assert-caps"},
-			wantCode: 2,
-			want:     "cannot load the subcommands",
-		},
-		{
-			name:     "app-returns-no-commands",
-			app:      `<?php return 'nothing';`,
-			args:     []string{"assert-caps"},
-			wantCode: 2,
-			want:     "cannot load the subcommands",
-		},
-		{
-			name:     "app-does-not-parse",
-			app:      `<?php return [`,
-			args:     []string{"assert-caps"},
-			wantCode: 2,
-			want:     "cannot load the subcommands",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, "core.php"), coreProbe, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if tt.app != "" {
-				if err := os.WriteFile(filepath.Join(dir, "app.php"), []byte(tt.app), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			res := runPHP(t, filepath.Join(dir, "core.php"), tt.args...)
-			got := res.Stdout
-			if tt.wantCode == 2 {
-				got = res.Stderr
-			}
-			if res.Code != tt.wantCode || !strings.HasPrefix(string(got), tt.want) {
-				t.Errorf("core.php %q = exit %d, stdout %q, stderr %q; want exit %d, starting %q",
-					tt.args, res.Code, res.Stdout, res.Stderr, tt.wantCode, tt.want)
-			}
-		})
 	}
 }

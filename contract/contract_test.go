@@ -872,6 +872,34 @@ func TestMountsRecord(t *testing.T) {
 		{name: "docker", given: []harness.Mount{data}, ins: docker},
 		{name: "podman", given: []harness.Mount{data}, ins: podman},
 		{
+			// The probe's own volume, which the harness mounts to run the
+			// checks, is set aside
+			name:  "the-probe-volume",
+			given: []harness.Mount{data},
+			ins: with(docker, func(ins *harness.Inspect) {
+				ins.Mounts = append(ins.Mounts, harness.MountPoint{Type: "volume", Name: "divbast-probe-x", Destination: "/divbast/probe"})
+			}),
+		},
+		{
+			name:  "the-probe-volume-writable",
+			given: []harness.Mount{data},
+			ins: with(docker, func(ins *harness.Inspect) {
+				ins.Mounts = append(ins.Mounts, harness.MountPoint{Type: "volume", Name: "divbast-probe-x", Destination: "/divbast/probe", RW: true})
+			}),
+			found: "tmpfs /tmp, volume /data, volume /divbast/probe",
+		},
+		{
+			// Only once: a second mount there is no probe's
+			name:  "the-probe-volume-twice",
+			given: []harness.Mount{data},
+			ins: with(docker, func(ins *harness.Inspect) {
+				ins.Mounts = append(ins.Mounts,
+					harness.MountPoint{Type: "volume", Name: "divbast-probe-x", Destination: "/divbast/probe"},
+					harness.MountPoint{Type: "bind", Destination: "/divbast/probe"})
+			}),
+			found: "bind /divbast/probe (read-only), tmpfs /tmp, volume /data",
+		},
+		{
 			name: "no-mounts",
 			ins:  with(docker, func(ins *harness.Inspect) { ins.Mounts = nil }),
 		},

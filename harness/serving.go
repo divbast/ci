@@ -43,8 +43,9 @@ type ServeSpec struct {
 	// ReadyPath is what Serve asks for, with GET from the host, until any
 	// status comes back: "/" when it is empty.
 	ReadyPath string
-	// ProbeApp is the app's own probe subcommands, which [InstallProbe]
-	// puts beside the core probe. Nil installs the core probe alone.
+	// ProbeApp is a PHP app's own probe subcommands, its app.php, which
+	// [AttachProbe] writes beside the PHP probe. Nil mounts the core probe
+	// alone.
 	ProbeApp []byte
 }
 
@@ -67,7 +68,6 @@ type Serving struct {
 
 	appPort, healthPort int
 	readyPath           string
-	probeApp            []byte
 	// parent is the Serving a copy Health made was taken from, whose
 	// health port the copy's requests go to; nil for any other Serving.
 	parent *Serving
@@ -115,6 +115,10 @@ func (e Engine) StartServing(ctx context.Context, tb testing.TB, sp *ServeSpec) 
 		}
 		run.Network = network
 	}
+	run.Probe = &ProbeSpec{}
+	if len(sp.ProbeApp) > 0 {
+		run.Probe.PHP = &PHPProbe{Binary: defaultPHP, Probe: sp.ProbeApp}
+	}
 	run.Publish = []string{loopback(sp.AppPort)}
 	if sp.HealthPort != 0 {
 		run.Publish = append(run.Publish, loopback(sp.HealthPort))
@@ -129,7 +133,6 @@ func (e Engine) StartServing(ctx context.Context, tb testing.TB, sp *ServeSpec) 
 		appPort:    sp.AppPort,
 		healthPort: sp.HealthPort,
 		readyPath:  cmp.Or(sp.ReadyPath, "/"),
-		probeApp:   sp.ProbeApp,
 	}
 	if err := s.readPorts(ctx); err != nil {
 		return nil, err
@@ -227,7 +230,7 @@ func (s *Serving) Wait(ctx context.Context, path string) error {
 			return err
 		}
 	}
-	p, err := InstallProbe(ctx, s.C, s.probeApp)
+	p, err := AttachProbe(ctx, s.C)
 	if err != nil {
 		return err
 	}
@@ -372,11 +375,14 @@ func (s *Serving) Do(ctx context.Context, client *http.Client, method, path stri
 	return Response{Status: resp.StatusCode, Header: resp.Header, Body: b}, nil
 }
 
+// defaultPHP is the PHP PHPIn runs, and a ProbeApp runs under.
+const defaultPHP = "/usr/local/bin/frankenphp"
+
 // PHPIn runs PHP code in c, as c's own PHP, php-cli -r, and returns what
 // it printed: its stdout, then its stderr. A non-zero exit status is an
 // error, carrying both.
 func PHPIn(ctx context.Context, c *Container, code string) (string, error) {
-	res, err := c.Exec(ctx, nil, FrankenPHP, "php-cli", "-r", code)
+	res, err := c.Exec(ctx, nil, defaultPHP, "php-cli", "-r", code)
 	if err != nil {
 		return "", err
 	}

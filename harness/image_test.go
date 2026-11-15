@@ -55,7 +55,8 @@ const configBlob = `{"architecture":"arm64","os":"linux","config":{"User":"65532
 // wantConfig is what configBlob, or Docker's inspection of that image,
 // holds.
 var wantConfig = Config{
-	User: "65532:65532",
+	Architecture: "arm64",
+	User:         "65532:65532",
 	Healthcheck: &Healthcheck{
 		Test:     []string{"CMD", "/usr/local/bin/frankenphp", "php-cli", "/x"},
 		Interval: 30 * time.Second, Timeout: 10 * time.Second, StartPeriod: time.Minute, Retries: 3,
@@ -64,7 +65,7 @@ var wantConfig = Config{
 
 // sameConfig reports whether two configurations say the same thing.
 func sameConfig(a, b Config) bool {
-	if a.User != b.User || (a.Healthcheck == nil) != (b.Healthcheck == nil) || !maps.Equal(a.Volumes, b.Volumes) {
+	if a.Architecture != b.Architecture || a.User != b.User || (a.Healthcheck == nil) != (b.Healthcheck == nil) || !maps.Equal(a.Volumes, b.Volumes) {
 		return false
 	}
 	if a.Healthcheck == nil {
@@ -141,11 +142,11 @@ func TestImageConfigDocker(t *testing.T) {
 	t.Parallel()
 
 	id := []string{"docker", "image", "inspect", "--format", "{{.Id}}", "img"}
-	inspect := []string{"docker", "image", "inspect", "--format", "{{json .Config}}", "img"}
+	inspect := []string{"docker", "image", "inspect", "--format", `{"architecture":{{json .Architecture}},"config":{{json .Config}}}`, "img"}
 	pull := []string{"docker", "pull", "-q", "img"}
 	absent := execx.Result{Code: 1, Stderr: []byte("Error response from daemon: No such image: img")}
-	config := execx.Result{Stdout: []byte(`{"User":"65532:65532","Healthcheck":{"Test":["CMD","/usr/local/bin/frankenphp","php-cli","/x"],` +
-		`"Interval":30000000000,"Timeout":10000000000,"StartPeriod":60000000000,"Retries":3}}` + "\n")}
+	config := execx.Result{Stdout: []byte(`{"architecture":"arm64","config":{"User":"65532:65532","Healthcheck":{"Test":["CMD","/usr/local/bin/frankenphp","php-cli","/x"],` +
+		`"Interval":30000000000,"Timeout":10000000000,"StartPeriod":60000000000,"Retries":3}}}` + "\n")}
 
 	tests := []struct {
 		name    string
@@ -240,8 +241,8 @@ func TestImageConfigPodman(t *testing.T) {
 		return tarball(t, file{"l1.tar", "a layer"}, file{digest(blob) + ".json", blob},
 			file{"manifest.json", `[{"Config":"` + digest(blob) + `.json","RepoTags":[],"Layers":["l1.tar"]}]`})
 	}
-	const noHealthcheck = `{"config":{"User":"0:0"}}`
-	const volume = `{"config":{"User":"65532:65532","Volumes":{"/data":{}}}}`
+	const noHealthcheck = `{"architecture":"amd64","config":{"User":"0:0"}}`
+	const volume = `{"architecture":"arm64","config":{"User":"65532:65532","Volumes":{"/data":{}}}}`
 
 	tests := []struct {
 		name    string
@@ -255,11 +256,11 @@ func TestImageConfigPodman(t *testing.T) {
 			// What Podman's own image inspect never shows for an OCI image is
 			// absent here only when the image itself has none.
 			name: "no-healthcheck", id: digest(noHealthcheck), archive: archive(noHealthcheck),
-			want: Config{User: "0:0"},
+			want: Config{Architecture: "amd64", User: "0:0"},
 		},
 		{
 			name: "volume", id: digest(volume), archive: archive(volume),
-			want: Config{User: "65532:65532", Volumes: map[string]struct{}{"/data": {}}},
+			want: Config{Architecture: "arm64", User: "65532:65532", Volumes: map[string]struct{}{"/data": {}}},
 		},
 		{
 			// Why the configuration could not be found, not merely that it

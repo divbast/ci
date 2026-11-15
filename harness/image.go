@@ -25,9 +25,9 @@ import (
 	"testing"
 )
 
-// ImageConfig returns the user, the HEALTHCHECK and the volumes image
-// declares, as its own configuration holds them, pulling it first if it is
-// not here.
+// ImageConfig returns the architecture, the user, the HEALTHCHECK and the
+// volumes image declares, as its own configuration holds them, pulling it
+// first if it is not here.
 //
 // Docker's image inspect reads all three from that configuration.
 // Podman's reads a health check only from an image whose manifest is
@@ -44,15 +44,30 @@ func (e Engine) ImageConfig(ctx context.Context, tb testing.TB, image string) (C
 		return e.savedConfig(ctx, tb, image, id)
 	}
 
-	out, err := e.output(ctx, "image", "inspect", "--format", "{{json .Config}}", image)
+	// The same shape as the configuration blob, which is what it reads
+	out, err := e.output(ctx, "image", "inspect", "--format", `{"architecture":{{json .Architecture}},"config":{{json .Config}}}`, image)
 	if err != nil {
 		return Config{}, err
 	}
-	var cfg Config
-	if err := json.Unmarshal(out, &cfg); err != nil {
+	cfg, err := parseConfigDoc(out)
+	if err != nil {
 		return Config{}, fmt.Errorf("%s image inspect %s printed what is not a configuration: %w", e.name, image, err)
 	}
 	return cfg, nil
+}
+
+// parseConfigDoc reads an image's configuration as its blob holds it: the
+// architecture at the top, and the rest under "config".
+func parseConfigDoc(b []byte) (Config, error) {
+	var doc struct {
+		Architecture string `json:"architecture"`
+		Config       Config `json:"config"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return Config{}, err
+	}
+	doc.Config.Architecture = doc.Architecture
+	return doc.Config, nil
 }
 
 // imageID returns image's ID, pulling it first if it is not here.
@@ -230,13 +245,11 @@ func savedImageConfig(blob []byte, image, id string) (Config, error) {
 	if got, want := hex.EncodeToString(sum[:]), strings.TrimPrefix(id, "sha256:"); got != want {
 		return Config{}, fmt.Errorf("the save of %s holds a configuration whose digest, %s, is not its ID, %s", image, got, want)
 	}
-	var doc struct {
-		Config Config `json:"config"`
-	}
-	if err := json.Unmarshal(blob, &doc); err != nil {
+	cfg, err := parseConfigDoc(blob)
+	if err != nil {
 		return Config{}, fmt.Errorf("the configuration of %s: %w", image, err)
 	}
-	return doc.Config, nil
+	return cfg, nil
 }
 
 // readSave reads the docker-archive file name, in dir, for its

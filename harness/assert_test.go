@@ -233,7 +233,7 @@ func TestIsFile(t *testing.T) {
 	t.Parallel()
 
 	const path = `/data/it's $HOME`
-	exec := []string{"docker", "exec", "abc", FrankenPHP, "php-cli", "-r", `echo file_exists('/data/it\'s $HOME') ? "present" : "absent";`}
+	exec := []string{"docker", "exec", "abc", frankenphp, "php-cli", "-r", `echo file_exists('/data/it\'s $HOME') ? "present" : "absent";`}
 	tests := []struct {
 		name     string
 		want     string

@@ -6,54 +6,87 @@ package harness
 import (
 	"bytes"
 	"context"
-	_ "embed" // for coreProbe
+	_ "embed" // for phpProbe
+	"errors"
 	"fmt"
 	"path"
 	"slices"
 	"strings"
 )
 
-// FrankenPHP is the PHP every divbast image runs, and so the probe's.
-const FrankenPHP = "/usr/local/bin/frankenphp"
+// ProbeMount is where the probe volume is mounted, read-only, in every
+// container started with a [RunSpec.Probe]: CoreProbePath is the core
+// probe, and AppProbePath the app's own Go probe, when it has one.
+const (
+	ProbeMount    = "/divbast/probe"
+	CoreProbePath = ProbeMount + "/core"
+	AppProbePath  = ProbeMount + "/app"
+)
 
-// ProbeDir is where [InstallProbe] puts the probe inside a container: on
-// /tmp, the one place the contract lets a container write.
-const ProbeDir = "/tmp/divbast-probe"
+// PHPProbeDir is where [AttachProbe] writes a PHP app's probe, through the
+// app's own PHP: probe.php and the app's app.php beside it, on /tmp, the
+// one place the contract lets a container write.
+const PHPProbeDir = "/tmp/divbast-probe"
 
-// coreProbe is probe/core.php, the subcommands every app shares.
+// phpProbe is probe/php/probe.php, which runs a PHP app's own
+// subcommands.
 //
-//go:embed probe/core.php
-var coreProbe []byte
+//go:embed probe/php/probe.php
+var phpProbe []byte
 
-// Probe is the probe installed in one container.
-type Probe struct {
-	c *Container
+// PHPProbe is a PHP app's own probe subcommands, which run under the
+// app's own PHP.
+type PHPProbe struct {
+	// Binary is the app's PHP, as an absolute path, run as
+	// "<Binary> php-cli": FrankenPHP's, as /usr/local/bin/frankenphp.
+	Binary string
+	// Probe is the app's app.php: PHP returning its subcommands.
+	Probe []byte
 }
 
-// InstallProbe writes the core probe into c at ProbeDir, and app, when it
-// is not empty, beside it as app.php: PHP returning the app's own
-// subcommands, which core.php merges after its own.
-//
-// Each file goes in on stdin and the container's own PHP writes it out,
-// since `cp` refuses a container whose root is read-only, and a container
-// with no volume has nowhere else to put it.
-func InstallProbe(ctx context.Context, c *Container, app []byte) (*Probe, error) {
-	if err := install(ctx, c, path.Join(ProbeDir, "core.php"), coreProbe); err != nil {
-		return nil, err
+// ProbeSpec asks for the probe in a container: the core probe always,
+// and the app's own subcommands, in Go, PHP or both.
+type ProbeSpec struct {
+	// AppPackage is a Go main package of the module under test, as go build
+	// takes it from the module's root, such as "./test/probe": the app's
+	// own probe, built and mounted beside the core one. Empty for none.
+	AppPackage string
+	// PHP is a PHP app's own probe, nil for none.
+	PHP *PHPProbe
+}
+
+// Probe is the probe in one container.
+type Probe struct {
+	c    *Container
+	spec ProbeSpec
+}
+
+// AttachProbe returns the probe in c, which must have been started with
+// a [RunSpec.Probe]: the core probe, and any Go app probe, are on its
+// read-only mount already. A PHP app probe is written into c's /tmp
+// first, at PHPProbeDir, as it must be again after a restart empties
+// /tmp. Each file goes in on stdin and the app's own PHP writes it out,
+// since `cp` refuses a container whose root is read-only.
+func AttachProbe(ctx context.Context, c *Container) (*Probe, error) {
+	if c.probe == nil {
+		return nil, fmt.Errorf("container %s was started without the probe: set RunSpec.Probe to mount it", c)
 	}
-	if len(app) > 0 {
-		if err := install(ctx, c, path.Join(ProbeDir, "app.php"), app); err != nil {
+	if php := c.probe.PHP; php != nil {
+		if err := install(ctx, c, php.Binary, path.Join(PHPProbeDir, "probe.php"), phpProbe); err != nil {
+			return nil, err
+		}
+		if err := install(ctx, c, php.Binary, path.Join(PHPProbeDir, "app.php"), php.Probe); err != nil {
 			return nil, err
 		}
 	}
-	return &Probe{c: c}, nil
+	return &Probe{c: c, spec: *c.probe}, nil
 }
 
-// install writes body to file in c. An exec the engine refuses is tried
-// again by [Container.Exec], so a container still starting gets the file
-// all the same.
-func install(ctx context.Context, c *Container, file string, body []byte) error {
-	res, err := c.Exec(ctx, bytes.NewReader(body), FrankenPHP, "php-cli", "-r", installCode(file))
+// install writes body to file in c, through binary's PHP. An exec the
+// engine refuses is tried again by [Container.Exec], so a container still
+// starting gets the file all the same.
+func install(ctx context.Context, c *Container, binary, file string, body []byte) error {
+	res, err := c.Exec(ctx, bytes.NewReader(body), binary, "php-cli", "-r", installCode(file))
 	if err != nil {
 		return fmt.Errorf("installing %s: %w", file, err)
 	}
@@ -83,24 +116,59 @@ func phpString(s string) string {
 	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
 }
 
-// Output runs one probe subcommand and returns what it printed, for the
-// subcommands that print what they read rather than records.
+// Output runs one core probe subcommand and returns what it printed, for
+// the subcommands that print what they read rather than records.
 func (p *Probe) Output(ctx context.Context, sub string, args ...string) (Result, error) {
-	return p.c.Exec(ctx, nil, slices.Concat([]string{FrankenPHP, "php-cli", path.Join(ProbeDir, "core.php"), sub}, args)...)
+	return p.c.Exec(ctx, nil, slices.Concat([]string{CoreProbePath, sub}, args)...)
 }
 
-// Record is one assertion the probe made.
-type Record struct {
-	OK                    bool
-	What, Expected, Found string
-}
-
-// Run runs one probe subcommand and returns its records. A FAIL among them
-// is no error: [Checks.Records] reports it. The error is for a subcommand
-// that could not be run, printed something other than records, printed
-// none, or exited with a status its records do not bear out.
+// Run runs one core probe subcommand and returns its records. A FAIL
+// among them is no error: [Checks.Records] reports it. The error is for
+// a subcommand that could not be run, printed something other than
+// records, printed none, or exited with a status its records do not bear
+// out.
 func (p *Probe) Run(ctx context.Context, sub string, args ...string) ([]Record, error) {
-	res, err := p.Output(ctx, sub, args...)
+	return p.records(ctx, sub, p.Output, args)
+}
+
+// errNoAppProbe means a probe was asked for app subcommands of a kind its
+// container was not started with.
+var errNoAppProbe = errors.New("no such app probe")
+
+// OutputApp runs one subcommand of the app's Go probe and returns what it
+// printed. It is an error unless the container's probe has an AppPackage.
+func (p *Probe) OutputApp(ctx context.Context, sub string, args ...string) (Result, error) {
+	if p.spec.AppPackage == "" {
+		return Result{}, fmt.Errorf("container %s: %w: its probe has no Go app probe, so set ProbeSpec.AppPackage", p.c, errNoAppProbe)
+	}
+	return p.c.Exec(ctx, nil, slices.Concat([]string{AppProbePath, sub}, args)...)
+}
+
+// RunApp runs one subcommand of the app's Go probe and returns its
+// records, as [Probe.Run] does.
+func (p *Probe) RunApp(ctx context.Context, sub string, args ...string) ([]Record, error) {
+	return p.records(ctx, sub, p.OutputApp, args)
+}
+
+// OutputPHP runs one of a PHP app's own subcommands, under the app's PHP,
+// and returns what it printed. It is an error unless the container's
+// probe has PHP.
+func (p *Probe) OutputPHP(ctx context.Context, sub string, args ...string) (Result, error) {
+	if p.spec.PHP == nil {
+		return Result{}, fmt.Errorf("container %s: %w: its probe has no PHP app probe, so set ProbeSpec.PHP", p.c, errNoAppProbe)
+	}
+	return p.c.Exec(ctx, nil, slices.Concat([]string{p.spec.PHP.Binary, "php-cli", path.Join(PHPProbeDir, "probe.php"), sub}, args)...)
+}
+
+// RunPHP runs one of a PHP app's own subcommands and returns its records,
+// as [Probe.Run] does.
+func (p *Probe) RunPHP(ctx context.Context, sub string, args ...string) ([]Record, error) {
+	return p.records(ctx, sub, p.OutputPHP, args)
+}
+
+// records runs sub through output and reads its records.
+func (p *Probe) records(ctx context.Context, sub string, output func(context.Context, string, ...string) (Result, error), args []string) ([]Record, error) {
+	res, err := output(ctx, sub, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +186,12 @@ func (p *Probe) Run(ctx context.Context, sub string, args ...string) ([]Record, 
 		return nil, fmt.Errorf("%s exited %d, which disagrees with its records:\n%s", what, res.Code, res.Stdout)
 	}
 	return records, nil
+}
+
+// Record is one assertion the probe made.
+type Record struct {
+	OK                    bool
+	What, Expected, Found string
 }
 
 // parseRecords reads the probe's records, one per line: ok or FAIL, what,
