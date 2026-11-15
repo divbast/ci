@@ -94,11 +94,17 @@ func (s *suite) start(ctx context.Context, tb testing.TB, loosen []string) error
 // probeSpec is the probe the container under test is started with: the
 // core probe, and the app's own subcommands beside it.
 func (s *suite) probeSpec() *harness.ProbeSpec {
-	spec := &harness.ProbeSpec{}
-	if len(s.cfg.ProbeApp) > 0 {
-		spec.PHP = &harness.PHPProbe{Binary: frankenPHP, Probe: s.cfg.ProbeApp}
+	return &harness.ProbeSpec{AppPackage: s.cfg.AppProbe, PHP: s.cfg.PHP}
+}
+
+// ports is every TCP port listeners allows: AppPort, HealthPort and
+// ExtraTCPPorts.
+func ports(cfg *Config) []string {
+	p := make([]string, 0, 2+len(cfg.ExtraTCPPorts))
+	for _, port := range slices.Concat([]int{cfg.AppPort, cfg.HealthPort}, cfg.ExtraTCPPorts) {
+		p = append(p, strconv.Itoa(port))
 	}
-	return spec
+	return p
 }
 
 // awaitReady returns once the app's own Ready or ReadyProbe says the app
@@ -211,28 +217,27 @@ func runtimeUserRecords(user, out string) ([]harness.Record, error) {
 	}, nil
 }
 
-// fileCapabilityRecord is the record file-capability makes. It names what
-// the exec shows: a capability with no effective bit runs as any binary
-// does, and only no-file-capability-xattr's scan sees it.
-// frankenPHP is the binary file-capability runs, and the PHP a ProbeApp
-// runs under.
-const frankenPHP = "/usr/local/bin/frankenphp"
+// fileCapabilityRecord is the record file-capability makes about binary.
+// It names what the exec shows: a capability with no effective bit runs
+// as any binary does, and only no-file-capability-xattr's scan sees it.
+func fileCapabilityRecord(binary string) string {
+	return binary + " runs under --cap-drop ALL, so it carries no effective file capability"
+}
 
-const fileCapabilityRecord = frankenPHP + " runs under --cap-drop ALL, so it carries no effective file capability"
-
-// fileCapability runs the FrankenPHP binary under the contract. A binary
-// carrying a file capability with the effective bit, which --cap-drop ALL
-// leaves out of the bounding set, cannot be executed at all: the kernel
-// answers EPERM before a line of PHP runs. It runs in the foreground,
-// since crun reports that refusal nowhere else.
+// fileCapability runs Config.Exec under the contract. A binary carrying a
+// file capability with the effective bit, which --cap-drop ALL leaves out
+// of the bounding set, cannot be executed at all: the kernel answers
+// EPERM before a line of it runs. It runs in the foreground, since crun
+// reports that refusal nowhere else.
 func (s *suite) fileCapability(ctx context.Context, tb testing.TB) ([]harness.Record, error) {
 	tb.Helper()
+	binary := s.cfg.Exec[0]
 	res, err := s.engine.Run(ctx, tb, &harness.RunSpec{
 		Image:      s.cfg.Image,
 		Network:    "none",
 		Confine:    harness.Contract(s.cfg.TmpfsSize),
-		Entrypoint: []string{frankenPHP},
-		Args:       []string{"version"},
+		Entrypoint: s.cfg.Exec[:1],
+		Args:       s.cfg.Exec[1:],
 	})
 	if err != nil {
 		return nil, err
@@ -241,24 +246,24 @@ func (s *suite) fileCapability(ctx context.Context, tb testing.TB) ([]harness.Re
 	if res.Code != 0 {
 		out := strings.TrimSpace(string(res.Stdout) + string(res.Stderr))
 		found = fmt.Sprintf("exit status %d: %s", res.Code, out)
-		if execRefused(out) {
+		if execRefused(out, binary) {
 			found = "the kernel refused to execute it, as it does a binary carrying a file capability: " + found
 		}
 	}
 	return []harness.Record{{
 		OK:       res.Code == 0,
-		What:     fileCapabilityRecord,
+		What:     fileCapabilityRecord(binary),
 		Expected: "exit status 0",
 		Found:    found,
 	}}, nil
 }
 
 // execRefused reports whether a run's output says the kernel refused to
-// execute the FrankenPHP binary, in any runtime's words: runc's "exec
+// execute binary, in any runtime's words: runc's "exec
 // /usr/local/bin/frankenphp: operation not permitted", or crun's "exec
 // container process `/usr/local/bin/frankenphp`: Operation not permitted".
-func execRefused(out string) bool {
-	return strings.Contains(strings.ToLower(out), "operation not permitted") && strings.Contains(out, frankenPHP)
+func execRefused(out, binary string) bool {
+	return strings.Contains(strings.ToLower(out), "operation not permitted") && strings.Contains(out, binary)
 }
 
 // xattrRecord is the record no-file-capability-xattr makes.
@@ -267,7 +272,7 @@ const xattrRecord = "no file in any layer of the image carries a security.capabi
 // noFileCapabilityXattr reads the image's layers, as the engine saves
 // them, for any file carrying a file capability. fileCapability can see
 // only one with the effective bit, which the kernel refuses to exec, and
-// only on the FrankenPHP binary: a capability with no effective bit runs,
+// only on the binary Config.Exec runs: a capability with no effective bit runs,
 // as does any binary nothing runs.
 func (s *suite) noFileCapabilityXattr(ctx context.Context, tb testing.TB) ([]harness.Record, error) {
 	tb.Helper()
@@ -454,7 +459,29 @@ func (s *suite) noVolume(ctx context.Context, _ testing.TB) ([]harness.Record, e
 	if err != nil {
 		return []harness.Record{declared}, err
 	}
-	return []harness.Record{declared, mountsRecord(s.mounts, &ins)}, nil
+	return []harness.Record{declared, mountsRecord(s.mounts, &ins), probeMountRecord(&ins)}, nil
+}
+
+// probeMountRecordWhat is the record no-volume makes of the probe's own
+// mount.
+const probeMountRecordWhat = "the probe's volume is mounted read-only at " + harness.ProbeMount + ", and only there"
+
+// probeMountRecord checks the mounts ins reports at harness.ProbeMount are
+// exactly the probe's volume, read-only, once: mountsRecord sets that one
+// aside, and a writable one would let the container change the probe the
+// checks run.
+func probeMountRecord(ins *harness.Inspect) harness.Record {
+	var at []string
+	for _, m := range ins.Mounts {
+		if m.Destination == harness.ProbeMount {
+			at = append(at, mountName(m.Type, m.Destination, m.RW))
+		}
+	}
+	found := "none"
+	if len(at) > 0 {
+		found = strings.Join(at, ", ")
+	}
+	return equal(probeMountRecordWhat, mountName("volume", harness.ProbeMount, false), found)
 }
 
 // mountsRecord checks the mounts ins reports are exactly the contract's
@@ -551,7 +578,28 @@ func hostConfigRecords(raw json.RawMessage) ([]harness.Record, error) {
 
 // hostConfigFields names the field each of hostConfigValues' records
 // reads, in order, and must find printed: all but Init's.
-var hostConfigFields = []string{"CapAdd", "Privileged", "ReadonlyRootfs", "SecurityOpt", "", "NetworkMode"}
+var hostConfigFields = []string{"CapAdd", "Privileged", "ReadonlyRootfs", "SecurityOpt", "SecurityOpt", "", "NetworkMode"}
+
+// noNewPrivilegesRecordWhat is the record host-config makes of
+// no-new-privileges.
+const noNewPrivilegesRecordWhat = "the engine sets no-new-privileges (HostConfig.SecurityOpt)"
+
+// noNewPrivileges reports whether opts, as either engine records them,
+// set no-new-privileges and never unset it: Docker keeps the option as it
+// was typed, the bare word or with ":true" or "=true", and Podman writes
+// the bare word for each and drops one set false.
+func noNewPrivileges(opts []string) bool {
+	set := false
+	for _, opt := range opts {
+		switch opt {
+		case "no-new-privileges", "no-new-privileges:true", "no-new-privileges=true":
+			set = true
+		case "no-new-privileges:false", "no-new-privileges=false":
+			return false
+		}
+	}
+	return set
+}
 
 // hostConfigValues checks the values in h, as hostConfigRecords says.
 func hostConfigValues(h *harness.HostConfig) []harness.Record {
@@ -568,6 +616,12 @@ func hostConfigValues(h *harness.HostConfig) []harness.Record {
 			OK:       len(loosening) == 0,
 			What:     "no security option turns off seccomp, AppArmor or SELinux confinement (HostConfig.SecurityOpt)",
 			Expected: "no seccomp or apparmor option, and no label=disable",
+			Found:    listOrNone(h.SecurityOpt),
+		},
+		{
+			OK:       noNewPrivileges(h.SecurityOpt),
+			What:     noNewPrivilegesRecordWhat,
+			Expected: "no-new-privileges",
 			Found:    listOrNone(h.SecurityOpt),
 		},
 		{

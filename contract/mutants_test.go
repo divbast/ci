@@ -82,7 +82,7 @@ func TestContractMutants(t *testing.T) {
 			// of the layers finds the capability without running anything.
 			name: "filecap", dir: "filecap",
 			fails: []failure{
-				{checkFileCapability, fileCapabilityRecord, []string{"operation not permitted", "/usr/local/bin/frankenphp"}},
+				{checkFileCapability, fileCapabilityRecord(frankenphp), []string{"operation not permitted", "/usr/local/bin/frankenphp"}},
 				{checkNoFileCapabilityXattr, xattrRecord, []string{"/usr/local/bin/frankenphp"}},
 			},
 			unstartable: true,

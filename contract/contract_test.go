@@ -23,6 +23,10 @@ import (
 
 // healthCmd is LibreSpeed's health probe, as its HEALTHCHECK runs it and
 // as a Podman user passes it.
+// frankenphp is the PHP divbast's PHP images run, and the binary their
+// Exec runs.
+const frankenphp = "/usr/local/bin/frankenphp"
+
 var healthCmd = []string{"/usr/local/bin/frankenphp", "php-cli", "/usr/local/bin/librespeed-health"}
 
 // libreSpeed is LibreSpeed's contract, as its Containerfile and README
@@ -36,6 +40,7 @@ func libreSpeed(image string) Config {
 		// What its bootstrap hands over to: pcntl_exec(SERVER_BIN, ['run',
 		// '--config', CADDYFILE])
 		PID1:      []string{"/usr/local/bin/frankenphp", "run", "--config", "/etc/frankenphp/Caddyfile"},
+		Exec:      []string{frankenphp, "version"},
 		HealthCmd: healthCmd,
 		Healthcheck: Healthcheck{
 			Test:        slices.Concat([]string{"CMD"}, healthCmd),
@@ -69,6 +74,7 @@ func baikal(tb testing.TB, e harness.Engine, image string) Config {
 		// What its bootstrap hands over to: pcntl_exec(SERVER_BIN, ['run',
 		// '--config', CADDYFILE])
 		PID1:      []string{"/usr/local/bin/frankenphp", "run", "--config", "/etc/caddy/Caddyfile"},
+		Exec:      []string{frankenphp, "version"},
 		HealthCmd: baikalHealthCmd,
 		Healthcheck: Healthcheck{
 			Test:        slices.Concat([]string{"CMD"}, baikalHealthCmd),
@@ -232,6 +238,19 @@ func TestValidate(t *testing.T) {
 		{name: "no-tmpfs-size", change: func(c *Config) { c.TmpfsSize = "" }, want: "TmpfsSize"},
 		{name: "no-pid1", change: func(c *Config) { c.PID1 = nil }, want: "PID1"},
 		{name: "no-health-cmd", change: func(c *Config) { c.HealthCmd = nil }, want: "HealthCmd"},
+		{name: "no-exec", change: func(c *Config) { c.Exec = nil }, want: "Config.Exec"},
+		{name: "exec-relative", change: func(c *Config) { c.Exec = []string{"frankenphp", "version"} }, want: "Config.Exec"},
+		{name: "extra-port", change: func(c *Config) { c.ExtraTCPPorts = []int{7070} }},
+		{name: "extra-port-zero", change: func(c *Config) { c.ExtraTCPPorts = []int{0} }, want: "Config.ExtraTCPPorts"},
+		{name: "extra-port-too-high", change: func(c *Config) { c.ExtraTCPPorts = []int{65536} }, want: "Config.ExtraTCPPorts"},
+		{name: "extra-port-twice", change: func(c *Config) { c.ExtraTCPPorts = []int{7070, 7070} }, want: "Config.ExtraTCPPorts"},
+		{name: "extra-port-is-app-port", change: func(c *Config) { c.ExtraTCPPorts = []int{c.AppPort} }, want: "Config.ExtraTCPPorts"},
+		{name: "extra-port-is-health-port", change: func(c *Config) { c.ExtraTCPPorts = []int{c.HealthPort} }, want: "Config.ExtraTCPPorts"},
+		{name: "php", change: func(c *Config) { c.PHP = &PHP{Binary: frankenphp, Probe: []byte("<?php return [];")} }},
+		{name: "php-no-binary", change: func(c *Config) { c.PHP = &PHP{Probe: []byte("<?php return [];")} }, want: "Config.PHP"},
+		{name: "php-relative-binary", change: func(c *Config) { c.PHP = &PHP{Binary: "frankenphp", Probe: []byte("<?php return [];")} }, want: "Config.PHP"},
+		{name: "php-no-probe", change: func(c *Config) { c.PHP = &PHP{Binary: frankenphp} }, want: "Config.PHP"},
+		{name: "app-probe", change: func(c *Config) { c.AppProbe = "./test/probe" }},
 		{name: "scenario", change: func(c *Config) { c.Scenario = "telemetry off" }},
 		{
 			name: "ready-probe",
@@ -313,7 +332,9 @@ func TestRecordNames(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct{ got, want string }{
-		{fileCapabilityRecord, "/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no effective file capability"},
+		{fileCapabilityRecord(frankenphp), "/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no effective file capability"},
+		{probeMountRecordWhat, "the probe's volume is mounted read-only at /divbast/probe, and only there"},
+		{noNewPrivilegesRecordWhat, "the engine sets no-new-privileges (HostConfig.SecurityOpt)"},
 		{
 			healthcheckRecord(libreSpeed("img").Healthcheck, nil).What,
 			"the image's HEALTHCHECK: the probe in exec form, with no shell, at the timings Config.Healthcheck states",
@@ -423,10 +444,10 @@ func TestHostConfigRecords(t *testing.T) {
 	// Podman prints empty lists, a false Init and bridge for any named
 	// network.
 	docker := map[string]any{
-		"CapAdd": nil, "Privileged": false, "ReadonlyRootfs": true, "SecurityOpt": nil, "NetworkMode": "divbast-net",
+		"CapAdd": nil, "Privileged": false, "ReadonlyRootfs": true, "SecurityOpt": []string{"no-new-privileges"}, "NetworkMode": "divbast-net",
 	}
 	podman := map[string]any{
-		"CapAdd": []string{}, "Privileged": false, "ReadonlyRootfs": true, "SecurityOpt": []string{}, "Init": false,
+		"CapAdd": []string{}, "Privileged": false, "ReadonlyRootfs": true, "SecurityOpt": []string{"no-new-privileges"}, "Init": false,
 		"NetworkMode": "bridge",
 	}
 
@@ -435,6 +456,7 @@ func TestHostConfigRecords(t *testing.T) {
 		privileged = "the container is not privileged (HostConfig.Privileged)"
 		readOnly   = "the engine mounts the root filesystem read-only (HostConfig.ReadonlyRootfs)"
 		security   = "no security option turns off seccomp, AppArmor or SELinux confinement (HostConfig.SecurityOpt)"
+		nnp        = "the engine sets no-new-privileges (HostConfig.SecurityOpt)"
 		withInit   = "the engine puts no init before the entrypoint (HostConfig.Init)"
 		network    = "the container shares no other network namespace (HostConfig.NetworkMode)"
 	)
@@ -454,6 +476,7 @@ func TestHostConfigRecords(t *testing.T) {
 		name  string
 		h     map[string]any
 		fail  string // the one record that must FAIL; empty for none
+		also  string // another that must FAIL beside it, for a field two records read
 		found string // in that record's finding
 	}{
 		{name: "docker", h: docker},
@@ -468,18 +491,18 @@ func TestHostConfigRecords(t *testing.T) {
 		{name: "writable-root", h: with(docker, "ReadonlyRootfs", false), fail: readOnly, found: "false"},
 		{
 			name: "docker-seccomp-unconfined",
-			h:    with(docker, "SecurityOpt", []string{"seccomp=unconfined"}), fail: security, found: "seccomp=unconfined",
+			h:    with(docker, "SecurityOpt", []string{"no-new-privileges", "seccomp=unconfined"}), fail: security, found: "seccomp=unconfined",
 		},
 		{
 			// Docker keeps the option as it was typed, and takes a colon too.
 			name: "docker-seccomp-colon",
-			h:    with(docker, "SecurityOpt", []string{"seccomp:unconfined"}), fail: security, found: "seccomp:unconfined",
+			h:    with(docker, "SecurityOpt", []string{"no-new-privileges", "seccomp:unconfined"}), fail: security, found: "seccomp:unconfined",
 		},
 		{
 			// A profile of one's own replaces the engine's, and nothing here
 			// can tell whether it is any tighter.
 			name: "docker-seccomp-profile",
-			h:    with(docker, "SecurityOpt", []string{`seccomp={"defaultAction":"SCMP_ACT_ALLOW"}`}),
+			h:    with(docker, "SecurityOpt", []string{"no-new-privileges", `seccomp={"defaultAction":"SCMP_ACT_ALLOW"}`}),
 			fail: security, found: "SCMP_ACT_ALLOW",
 		},
 		{
@@ -489,7 +512,7 @@ func TestHostConfigRecords(t *testing.T) {
 		},
 		{
 			name: "podman-label-disable",
-			h:    with(podman, "SecurityOpt", []string{"label=disable"}), fail: security, found: "label=disable",
+			h:    with(podman, "SecurityOpt", []string{"no-new-privileges", "label=disable"}), fail: security, found: "label=disable",
 		},
 		{
 			// no-new-privileges tightens; it is no loosening.
@@ -515,7 +538,7 @@ func TestHostConfigRecords(t *testing.T) {
 		{name: "no-cap-add", h: without(docker, "CapAdd"), fail: capAdd, found: "absent"},
 		{name: "no-privileged", h: without(podman, "Privileged"), fail: privileged, found: "absent"},
 		{name: "no-readonly-rootfs", h: without(docker, "ReadonlyRootfs"), fail: readOnly, found: "absent"},
-		{name: "no-security-opt", h: without(podman, "SecurityOpt"), fail: security, found: "absent"},
+		{name: "no-security-opt", h: without(podman, "SecurityOpt"), fail: security, also: nnp, found: "absent"},
 		{name: "no-network-mode", h: without(docker, "NetworkMode"), fail: network, found: "absent"},
 		{name: "podman-no-init", h: without(podman, "Init")},
 	}
@@ -534,14 +557,14 @@ func TestHostConfigRecords(t *testing.T) {
 			whats := make([]string, len(records))
 			for i, r := range records {
 				whats[i] = r.What
-				if want := r.What != tt.fail; r.OK != want {
+				if want := r.What != tt.fail && r.What != tt.also; r.OK != want {
 					t.Errorf("%s: OK = %t, want %t (found %q)", r.What, r.OK, want, r.Found)
 				}
 				if r.What == tt.fail && !strings.Contains(r.Found, tt.found) {
 					t.Errorf("%s: found %q, which does not say %q", r.What, r.Found, tt.found)
 				}
 			}
-			if want := []string{capAdd, privileged, readOnly, security, withInit, network}; !slices.Equal(whats, want) {
+			if want := []string{capAdd, privileged, readOnly, security, nnp, withInit, network}; !slices.Equal(whats, want) {
 				t.Errorf("hostConfigRecords() made %q, want %q", whats, want)
 			}
 		})
@@ -971,5 +994,106 @@ func TestMountsRecord(t *testing.T) {
 					r.OK, r.Found, r.Expected, tt.found == "", tt.found)
 			}
 		})
+	}
+}
+
+// TestHostConfigNoNewPrivileges reads no-new-privileges as each engine
+// records it: Docker keeps the option as it was typed, the bare word or
+// with ":true" or "=true", and Podman 5.7 writes the bare word for each
+// and drops one set false. Set false, or not there at all, fails.
+func TestHostConfigNoNewPrivileges(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		opts []string
+		ok   bool
+	}{
+		{opts: []string{"no-new-privileges"}, ok: true},
+		{opts: []string{"no-new-privileges:true"}, ok: true},
+		{opts: []string{"no-new-privileges=true"}, ok: true},
+		{opts: []string{"label=type:x", "no-new-privileges"}, ok: true},
+		{opts: []string{"no-new-privileges=false"}},
+		{opts: []string{"no-new-privileges:false"}},
+		{opts: []string{"no-new-privileges", "no-new-privileges=false"}},
+		{opts: []string{}},
+		{opts: nil},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.opts, ","), func(t *testing.T) {
+			t.Parallel()
+
+			var r harness.Record
+			for _, rec := range hostConfigValues(&harness.HostConfig{ReadonlyRootfs: true, SecurityOpt: tt.opts}) {
+				if rec.What == noNewPrivilegesRecordWhat {
+					r = rec
+				}
+			}
+			if r.What == "" || r.OK != tt.ok {
+				t.Errorf("SecurityOpt %q: the no-new-privileges record = %+v, want ok %t", tt.opts, r, tt.ok)
+			}
+		})
+	}
+}
+
+// TestProbeMountRecord checks the probe's own volume is there, read-only,
+// once: a writable one would let a container change the probe the checks
+// run, and one missing means no check ran it.
+func TestProbeMountRecord(t *testing.T) {
+	t.Parallel()
+
+	probe := harness.MountPoint{Type: "volume", Name: "divbast-probe-x", Destination: "/divbast/probe"}
+	writable := probe
+	writable.RW = true
+	data := harness.MountPoint{Type: "volume", Name: "d", Destination: "/data", RW: true}
+	tests := []struct {
+		name   string
+		mounts []harness.MountPoint
+		found  string // when the record must FAIL
+	}{
+		{name: "read-only", mounts: []harness.MountPoint{data, probe}},
+		{name: "absent", mounts: []harness.MountPoint{data}, found: "none"},
+		{name: "writable", mounts: []harness.MountPoint{writable}, found: "volume /divbast/probe"},
+		{name: "twice", mounts: []harness.MountPoint{probe, probe}, found: "volume /divbast/probe (read-only), volume /divbast/probe (read-only)"},
+		{name: "a-bind", mounts: []harness.MountPoint{{Type: "bind", Destination: "/divbast/probe"}}, found: "bind /divbast/probe (read-only)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := probeMountRecord(&harness.Inspect{Mounts: tt.mounts})
+			if r.What != probeMountRecordWhat || r.Expected != "volume /divbast/probe (read-only)" {
+				t.Fatalf("probeMountRecord() = %+v, want the probe mount's record", r)
+			}
+			if want := tt.found == ""; r.OK != want || (!want && r.Found != tt.found) {
+				t.Errorf("probeMountRecord() = ok %t, found %q; want ok %t, found %q", r.OK, r.Found, want, tt.found)
+			}
+		})
+	}
+}
+
+// TestFileCapabilityRecord names the binary Config.Exec runs, so for a
+// PHP app's FrankenPHP it reads exactly as it did before Exec existed.
+func TestFileCapabilityRecord(t *testing.T) {
+	t.Parallel()
+
+	if got, want := fileCapabilityRecord("/usr/local/bin/frankenphp"),
+		"/usr/local/bin/frankenphp runs under --cap-drop ALL, so it carries no effective file capability"; got != want {
+		t.Errorf("fileCapabilityRecord() = %q, want %q", got, want)
+	}
+	if got := fileCapabilityRecord("/usr/local/bin/writefreely"); !strings.HasPrefix(got, "/usr/local/bin/writefreely runs under") {
+		t.Errorf("fileCapabilityRecord() = %q, want it to name the binary", got)
+	}
+	for _, tt := range []struct {
+		out  string
+		want bool
+	}{
+		{"exec /usr/local/bin/x: operation not permitted", true},
+		{"exec container process `/usr/local/bin/x`: Operation not permitted", true},
+		{"exec /usr/local/bin/other: operation not permitted", false},
+		{"exec /usr/local/bin/x: no such file or directory", false},
+	} {
+		if got := execRefused(tt.out, "/usr/local/bin/x"); got != tt.want {
+			t.Errorf("execRefused(%q) = %t, want %t", tt.out, got, tt.want)
+		}
 	}
 }
