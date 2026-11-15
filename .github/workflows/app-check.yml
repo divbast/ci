@@ -69,7 +69,7 @@ jobs:
           persist-credentials: false
 
       # Before the pin check, which needs the caller's pinned Go.
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -128,7 +128,7 @@ jobs:
           persist-credentials: false
 
       # Before the pin check, which needs the caller's pinned Go.
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -246,7 +246,7 @@ jobs:
           persist-credentials: false
 
       # Before the pin check, which needs the caller's pinned Go.
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -364,7 +364,7 @@ jobs:
       # what the scan runs: Go for the pin check and ci's tools, just for
       # the recipe, and Trivy. An install runs code from outside the
       # repository, and this job can dismiss code scanning alerts.
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: core:go aqua:casey/just aqua:aquasecurity/trivy
