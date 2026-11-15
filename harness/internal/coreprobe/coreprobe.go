@@ -64,6 +64,11 @@ func Commands(env *Env) map[string]probekit.Command {
 		"http-request":     {Args: []string{"method", "url", "headers", "body"}, Run: httpRequest},
 		"parse-listeners":  {Args: []string{"tcp-table", "udp-table", "fd-targets"}, Run: parseListeners},
 		"is-file":          {Args: []string{"path"}, Run: env.isFile},
+
+		"assert-no-new-privs":       {Run: env.assertNoNewPrivs},
+		"assert-seccomp":            {Run: env.assertSeccomp},
+		"assert-writable-mounts":    {Variadic: true, Run: env.assertWritableMounts}, // each target the app declares
+		"assert-no-package-manager": {Run: env.assertNoPackageManager},
 	}
 }
 
