@@ -55,11 +55,13 @@ func TestContractMinimal(t *testing.T) {
 		{name: "fixture"},
 		{
 			// Docker and Podman both mount an anonymous volume where the
-			// image declares one, writable, whatever the run asked for.
+			// image declares one, writable, whatever the run asked for, and
+			// with no noexec.
 			name: "volume", dir: "volume",
 			fails: []failure{
 				{checkNoVolume, volumeRecord, []string{"/data"}},
 				{checkNoVolume, mountsRecordWhat, []string{"volume /data"}},
+				{checkWritableMounts, "/data is mounted noexec, nosuid and nodev", nil},
 			},
 		},
 		{

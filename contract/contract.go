@@ -17,16 +17,29 @@
 //     engine saves it, carries a security.capability extended attribute,
 //     with the effective bit or without, on whatever file;
 //   - caps: PID 1 holds no capability, in any of its five sets;
+//   - no-new-privs: PID 1 runs with no_new_privs set, so nothing it execs
+//     can gain a privilege, as its status gives it;
+//   - seccomp: PID 1 is confined by a seccomp filter, as its status gives
+//     it;
 //   - read-only: creating /.divbast-write-probe fails because the root is
 //     mounted read-only;
 //   - no-volume: the image declares no VOLUME, the mounts the engine
 //     reports (Mounts and HostConfig.Tmpfs) are exactly tmpfs /tmp plus
 //     Config.Mounts, beside the probe's own volume, and that volume is
 //     mounted read-only at /divbast/probe, once;
+//   - writable-mounts: every mount the container's user can write, but
+//     Config.Mounts, is noexec, nosuid and nodev, and /tmp is a tmpfs it
+//     can write. On Podman this is what catches the tmpfs mounts
+//     --read-only adds of its own, at /run and /var/tmp, unless
+//     --read-only-tmpfs=false is given, which it does not report;
 //   - pid1: PID 1's comm is the file name of Config.PID1's first word, as
 //     the kernel cuts it to 15 bytes, and its whole argv is Config.PID1;
 //   - no-shell: nothing is at /bin/sh, /bin/bash or /bin/dash, and a path
 //     the probe may not look up counts as one that is there;
+//   - no-package-manager: no dpkg, apt, apk, rpm, dnf, microdnf or yum is
+//     on PID 1's PATH or in the usual directories. The package database
+//     a scanner reads, /var/lib/dpkg/status.d, is no package manager, and
+//     stays;
 //   - listeners: the processes in the container listen on Config.AppPort,
 //     Config.HealthPort and Config.ExtraTCPPorts alone, hold no UDP
 //     socket, and the probe can read the descriptors of every one of them;
@@ -253,6 +266,10 @@ const (
 	checkHostConfig            = "host-config"
 	checkNoVolume              = "no-volume"
 	checkNoFileCapabilityXattr = "no-file-capability-xattr"
+	checkNoNewPrivs            = "no-new-privs"
+	checkSeccomp               = "seccomp"
+	checkWritableMounts        = "writable-mounts"
+	checkNoPackageManager      = "no-package-manager"
 )
 
 // scenarioChecks are the checks whose records a Scenario names: those
@@ -261,9 +278,10 @@ var scenarioChecks = map[string]bool{checkHealthProbe: true, checkEngineHealthy:
 
 // allChecks is every check, in the order Check runs and returns them.
 var allChecks = []string{
-	checkDefaultUser, checkRuntimeUser, checkFileCapability, checkNoFileCapabilityXattr, checkCaps, checkReadOnly,
-	checkNoVolume, checkPID1, checkNoShell, checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe,
-	checkEngineHealthy, checkHealthPortOnly, checkHostConfig,
+	checkDefaultUser, checkRuntimeUser, checkFileCapability, checkNoFileCapabilityXattr, checkCaps, checkNoNewPrivs,
+	checkSeccomp, checkReadOnly, checkNoVolume, checkWritableMounts, checkPID1, checkNoShell, checkNoPackageManager,
+	checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe, checkEngineHealthy, checkHealthPortOnly,
+	checkHostConfig,
 }
 
 // Check runs every check against cfg's image, under the engine $ENGINE
@@ -306,10 +324,14 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 		checkFileCapability:        s.fileCapability,
 		checkNoFileCapabilityXattr: s.noFileCapabilityXattr,
 		checkCaps:                  s.probeCheck("assert-caps"),
+		checkNoNewPrivs:            s.probeCheck("assert-no-new-privs"),
+		checkSeccomp:               s.probeCheck("assert-seccomp"),
 		checkReadOnly:              s.probeCheck("assert-read-only"),
 		checkNoVolume:              s.noVolume,
+		checkWritableMounts:        s.probeCheck("assert-writable-mounts", s.mountTargets()...),
 		checkPID1:                  s.probeCheck("assert-pid1", cfg.PID1...),
 		checkNoShell:               s.probeCheck("assert-no-shell"),
+		checkNoPackageManager:      s.probeCheck("assert-no-package-manager"),
 		checkListeners:             s.probeCheck("assert-listeners", ports(&cfg)...),
 		checkNoEgress:              s.noEgress,
 		checkHealthcheckConfig:     s.healthcheckConfig,

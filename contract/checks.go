@@ -97,6 +97,16 @@ func (s *suite) probeSpec() *harness.ProbeSpec {
 	return &harness.ProbeSpec{AppPackage: s.cfg.AppProbe, PHP: s.cfg.PHP}
 }
 
+// mountTargets is where each of the mounts the app's Config gave the
+// container is: what writable-mounts sets aside as the app's own.
+func (s *suite) mountTargets() []string {
+	targets := make([]string, len(s.mounts))
+	for i, m := range s.mounts {
+		targets[i] = m.Target
+	}
+	return targets
+}
+
 // ports is every TCP port listeners allows: AppPort, HealthPort and
 // ExtraTCPPorts.
 func ports(cfg *Config) []string {
