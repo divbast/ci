@@ -926,8 +926,12 @@ func minimalServe(image string) ServeSpec {
 		Run:        RunSpec{Image: image, Confine: Contract("16m"), HealthCmd: minimalHealthCmd},
 		AppPort:    8080,
 		HealthPort: 8081,
+		Probe:      ProbeSpec{PHP: &PHPProbe{Binary: frankenphp, Probe: minimalApp}},
 	}
 }
+
+// minimalApp is an app.php with one subcommand, which records one ok.
+var minimalApp = []byte("<?php\nreturn ['app-ok' => static function (array $operands): void { Assertions::equals('the app probe runs', 'yes', 'yes'); }];\n")
 
 // loopbackPort returns the port of base, failing t unless base is
 // http://127.0.0.1:<port>, at a port the engine picked.
@@ -999,14 +1003,14 @@ func TestServeEnginePickedPort(t *testing.T) {
 		RunRecords(t, s.Probe, "assert-listeners", "8080", "8081")
 	}
 
-	// The container's own PHP, and a path PHP would read otherwise if it
-	// interpolated: IsFile must look for the path exactly as written.
-	c := served[0].C
-	if out, err := PHPIn(ctx, c, `echo PHP_SAPI; file_put_contents("/tmp/it's \$HOME", "");`); err != nil || out != "cli" {
+	// The container's own PHP, and a path a shell or PHP would read
+	// otherwise: IsFile must look for the path exactly as written.
+	c, p := served[0].C, served[0].Probe
+	if out, err := PHPIn(ctx, c, frankenphp, `echo PHP_SAPI; file_put_contents("/tmp/it's \$HOME", "");`); err != nil || out != "cli" {
 		t.Errorf("PHPIn() = %q, %v; want cli", out, err)
 	}
-	IsFile(t, c, "a path holding a quote and a dollar sign is present", "present", `/tmp/it's $HOME`)
-	IsFile(t, c, "the image has no /bin/sh", "absent", "/bin/sh")
+	IsFile(t, p, "a path holding a quote and a dollar sign is present", "present", `/tmp/it's $HOME`)
+	IsFile(t, p, "the image has no /bin/sh", "absent", "/bin/sh")
 
 	unpublished := sp
 	unpublished.HealthPort = 0
@@ -1111,6 +1115,9 @@ func TestServingRestart(t *testing.T) {
 		t.Errorf("after Restart(), the probe is %p (was %p), want one installed again", s.Probe, probe)
 	}
 	RunRecords(t, s.Probe, "assert-read-only")
+	RunRecords(t, s.Probe, "assert-caps")
+	// The PHP probe went with the old /tmp, and was written again
+	RunPHPRecords(t, s.Probe, "app-ok")
 
 	// A health copy taken before the restart sends to the health port
 	// where it is now, which Docker moved, and never to the app port:

@@ -882,7 +882,7 @@ func TestServingGetUnfollowed(t *testing.T) {
 func TestPHPIn(t *testing.T) {
 	t.Parallel()
 
-	run := []string{"docker", "exec", "abc", frankenphp, "php-cli", "-r", "echo 1;"}
+	run := []string{"docker", "exec", "abc", "/opt/php", "php-cli", "-r", "echo 1;"}
 	tests := []struct {
 		name    string
 		res     execx.Result
@@ -896,7 +896,7 @@ func TestPHPIn(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, execx.Call{Argv: run, Result: tt.res}))}
-			got, err := PHPIn(t.Context(), c, "echo 1;")
+			got, err := PHPIn(t.Context(), c, "/opt/php", "echo 1;")
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Errorf("PHPIn() = %q, %v; want an error containing %q", got, err, tt.wantErr)

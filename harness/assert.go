@@ -4,6 +4,7 @@
 package harness
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -99,43 +100,62 @@ const (
 	absent  = "absent"
 )
 
-// IsFile checks that path is in c or not, as want says: "present" or
-// "absent". It asks c's own PHP, with file_exists, which finds a path
-// whatever it is, a file or a directory, that the container's user may
-// look up.
-func IsFile(tb testing.TB, c *Container, what, want, path string) {
+// IsFile checks that path is in p's container or not, as want says:
+// "present" or "absent". It asks the core probe, which finds a path
+// whatever it is, a file or a directory, as the container's user looks
+// it up: one the user may not look up counts as present, since it may
+// be there. A nil p fails: a probe never installed.
+func IsFile(tb testing.TB, p *Probe, what, want, path string) {
 	tb.Helper()
 	checks := NewChecks(tb)
-	if want != present && want != absent {
+	switch {
+	case want != present && want != absent:
 		checks.True(what, false, fmt.Sprintf("want is %q, and a path is %s or %s", want, present, absent))
 		return
-	}
-	got, err := PHPIn(tb.Context(), c, fileStateCode(path))
-	if err != nil {
-		checks.True(what, false, err.Error())
+	case p == nil:
+		checks.True(what, false, "no probe is installed")
 		return
 	}
-	Equal(checks, what, want, got)
+	res, err := p.Output(tb.Context(), "is-file", path)
+	switch {
+	case err != nil:
+		checks.True(what, false, err.Error())
+	case res.Code != 0:
+		checks.True(what, false, fmt.Sprintf("probe is-file in container %s: exit status %d: %s", p.c, res.Code, combined(res)))
+	default:
+		Equal(checks, what, want, strings.TrimSpace(string(res.Stdout)))
+	}
 }
 
-// fileStateCode is PHP that prints present or absent, as path is in the
-// container or not. The path goes in single-quoted, so nothing in it is
-// interpolated.
-func fileStateCode(path string) string {
-	return fmt.Sprintf(`echo file_exists(%s) ? %q : %q;`, phpString(path), present, absent)
-}
-
-// RunRecords runs the probe subcommand sub in p, with args, and reports
-// each of its records as a check of its own, named by its What. A
-// subcommand that could not be run, or printed no records, fails the
+// RunRecords runs the core probe subcommand sub in p, with args, and
+// reports each of its records as a check of its own, named by its What.
+// A subcommand that could not be run, or printed no records, fails the
 // test, as does a nil p: a probe never installed.
 func RunRecords(tb testing.TB, p *Probe, sub string, args ...string) {
+	tb.Helper()
+	runRecords(tb, p, (*Probe).Run, sub, args)
+}
+
+// RunAppRecords is [RunRecords] for a subcommand of the app's Go probe.
+func RunAppRecords(tb testing.TB, p *Probe, sub string, args ...string) {
+	tb.Helper()
+	runRecords(tb, p, (*Probe).RunApp, sub, args)
+}
+
+// RunPHPRecords is [RunRecords] for one of a PHP app's own subcommands.
+func RunPHPRecords(tb testing.TB, p *Probe, sub string, args ...string) {
+	tb.Helper()
+	runRecords(tb, p, (*Probe).RunPHP, sub, args)
+}
+
+// runRecords runs sub through run and reports its records.
+func runRecords(tb testing.TB, p *Probe, run func(*Probe, context.Context, string, ...string) ([]Record, error), sub string, args []string) {
 	tb.Helper()
 	if p == nil {
 		tb.Errorf("FAIL probe %s: no probe is installed", sub)
 		return
 	}
-	records, err := p.Run(tb.Context(), sub, args...)
+	records, err := run(p, tb.Context(), sub, args...)
 	if err != nil {
 		tb.Errorf("FAIL %v", err)
 		return
