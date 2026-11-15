@@ -27,6 +27,22 @@ import (
 // Exec runs.
 const frankenphp = "/usr/local/bin/frankenphp"
 
+// phpApp is an app.php with one subcommand, which records one ok, and
+// phpReady runs it, as a PHP app's ReadyProbe asks its app through its
+// own PHP.
+var phpApp = []byte("<?php\nreturn ['app-ok' => static function (array $operands): void { Assertions::equals('the PHP probe runs', 'yes', 'yes'); }];\n")
+
+func phpReady(ctx context.Context, _ *harness.Container, p *harness.Probe) error {
+	records, err := p.RunPHP(ctx, "app-ok")
+	if err != nil {
+		return err
+	}
+	if len(records) != 1 || !records[0].OK {
+		return fmt.Errorf("app-ok recorded %+v, want one ok record", records)
+	}
+	return nil
+}
+
 var healthCmd = []string{"/usr/local/bin/frankenphp", "php-cli", "/usr/local/bin/librespeed-health"}
 
 // libreSpeed is LibreSpeed's contract, as its Containerfile and README
@@ -41,6 +57,7 @@ func libreSpeed(image string) Config {
 		// '--config', CADDYFILE])
 		PID1:      []string{"/usr/local/bin/frankenphp", "run", "--config", "/etc/frankenphp/Caddyfile"},
 		Exec:      []string{frankenphp, "version"},
+		PHP:       &PHP{Binary: frankenphp, Probe: phpApp},
 		HealthCmd: healthCmd,
 		Healthcheck: Healthcheck{
 			Test:        slices.Concat([]string{"CMD"}, healthCmd),
@@ -50,6 +67,7 @@ func libreSpeed(image string) Config {
 			Retries:     3,
 		},
 		HealthOnly404: []string{"/", "/backend/getIP.php", "/index.php"},
+		ReadyProbe:    phpReady,
 	}
 }
 
@@ -75,6 +93,7 @@ func baikal(tb testing.TB, e harness.Engine, image string) Config {
 		// '--config', CADDYFILE])
 		PID1:      []string{"/usr/local/bin/frankenphp", "run", "--config", "/etc/caddy/Caddyfile"},
 		Exec:      []string{frankenphp, "version"},
+		PHP:       &PHP{Binary: frankenphp, Probe: phpApp},
 		HealthCmd: baikalHealthCmd,
 		Healthcheck: Healthcheck{
 			Test:        slices.Concat([]string{"CMD"}, baikalHealthCmd),
@@ -91,6 +110,7 @@ func baikal(tb testing.TB, e harness.Engine, image string) Config {
 		// The health port's root, and DAV's own entry point: neither may
 		// answer there
 		HealthOnly404: []string{"/", "/dav.php"},
+		ReadyProbe:    phpReady,
 	}
 }
 
