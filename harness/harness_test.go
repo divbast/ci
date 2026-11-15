@@ -529,6 +529,61 @@ func TestNetwork(t *testing.T) {
 	}
 }
 
+// TestNetworkWaitsForAFreeSubnet makes a network while the engine has
+// none of its address pools left, as when many tests at once each hold a
+// network of their own: Network waits, a second apart, for one to come
+// free, and gives up after networkWithin with the engine's own words.
+func TestNetworkWaitsForAFreeSubnet(t *testing.T) {
+	t.Parallel()
+
+	create := []string{"docker", "network", "create", "--label", ownLabel, "--internal", "net"}
+	inspect := []string{"docker", "network", "inspect", "--format", "{{.Internal}}", "net"}
+	full := execx.Result{Code: 1, Stderr: []byte("Error response from daemon: all predefined address pools have been fully subnetted\n")}
+	podmanFull := execx.Result{Code: 125, Stderr: []byte("Error: could not find free subnet from subnet pools\n")}
+
+	t.Run("one-comes-free", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			e := newEngine("docker", execx.NewFake(t,
+				execx.Call{Argv: create, Result: full},
+				execx.Call{Argv: create, Result: podmanFull},
+				execx.Call{Argv: create, Result: execx.Result{Stdout: []byte("f00\n")}},
+				execx.Call{Argv: inspect, Result: execx.Result{Stdout: []byte("true\n")}},
+				execx.Call{Argv: []string{"docker", "network", "rm", "net"}},
+			))
+			start := time.Now()
+			if got, err := e.Network(t.Context(), t, "net", "", true); err != nil || got != "net" {
+				t.Errorf("Network() = %q, %v; want net once a subnet came free", got, err)
+			}
+			if waited := time.Since(start); waited != 2*time.Second {
+				t.Errorf("Network() waited %s, want two retries a second apart", waited)
+			}
+		})
+	})
+	t.Run("none-comes-free", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			tries := 0
+			e := newEngine("docker", runFunc(func(argv []string) execx.Result {
+				if !slices.Equal(argv, create) {
+					t.Errorf("unexpected command %q", argv)
+					return execx.Result{Code: 125}
+				}
+				tries++
+				return full
+			}))
+			start := time.Now()
+			_, err := e.Network(t.Context(), t, "net", "", true)
+			if err == nil || !strings.Contains(err.Error(), "fully subnetted") || !strings.Contains(err.Error(), networkWithin.String()) {
+				t.Errorf("Network() error = %v, want the engine's words after %s", err, networkWithin)
+			}
+			if waited := time.Since(start); waited < networkWithin || tries < 2 {
+				t.Errorf("Network() gave up after %s and %d tries, want it to keep trying for %s", waited, tries, networkWithin)
+			}
+		})
+	})
+}
+
 func TestVolume(t *testing.T) {
 	t.Parallel()
 
