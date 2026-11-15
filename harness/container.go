@@ -35,8 +35,15 @@ type Confinement struct {
 	// TmpfsSize sizes a tmpfs at /tmp, as --tmpfs /tmp:size=<TmpfsSize>.
 	// Empty mounts none.
 	TmpfsSize string
-	// ReadOnly is --read-only, and CapDropAll is --cap-drop ALL.
+	// ReadOnly is --read-only, and on Podman --read-only-tmpfs=false too,
+	// so that Podman adds no writable tmpfs mounts of its own, at /run,
+	// /var/tmp and elsewhere, beside the read-only root. CapDropAll is
+	// --cap-drop ALL.
 	ReadOnly, CapDropAll bool
+	// NoNewPrivileges is --security-opt no-new-privileges: nothing the
+	// container execs can gain a privilege its parent lacks, as through a
+	// setuid binary or a file capability.
+	NoNewPrivileges bool
 
 	// none marks what Unconfined returns: no confinement on purpose, which
 	// the zero Confinement is only by omission.
@@ -44,10 +51,11 @@ type Confinement struct {
 }
 
 // Contract returns the confinement every divbast image's contract claims
-// it runs under: uid and gid 65532, a read-only root, no capabilities, and
-// a tmpfs at /tmp of tmpfsSize, which is the only writable place it has.
+// it runs under: uid and gid 65532, a read-only root, no capabilities, no
+// new privileges, and a tmpfs at /tmp of tmpfsSize, noexec, nosuid and
+// nodev, which is the only writable place it has.
 func Contract(tmpfsSize string) Confinement {
-	return Confinement{User: "65532:65532", TmpfsSize: tmpfsSize, ReadOnly: true, CapDropAll: true}
+	return Confinement{User: "65532:65532", TmpfsSize: tmpfsSize, ReadOnly: true, CapDropAll: true, NoNewPrivileges: true}
 }
 
 // Unconfined returns the Confinement that adds no flag at all, and leaves
@@ -57,20 +65,28 @@ func Unconfined() Confinement {
 	return Confinement{none: true}
 }
 
-// flags returns c as run flags, always in the same order.
-func (c Confinement) flags() []string {
+// flags returns c as engine's run flags, always in the same order. The
+// tmpfs's options are spelt out, so that Docker and Podman agree rather
+// than each falling back on its own defaults.
+func (c Confinement) flags(engine string) []string {
 	var f []string
 	if c.CapDropAll {
 		f = append(f, "--cap-drop", "ALL")
 	}
 	if c.ReadOnly {
 		f = append(f, "--read-only")
+		if engine == "podman" {
+			f = append(f, "--read-only-tmpfs=false")
+		}
+	}
+	if c.NoNewPrivileges {
+		f = append(f, "--security-opt", "no-new-privileges")
 	}
 	if c.User != "" {
 		f = append(f, "--user", c.User)
 	}
 	if c.TmpfsSize != "" {
-		f = append(f, "--tmpfs", "/tmp:size="+c.TmpfsSize)
+		f = append(f, "--tmpfs", "/tmp:size="+c.TmpfsSize+",noexec,nosuid,nodev")
 	}
 	return f
 }
@@ -155,7 +171,7 @@ func (e Engine) argv(spec *RunSpec, mode string) []string {
 	if spec.Name != "" {
 		argv = append(argv, "--name", spec.Name)
 	}
-	argv = append(argv, spec.Confine.flags()...)
+	argv = append(argv, spec.Confine.flags(e.name)...)
 	if spec.Network != "" {
 		argv = append(argv, "--network", spec.Network)
 	}

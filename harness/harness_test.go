@@ -32,9 +32,17 @@ import (
 // tests, whose binaries are built in ci's module.
 const ownLabel = "divbast.harness=github.com/divbast/ci"
 
-// contractFlags is what every container run under the contract carries, in
-// this order, and exactly once.
-var contractFlags = []string{"--cap-drop", "ALL", "--read-only", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m"}
+// contractFlags is what every container run under Contract("16m")
+// carries on engine, in this order, and exactly once: on Podman,
+// --read-only-tmpfs=false too, which keeps Podman from adding writable
+// tmpfs mounts of its own beside the read-only root.
+func contractFlags(engine string) []string {
+	f := []string{"--cap-drop", "ALL", "--read-only"}
+	if engine == "podman" {
+		f = append(f, "--read-only-tmpfs=false")
+	}
+	return append(f, "--security-opt", "no-new-privileges", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m,noexec,nosuid,nodev")
+}
 
 // healthProbe is an exec-form health command, as both apps' images declare
 // theirs.
@@ -93,13 +101,13 @@ func TestArgvContract(t *testing.T) {
 
 			e := newEngine(name, nil)
 			got := e.Argv(&RunSpec{Image: "img", Confine: Contract("16m")})
-			if n := count(got, contractFlags); n != 1 {
-				t.Errorf("Argv(Contract(16m)) = %q\nholds %q %d times, want exactly once", got, contractFlags, n)
+			if n := count(got, contractFlags(name)); n != 1 {
+				t.Errorf("Argv(Contract(16m)) = %q\nholds %q %d times, want exactly once", got, contractFlags(name), n)
 			}
 
 			// A spec that asks for no confinement gets none of it.
 			loose := e.Argv(&RunSpec{Image: "img", Confine: Unconfined()})
-			for _, flag := range []string{"--cap-drop", "--read-only", "--user", "--tmpfs"} {
+			for _, flag := range []string{"--cap-drop", "--read-only", "--read-only-tmpfs=false", "--security-opt", "--user", "--tmpfs"} {
 				if slices.Contains(loose, flag) {
 					t.Errorf("Argv(Unconfined()) = %q, holds %s", loose, flag)
 				}
@@ -148,13 +156,13 @@ func TestArgv(t *testing.T) {
 		Args:       []string{"a1"},
 		Extra:      []string{"--init"},
 	}
-	head := []string{
-		"run", "-d", "--label", ownLabel, "--name", "ctr",
-		"--cap-drop", "ALL", "--read-only", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m",
-		"--network", "net", "--ip", "10.89.66.200",
-		"-e", "A=1 2", "-e", "B=2",
-		"-v", "vol:/data", "-v", "/host/dir:/x:ro",
-		"-p", "18080:8080",
+	head := func(engine string) []string {
+		return slices.Concat([]string{"run", "-d", "--label", ownLabel, "--name", "ctr"}, contractFlags(engine), []string{
+			"--network", "net", "--ip", "10.89.66.200",
+			"-e", "A=1 2", "-e", "B=2",
+			"-v", "vol:/data", "-v", "/host/dir:/x:ro",
+			"-p", "18080:8080",
+		})
 	}
 	// Docker's --entrypoint takes one word, so the rest goes before Args.
 	tail := []string{"--entrypoint", "/bin/e", "--init", "img", "first", "a1"}
@@ -163,8 +171,8 @@ func TestArgv(t *testing.T) {
 		engine string
 		want   []string
 	}{
-		{engine: "docker", want: slices.Concat(head, tail)},
-		{engine: "podman", want: slices.Concat(head, []string{"--health-cmd", `["/usr/local/bin/frankenphp","php-cli","/x"]`}, tail)},
+		{engine: "docker", want: slices.Concat(head("docker"), tail)},
+		{engine: "podman", want: slices.Concat(head("podman"), []string{"--health-cmd", `["/usr/local/bin/frankenphp","php-cli","/x"]`}, tail)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.engine, func(t *testing.T) {
@@ -419,7 +427,7 @@ func TestZeroConfinementRefused(t *testing.T) {
 	if Unconfined() == (Confinement{}) {
 		t.Fatal("Unconfined() is the zero Confinement, which Start and Run refuse")
 	}
-	if f := Unconfined().flags(); len(f) != 0 {
+	if f := Unconfined().flags("podman"); len(f) != 0 {
 		t.Errorf("Unconfined() runs with %q, want no confinement flags at all", f)
 	}
 
@@ -1189,11 +1197,8 @@ func TestRun(t *testing.T) {
 	e := newEngine("docker", nil)
 	e.run = execx.NewFake(t,
 		execx.Call{
-			Argv: []string{
-				"docker", "run", "--rm", "--label", ownLabel, "--name", "ctr",
-				"--cap-drop", "ALL", "--read-only", "--user", "65532:65532", "--tmpfs", "/tmp:size=16m",
-				"--network", "none", "--entrypoint", frankenphp, "img", "version",
-			},
+			Argv: slices.Concat([]string{"docker", "run", "--rm", "--label", ownLabel, "--name", "ctr"}, contractFlags("docker"),
+				[]string{"--network", "none", "--entrypoint", frankenphp, "img", "version"}),
 			Result: refused,
 		},
 		// --rm removed it already, and a missing one is no failure.
