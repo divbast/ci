@@ -688,6 +688,11 @@ changes these.
   `IsFile` takes the `*Probe` in place of the container, and `PHPIn`
   takes the PHP binary. A suite's `TestMain` may call
   `Engine.RemoveProbeVolumes` after `m.Run`.
+- **The PHP probe's file.** `harness/probe/core.php` is gone. What an
+  `app.php` may use, `Assertions`, `readOrThrow()`, `jsonList()` and
+  `httpRequest()`, is in `harness/probe/php/probe.php`, so a PHPStan
+  configuration that scans `.ci/harness/probe/core.php` for those
+  definitions scans `.ci/harness/probe/php/probe.php` instead.
 - **The confinement.** `harness.Contract` adds
   `--security-opt no-new-privileges`, mounts `/tmp` as
   `size=<n>,noexec,nosuid,nodev`, and on Podman adds
