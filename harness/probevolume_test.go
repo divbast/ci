@@ -4,7 +4,11 @@
 package harness
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -34,6 +38,9 @@ type volumeMaker struct {
 	mu     sync.Mutex
 	counts map[string]int
 	builds [][]string // each go build's argv
+	// containerfiles holds each probe image's Containerfile, as the
+	// build found it
+	containerfiles []string
 }
 
 func newVolumeMaker(t *testing.T, fill execx.Result) *volumeMaker {
@@ -60,6 +67,13 @@ func (m *volumeMaker) run(argv []string) execx.Result {
 		return execx.Result{}
 	case argv[0] == "docker" && argv[1] == "build":
 		m.counts["build"]++
+		if i := slices.Index(argv, "-f"); i >= 0 {
+			b, err := os.ReadFile(argv[i+1])
+			if err != nil {
+				m.t.Errorf("reading the probe image's Containerfile: %v", err)
+			}
+			m.containerfiles = append(m.containerfiles, string(b))
+		}
 		return execx.Result{}
 	case argv[0] == "docker" && argv[1] == "volume" && argv[2] == "create":
 		m.counts["volume create"]++
@@ -70,6 +84,9 @@ func (m *volumeMaker) run(argv []string) execx.Result {
 	case argv[0] == "docker" && argv[1] == "run":
 		m.counts["fill"]++
 		return m.fill
+	case argv[0] == "docker" && argv[1] == "volume" && argv[2] == "rm":
+		m.counts["volume rm"]++
+		return execx.Result{}
 	case argv[0] == "docker" && (argv[1] == "rm" || argv[1] == "image"):
 		// A cleanup's
 		return execx.Result{}
@@ -128,6 +145,15 @@ func TestProbeVolumeOnce(t *testing.T) {
 	if b := m.builds[2]; b[len(b)-1] != "./test/probe" || !strings.HasSuffix(b[len(b)-2], "/app") {
 		t.Errorf("the app probe was built with %q, want ./test/probe built to app", b)
 	}
+	// go build's output keeps the host's umask, which may leave it 0700:
+	// root's, in the image, and no one else's to run
+	for _, cf := range m.containerfiles {
+		for line := range strings.Lines(cf) {
+			if strings.HasPrefix(line, "COPY ") && !strings.HasPrefix(line, "COPY --chmod=0555 ") {
+				t.Errorf("the probe image's Containerfile has %q, want every probe copied --chmod=0555, so uid 65532 can run it whatever the umask", line)
+			}
+		}
+	}
 }
 
 func TestProbeVolumeEmpty(t *testing.T) {
@@ -138,11 +164,11 @@ func TestProbeVolumeEmpty(t *testing.T) {
 		fill execx.Result
 		want []string
 	}{
-		{name: "absent", fill: execx.Result{Stdout: []byte("absent\n")}, want: []string{"the probe volume", "is empty"}},
+		{name: "absent", fill: execx.Result{Stdout: []byte("absent\n")}, want: []string{"the probe volume", "could not run the probe"}},
 		{
 			name: "engine-refused",
 			fill: execx.Result{Code: 125, Stderr: []byte("docker: Error response from daemon: volume copy-up is not supported\n")},
-			want: []string{"the probe volume", "is empty", "volume copy-up is not supported"},
+			want: []string{"the probe volume", "could not run the probe", "volume copy-up is not supported"},
 		},
 	}
 	for _, tt := range tests {
@@ -161,7 +187,47 @@ func TestProbeVolumeEmpty(t *testing.T) {
 			if _, again := e.probeVolume(t.Context(), t, "amd64", ""); again == nil || m.count("fill") != 1 {
 				t.Errorf("probeVolume() again = %v after %d fills; want the first failure, and no second fill", again, m.count("fill"))
 			}
+			// The volume it made and could not fill is removed with the rest
+			if err := e.RemoveProbeVolumes(t.Context()); err != nil || m.count("volume rm") != 1 {
+				t.Errorf("RemoveProbeVolumes() = %v after %d removals; want the half-made volume removed", err, m.count("volume rm"))
+			}
 		})
+	}
+}
+
+// cancelledOnce is a volumeMaker whose first go env GOMOD finds its
+// context gone, as a first test's would when it ends mid-build.
+type cancelledOnce struct {
+	*volumeMaker
+	once sync.Once
+}
+
+func (c *cancelledOnce) RunStdin(_ context.Context, _ io.Reader, name string, args ...string) (execx.Result, error) {
+	argv := append([]string{name}, args...)
+	var err error
+	if slices.Equal(argv, []string{"go", "env", "GOMOD"}) {
+		c.once.Do(func() { err = fmt.Errorf("run go: %w", context.Canceled) })
+	}
+	if err != nil {
+		return execx.Result{}, err
+	}
+	return c.run(argv), nil
+}
+
+// TestProbeVolumeRetriesAfterCancel makes the probe volume for a first
+// caller whose context ended mid-build: that caller's failure is its own,
+// and the next caller, with a context still live, makes the volume.
+func TestProbeVolumeRetriesAfterCancel(t *testing.T) {
+	t.Parallel()
+
+	runner := &cancelledOnce{volumeMaker: newVolumeMaker(t, execx.Result{Stdout: []byte("present\n")})}
+	e := newEngine("docker", runner)
+	if _, err := e.probeVolume(t.Context(), t, "arm64", ""); !errors.Is(err, context.Canceled) {
+		t.Fatalf("probeVolume() with its context gone = %v, want context.Canceled", err)
+	}
+	name, err := e.probeVolume(t.Context(), t, "arm64", "")
+	if err != nil || name == "" {
+		t.Errorf("probeVolume() after a cancelled first try = %q, %v; want the volume made", name, err)
 	}
 }
 

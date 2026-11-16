@@ -6,6 +6,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,27 +79,46 @@ func (e Engine) probeArch(ctx context.Context, tb testing.TB, image string) (str
 // The volume carries e's label and outlives the test that made it, since
 // every later test of this process mounts it: [Engine.RemoveProbeVolumes]
 // removes it, or else the next run's [Engine.Sweep].
+//
+// A first caller whose context ended while it made the volume fails on
+// its own: the entry is dropped, so the next caller, or one waiting with
+// a context still live, makes it afresh.
 func (e Engine) probeVolume(ctx context.Context, tb testing.TB, arch, app string) (string, error) {
 	tb.Helper()
 	key := probeKey{engine: e.name, arch: arch, app: app}
-	e.probes.mu.Lock()
-	v, ok := e.probes.volumes[key]
-	if !ok {
-		v = &probeVolume{done: make(chan struct{})}
-		e.probes.volumes[key] = v
-	}
-	e.probes.mu.Unlock()
-	if ok {
+	for {
+		e.probes.mu.Lock()
+		v, ok := e.probes.volumes[key]
+		if !ok {
+			v = &probeVolume{done: make(chan struct{})}
+			e.probes.volumes[key] = v
+		}
+		e.probes.mu.Unlock()
+		if !ok {
+			v.name, v.err = e.makeProbeVolume(ctx, tb, arch, app)
+			if cancelled(v.err) {
+				e.probes.mu.Lock()
+				delete(e.probes.volumes, key)
+				e.probes.mu.Unlock()
+			}
+			close(v.done)
+			return v.name, v.err
+		}
 		select {
 		case <-v.done:
-			return v.name, v.err
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
+		if !cancelled(v.err) || ctx.Err() != nil {
+			return v.name, v.err
+		}
 	}
-	v.name, v.err = e.makeProbeVolume(ctx, tb, arch, app)
-	close(v.done)
-	return v.name, v.err
+}
+
+// cancelled reports whether err is a context's ending, which says nothing
+// of the probe volume itself.
+func cancelled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // makeProbeVolume builds the probes for arch, static, into an image
@@ -122,6 +142,8 @@ func (e Engine) makeProbeVolume(ctx context.Context, tb testing.TB, arch, app st
 	if _, err = e.output(ctx, "volume", "create", "--label", e.label, name); err != nil {
 		return "", err
 	}
+	// From here the volume exists: a failure returns its name too, so
+	// RemoveProbeVolumes removes it with the rest
 	res, err := e.Run(ctx, tb, &RunSpec{
 		Image:      image,
 		Network:    "none",
@@ -131,11 +153,11 @@ func (e Engine) makeProbeVolume(ctx context.Context, tb testing.TB, arch, app st
 		Args:       []string{"is-file", CoreProbePath},
 	})
 	if err != nil {
-		return "", err
+		return name, err
 	}
 	if res.Code != 0 || strings.TrimSpace(string(res.Stdout)) != present {
-		return "", fmt.Errorf("the probe volume %s is empty: %s did not copy the probe image's files into it on first mount, "+
-			"which the probe needs: exit status %d: %s", name, e.name, res.Code, combined(res))
+		return name, fmt.Errorf("the probe volume %s: %s could not run the probe from it, so the probe image's files "+
+			"were not copied into it on first mount, or cannot run there: exit status %d: %s", name, e.name, res.Code, combined(res))
 	}
 	return name, nil
 }
@@ -160,7 +182,9 @@ func (e Engine) probeImage(ctx context.Context, tb testing.TB, dir, arch, app st
 		if err != nil {
 			return "", err
 		}
-		containerfile.WriteString("COPY " + b.out + " " + b.at + "\n")
+		// go build's output keeps the host's umask, which may leave it
+		// 0700, root's in the image, and no one else's to run
+		containerfile.WriteString("COPY --chmod=0555 " + b.out + " " + b.at + "\n")
 	}
 	err = os.WriteFile(filepath.Join(dir, "Containerfile"), []byte(containerfile.String()), 0o600)
 	if err != nil {
@@ -217,7 +241,7 @@ func (e Engine) RemoveProbeVolumes(ctx context.Context) error {
 			// Still being made: whoever asked for it will use it.
 			continue
 		}
-		if v.err == nil {
+		if v.name != "" {
 			names = append(names, v.name)
 		}
 		delete(e.probes.volumes, key)
