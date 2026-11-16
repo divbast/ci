@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# The Go fixture: no more than a Go image needs to pass the contract, a
+# static binary on static-debian13, with no PHP, no shell and no
+# bootstrap. ci's own tests build it and run the contract against it, so
+# a contract change that would lean on anything in the image fails there
+# first.
+
+FROM golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9 AS build
+WORKDIR /src
+COPY main.go .
+# A module of its own, made here: the fixture needs nothing past the
+# standard library
+RUN go mod init example.com/minimal \
+    && CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -ldflags="-s -w" -o /out/minimal .
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
+COPY --from=build /out/minimal /usr/local/bin/minimal
+EXPOSE 8080 8081
+# Exec form, since the image has no shell to run any other
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/minimal", "health"]
+USER 65532:65532
+# The server itself, as PID 1
+ENTRYPOINT ["/usr/local/bin/minimal", "serve"]

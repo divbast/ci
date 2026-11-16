@@ -32,7 +32,7 @@ BASELINE := ARCHIVE + ".published.json"
 # Podman builds in Docker's format, as the harness's Build does: Podman's
 # default, OCI, has no place for a HEALTHCHECK, and drops the image's.
 
-# Build the image. CI first verifies the FrankenPHP binary's attestation; this does not
+# Build the image. CI first verifies the images the Containerfile builds from; this does not
 build:
     {{ ENGINE }} build {{ if ENGINE == "podman" { "--format docker " } else { "" } }}-t {{ IMAGE }} -f Containerfile .
 

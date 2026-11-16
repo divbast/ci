@@ -225,65 +225,87 @@ func TestLogContainsLacks(t *testing.T) {
 	}
 }
 
-// TestIsFile asks the container's PHP whether a path is there. The path
-// goes to PHP as a single-quoted string, in which nothing is
-// interpolated, and a want other than present or absent, which no check
-// could find, fails as such.
+// TestIsFile asks the core probe whether a path is there, which needs
+// nothing in the image. The path goes as an argument, so nothing in it is
+// read as anything else, and a want other than present or absent, which
+// no check could find, fails as such.
 func TestIsFile(t *testing.T) {
 	t.Parallel()
 
 	const path = `/data/it's $HOME`
-	exec := []string{"docker", "exec", "abc", FrankenPHP, "php-cli", "-r", `echo file_exists('/data/it\'s $HOME') ? "present" : "absent";`}
+	exec := probeArgv("is-file", path)
 	tests := []struct {
 		name     string
 		want     string
 		calls    []execx.Call
+		noProbe  bool
 		wantLogs []string
 		wantErrs [][]string
 	}{
 		{
 			name:     "present",
 			want:     "present",
-			calls:    []execx.Call{{Argv: exec, Result: execx.Result{Stdout: []byte("present")}}},
+			calls:    []execx.Call{{Argv: exec, Result: execx.Result{Stdout: []byte("present\n")}}},
 			wantLogs: []string{`ok   the file ("present")`},
 		},
 		{
 			name:     "absent-not-present",
 			want:     "present",
-			calls:    []execx.Call{{Argv: exec, Result: execx.Result{Stdout: []byte("absent")}}},
+			calls:    []execx.Call{{Argv: exec, Result: execx.Result{Stdout: []byte("absent\n")}}},
 			wantErrs: [][]string{{`FAIL the file: got "absent", want "present"`}},
 		},
 		{
-			name:     "php-fails",
+			name:     "probe-fails",
 			want:     "absent",
-			calls:    []execx.Call{{Argv: exec, Result: phpFatal}},
-			wantErrs: [][]string{{"FAIL the file: php-cli -r in container abc: exit status 255"}},
+			calls:    []execx.Call{{Argv: exec, Result: execx.Result{Code: 2, Stderr: []byte("unknown subcommand 'is-file'\n")}}},
+			wantErrs: [][]string{{"FAIL the file: probe is-file in container abc: exit status 2: unknown subcommand 'is-file'"}},
 		},
 		{
 			name:     "neither",
 			want:     "exists",
 			wantErrs: [][]string{{`FAIL the file: want is "exists", and a path is present or absent`}},
 		},
+		{
+			name:     "no-probe",
+			want:     "present",
+			noProbe:  true,
+			wantErrs: [][]string{{"FAIL the file: no probe is installed"}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			tb := &recTB{t: t}
-			c := &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t, tt.calls...))}
-			IsFile(tb, c, "the file", tt.want, path)
+			var p *Probe
+			if !tt.noProbe {
+				p = &Probe{c: probedContainer(t, ProbeSpec{}, tt.calls...)}
+			}
+			IsFile(tb, p, "the file", tt.want, path)
 			recorded(t, tb, tt.wantLogs, tt.wantErrs...)
 		})
 	}
 }
 
 // TestRunRecords reports each of a probe subcommand's records as a check
-// of its own. A subcommand that could not run, and a probe never
-// installed, are failures that say so.
+// of its own, from the core probe, the app's Go probe or its PHP one. A
+// subcommand that could not run, and a probe never installed, are
+// failures that say so.
 func TestRunRecords(t *testing.T) {
 	t.Parallel()
 
 	okRecord := "ok\tCapEff, every capability bit clear\t0\t0\n"
 	failRecord := "FAIL\tCapBnd, every capability bit clear\t0\t2000\n"
+	php := &PHPProbe{Binary: frankenphp, Probe: []byte("<?php return [];")}
+	helpers := []struct {
+		name string
+		run  func(testing.TB, *Probe, string, ...string)
+		spec ProbeSpec
+		argv []string
+	}{
+		{name: "core", run: RunRecords, argv: probeArgv("assert-caps", "x")},
+		{name: "app", run: RunAppRecords, spec: ProbeSpec{AppPackage: "./test/probe"}, argv: []string{"docker", "exec", "abc", "/divbast/probe/app", "assert-caps", "x"}},
+		{name: "php", run: RunPHPRecords, spec: ProbeSpec{PHP: php}, argv: []string{"docker", "exec", "abc", frankenphp, "php-cli", "/tmp/divbast-probe/probe.php", "assert-caps", "x"}},
+	}
 	tests := []struct {
 		name     string
 		res      *execx.Result
@@ -308,19 +330,20 @@ func TestRunRecords(t *testing.T) {
 		},
 		{name: "no-probe", wantErrs: [][]string{{"FAIL probe assert-caps: no probe is installed"}}},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			tb := &recTB{t: t}
-			var p *Probe
-			if tt.res != nil {
-				p = &Probe{c: &Container{ID: "abc", engine: newEngine("docker", execx.NewFake(t,
-					execx.Call{Argv: probeArgv("assert-caps", "x"), Result: *tt.res},
-				))}}
-			}
-			RunRecords(tb, p, "assert-caps", "x")
-			recorded(t, tb, tt.wantLogs, tt.wantErrs...)
-		})
+	for _, h := range helpers {
+		for _, tt := range tests {
+			t.Run(h.name+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				tb := &recTB{t: t}
+				var p *Probe
+				if tt.res != nil {
+					c := probedContainer(t, h.spec, execx.Call{Argv: h.argv, Result: *tt.res})
+					p = &Probe{c: c, spec: h.spec}
+				}
+				h.run(tb, p, "assert-caps", "x")
+				recorded(t, tb, tt.wantLogs, tt.wantErrs...)
+			})
+		}
 	}
 }
 

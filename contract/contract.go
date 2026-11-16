@@ -10,26 +10,39 @@
 //     its user;
 //   - runtime-user: PID 1 runs as 65532:65532, in each of the real,
 //     effective, saved and filesystem IDs its status gives for each;
-//   - file-capability: /usr/local/bin/frankenphp runs under --cap-drop ALL,
+//   - file-capability: Config.Exec runs to exit 0 under --cap-drop ALL,
 //     which the kernel refuses to a binary whose file capability has the
 //     effective bit;
 //   - no-file-capability-xattr: no file in any layer of the image, as the
 //     engine saves it, carries a security.capability extended attribute,
 //     with the effective bit or without, on whatever file;
 //   - caps: PID 1 holds no capability, in any of its five sets;
+//   - no-new-privs: PID 1 runs with no_new_privs set, so nothing it execs
+//     can gain a privilege, as its status gives it;
+//   - seccomp: PID 1 is confined by a seccomp filter, as its status gives
+//     it;
 //   - read-only: creating /.divbast-write-probe fails because the root is
 //     mounted read-only;
-//   - no-volume: the image declares no VOLUME, and the mounts the engine
+//   - no-volume: the image declares no VOLUME, the mounts the engine
 //     reports (Mounts and HostConfig.Tmpfs) are exactly tmpfs /tmp plus
-//     Config.Mounts. Podman's --read-only adds writable tmpfs mounts of its
-//     own, /run and /var/tmp among them, which it does not report;
+//     Config.Mounts, beside the probe's own volume, and that volume is
+//     mounted read-only at /divbast/probe, once;
+//   - writable-mounts: every mount the container's user can write, but
+//     Config.Mounts, is noexec, nosuid and nodev, and /tmp is a tmpfs it
+//     can write. On Podman this is what catches the tmpfs mounts
+//     --read-only adds of its own, at /run and /var/tmp, unless
+//     --read-only-tmpfs=false is given, which it does not report;
 //   - pid1: PID 1's comm is the file name of Config.PID1's first word, as
 //     the kernel cuts it to 15 bytes, and its whole argv is Config.PID1;
 //   - no-shell: nothing is at /bin/sh, /bin/bash or /bin/dash, and a path
 //     the probe may not look up counts as one that is there;
-//   - listeners: the processes in the container listen on Config.AppPort
-//     and Config.HealthPort alone, hold no UDP socket, and the probe can
-//     read the descriptors of every one of them;
+//   - no-package-manager: no dpkg, apt, apk, rpm, dnf, microdnf or yum is
+//     on PID 1's PATH or in the usual directories. The package database
+//     a scanner reads, /var/lib/dpkg/status.d, is no package manager, and
+//     stays;
+//   - listeners: the processes in the container listen on Config.AppPort,
+//     Config.HealthPort and Config.ExtraTCPPorts alone, hold no UDP
+//     socket, and the probe can read the descriptors of every one of them;
 //   - no-egress: the container's network is one the engine reports
 //     internal, and a TCP connect from it to 9.9.9.9:443 fails;
 //   - healthcheck-config: its HEALTHCHECK is Config.Healthcheck, in exec
@@ -46,9 +59,9 @@
 //     on the app port;
 //   - host-config: the engine reports adding no capability, no
 //     --privileged, a read-only root, no security option that loosens
-//     seccomp, AppArmor or SELinux, no init before the entrypoint, and a
-//     network namespace of the container's own, and leaves none of those
-//     fields out but Init.
+//     seccomp, AppArmor or SELinux, no-new-privileges, no init before the
+//     entrypoint, and a network namespace of the container's own, and
+//     leaves none of those fields out but Init.
 //
 // Every container a check runs is run under exactly the confinement the
 // contract claims, so no check can pass under a looser one. The container
@@ -68,8 +81,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -80,6 +93,10 @@ import (
 // Healthcheck is an image's HEALTHCHECK: its command, starting "CMD" for
 // the exec form, and its timings, zero for one left unset.
 type Healthcheck = harness.Healthcheck
+
+// PHP is a PHP app's own probe subcommands, as [harness.PHPProbe] gives
+// them: its PHP binary, and its app.php.
+type PHP = harness.PHPProbe
 
 // Config is what an app's contract says about its image.
 type Config struct {
@@ -93,6 +110,16 @@ type Config struct {
 	// PID1 is PID 1's whole argv once the image has started: the server,
 	// as its bootstrap hands over to it.
 	PID1 []string
+	// Exec is an argv that runs to exit 0 under the contract with no
+	// network, its first word an absolute path to one of the app's own
+	// binaries, such as ["/usr/local/bin/frankenphp", "version"]:
+	// file-capability runs it, and the kernel refuses to execute a binary
+	// that carries an effective file capability.
+	Exec []string
+	// ExtraTCPPorts are the TCP ports the app listens on in this
+	// configuration beside AppPort and HealthPort, such as a Gopher
+	// server's. listeners allows these and no others.
+	ExtraTCPPorts []int
 	// HealthCmd is the image's health command, as a Podman user passes it
 	// with --health-cmd.
 	HealthCmd []string
@@ -109,14 +136,17 @@ type Config struct {
 	// context ends a minute after it is called, as long as each port had
 	// to answer.
 	Ready func(ctx context.Context, c *harness.Container) error
-	// ReadyProbe is Ready, given as well the probe the contract installed
-	// in c, with ProbeApp beside it, for an app that asks its app through
-	// the probe: one installed again would be the same files. Set Ready or
-	// ReadyProbe, not both.
+	// ReadyProbe is Ready, given as well the probe the contract attached
+	// in c, with AppProbe or PHP beside the core probe, for an app that
+	// asks its app through the probe. Set Ready or ReadyProbe, not both.
 	ReadyProbe func(ctx context.Context, c *harness.Container, p *harness.Probe) error
-	// ProbeApp is the app's own probe subcommands, installed beside the
-	// core probe as app.php. Empty installs none.
-	ProbeApp []byte
+	// AppProbe is the app's own Go probe: a main package of the module
+	// under test, as go build takes it from the module's root, such as
+	// "./test/probe", mounted beside the core probe. Empty for none.
+	AppProbe string
+	// PHP is a PHP app's own probe subcommands, written into the
+	// container's /tmp and run under its PHP. Nil for none.
+	PHP *PHP
 	// HealthOnly404 holds the paths that must answer 404 on HealthPort,
 	// such as the app's own pages: one at least.
 	HealthOnly404 []string
@@ -168,11 +198,37 @@ func (c *Config) validate() error {
 	if len(c.HealthCmd) == 0 {
 		errs = append(errs, errors.New("Config.HealthCmd is empty"))
 	}
+	if len(c.Exec) == 0 || !path.IsAbs(c.Exec[0]) {
+		errs = append(errs, fmt.Errorf("Config.Exec is %q: file-capability runs it, and needs an argv whose first word "+
+			"is an absolute path to one of the app's binaries", c.Exec))
+	}
+	errs = append(errs, c.validateExtraPorts()...)
+	if c.PHP != nil && (!path.IsAbs(c.PHP.Binary) || len(c.PHP.Probe) == 0) {
+		errs = append(errs, fmt.Errorf("Config.PHP names the binary %q and %d bytes of app.php: it needs the app's PHP "+
+			"as an absolute path, and an app.php", c.PHP.Binary, len(c.PHP.Probe)))
+	}
 	if want := slices.Concat([]string{"CMD"}, c.HealthCmd); len(c.HealthCmd) > 0 && !slices.Equal(c.Healthcheck.Test, want) {
 		errs = append(errs, fmt.Errorf("Config.Healthcheck.Test is %q, want %q: the exec form, since no divbast image has a shell, "+
 			"and the command a Podman user is given", c.Healthcheck.Test, want))
 	}
 	return errors.Join(errs...)
+}
+
+// validateExtraPorts refuses an ExtraTCPPorts entry that is no TCP port,
+// one given twice, and one that is AppPort or HealthPort.
+func (c *Config) validateExtraPorts() []error {
+	var errs []error
+	seen := map[int]bool{c.AppPort: true, c.HealthPort: true}
+	for _, p := range c.ExtraTCPPorts {
+		switch {
+		case p < 1 || p > 65535:
+			errs = append(errs, fmt.Errorf("Config.ExtraTCPPorts holds %d, which is not a TCP port", p))
+		case seen[p]:
+			errs = append(errs, fmt.Errorf("Config.ExtraTCPPorts holds %d, which is AppPort, HealthPort or another of its own", p))
+		}
+		seen[p] = true
+	}
+	return errs
 }
 
 // Result is one check's outcome.
@@ -210,6 +266,10 @@ const (
 	checkHostConfig            = "host-config"
 	checkNoVolume              = "no-volume"
 	checkNoFileCapabilityXattr = "no-file-capability-xattr"
+	checkNoNewPrivs            = "no-new-privs"
+	checkSeccomp               = "seccomp"
+	checkWritableMounts        = "writable-mounts"
+	checkNoPackageManager      = "no-package-manager"
 )
 
 // scenarioChecks are the checks whose records a Scenario names: those
@@ -218,9 +278,10 @@ var scenarioChecks = map[string]bool{checkHealthProbe: true, checkEngineHealthy:
 
 // allChecks is every check, in the order Check runs and returns them.
 var allChecks = []string{
-	checkDefaultUser, checkRuntimeUser, checkFileCapability, checkNoFileCapabilityXattr, checkCaps, checkReadOnly,
-	checkNoVolume, checkPID1, checkNoShell, checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe,
-	checkEngineHealthy, checkHealthPortOnly, checkHostConfig,
+	checkDefaultUser, checkRuntimeUser, checkFileCapability, checkNoFileCapabilityXattr, checkCaps, checkNoNewPrivs,
+	checkSeccomp, checkReadOnly, checkNoVolume, checkWritableMounts, checkPID1, checkNoShell, checkNoPackageManager,
+	checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe, checkEngineHealthy, checkHealthPortOnly,
+	checkHostConfig,
 }
 
 // Check runs every check against cfg's image, under the engine $ENGINE
@@ -263,11 +324,15 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 		checkFileCapability:        s.fileCapability,
 		checkNoFileCapabilityXattr: s.noFileCapabilityXattr,
 		checkCaps:                  s.probeCheck("assert-caps"),
+		checkNoNewPrivs:            s.probeCheck("assert-no-new-privs"),
+		checkSeccomp:               s.probeCheck("assert-seccomp"),
 		checkReadOnly:              s.probeCheck("assert-read-only"),
 		checkNoVolume:              s.noVolume,
+		checkWritableMounts:        s.probeCheck("assert-writable-mounts", s.mountTargets()...),
 		checkPID1:                  s.probeCheck("assert-pid1", cfg.PID1...),
 		checkNoShell:               s.probeCheck("assert-no-shell"),
-		checkListeners:             s.probeCheck("assert-listeners", strconv.Itoa(cfg.AppPort), strconv.Itoa(cfg.HealthPort)),
+		checkNoPackageManager:      s.probeCheck("assert-no-package-manager"),
+		checkListeners:             s.probeCheck("assert-listeners", ports(&cfg)...),
 		checkNoEgress:              s.noEgress,
 		checkHealthcheckConfig:     s.healthcheckConfig,
 		checkHealthProbe:           s.healthProbe,

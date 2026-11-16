@@ -17,7 +17,8 @@ import (
 // contract, rather than reading the image or running a container of its
 // own.
 var needsContainer = map[string]bool{
-	checkRuntimeUser: true, checkCaps: true, checkReadOnly: true, checkNoVolume: true, checkPID1: true, checkNoShell: true,
+	checkRuntimeUser: true, checkCaps: true, checkNoNewPrivs: true, checkSeccomp: true, checkReadOnly: true,
+	checkNoVolume: true, checkWritableMounts: true, checkPID1: true, checkNoShell: true, checkNoPackageManager: true,
 	checkListeners: true, checkNoEgress: true, checkHealthProbe: true, checkEngineHealthy: true, checkHealthPortOnly: true,
 	checkHostConfig: true,
 }
@@ -39,6 +40,10 @@ type mutant struct {
 	dir string
 	// loosen holds raw run flags for the container under the contract.
 	loosen []string
+	// engine, when set, is the one engine the mutant can be made on.
+	engine string
+	// config changes the fixture's Config, when set.
+	config func(*Config)
 	// fails is every record that must FAIL. Every other record, of these
 	// checks or any other, must be ok.
 	fails []failure
@@ -66,12 +71,14 @@ func TestContractMutants(t *testing.T) {
 		},
 		{
 			// A shell 65532 cannot look up is not proven absent. The
-			// directory hides bash and dash alike, which are not there.
+			// directory hides bash and dash alike, which are not there, and
+			// every package manager's name in it too.
 			name: "shell-unsearchable", dir: "shell-unsearchable",
 			fails: []failure{
 				{checkNoShell, "/bin/sh is absent from the image", []string{"Permission denied"}},
 				{checkNoShell, "/bin/bash is absent from the image", []string{"Permission denied"}},
 				{checkNoShell, "/bin/dash is absent from the image", []string{"Permission denied"}},
+				{checkNoPackageManager, "no package manager is in the image", []string{"/usr/bin/dpkg", "/usr/bin/apt"}},
 			},
 		},
 		{
@@ -82,7 +89,7 @@ func TestContractMutants(t *testing.T) {
 			// of the layers finds the capability without running anything.
 			name: "filecap", dir: "filecap",
 			fails: []failure{
-				{checkFileCapability, fileCapabilityRecord, []string{"operation not permitted", "/usr/local/bin/frankenphp"}},
+				{checkFileCapability, fileCapabilityRecord(frankenphp), []string{"operation not permitted", "/usr/local/bin/frankenphp"}},
 				{checkNoFileCapabilityXattr, xattrRecord, []string{"/usr/local/bin/frankenphp"}},
 			},
 			unstartable: true,
@@ -96,18 +103,59 @@ func TestContractMutants(t *testing.T) {
 			fails: []failure{{checkListeners, "TCP ports a process in the container listens on", []string{"9090"}}},
 		},
 		{
-			// Not an image: a flag that loosens the run, which the probe
-			// inside cannot see
+			// The same listener, named as one this configuration has
+			name: "extra-listener", dir: "listener",
+			config: func(c *Config) { c.ExtraTCPPorts = []int{9090} },
+		},
+		{
+			// Something a package manager would be found as
+			name: "dpkg", dir: "dpkg",
+			fails: []failure{{checkNoPackageManager, "no package manager is in the image", []string{"/usr/bin/dpkg"}}},
+		},
+		{
+			// Not an image: a flag that loosens the run. The kernel says so
+			// inside, and the engine outside.
 			name: "seccomp-unconfined", loosen: []string{"--security-opt", "seccomp=unconfined"},
-			fails: []failure{{
-				checkHostConfig,
-				"no security option turns off seccomp, AppArmor or SELinux confinement (HostConfig.SecurityOpt)",
-				[]string{"seccomp=unconfined"},
-			}},
+			fails: []failure{
+				{checkSeccomp, "PID 1 is confined by a seccomp filter (Seccomp in /proc/1/status)", []string{"0"}},
+				{
+					checkHostConfig,
+					"no security option turns off seccomp, AppArmor or SELinux confinement (HostConfig.SecurityOpt)",
+					[]string{"seccomp=unconfined"},
+				},
+			},
+		},
+		{
+			// The later option wins, on both engines
+			name: "new-privs", loosen: []string{"--security-opt", "no-new-privileges=false"},
+			fails: []failure{
+				{checkNoNewPrivs, "PID 1 has no_new_privs set (NoNewPrivs in /proc/1/status)", []string{"0"}},
+				{checkHostConfig, "the engine sets no-new-privileges (HostConfig.SecurityOpt)", nil},
+			},
+		},
+		{
+			// A second tmpfs, one 65532 can write, which can execute what
+			// is written there. Without its mode it would be the image's
+			// /run, root's and 0755, which 65532 cannot write at all.
+			name: "exec-run", loosen: []string{"--tmpfs", "/run:exec,mode=1777"},
+			fails: []failure{
+				{checkWritableMounts, "/run is mounted noexec, nosuid and nodev", []string{"nosuid nodev"}},
+				{checkNoVolume, mountsRecordWhat, []string{"tmpfs /run"}},
+			},
+		},
+		{
+			// Podman's own tmpfs mounts beside the read-only root, which it
+			// does not report: only /var/tmp is one 65532 can write, since
+			// /run is root's, 0755.
+			name: "podman-tmpfs", engine: "podman", loosen: []string{"--read-only-tmpfs=true"},
+			fails: []failure{{checkWritableMounts, "/var/tmp is mounted noexec, nosuid and nodev", []string{"nosuid nodev"}}},
 		},
 	} {
 		t.Run(m.name, func(t *testing.T) {
 			t.Parallel()
+			if m.engine != "" && m.engine != e.Name() {
+				t.Skipf("the %s mutant is made on %s alone", m.name, m.engine)
+			}
 			runMutant(t, e, testfixture.LibreSpeed, libreSpeed, &m)
 		})
 	}
@@ -129,6 +177,9 @@ func runMutant(t *testing.T, e harness.Engine, fixture string, config func(image
 		}
 	}
 	cfg := config(image)
+	if m.config != nil {
+		m.config(&cfg)
+	}
 	results := check(ctx, t, &cfg, m.loosen)
 	if got := checkNames(results); !slices.Equal(got, allChecks) {
 		t.Fatalf("check() ran %q, want %q", got, allChecks)

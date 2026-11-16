@@ -6,6 +6,13 @@
 
 # The minimal fixture, which the test builds and passes in
 ARG FIXTURE
-FROM ${FIXTURE}
 
+FROM docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6 AS data
+RUN mkdir -p /out/data
+
+# /data is 65532's, as an app's would be, so the anonymous volume each
+# engine mounts there takes that owner: on Docker as on Podman, the
+# contract's user can write to it, and exec what it wrote
+FROM ${FIXTURE}
+COPY --from=data --chown=65532:65532 /out/data /data
 VOLUME /data

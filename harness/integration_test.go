@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -382,7 +381,7 @@ func TestRestartSameContainer(t *testing.T) {
 	})
 	php := func(code string) string {
 		t.Helper()
-		res, execErr := c.Exec(ctx, nil, FrankenPHP, "php-cli", "-r", code)
+		res, execErr := c.Exec(ctx, nil, frankenphp, "php-cli", "-r", code)
 		if execErr != nil {
 			t.Fatal(execErr)
 		}
@@ -445,9 +444,9 @@ func TestRestartSameContainer(t *testing.T) {
 		}
 	}
 
-	// As a caller does after a restart: the probe installed again answers
+	// As a caller does after a restart: the probe attached again answers
 	// on both ports, and the address Inspect now gives reaches the app.
-	p, err := InstallProbe(ctx, c, nil)
+	p, err := AttachProbe(ctx, c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,16 +471,22 @@ func TestRestartSameContainer(t *testing.T) {
 	}
 }
 
-// startServed starts spec, installs the probe, and waits until both of the
-// contract's ports answer from inside the container.
+// startServed starts spec, with the core probe unless it asks for more,
+// attaches the probe, and waits until both of the contract's ports answer
+// from inside the container.
 func startServed(t *testing.T, e Engine, spec *RunSpec) (*Container, *Probe) {
 	t.Helper()
 	ctx := t.Context()
+	if spec.Probe == nil {
+		s := *spec
+		s.Probe = &ProbeSpec{}
+		spec = &s
+	}
 	c, err := e.Start(ctx, t, spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := InstallProbe(ctx, c, nil)
+	p, err := AttachProbe(ctx, c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,14 +507,21 @@ func TestProbeOnFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	app := []byte("<?php\nreturn ['app-ok' => static function (array $operands): void { Assertions::equals('the app probe runs', 'yes', 'yes'); }];\n")
 	c, p := startServed(t, e, &RunSpec{
 		Image:     testfixture.LibreSpeed,
 		Network:   network,
 		Confine:   Contract("16m"),
 		HealthCmd: healthCmd,
+		Probe:     &ProbeSpec{PHP: &PHPProbe{Binary: frankenphp, Probe: app}},
 	})
 
 	checks := NewChecks(t)
+	if records, runErr := p.RunPHP(ctx, "app-ok"); runErr != nil {
+		t.Error(runErr)
+	} else {
+		checks.Records(records)
+	}
 	for _, sub := range [][]string{
 		{"assert-caps"},
 		{"assert-no-shell"},
@@ -566,13 +578,13 @@ func TestProbeCapsArePID1s(t *testing.T) {
 	}
 
 	// That the exec holds a capability at all, or this shows nothing
-	self := privileged(FrankenPHP, "php-cli", "-r", `echo file_get_contents('/proc/self/status');`)
+	self := privileged(frankenphp, "php-cli", "-r", `echo file_get_contents('/proc/self/status');`)
 	if !regexp.MustCompile(`(?m)^CapBnd:\s*0*[1-9a-f]`).Match(self.Stdout) {
 		t.Fatalf("exec --privileged holds no capability, so it cannot tell PID 1's from its own: exit %d: %s",
 			self.Code, combined(self))
 	}
 
-	res := privileged(FrankenPHP, "php-cli", path.Join(ProbeDir, "core.php"), "assert-caps")
+	res := privileged(CoreProbePath, "assert-caps")
 	records, err := parseRecords(res.Stdout)
 	if err != nil {
 		t.Fatalf("assert-caps: %v: %s", err, combined(res))
@@ -656,7 +668,7 @@ func TestProbeNegative(t *testing.T) {
 			// any socket it held would go uncounted.
 			name:   "a-process-the-probe-cannot-look-into",
 			spec:   &RunSpec{Confine: Contract("16m")},
-			asRoot: []string{FrankenPHP, "php-cli", "-r", "sleep(600);"},
+			asRoot: []string{frankenphp, "php-cli", "-r", "sleep(600);"},
 			sub:    []string{"assert-listeners", "8080", "8081"},
 			fail:   "processes in the container whose descriptors the probe cannot read",
 			ok:     []string{"TCP ports a process in the container listens on", "UDP ports a process in the container holds a socket on"},
@@ -880,7 +892,7 @@ func TestEngineHealthyWaitsForTimer(t *testing.T) {
 
 // minimalHealthCmd is the minimal fixture's health probe, as its
 // HEALTHCHECK runs it and a Podman user passes it.
-var minimalHealthCmd = []string{FrankenPHP, "php-cli", "/usr/local/bin/minimal-health"}
+var minimalHealthCmd = []string{frankenphp, "php-cli", "/usr/local/bin/minimal-health"}
 
 // minimalPage is exactly what the minimal fixture's GET / answers.
 const minimalPage = "Hello from frankenphp\n"
@@ -914,8 +926,12 @@ func minimalServe(image string) ServeSpec {
 		Run:        RunSpec{Image: image, Confine: Contract("16m"), HealthCmd: minimalHealthCmd},
 		AppPort:    8080,
 		HealthPort: 8081,
+		Probe:      ProbeSpec{PHP: &PHPProbe{Binary: frankenphp, Probe: minimalApp}},
 	}
 }
+
+// minimalApp is an app.php with one subcommand, which records one ok.
+var minimalApp = []byte("<?php\nreturn ['app-ok' => static function (array $operands): void { Assertions::equals('the app probe runs', 'yes', 'yes'); }];\n")
 
 // loopbackPort returns the port of base, failing t unless base is
 // http://127.0.0.1:<port>, at a port the engine picked.
@@ -987,14 +1003,14 @@ func TestServeEnginePickedPort(t *testing.T) {
 		RunRecords(t, s.Probe, "assert-listeners", "8080", "8081")
 	}
 
-	// The container's own PHP, and a path PHP would read otherwise if it
-	// interpolated: IsFile must look for the path exactly as written.
-	c := served[0].C
-	if out, err := PHPIn(ctx, c, `echo PHP_SAPI; file_put_contents("/tmp/it's \$HOME", "");`); err != nil || out != "cli" {
+	// The container's own PHP, and a path a shell or PHP would read
+	// otherwise: IsFile must look for the path exactly as written.
+	c, p := served[0].C, served[0].Probe
+	if out, err := PHPIn(ctx, c, frankenphp, `echo PHP_SAPI; file_put_contents("/tmp/it's \$HOME", "");`); err != nil || out != "cli" {
 		t.Errorf("PHPIn() = %q, %v; want cli", out, err)
 	}
-	IsFile(t, c, "a path holding a quote and a dollar sign is present", "present", `/tmp/it's $HOME`)
-	IsFile(t, c, "the image has no /bin/sh", "absent", "/bin/sh")
+	IsFile(t, p, "a path holding a quote and a dollar sign is present", "present", `/tmp/it's $HOME`)
+	IsFile(t, p, "the image has no /bin/sh", "absent", "/bin/sh")
 
 	unpublished := sp
 	unpublished.HealthPort = 0
@@ -1099,6 +1115,9 @@ func TestServingRestart(t *testing.T) {
 		t.Errorf("after Restart(), the probe is %p (was %p), want one installed again", s.Probe, probe)
 	}
 	RunRecords(t, s.Probe, "assert-read-only")
+	RunRecords(t, s.Probe, "assert-caps")
+	// The PHP probe went with the old /tmp, and was written again
+	RunPHPRecords(t, s.Probe, "app-ok")
 
 	// A health copy taken before the restart sends to the health port
 	// where it is now, which Docker moved, and never to the app port:
@@ -1136,7 +1155,7 @@ func TestRefuses(t *testing.T) {
 	t.Run("exits-0", func(t *testing.T) {
 		t.Parallel()
 		zero := spec
-		zero.Entrypoint = []string{FrankenPHP, "php-cli", "-r", "fwrite(STDERR, '" + exitsSays + "' . PHP_EOL); exit(0);"}
+		zero.Entrypoint = []string{frankenphp, "php-cli", "-r", "fwrite(STDERR, '" + exitsSays + "' . PHP_EOL); exit(0);"}
 		tb := &recTB{t: t}
 		Refuses(tb, e, &zero, 3, "exits 0", exitsSays)
 		recorded(t, tb,

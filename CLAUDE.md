@@ -126,9 +126,11 @@ purpose and see the test catch it.
   - small interfaces, declared by the code that consumes them;
   - a doc comment on every exported identifier.
 - **Layout:** `cmd/<tool>` is a thin `main` over an `internal/` package.
-  `harness` and `contract` are imported by callers; everything else is
-  `internal/`. External commands run through `internal/execx`'s `Runner`,
-  so tests script them with `execx.Fake`.
+  `harness`, `harness/probekit` and `contract` are imported by callers,
+  `harness/probekit` by an app's own Go probe; everything else is
+  `internal/`, such as `harness/internal/coreprobe`, the core probe
+  `harness/probe/core` builds. External commands run through
+  `internal/execx`'s `Runner`, so tests script them with `execx.Fake`.
 - **Commands** print plain text for people, take Go's `flag` syntax, and
   document their usage and exit codes in the package comment: 0 for
   success, 1 for a refusal or a failure, 2 for a wrong command line. A

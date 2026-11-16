@@ -4,10 +4,11 @@
 // Package harness is divbast's acceptance harness. It drives containers
 // through the docker or podman CLI, with the same flags a user would type,
 // so a check runs under exactly the confinement an image's contract claims
-// and never a looser one an SDK might set up instead. It also ships the
-// probe those checks run inside a container, as the container's own PHP,
-// which needs the posix extension: no-shell asks it why a path could not
-// be looked up, to tell one that is absent from one it may not reach.
+// and never a looser one an SDK might set up instead. It also brings the
+// probe those checks run inside a container: a static Go binary, built
+// from the ci module the tests require, for the image's architecture, and
+// mounted read-only from a volume, so it needs nothing in the image at
+// all. A PHP app's own subcommands run under the app's own PHP instead.
 //
 // Every container, image, network and volume it makes carries the label
 // divbast.harness=<module>, where <module> is the path of the main module
@@ -80,6 +81,9 @@ type Engine struct {
 	// Podman. Every engine EngineFromEnv returns shares one, with every
 	// other process of the user's on the host.
 	store *storeLock
+	// probes holds the probe volumes it made. Every engine EngineFromEnv
+	// returns shares one.
+	probes *probeRegistry
 }
 
 // EngineFromEnv returns the engine $ENGINE names: docker, the default when
@@ -90,6 +94,7 @@ func EngineFromEnv() (Engine, error) {
 		e := newEngine(name, execx.OS{})
 		e.saves = sharedSaves
 		e.store = sharedStore()
+		e.probes = sharedProbes
 		return e, nil
 	default:
 		return Engine{}, fmt.Errorf("ENGINE is %q: it must be docker or podman", name)
@@ -97,7 +102,7 @@ func EngineFromEnv() (Engine, error) {
 }
 
 func newEngine(name string, run execx.StdinRunner) Engine {
-	return Engine{name: name, run: run, label: moduleLabel(), saves: newSaveCache(), store: newStoreLock("")}
+	return Engine{name: name, run: run, label: moduleLabel(), saves: newSaveCache(), store: newStoreLock(""), probes: newProbeRegistry()}
 }
 
 // Name returns the engine's command: docker or podman.

@@ -1,0 +1,23 @@
+3362 1220 0:102 / / ro,relatime - overlay overlay rw,upperdir=...,workdir=...
+3364 3362 0:119 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+3365 3362 0:120 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+3366 3365 0:121 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666
+3367 3362 0:122 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro
+3368 3367 0:32 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate
+3369 3365 0:117 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw
+3370 3365 0:123 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=16439296k
+3371 3362 0:38 /docker/volumes/spike-bk-data/_data /data rw,noatime master:69 - btrfs /dev/vdb1 rw,nodatasum,nodatacow,ssd,discard,space_cache=v2,subvolid=256,subvol=/docker
+3372 3362 0:124 / /tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=524288k
+3373 3362 0:38 /docker/containers/<id>/hostname /etc/hostname ro,noatime - btrfs /dev/vdb1 rw,nodatasum,nodatacow,ssd,discard,space_cache=v2,subvolid=256,subvol=/docker
+3374 3362 0:38 /docker/containers/<id>/hosts /etc/hosts ro,noatime - btrfs /dev/vdb1 rw,nodatasum,nodatacow,ssd,discard,space_cache=v2,subvolid=256,subvol=/docker
+3375 3362 0:38 /docker/containers/<id>/resolv.conf /etc/resolv.conf ro,noatime - btrfs /dev/vdb1 rw,nodatasum,nodatacow,ssd,discard,space_cache=v2,subvolid=256,subvol=/docker
+1223 3364 0:119 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+1224 3364 0:119 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw
+1225 3364 0:119 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw
+1227 3364 0:119 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+1228 3364 0:119 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw
+1229 3364 0:125 / /proc/asound ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1
+1230 3364 0:120 /null /proc/interrupts rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+1231 3364 0:120 /null /proc/keys rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+1232 3364 0:120 /null /proc/timer_list rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+1233 3367 0:125 / /sys/firmware ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1

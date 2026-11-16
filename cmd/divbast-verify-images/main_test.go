@@ -17,7 +17,10 @@ import (
 
 const (
 	digest = "sha256:d9ea226a05957bd70876b6b3eb81ca454fefc4365902f061dba82515efb12909"
+	other  = "sha256:4dcdd53971ba1f373c3eb90e393dd3944687938c5c03494ab684921594905fc7"
 	pinned = "ghcr.io/divbast/frankenphp:librespeed@" + digest
+	static = "gcr.io/distroless/static-debian13:nonroot@" + other
+	golang = "golang:1.27.4-trixie@" + other
 	denied = "\nError: the provided token was denied access to the requested resource\n"
 )
 
@@ -26,29 +29,34 @@ var (
 		Argv:   []string{"gh", "--version"},
 		Result: execx.Result{Stdout: []byte("gh version 2.103.3 (2026-10-21)\n")},
 	}
-	verifyArgv = []string{
+	attestArgv = []string{
 		"gh", "attestation", "verify", "oci://ghcr.io/divbast/frankenphp@" + digest,
 		"--repo", "divbast/frankenphp",
 		"--signer-workflow", "divbast/frankenphp/.github/workflows/build.yml@refs/heads/main",
 		"--source-ref", "refs/heads/main",
 	}
+	cosignArgv = []string{
+		"cosign", "verify", "gcr.io/distroless/static-debian13@" + other,
+		"--certificate-identity", "keyless@distroless.iam.gserviceaccount.com",
+		"--certificate-oidc-issuer", "https://accounts.google.com",
+	}
 )
 
-// gh hands run a Fake that replays calls, and records what run asked it
-// for.
-type gh struct {
+// tools hands run a Fake that replays calls, for gh and cosign alike, and
+// records what run asked it for.
+type tools struct {
 	t     *testing.T
 	calls []execx.Call
 
 	asked bool
 	env   []string
 	// dir is the directory DOCKER_CONFIG named, and empty whether it held
-	// nothing at the moment run asked for gh.
+	// nothing at the moment run asked for the tools.
 	dir   string
 	empty bool
 }
 
-func (g *gh) runner(env []string) execx.Runner {
+func (g *tools) runner(env []string) execx.Runner {
 	g.asked, g.env = true, env
 	if len(env) == 1 {
 		if dir, ok := strings.CutPrefix(env[0], "DOCKER_CONFIG="); ok {
@@ -72,25 +80,44 @@ func TestRun(t *testing.T) {
 		wantStdout string
 		// wantStderr lists what stderr must contain.
 		wantStderr []string
-		// wantGH is whether run must ask for gh at all.
-		wantGH bool
+		// wantTools is whether run must ask for gh and cosign at all.
+		wantTools bool
 	}{
 		{
-			name:          "verified",
+			name:          "frankenphp-attested",
 			containerfile: "FROM scratch\nCOPY --from=" + pinned + " --chmod=0755 /frankenphp /usr/local/bin/frankenphp\n",
-			calls:         []execx.Call{version, {Argv: verifyArgv}},
-			wantStdout: "verifying " + pinned + "\n" +
-				"verified: divbast/frankenphp's main build attested ghcr.io/divbast/frankenphp@" + digest + "\n",
-			wantGH: true,
+			calls:         []execx.Call{version, {Argv: attestArgv}},
+			wantStdout:    "verified: " + pinned + "\n",
+			wantTools:     true,
+		},
+		{
+			name:          "a-go-image",
+			containerfile: "FROM " + golang + " AS build\nFROM " + static + "\nCOPY --from=build /out/app /usr/local/bin/app\n",
+			calls:         []execx.Call{{Argv: cosignArgv}},
+			wantStdout:    "pinned: " + golang + "\nverified: " + static + "\n",
+			wantTools:     true,
+		},
+		{
+			name:          "third-party-only",
+			containerfile: "FROM " + golang + "\n",
+			wantStdout:    "pinned: " + golang + "\n",
+			wantTools:     true,
 		},
 		{
 			name:          "not-attested",
 			containerfile: "FROM scratch\nCOPY --from=" + pinned + " /frankenphp /usr/local/bin/frankenphp\n",
-			calls:         []execx.Call{version, {Argv: verifyArgv, Result: execx.Result{Code: 1, Stderr: []byte(denied)}}},
+			calls:         []execx.Call{version, {Argv: attestArgv, Result: execx.Result{Code: 1, Stderr: []byte(denied)}}},
 			wantCode:      1,
-			wantStdout:    "verifying " + pinned + "\n",
 			wantStderr:    []string{"denied access", "did not verify", pinned},
-			wantGH:        true,
+			wantTools:     true,
+		},
+		{
+			name:          "not-signed",
+			containerfile: "FROM " + static + "\n",
+			calls:         []execx.Call{{Argv: cosignArgv, Result: execx.Result{Code: 10, Stderr: []byte("Error: no signatures found\n")}}},
+			wantCode:      1,
+			wantStderr:    []string{"no signatures found", "did not verify", static},
+			wantTools:     true,
 		},
 		{
 			name:          "old-gh",
@@ -100,15 +127,14 @@ func TestRun(t *testing.T) {
 				Result: execx.Result{Stdout: []byte("gh version 2.101.0 (2026-09-01)\n")},
 			}},
 			wantCode:   1,
-			wantStdout: "verifying " + pinned + "\n",
 			wantStderr: []string{"older than 2.102.0", "2.101.0"},
-			wantGH:     true,
+			wantTools:  true,
 		},
 		{
-			name:          "no-ref",
-			containerfile: "FROM scratch\nCOPY --from=build /frankenphp /usr/local/bin/frankenphp\n",
+			name:          "unpinned",
+			containerfile: "FROM debian:13-slim\n",
 			wantCode:      1,
-			wantStderr:    []string{"no COPY --from= takes the binary"},
+			wantStderr:    []string{"not pinned", "line 1", "debian:13-slim"},
 		},
 		{
 			name:          "not-literal",
@@ -157,7 +183,7 @@ func TestRun(t *testing.T) {
 				args = []string{"-containerfile", filepath.Join(dir, args[1])}
 			}
 
-			g := &gh{t: t, calls: tt.calls}
+			g := &tools{t: t, calls: tt.calls}
 			var stdout, stderr bytes.Buffer
 			code := run(t.Context(), args, g.runner, &stdout, &stderr)
 
@@ -173,19 +199,20 @@ func TestRun(t *testing.T) {
 				}
 			}
 
-			if g.asked != tt.wantGH {
-				t.Fatalf("run(%q) asked for gh: %t, want %t", args, g.asked, tt.wantGH)
+			if g.asked != tt.wantTools {
+				t.Fatalf("run(%q) asked for the tools: %t, want %t", args, g.asked, tt.wantTools)
 			}
-			if !tt.wantGH {
+			if !tt.wantTools {
 				return
 			}
-			// gh gets DOCKER_CONFIG and nothing else, naming a directory
-			// that was empty when gh ran and is gone once run returns.
+			// The tools get DOCKER_CONFIG and nothing else, naming a
+			// directory that was empty when they ran and is gone once run
+			// returns.
 			if g.dir == "" || len(g.env) != 1 {
-				t.Fatalf("run(%q) gave gh the environment %q, want only DOCKER_CONFIG", args, g.env)
+				t.Fatalf("run(%q) gave the tools the environment %q, want only DOCKER_CONFIG", args, g.env)
 			}
 			if !g.empty {
-				t.Errorf("run(%q): DOCKER_CONFIG=%s was not an empty directory when gh ran", args, g.dir)
+				t.Errorf("run(%q): DOCKER_CONFIG=%s was not an empty directory when the tools ran", args, g.dir)
 			}
 			if _, err := os.Stat(g.dir); !errors.Is(err, fs.ErrNotExist) {
 				t.Errorf("run(%q) left DOCKER_CONFIG=%s behind: stat error = %v", args, g.dir, err)

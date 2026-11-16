@@ -43,9 +43,10 @@ type ServeSpec struct {
 	// ReadyPath is what Serve asks for, with GET from the host, until any
 	// status comes back: "/" when it is empty.
 	ReadyPath string
-	// ProbeApp is the app's own probe subcommands, which [InstallProbe]
-	// puts beside the core probe. Nil installs the core probe alone.
-	ProbeApp []byte
+	// Probe is the probe beside the core one, which is always mounted:
+	// the app's own Go or PHP subcommands. Its zero value is the core
+	// probe alone.
+	Probe ProbeSpec
 }
 
 // Serving is a container serving, as [Engine.Serve] or
@@ -67,7 +68,6 @@ type Serving struct {
 
 	appPort, healthPort int
 	readyPath           string
-	probeApp            []byte
 	// parent is the Serving a copy Health made was taken from, whose
 	// health port the copy's requests go to; nil for any other Serving.
 	parent *Serving
@@ -77,7 +77,7 @@ type Serving struct {
 }
 
 // Serve starts a container as sp says, waits until GET sp.ReadyPath from
-// the host gets any answer, and installs the probe: [Engine.StartServing],
+// the host gets any answer, and attaches the probe: [Engine.StartServing],
 // then [Serving.Wait]. A container that stops first, or still does not
 // answer after ServeWithin, is an error carrying its log. tb's cleanup
 // removes the container, and any network Serve made for it. sp itself is
@@ -115,6 +115,8 @@ func (e Engine) StartServing(ctx context.Context, tb testing.TB, sp *ServeSpec) 
 		}
 		run.Network = network
 	}
+	probe := sp.Probe
+	run.Probe = &probe
 	run.Publish = []string{loopback(sp.AppPort)}
 	if sp.HealthPort != 0 {
 		run.Publish = append(run.Publish, loopback(sp.HealthPort))
@@ -129,7 +131,6 @@ func (e Engine) StartServing(ctx context.Context, tb testing.TB, sp *ServeSpec) 
 		appPort:    sp.AppPort,
 		healthPort: sp.HealthPort,
 		readyPath:  cmp.Or(sp.ReadyPath, "/"),
-		probeApp:   sp.ProbeApp,
 	}
 	if err := s.readPorts(ctx); err != nil {
 		return nil, err
@@ -196,7 +197,7 @@ func (s *Serving) hostURL(ctx context.Context, ins *Inspect, port int) (string, 
 }
 
 // Wait sends GET path from the host once a second until any status comes
-// back, then installs the probe: an answer is all serving means here, and
+// back, then attaches the probe: an answer is all serving means here, and
 // a check asserts the status itself. Each request is bounded by its own
 // 5 seconds, and the whole wait by ServeWithin. A container that stops
 // first, or one still not serving at the end, is an error carrying its
@@ -227,7 +228,7 @@ func (s *Serving) Wait(ctx context.Context, path string) error {
 			return err
 		}
 	}
-	p, err := InstallProbe(ctx, s.C, s.probeApp)
+	p, err := AttachProbe(ctx, s.C)
 	if err != nil {
 		return err
 	}
@@ -241,7 +242,7 @@ func (s *Serving) Wait(ctx context.Context, path string) error {
 // Restart restarts the container in place, with [Container.Restart], and
 // returns once it serves again, as Serve does: it reads the ports again,
 // since Docker binds others on a restart, waits at the ready path the
-// Serving was started with, and installs the probe again, since a restart
+// Serving was started with, and attaches the probe again, since a restart
 // empties /tmp. Until that is done, Probe is nil. A container that does
 // not come back is an error carrying its log. On a copy [Serving.Health]
 // made, it restarts the Serving the copy was taken from.
@@ -265,7 +266,7 @@ func (s *Serving) Restart(ctx context.Context) error {
 // request is sent, so the copy follows s across a restart, Docker's moved
 // port included, and never goes to the app port in its place: with the
 // health port unpublished, every request is an error saying so. Wait on
-// the copy waits on the health port, and installs the probe for s too,
+// the copy waits on the health port, and attaches the probe for s too,
 // and Restart on it restarts s. The copy's own fields are s's when it was
 // taken, and its Base is the HealthBase s had then.
 func (s *Serving) Health() *Serving {
@@ -372,11 +373,12 @@ func (s *Serving) Do(ctx context.Context, client *http.Client, method, path stri
 	return Response{Status: resp.StatusCode, Header: resp.Header, Body: b}, nil
 }
 
-// PHPIn runs PHP code in c, as c's own PHP, php-cli -r, and returns what
-// it printed: its stdout, then its stderr. A non-zero exit status is an
+// PHPIn runs PHP code in c, as the PHP binary, such as a FrankenPHP app's
+// /usr/local/bin/frankenphp, with php-cli -r, and returns what it
+// printed: its stdout, then its stderr. A non-zero exit status is an
 // error, carrying both.
-func PHPIn(ctx context.Context, c *Container, code string) (string, error) {
-	res, err := c.Exec(ctx, nil, FrankenPHP, "php-cli", "-r", code)
+func PHPIn(ctx context.Context, c *Container, binary, code string) (string, error) {
+	res, err := c.Exec(ctx, nil, binary, "php-cli", "-r", code)
 	if err != nil {
 		return "", err
 	}
