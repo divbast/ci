@@ -13,11 +13,14 @@
 // as .ci/bin/divbast-verify-images, once `just ci-tools` has built it.
 //
 // It reads every image the Containerfile's FROM, COPY --from= and RUN
-// --mount from= take, a FROM's build argument resolved to its default.
-// Each must be <name>:<tag>@sha256:<digest>, written out in full, so that
-// Renovate can move it; a tag without a digest, a COPY --from= built from
-// a variable, or a FROM built from a build argument with no default, is
-// refused. Then each image in its table is verified:
+// --mount from= take, a FROM's build argument resolved to its default,
+// and the frontend a # syntax= directive names, which BuildKit runs as
+// the build itself. Each must be <name>:<tag>@sha256:<digest>, written
+// out in full, so that Renovate can move it; a tag without a digest, a
+// COPY --from= built from a variable, or a FROM built from a build
+// argument with no default, or from one that names another, is refused.
+// A registry is read as it serves an image, its host in lower case and
+// without :443. Then each image in its table is verified:
 //
 //	ghcr.io/divbast/frankenphp, by its attestation, once:
 //	  gh attestation verify oci://ghcr.io/divbast/frankenphp@sha256:<digest> \

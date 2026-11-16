@@ -27,7 +27,7 @@ const (
 // runtime stage takes the binary: the runtime image an ARG names, and a
 // fetch stage the runtime copies from.
 func app(lines ...string) string {
-	return `# syntax=docker/dockerfile:1
+	return `# An app's Containerfile
 ARG RUNTIME_IMAGE=` + runtime + `
 
 FROM ` + fetch + ` AS fetch
@@ -269,6 +269,117 @@ func TestRefsShapes(t *testing.T) {
 	}
 	if want := []string{golang + " line 03", static + " line 06"}; !slices.Equal(names(got), want) {
 		t.Errorf("Refs() = %q, want %q", names(got), want)
+	}
+}
+
+// TestRefsBypasses reads every way, found in review, that a Containerfile
+// could name an image BuildKit pulls but the verifier read as something
+// else: a variable left after expansion, a registry written with its port
+// or in capitals, an unpinned frontend, a stage inside a heredoc, and a
+// mount's from= in capitals.
+func TestRefsBypasses(t *testing.T) {
+	t.Parallel()
+
+	static := "gcr.io/distroless/static-debian13:nonroot@" + digest
+	tests := []struct {
+		name          string
+		containerfile string
+		want          []string // when it reads
+		wantErr       error
+		wantIn        []string
+	}{
+		{
+			name:          "a-default-inside-a-variable",
+			containerfile: "ARG A\nFROM ${A:-ghcr.io/divbast}/frankenphp:librespeed@" + digest + "\n",
+			wantErr:       verify.ErrNotLiteral,
+			wantIn:        []string{"line 2"},
+		},
+		{
+			name:          "an-arg-built-from-an-arg",
+			containerfile: "ARG REG=ghcr.io/divbast\nARG IMG=${REG}/frankenphp:librespeed@" + digest + "\nFROM ${IMG}\n",
+			wantErr:       verify.ErrNotLiteral,
+			wantIn:        []string{"line 3"},
+		},
+		{
+			name:          "a-registry-port",
+			containerfile: "FROM ghcr.io:443/divbast/frankenphp:librespeed@" + digest + "\n",
+			want:          []string{pinned + " line 01"},
+		},
+		{
+			name:          "a-registry-in-capitals",
+			containerfile: "FROM scratch\nCOPY --from=GCR.IO:443/distroless/static-debian13:nonroot@" + digest + " /a /b\n",
+			want:          []string{static + " line 02"},
+		},
+		{
+			name:          "an-unpinned-frontend",
+			containerfile: "# syntax=docker/dockerfile:1\nFROM scratch\n",
+			wantErr:       verify.ErrUnpinned,
+			wantIn:        []string{"line 1", "docker/dockerfile:1"},
+		},
+		{
+			name:          "a-pinned-frontend",
+			containerfile: "# syntax = docker/dockerfile:1.12@" + other + "\nFROM scratch\n",
+			want:          []string{"docker/dockerfile:1.12@" + other + " line 01"},
+		},
+		{
+			name:          "a-directive-after-the-first-instruction-is-a-comment",
+			containerfile: "FROM scratch\n# syntax=docker/dockerfile:1\n",
+		},
+		{
+			name:          "another-escape",
+			containerfile: "# escape=`\nFROM scratch\n",
+			wantErr:       verify.ErrNotLiteral,
+			wantIn:        []string{"escape"},
+		},
+		{
+			name:          "a-stage-inside-a-heredoc",
+			containerfile: "FROM " + fetch + "\nRUN <<EOF\nFROM scratch AS alpine\nEOF\nCOPY --from=alpine /x /y\n",
+			wantErr:       verify.ErrUnpinned,
+			wantIn:        []string{"line 5", "alpine"},
+		},
+		{
+			name:          "a-heredoc-with-tabs-stripped-and-quoted",
+			containerfile: "FROM " + fetch + "\nRUN <<-\"END\"\n\tFROM scratch AS x\n\tEND\nCOPY --from=x /x /y\n",
+			wantErr:       verify.ErrUnpinned,
+			wantIn:        []string{"line 5"},
+		},
+		{
+			// A marker in quotes is no heredoc, so the next line is read
+			name:          "a-heredoc-marker-in-quotes",
+			containerfile: "FROM " + fetch + "\nRUN echo \"a <<END\" 'b <<END'\nFROM alpine\n",
+			wantErr:       verify.ErrUnpinned,
+			wantIn:        []string{"line 3", "alpine"},
+		},
+		{
+			name:          "a-heredoc-that-never-ends",
+			containerfile: "FROM " + fetch + "\nRUN <<EOF\necho\n",
+			wantErr:       verify.ErrNotLiteral,
+			wantIn:        []string{"EOF"},
+		},
+		{
+			name:          "a-mounts-from-in-capitals",
+			containerfile: "FROM scratch\nRUN --mount=type=bind,FROM=alpine,target=/a true\n",
+			wantErr:       verify.ErrUnpinned,
+			wantIn:        []string{"line 2", "alpine"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := verify.Refs(strings.NewReader(tt.containerfile))
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Refs() = %q, %v; want error %v", names(got), err, tt.wantErr)
+			}
+			for _, s := range tt.wantIn {
+				if !strings.Contains(err.Error(), s) {
+					t.Errorf("Refs() error = %q, want it to contain %q", err, s)
+				}
+			}
+			if tt.wantErr == nil && !slices.Equal(names(got), tt.want) {
+				t.Errorf("Refs() = %q, want %q", names(got), tt.want)
+			}
+		})
 	}
 }
 

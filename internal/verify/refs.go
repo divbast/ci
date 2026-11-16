@@ -74,11 +74,13 @@ var (
 )
 
 // Refs returns every image the Containerfile read from containerfile
-// builds from, in order: each FROM that is neither scratch nor an earlier
-// stage, each COPY --from= that is neither a stage's name nor its number,
-// and each RUN --mount whose from= is an image. A FROM's image may be a
-// build argument declared, with its default, before the first FROM, and
-// is that default.
+// builds from, in order: the frontend a # syntax= directive names, each
+// FROM that is neither scratch nor an earlier stage, each COPY --from=
+// that is neither a stage's name nor its number, and each RUN --mount
+// whose from= is an image. A FROM's image may be a build argument
+// declared, with its default, before the first FROM, and is that
+// default, which may name no other. Each image's registry host is read
+// in lower case and without :443, as the registry serves it.
 //
 // It reads the Containerfile's instructions, with continued lines joined
 // and comments dropped, as BuildKit reads them. Every mention of a [Table]
@@ -89,15 +91,15 @@ var (
 // The error wraps [ErrNoFrom], [ErrUnpinned], [ErrNotLiteral] or
 // [ErrStray], and names the line involved.
 func Refs(containerfile io.Reader) ([]Ref, error) {
+	r := &reader{args: map[string]arg{}}
 	var lines []instruction
-	if err := instructions(containerfile, func(line int, text string) error {
+	if err := instructions(containerfile, r.directive, func(line int, text string) error {
 		lines = append(lines, instruction{line, text})
 		return nil
 	}); err != nil {
 		return nil, err
 	}
 
-	r := &reader{args: map[string]arg{}}
 	for _, in := range lines {
 		if err := r.read(in); err != nil {
 			return nil, err
@@ -137,6 +139,27 @@ type reader struct {
 	explained map[int]int
 }
 
+// directive reads one parser directive, at the top of the file: syntax
+// names the frontend BuildKit pulls and runs as the build itself, so it is
+// an image like any other, and escape would change how every line after
+// it reads, which this does not follow.
+func (r *reader) directive(line int, key, value string) error {
+	switch key {
+	case "syntax":
+		ref, err := parseRef(line, value)
+		if err != nil {
+			return err
+		}
+		r.refs = append(r.refs, ref)
+	case "escape":
+		if value != `\` {
+			return fmt.Errorf("%w: line %d sets the escape directive to %s, and only the default is read", ErrNotLiteral, line, value)
+		}
+	}
+	return nil
+}
+
+// read reads one instruction.
 func (r *reader) read(in instruction) error {
 	fields := strings.Fields(in.text)
 	if len(fields) == 0 {
@@ -158,7 +181,8 @@ func (r *reader) read(in instruction) error {
 	case "RUN":
 		for _, m := range flagValues(fields[1:], "mount") {
 			for opt := range strings.SplitSeq(m, ",") {
-				if from, ok := strings.CutPrefix(opt, "from="); ok {
+				// BuildKit reads a mount's keys without regard to case
+				if key, from, ok := strings.Cut(opt, "="); ok && strings.EqualFold(key, "from") {
 					if err := r.source(in.line, "--mount from="+from, from, false); err != nil {
 						return err
 					}
@@ -231,6 +255,10 @@ func (r *reader) expand(line int, image string) (string, error) {
 		r.args[name] = a
 		return a.value
 	})
+	if err == nil && strings.Contains(out, "$") {
+		err = fmt.Errorf("%w: line %d has FROM %s, which is %s once its build arguments are read: "+
+			"name the image in full, as the default of a build argument that names no other", ErrNotLiteral, line, image, out)
+	}
 	return out, err
 }
 
@@ -302,7 +330,22 @@ func parseRef(line int, image string) (Ref, error) {
 	if !pinnedTag.MatchString(tag) {
 		return Ref{}, unpinned
 	}
-	return Ref{Name: name, Tag: tag, Digest: digest, Line: line}, nil
+	return Ref{Name: canonical(name), Tag: tag, Digest: digest, Line: line}, nil
+}
+
+// defaultPort is a registry host's port as an image name may spell it,
+// which names the same registry as the host alone.
+var defaultPort = regexp.MustCompile(`^([a-z0-9.-]+):443(/|$)`)
+
+// canonical returns name with its registry host, when it names one, as
+// the registry knows it: in lower case, and without the default port.
+// GHCR.IO:443/divbast/frankenphp is ghcr.io/divbast/frankenphp.
+func canonical(name string) string {
+	host, rest, ok := strings.Cut(name, "/")
+	if !ok || !strings.ContainsAny(host, ".:") && host != "localhost" {
+		return name
+	}
+	return defaultPort.ReplaceAllString(strings.ToLower(host)+"/", "$1/") + rest
 }
 
 // flagValues returns the value of every --<name>= flag among words, which
@@ -324,21 +367,93 @@ func flagValues(words []string, name string) []string {
 // maxLine bounds one physical line of a Containerfile.
 const maxLine = 1 << 20
 
-// instructions calls each with every instruction in r and the line it
-// starts on, and stops at the first error each returns. A line ending in
-// a backslash continues on the next. A comment line, one whose first
-// non-blank character is #, is dropped, as is a blank line, even inside an
-// instruction.
-func instructions(r io.Reader, each func(line int, text string) error) error {
+var (
+	// parserDirective is a parser directive: a comment of key=value, which
+	// BuildKit reads only before anything else in the file.
+	parserDirective = regexp.MustCompile(`^#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*?)\s*$`)
+	// heredocMarker is a heredoc's <<WORD, <<-WORD or a quoted WORD.
+	heredocMarker = regexp.MustCompile(`^<<(-?)(["']?)([A-Za-z_][A-Za-z0-9_]*)(["']?)`)
+)
+
+// heredoc is one heredoc's end: the line that closes it, and whether tabs
+// before that line are stripped.
+type heredoc struct {
+	word  string
+	strip bool
+}
+
+// heredocs returns the heredocs a RUN, COPY or ADD instruction opens, in
+// order: each <<WORD outside quotes, whose body is the lines after the
+// instruction, up to a line that is WORD.
+func heredocs(text string) []heredoc {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return nil
+	}
+	switch strings.ToUpper(fields[0]) {
+	case "RUN", "COPY", "ADD":
+	default:
+		return nil
+	}
+	var docs []heredoc
+	var quote byte
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '<':
+			m := heredocMarker.FindStringSubmatch(text[i:])
+			if len(m) == 5 && m[2] == m[4] {
+				docs = append(docs, heredoc{word: m[3], strip: m[1] == "-"})
+				i += len(m[0]) - 1
+			}
+		}
+	}
+	return docs
+}
+
+// instructions calls directive with each parser directive at the top of
+// r, and each with every instruction in r and the line it starts on, and
+// stops at the first error either returns. A line ending in a backslash
+// continues on the next. A comment line, one whose first non-blank
+// character is #, is dropped, as is a blank line, even inside an
+// instruction. The body of a heredoc is no instruction, and is dropped.
+func instructions(r io.Reader, directive func(line int, key, value string) error, each func(line int, text string) error) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(nil, maxLine)
 
 	var (
-		text  strings.Builder
-		start int
+		text       strings.Builder
+		start      int
+		directives = true
+		pending    []heredoc
 	)
 	for n := 1; scanner.Scan(); n++ {
 		line := scanner.Text()
+		if len(pending) > 0 {
+			end := line
+			if pending[0].strip {
+				end = strings.TrimLeft(line, "\t")
+			}
+			if end == pending[0].word {
+				pending = pending[1:]
+			}
+			continue
+		}
+		if directives {
+			if m := parserDirective.FindStringSubmatch(line); m != nil {
+				if err := directive(n, strings.ToLower(m[1]), m[2]); err != nil {
+					return err
+				}
+				continue
+			}
+			directives = false
+		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -355,10 +470,14 @@ func instructions(r io.Reader, each func(line int, text string) error) error {
 		if err := each(start, text.String()); err != nil {
 			return err
 		}
+		pending = heredocs(text.String())
 		text.Reset()
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read the Containerfile: %w", err)
+	}
+	if len(pending) > 0 {
+		return fmt.Errorf("%w: a heredoc ending %s never ends", ErrNotLiteral, pending[0].word)
 	}
 	if text.Len() > 0 {
 		return each(start, text.String())
@@ -370,7 +489,7 @@ func instructions(r io.Reader, each func(line int, text string) error) error {
 // without regard to case: a registry's host name ignores case, and
 // counting too many here only refuses more.
 func countMentions(text string) int {
-	lower := strings.ToLower(text)
+	lower := mentionPort.ReplaceAllString(strings.ToLower(text), "$1/")
 	n := 0
 	for _, rule := range Table {
 		prefix := strings.ToLower(rule.Prefix)
@@ -388,6 +507,10 @@ func countMentions(text string) int {
 	}
 	return n
 }
+
+// mentionPort is a registry host spelt with its default port, anywhere in
+// a line.
+var mentionPort = regexp.MustCompile(`([a-z0-9.-]+):443/`)
 
 // isHostByte reports whether b can stand in a host name, so that a name
 // ending in it before a Table image's host is some other host.

@@ -1043,7 +1043,8 @@ Every image a Containerfile builds from is pinned, and every one whose
 publisher signs it is verified as theirs, before `app-check.yml` builds
 anything. `divbast-verify-images` reads each image a `FROM`, a
 `COPY --from=` or a `RUN --mount from=` takes, a `FROM`'s build argument
-resolved to its default:
+resolved to its default, and the frontend a `# syntax=` directive names,
+which BuildKit runs as the build itself:
 
 ```dockerfile
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:<digest>
@@ -1054,7 +1055,10 @@ COPY --from=ghcr.io/divbast/frankenphp:librespeed@sha256:<digest> --chmod=0755 /
 Each must be `<name>:<tag>@sha256:<digest>`, written out in full, so that
 Renovate can follow the tag and move the digest. A tag with no digest, a
 `COPY --from=` built from a variable, or a `FROM` built from a build
-argument with no default before the first `FROM`, fails the build. Then
+argument with no default before the first `FROM`, or from one whose
+default names another, fails the build. A registry host is read as the
+registry serves it, so `GHCR.IO:443/divbast/frankenphp` is verified as
+`ghcr.io/divbast/frankenphp`. Then
 each image in its table is verified:
 
 | Image | Verified by |
