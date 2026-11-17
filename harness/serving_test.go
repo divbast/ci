@@ -53,6 +53,9 @@ type script struct {
 	// container to inspect.
 	inspect [][]byte
 	logs    string
+	// runs is what each run returns, in turn, before any run starts
+	// container abc; a run that fails here leaves its container made.
+	runs []execx.Result
 }
 
 func (s *script) RunStdin(_ context.Context, _ io.Reader, name string, args ...string) (execx.Result, error) {
@@ -63,8 +66,14 @@ func (s *script) RunStdin(_ context.Context, _ io.Reader, name string, args ...s
 	switch {
 	case slices.Equal(args[:min(2, len(args))], []string{"network", "inspect"}):
 		return execx.Result{Stdout: []byte("false\n")}, nil
+	case args[0] == "run" && len(s.runs) > 0:
+		res := s.runs[0]
+		s.runs = s.runs[1:]
+		return res, nil
 	case args[0] == "run":
 		return execx.Result{Stdout: []byte("abc\n")}, nil
+	case slices.Equal(args[:min(4, len(args))], []string{"container", "inspect", "--format", "{{.Id}}"}):
+		return execx.Result{Stdout: []byte("made\n")}, nil
 	case slices.Equal(args[:min(2, len(args))], []string{"container", "inspect"}) && len(s.inspect) == 0:
 		return execx.Result{Code: 1, Stderr: []byte("Error: No such container: " + args[len(args)-1] + "\n")}, nil
 	case slices.Equal(args[:min(2, len(args))], []string{"container", "inspect"}):
@@ -326,6 +335,84 @@ func probedEngine(run execx.StdinRunner) Engine {
 	e := newEngine("docker", run)
 	probed(e, "", "probe-vol")
 	return e
+}
+
+// TestStartServingRetriesTakenPort starts a container again when the host
+// port the engine picked was taken before the engine could bind it, as
+// rootless Podman's rootlessport reports, or Docker's own allocator: the
+// harness's race, not the app's. It stops at three runs, and at any other
+// failure, and a spec's own name is freed before it is used again.
+func TestStartServingRetriesTakenPort(t *testing.T) {
+	t.Parallel()
+
+	podman := execx.Result{Code: 126, Stderr: []byte("Error: rootlessport listen tcp 127.0.0.1:38655: bind: address already in use\n")}
+	docker := execx.Result{Code: 125, Stderr: []byte("docker: Error response from daemon: driver failed programming external connectivity on endpoint x: Bind for 127.0.0.1:40001 failed: port is already allocated.\n")}
+	other := execx.Result{Code: 126, Stderr: []byte("Error: crun: exec format error\n")}
+	tests := []struct {
+		name     string
+		named    string
+		runs     []execx.Result
+		wantRuns int
+		// wantErr is empty for a start that serves; otherwise each text
+		// the error must carry.
+		wantErr []string
+	}{
+		{name: "podman-once", runs: []execx.Result{podman}, wantRuns: 2},
+		{name: "docker-once", runs: []execx.Result{docker}, wantRuns: 2},
+		{name: "twice", runs: []execx.Result{podman, docker}, wantRuns: 3},
+		{name: "every-time", runs: []execx.Result{podman, podman, podman, podman}, wantRuns: 3, wantErr: []string{"never started", "bind: address already in use"}},
+		{name: "another-failure", runs: []execx.Result{other}, wantRuns: 1, wantErr: []string{"never started", "exec format error"}},
+		{name: "named", named: "app", runs: []execx.Result{podman}, wantRuns: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sc := &script{runs: tt.runs, inspect: [][]byte{withPorts("running", true, 0, map[string]string{"8080/tcp": "40001"})}}
+			sp := ServeSpec{Run: RunSpec{Image: "img", Network: "net", Name: tt.named, Confine: Contract("16m")}, AppPort: 8080}
+
+			s, err := probedEngine(sc).StartServing(t.Context(), t, &sp)
+			switch {
+			case len(tt.wantErr) == 0 && err != nil:
+				t.Fatalf("StartServing() error = %v, want it started", err)
+			case len(tt.wantErr) == 0 && s.Base != "http://127.0.0.1:40001":
+				t.Errorf("StartServing() Base = %q, want the started container's port", s.Base)
+			case len(tt.wantErr) > 0 && (err == nil || !errors.Is(err, ErrNeverStarted)):
+				t.Fatalf("StartServing() = %+v, %v; want an error wrapping ErrNeverStarted", s, err)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("StartServing() error = %v, want it to carry %q", err, want)
+				}
+			}
+
+			runs := sc.commands("run")
+			if len(runs) != tt.wantRuns {
+				t.Fatalf("ran %d times, want %d: %q", len(runs), tt.wantRuns, runs)
+			}
+			if tt.named == "" {
+				return
+			}
+			// The failed run made a container called app: it goes before
+			// the name is run again.
+			for _, run := range runs {
+				if got := flagValues(run, "--name"); !slices.Equal(got, []string{tt.named}) {
+					t.Errorf("ran with names %q, want %q each time", got, tt.named)
+				}
+			}
+			var runAt []int
+			for i, argv := range sc.calls {
+				if argv[1] == "run" {
+					runAt = append(runAt, i)
+				}
+			}
+			rm := slices.IndexFunc(sc.calls, func(argv []string) bool {
+				return slices.Equal(argv[1:], []string{"rm", "-f", "-v", tt.named})
+			})
+			if rm < runAt[0] || rm > runAt[1] {
+				t.Errorf("calls %q: want rm -f -v %s between the two runs", sc.calls, tt.named)
+			}
+		})
+	}
 }
 
 // TestServingWait waits for a container to serve: any status from the
