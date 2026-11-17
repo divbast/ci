@@ -20,7 +20,8 @@ var needsContainer = map[string]bool{
 	checkRuntimeUser: true, checkCaps: true, checkNoNewPrivs: true, checkSeccomp: true, checkReadOnly: true,
 	checkNoVolume: true, checkWritableMounts: true, checkPID1: true, checkNoShell: true, checkNoPackageManager: true,
 	checkListeners: true, checkNoEgress: true, checkHealthProbe: true, checkEngineHealthy: true, checkHealthPortOnly: true,
-	checkHostConfig: true,
+	checkHealthOnAppPort: true,
+	checkHostConfig:      true,
 }
 
 // failure is a record a mutant must make FAIL: the check that makes it,
@@ -181,8 +182,9 @@ func runMutant(t *testing.T, e harness.Engine, fixture string, config func(image
 		m.config(&cfg)
 	}
 	results := check(ctx, t, &cfg, m.loosen)
-	if got := checkNames(results); !slices.Equal(got, allChecks) {
-		t.Fatalf("check() ran %q, want %q", got, allChecks)
+	checks := checksFor(&cfg)
+	if got := checkNames(results); !slices.Equal(got, checks) {
+		t.Fatalf("check() ran %q, want %q", got, checks)
 	}
 
 	var shared string // why the container did not come up
@@ -211,7 +213,7 @@ func runMutant(t *testing.T, e harness.Engine, fixture string, config func(image
 		}
 	}
 	for _, f := range m.fails {
-		if !slices.Contains(allChecks, f.check) {
+		if !slices.Contains(checks, f.check) {
 			t.Errorf("no check %s ran, to fail %q", f.check, f.record)
 		}
 	}

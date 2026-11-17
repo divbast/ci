@@ -10,8 +10,10 @@
 //	minimal health   exit 0, printing nothing, when both answer
 //	minimal version  print the version
 //
-// serve listens on $MINIMAL_EXTRA_PORT as well when it is set, as an app
-// with a third listener would. It stops on SIGTERM or SIGINT, as PID 1
+// With $MINIMAL_ONE_PORT set, serve listens on 8080 alone, which answers
+// /ping as well as the page, as a .NET Servarr app does, and health
+// checks those two. serve listens on $MINIMAL_EXTRA_PORT as well when it
+// is set, as an app with a third listener would. It stops on SIGTERM or SIGINT, as PID 1
 // must, since the kernel drops a signal to PID 1 that it does not handle.
 package main
 
@@ -67,11 +69,20 @@ func only(path, body string) http.Handler {
 	})
 }
 
+// oneport is whether the fixture serves on the app port alone.
+func oneport() bool { return os.Getenv("MINIMAL_ONE_PORT") != "" }
+
 func serve() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	servers := map[string]http.Handler{":8080": only("/", page), ":8081": only("/healthz", "ok")}
+	if oneport() {
+		mux := http.NewServeMux()
+		mux.Handle("/ping", only("/ping", "ok"))
+		mux.Handle("/", only("/", page))
+		servers = map[string]http.Handler{":8080": mux}
+	}
 	if port := os.Getenv("MINIMAL_EXTRA_PORT"); port != "" {
 		servers[":"+port] = only("/", page)
 	}
@@ -105,7 +116,11 @@ func health() error {
 	client := &http.Client{Timeout: 4 * time.Second, Transport: &http.Transport{
 		DialContext: (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
 	}}
-	for _, url := range []string{"http://127.0.0.1:8081/healthz", "http://127.0.0.1:8080/"} {
+	urls := []string{"http://127.0.0.1:8081/healthz", "http://127.0.0.1:8080/"}
+	if oneport() {
+		urls = []string{"http://127.0.0.1:8080/ping", "http://127.0.0.1:8080/"}
+	}
+	for _, url := range urls {
 		resp, err := client.Get(url)
 		if err != nil {
 			return err

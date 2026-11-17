@@ -65,6 +65,16 @@ func TestContractMinimalGo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The fixture serving on the app port alone, its health route /ping
+	onePort := func(then func(*Config)) func(*Config) {
+		return func(c *Config) {
+			c.HealthPort, c.HealthPath, c.HealthOnly404 = 0, "/ping", nil
+			c.Env = map[string]string{"MINIMAL_ONE_PORT": "1"}
+			if then != nil {
+				then(c)
+			}
+		}
+	}
 	extra := func(c *Config) { c.Env = map[string]string{"MINIMAL_EXTRA_PORT": "7070"} }
 	for _, m := range []mutant{
 		{name: "fixture"},
@@ -81,6 +91,22 @@ func TestContractMinimalGo(t *testing.T) {
 			// The same listener, which the configuration does not name
 			name: "extra-port-undeclared", config: extra,
 			fails: []failure{{checkListeners, "TCP ports a process in the container listens on", []string{"7070"}}},
+		},
+		{
+			// One listener, which serves the health route too
+			name: "one-port", config: onePort(nil),
+		},
+		{
+			// A health route the app does not serve
+			name:   "one-port-wrong-path",
+			config: onePort(func(c *Config) { c.HealthPath = "/nowhere" }),
+			fails:  []failure{{checkHealthOnAppPort, "GET :8080/nowhere", []string{"404"}}},
+		},
+		{
+			// A health port opened anyway, which the app-port mode has none of
+			name:   "one-port-health-port-open",
+			config: onePort(func(c *Config) { c.Env["MINIMAL_EXTRA_PORT"] = "8081" }),
+			fails:  []failure{{checkListeners, "TCP ports a process in the container listens on", []string{"8081"}}},
 		},
 	} {
 		t.Run(m.name, func(t *testing.T) {

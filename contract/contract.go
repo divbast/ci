@@ -41,7 +41,7 @@
 //     a scanner reads, /var/lib/dpkg/status.d, is no package manager, and
 //     stays;
 //   - listeners: the processes in the container listen on Config.AppPort,
-//     Config.HealthPort and Config.ExtraTCPPorts alone, hold no UDP
+//     Config.HealthPort, when it has one, and Config.ExtraTCPPorts alone, hold no UDP
 //     socket, and the probe can read the descriptors of every one of them;
 //   - no-egress: the container's network is one the engine reports
 //     internal, and a TCP connect from it to 9.9.9.9:443 fails;
@@ -54,9 +54,13 @@
 //     systemd timer its --health-cmd sets up, and reports the container
 //     healthy within the image's start period and three of the intervals
 //     it runs the check at;
-//   - health-port-only: each path in Config.HealthOnly404, which may not
-//     be empty, answers 404 on the health port, and /healthz answers 404
-//     on the app port;
+//   - health-port-only, when Config.HealthPort is set: each path in
+//     Config.HealthOnly404, which may not be empty, answers 404 on the
+//     health port, and /healthz answers 404 on the app port;
+//   - health-on-app-port, when Config.HealthPath is set and HealthPort is
+//     0, for an app with one listener and no wrapper process: Config.
+//     HealthPath answers 200 on the app port. It runs in health-port-only's
+//     place, and the app has no health port;
 //   - host-config: the engine reports adding no capability, no
 //     --privileged, a read-only root, no security option that loosens
 //     seccomp, AppArmor or SELinux, no-new-privileges, no init before the
@@ -103,8 +107,13 @@ type Config struct {
 	// Image is the image under test. Empty takes $IMAGE.
 	Image string
 	// AppPort is the port the app serves on, and HealthPort the one only
-	// /healthz answers on.
+	// /healthz answers on. HealthPort 0 means the app has no health port:
+	// set HealthPath, and HealthOnly404 stays empty.
 	AppPort, HealthPort int
+	// HealthPath is the path the app serves its health route at on
+	// AppPort, such as "/ping", when HealthPort is 0. Set one of
+	// HealthPort and HealthPath, not both.
+	HealthPath string
 	// TmpfsSize sizes the one tmpfs the contract grants, at /tmp.
 	TmpfsSize string
 	// PID1 is PID 1's whole argv once the image has started: the server,
@@ -148,7 +157,8 @@ type Config struct {
 	// container's /tmp and run under its PHP. Nil for none.
 	PHP *PHP
 	// HealthOnly404 holds the paths that must answer 404 on HealthPort,
-	// such as the app's own pages: one at least.
+	// such as the app's own pages: one at least when HealthPort is set,
+	// and none when it is 0.
 	HealthOnly404 []string
 	// Scenario, when set, names the configuration the container under the
 	// contract runs in, such as "telemetry off", for a suite that runs the
@@ -168,15 +178,24 @@ func (c *Config) validate() error {
 	if c.Image == "" {
 		errs = append(errs, errors.New("no image to check: set Config.Image, or IMAGE"))
 	}
-	for _, p := range []struct {
-		name string
-		port int
-	}{{"AppPort", c.AppPort}, {"HealthPort", c.HealthPort}} {
-		if p.port < 1 || p.port > 65535 {
-			errs = append(errs, fmt.Errorf("the port in Config.%s, %d, is not a TCP port", p.name, p.port))
-		}
+	if c.AppPort < 1 || c.AppPort > 65535 {
+		errs = append(errs, fmt.Errorf("the port in Config.AppPort, %d, is not a TCP port", c.AppPort))
 	}
-	if c.AppPort == c.HealthPort {
+	switch {
+	case c.HealthPort != 0 && c.HealthPath != "":
+		errs = append(errs, fmt.Errorf("Config.HealthPort is %d and Config.HealthPath is %q: set one, since a health "+
+			"route is on the health port or on the app port", c.HealthPort, c.HealthPath))
+	case c.HealthPort == 0 && c.HealthPath == "":
+		errs = append(errs, errors.New("neither Config.HealthPort nor Config.HealthPath is set: set one, to say where "+
+			"the health route is"))
+	}
+	if c.HealthPort != 0 && (c.HealthPort < 1 || c.HealthPort > 65535) {
+		errs = append(errs, fmt.Errorf("the port in Config.HealthPort, %d, is not a TCP port", c.HealthPort))
+	}
+	if c.HealthPath != "" && !strings.HasPrefix(c.HealthPath, "/") {
+		errs = append(errs, fmt.Errorf("Config.HealthPath is %q: it needs an absolute path, starting with /", c.HealthPath))
+	}
+	if c.HealthPort != 0 && c.AppPort == c.HealthPort {
 		errs = append(errs, fmt.Errorf("Config.AppPort and Config.HealthPort are the same port, %d", c.AppPort))
 	}
 	if strings.ContainsAny(c.Scenario, "\t\n\r") {
@@ -185,9 +204,13 @@ func (c *Config) validate() error {
 	if c.TmpfsSize == "" {
 		errs = append(errs, errors.New("Config.TmpfsSize is empty: the contract's one tmpfs, /tmp, needs its size"))
 	}
-	if len(c.HealthOnly404) == 0 {
+	switch {
+	case c.HealthPort != 0 && len(c.HealthOnly404) == 0:
 		errs = append(errs, errors.New("Config.HealthOnly404 is empty: health-port-only would check the app port alone, "+
 			"and nothing of what the health port refuses"))
+	case c.HealthPort == 0 && len(c.HealthOnly404) > 0:
+		errs = append(errs, errors.New("Config.HealthOnly404 is set with no health port: it names paths the health port "+
+			"refuses, and health-on-app-port checks none"))
 	}
 	if c.Ready != nil && c.ReadyProbe != nil {
 		errs = append(errs, errors.New("Config.Ready and Config.ReadyProbe are both set: set one"))
@@ -218,7 +241,10 @@ func (c *Config) validate() error {
 // one given twice, and one that is AppPort or HealthPort.
 func (c *Config) validateExtraPorts() []error {
 	var errs []error
-	seen := map[int]bool{c.AppPort: true, c.HealthPort: true}
+	seen := map[int]bool{c.AppPort: true}
+	if c.HealthPort != 0 {
+		seen[c.HealthPort] = true
+	}
 	for _, p := range c.ExtraTCPPorts {
 		switch {
 		case p < 1 || p > 65535:
@@ -263,6 +289,7 @@ const (
 	checkHealthProbe           = "health-probe"
 	checkEngineHealthy         = "engine-healthy"
 	checkHealthPortOnly        = "health-port-only"
+	checkHealthOnAppPort       = "health-on-app-port"
 	checkHostConfig            = "host-config"
 	checkNoVolume              = "no-volume"
 	checkNoFileCapabilityXattr = "no-file-capability-xattr"
@@ -282,6 +309,16 @@ var allChecks = []string{
 	checkSeccomp, checkReadOnly, checkNoVolume, checkWritableMounts, checkPID1, checkNoShell, checkNoPackageManager,
 	checkListeners, checkNoEgress, checkHealthcheckConfig, checkHealthProbe, checkEngineHealthy, checkHealthPortOnly,
 	checkHostConfig,
+}
+
+// checksFor is the checks cfg runs: allChecks, but for an app with no
+// health port, which has health-on-app-port in health-port-only's place.
+func checksFor(cfg *Config) []string {
+	if cfg.HealthPort != 0 {
+		return allChecks
+	}
+	return slices.Replace(slices.Clone(allChecks), slices.Index(allChecks, checkHealthPortOnly),
+		slices.Index(allChecks, checkHealthPortOnly)+1, checkHealthOnAppPort)
 }
 
 // Check runs every check against cfg's image, under the engine $ENGINE
@@ -307,8 +344,9 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 		err = cfg.validate()
 	}
 	if err != nil {
-		results := make([]Result, len(allChecks))
-		for i, name := range allChecks {
+		names := checksFor(&cfg)
+		results := make([]Result, len(names))
+		for i, name := range names {
 			results[i] = resultFor(cfg.Scenario, name, nil, fmt.Errorf("the contract cannot be checked: %w", err))
 		}
 		return results
@@ -338,10 +376,12 @@ func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) [
 		checkHealthProbe:           s.healthProbe,
 		checkEngineHealthy:         s.engineHealthy,
 		checkHealthPortOnly:        s.healthPortOnly,
+		checkHealthOnAppPort:       s.healthOnAppPort,
 		checkHostConfig:            s.hostConfig,
 	}
-	results := make([]Result, 0, len(allChecks))
-	for _, name := range allChecks {
+	names := checksFor(&cfg)
+	results := make([]Result, 0, len(names))
+	for _, name := range names {
 		records, err := run[name](ctx, tb)
 		results = append(results, resultFor(cfg.Scenario, name, records, err))
 	}

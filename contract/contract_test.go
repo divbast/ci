@@ -260,6 +260,39 @@ func TestValidate(t *testing.T) {
 		{name: "no-health-cmd", change: func(c *Config) { c.HealthCmd = nil }, want: "HealthCmd"},
 		{name: "no-exec", change: func(c *Config) { c.Exec = nil }, want: "Config.Exec"},
 		{name: "exec-relative", change: func(c *Config) { c.Exec = []string{"frankenphp", "version"} }, want: "Config.Exec"},
+		{
+			name:   "health path, no health port",
+			change: func(c *Config) { c.HealthPort, c.HealthPath, c.HealthOnly404 = 0, "/ping", nil },
+		},
+		{name: "both health port and path", change: func(c *Config) { c.HealthPath = "/ping" }, want: "set one"},
+		{
+			name:   "neither health port nor path",
+			change: func(c *Config) { c.HealthPort, c.HealthOnly404 = 0, nil },
+			want:   "Config.HealthPort",
+		},
+		{
+			name:   "neither health port nor path, naming the path",
+			change: func(c *Config) { c.HealthPort, c.HealthOnly404 = 0, nil },
+			want:   "Config.HealthPath",
+		},
+		{
+			name:   "relative health path",
+			change: func(c *Config) { c.HealthPort, c.HealthPath, c.HealthOnly404 = 0, "ping", nil },
+			want:   "absolute",
+		},
+		{
+			name:   "HealthOnly404 with no health port",
+			change: func(c *Config) { c.HealthPort, c.HealthPath = 0, "/ping" },
+			want:   "no health port",
+		},
+		{
+			// The app port is the health port's own, which a zero one is not
+			name: "extra port is zero in app-port mode",
+			change: func(c *Config) {
+				c.HealthPort, c.HealthPath, c.HealthOnly404, c.ExtraTCPPorts = 0, "/ping", nil, []int{0}
+			},
+			want: "Config.ExtraTCPPorts",
+		},
 		{name: "extra-port", change: func(c *Config) { c.ExtraTCPPorts = []int{7070} }},
 		{name: "extra-port-zero", change: func(c *Config) { c.ExtraTCPPorts = []int{0} }, want: "Config.ExtraTCPPorts"},
 		{name: "extra-port-too-high", change: func(c *Config) { c.ExtraTCPPorts = []int{65536} }, want: "Config.ExtraTCPPorts"},
@@ -340,6 +373,56 @@ func TestValidateRefusesEmptyHealthOnly404(t *testing.T) {
 		cfg.HealthOnly404 = paths
 		if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "Config.HealthOnly404 is empty") {
 			t.Errorf("validate() with HealthOnly404 %#v: error = %v, want one saying Config.HealthOnly404 is empty", paths, err)
+		}
+	}
+}
+
+// TestChecksFor shows the checks a Config runs: every one in health-port
+// mode, and in app-port mode health-on-app-port in the place of
+// health-port-only.
+func TestChecksFor(t *testing.T) {
+	t.Parallel()
+
+	appPort := minimalGo("img")
+	appPort.HealthPort, appPort.HealthPath, appPort.HealthOnly404 = 0, "/ping", nil
+	want := slices.Clone(allChecks)
+	i := slices.Index(want, checkHealthPortOnly)
+	if i < 0 {
+		t.Fatalf("allChecks %q has no %s", allChecks, checkHealthPortOnly)
+	}
+	want[i] = checkHealthOnAppPort
+
+	healthPort := minimalGo("img")
+	for _, tt := range []struct {
+		name string
+		cfg  *Config
+		want []string
+	}{
+		{"health-port", &healthPort, allChecks},
+		{"app-port", &appPort, want},
+	} {
+		if got := checksFor(tt.cfg); !slices.Equal(got, tt.want) {
+			t.Errorf("%s: checksFor() = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestPorts shows the ports listeners allows: AppPort, HealthPort when
+// the Config has one, and ExtraTCPPorts.
+func TestPorts(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		cfg  Config
+		want []string
+	}{
+		{"health-port", Config{AppPort: 8080, HealthPort: 8081, ExtraTCPPorts: []int{7070}}, []string{"8080", "8081", "7070"}},
+		{"app-port", Config{AppPort: 8080, HealthPath: "/ping", ExtraTCPPorts: []int{7070}}, []string{"8080", "7070"}},
+		{"app-port-alone", Config{AppPort: 9696, HealthPath: "/ping"}, []string{"9696"}},
+	} {
+		if got := ports(&tt.cfg); !slices.Equal(got, tt.want) {
+			t.Errorf("%s: ports() = %q, want %q", tt.name, got, tt.want)
 		}
 	}
 }

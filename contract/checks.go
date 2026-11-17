@@ -79,7 +79,11 @@ func (s *suite) start(ctx context.Context, tb testing.TB, loosen []string) error
 	if err != nil {
 		return stopped(ctx, c, fmt.Errorf("installing the probe: %w", err))
 	}
-	for _, port := range []int{s.cfg.AppPort, s.cfg.HealthPort} {
+	waitOn := []int{s.cfg.AppPort}
+	if s.cfg.HealthPort != 0 {
+		waitOn = append(waitOn, s.cfg.HealthPort)
+	}
+	for _, port := range waitOn {
 		if _, err := p.WaitHTTP(ctx, fmt.Sprintf("http://127.0.0.1:%d/", port), readyWithin); err != nil {
 			return err
 		}
@@ -107,11 +111,15 @@ func (s *suite) mountTargets() []string {
 	return targets
 }
 
-// ports is every TCP port listeners allows: AppPort, HealthPort and
-// ExtraTCPPorts.
+// ports is every TCP port listeners allows: AppPort, HealthPort when it
+// is set, and ExtraTCPPorts.
 func ports(cfg *Config) []string {
+	all := []int{cfg.AppPort}
+	if cfg.HealthPort != 0 {
+		all = append(all, cfg.HealthPort)
+	}
 	p := make([]string, 0, 2+len(cfg.ExtraTCPPorts))
-	for _, port := range slices.Concat([]int{cfg.AppPort, cfg.HealthPort}, cfg.ExtraTCPPorts) {
+	for _, port := range slices.Concat(all, cfg.ExtraTCPPorts) {
 		p = append(p, strconv.Itoa(port))
 	}
 	return p
@@ -444,6 +452,24 @@ func (s *suite) healthPortOnly(ctx context.Context, _ testing.TB) ([]harness.Rec
 		records = append(records, equal(fmt.Sprintf("GET :%d%s", tg.port, tg.path), "404", found))
 	}
 	return records, nil
+}
+
+// healthOnAppPort checks the app serves its health route, Config.HealthPath,
+// on the app port, as an app with one listener and no wrapper process
+// does. No answer is a failing record.
+func (s *suite) healthOnAppPort(ctx context.Context, _ testing.TB) ([]harness.Record, error) {
+	p, err := s.container()
+	if err != nil {
+		return nil, err
+	}
+	var found string
+	resp, err := p.HTTP(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", s.cfg.AppPort, s.cfg.HealthPath), nil, "")
+	if err != nil {
+		found = "no answer: " + err.Error()
+	} else {
+		found = strconv.Itoa(resp.Status)
+	}
+	return []harness.Record{equal(fmt.Sprintf("GET :%d%s", s.cfg.AppPort, s.cfg.HealthPath), "200", found)}, nil
 }
 
 // The records no-volume makes.
