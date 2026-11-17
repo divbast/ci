@@ -28,8 +28,9 @@ type suite struct {
 	imageErr error
 
 	// The container the checks run in, on an internal network, with the
-	// probe installed and both ports answering. ctrErr says why it did
-	// not come up, if it did not; network is set if that much worked.
+	// probe installed and the app port, and the health port if there is
+	// one, answering. ctrErr says why it did not come up, if it did not;
+	// network is set if that much worked.
 	network string
 	ctr     *harness.Container
 	probe   *harness.Probe

@@ -285,14 +285,6 @@ func TestValidate(t *testing.T) {
 			change: func(c *Config) { c.HealthPort, c.HealthPath = 0, "/ping" },
 			want:   "no health port",
 		},
-		{
-			// The app port is the health port's own, which a zero one is not
-			name: "extra port is zero in app-port mode",
-			change: func(c *Config) {
-				c.HealthPort, c.HealthPath, c.HealthOnly404, c.ExtraTCPPorts = 0, "/ping", nil, []int{0}
-			},
-			want: "Config.ExtraTCPPorts",
-		},
 		{name: "extra-port", change: func(c *Config) { c.ExtraTCPPorts = []int{7070} }},
 		{name: "extra-port-zero", change: func(c *Config) { c.ExtraTCPPorts = []int{0} }, want: "Config.ExtraTCPPorts"},
 		{name: "extra-port-too-high", change: func(c *Config) { c.ExtraTCPPorts = []int{65536} }, want: "Config.ExtraTCPPorts"},
@@ -525,16 +517,28 @@ func TestRuntimeUser(t *testing.T) {
 func TestCheckRefusesConfig(t *testing.T) {
 	t.Setenv("IMAGE", "")
 
-	cfg := libreSpeed("")
-	results := Check(t.Context(), t, &cfg)
-	if got := checkNames(results); !slices.Equal(got, allChecks) {
-		t.Fatalf("Check() reported %q, want every check: %q", got, allChecks)
+	appPort := libreSpeed("")
+	appPort.HealthPort, appPort.HealthPath, appPort.HealthOnly404 = 0, "/ping", nil
+	refused := func(name string, cfg Config, has, not string) {
+		t.Run(name, func(t *testing.T) {
+			results := Check(t.Context(), t, &cfg)
+			want := checksFor(&cfg)
+			got := checkNames(results)
+			if !slices.Equal(got, want) {
+				t.Fatalf("Check() reported %q, want every check of the configuration: %q", got, want)
+			}
+			if !slices.Contains(got, has) || slices.Contains(got, not) {
+				t.Errorf("Check() reported %q, want %q and not %q", got, has, not)
+			}
+			for _, r := range results {
+				if r.OK || !strings.Contains(r.Detail, "image") {
+					t.Errorf("%s: OK = %t, Detail %q; want a failure naming the missing image", r.Check, r.OK, r.Detail)
+				}
+			}
+		})
 	}
-	for _, r := range results {
-		if r.OK || !strings.Contains(r.Detail, "image") {
-			t.Errorf("%s: OK = %t, Detail %q; want a failure naming the missing image", r.Check, r.OK, r.Detail)
-		}
-	}
+	refused("health-port", libreSpeed(""), checkHealthPortOnly, checkHealthOnAppPort)
+	refused("app-port", appPort, checkHealthOnAppPort, checkHealthPortOnly)
 }
 
 func TestHostConfigRecords(t *testing.T) {

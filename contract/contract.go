@@ -141,9 +141,9 @@ type Config struct {
 	// a volume made with [harness.Engine.Volume]. It may fail tb.
 	Mounts func(tb testing.TB) []harness.Mount
 	// Ready, when set, returns once the app in c is ready to be checked,
-	// after both ports answer, or an error saying why it never was. Its
-	// context ends a minute after it is called, as long as each port had
-	// to answer.
+	// after the app port, and the health port if there is one, answer, or
+	// an error saying why it never was. Its context ends a minute after it
+	// is called, as long as each port had to answer.
 	Ready func(ctx context.Context, c *harness.Container) error
 	// ReadyProbe is Ready, given as well the probe the contract attached
 	// in c, with AppProbe or PHP beside the core probe, for an app that
@@ -241,10 +241,7 @@ func (c *Config) validate() error {
 // one given twice, and one that is AppPort or HealthPort.
 func (c *Config) validateExtraPorts() []error {
 	var errs []error
-	seen := map[int]bool{c.AppPort: true}
-	if c.HealthPort != 0 {
-		seen[c.HealthPort] = true
-	}
+	seen := map[int]bool{c.AppPort: true, c.HealthPort: true}
 	for _, p := range c.ExtraTCPPorts {
 		switch {
 		case p < 1 || p > 65535:
@@ -471,6 +468,7 @@ func report(tb testing.TB, r *Result) {
 	}
 }
 
-// readyWithin bounds how long the container's two ports may take to
-// answer, as LibreSpeed's bash suite bounded it.
+// readyWithin bounds how long the container's app port, and its health
+// port if it has one, may take to answer, as LibreSpeed's bash suite
+// bounded it.
 const readyWithin = time.Minute

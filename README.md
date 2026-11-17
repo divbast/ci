@@ -1233,7 +1233,9 @@ first. The mutants under `contract/testdata/mutants` each break one thing
 in the LibreSpeed image or the minimal fixture, and exactly the records
 for that one thing must fail. The Go fixture's mutants are configurations
 instead: an extra listener the configuration names, and the same one
-unnamed.
+unnamed; and with the fixture serving its health route on the app port
+alone (`MINIMAL_ONE_PORT`), the route that fixture does not serve, and a
+health port opened anyway.
 Renovate's dockerfile manager moves the digests every one of those
 Containerfiles pins, and `just lint` runs hadolint over them, and PHPStan
 over the fixture's PHP and the mutants'. The contract package's
