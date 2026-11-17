@@ -11,7 +11,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384def
 
 # The binary divbast/frankenphp builds, by digest: the one the template
 # copies, built for Baikal
-COPY --from=ghcr.io/divbast/frankenphp:baikal@sha256:5e7a902e6407866a2bbecd1d9d5460039b9b4b29ced4628db471094aeb48f55e --chmod=0755 /frankenphp /usr/local/bin/frankenphp
+COPY --from=ghcr.io/divbast/frankenphp:baikal@sha256:e4639370f8aac7cc1c16d4babbcbd2405a837bde2681d0f99d825def3d4fc41f --chmod=0755 /frankenphp /usr/local/bin/frankenphp
 
 # Root-owned, and never written. Only the probe takes --chmod: COPY gives
 # a directory it creates the mode it gives the file, and then no one could
