@@ -815,6 +815,12 @@ is what `packages: read` is for. It reads `PUBLISHED` with `skopeo`, from
 Each warning is a GitHub Actions warning and a callout on the run's
 summary. Only gh gets the token: Trivy and skopeo run without it.
 
+It also refuses a report, of the build or of `PUBLISHED`, in which Trivy
+recognised no operating system or saw no OS package. An image whose OS
+Trivy does not know still has its language packages, which would pass
+the check for a scan that saw no packages, yet the scan could then not
+see the OS packages, and nothing would show they are clean.
+
 Outside GitHub Actions the tool never asks GitHub, since the token a
 person gives the recipes, a fine-grained one, cannot read packages: the
 API answers it HTTP 403. A local `just scan`
@@ -1159,7 +1165,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

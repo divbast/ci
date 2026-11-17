@@ -145,6 +145,64 @@ func TestParseTrivyCountsPackages(t *testing.T) {
 	}
 }
 
+func TestParseTrivyReadsOS(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		report         string
+		wantOS         string
+		wantOSPackages int
+		wantPackages   int
+	}{
+		{
+			name: "debian",
+			report: `{"Metadata":{"OS":{"Family":"debian","Name":"13.2"}},"Results":[` +
+				`{"Class":"os-pkgs","Type":"debian","Packages":[{"ID":"a"},{"ID":"b"},{"ID":"c"}]}]}`,
+			wantOS:         "debian 13.2",
+			wantOSPackages: 3,
+			wantPackages:   3,
+		},
+		{
+			// An image whose OS Trivy did not recognise: the .NET packages
+			// still count as packages
+			name: "language-packages-only",
+			report: `{"Results":[{"Class":"lang-pkgs","Type":"dotnet-core",` +
+				`"Packages":[{"ID":"a"},{"ID":"b"},{"ID":"c"},{"ID":"d"},{"ID":"e"}]}]}`,
+			wantPackages: 5,
+		},
+		{
+			name: "os-with-language-packages",
+			report: `{"Metadata":{"OS":{"Family":"debian","Name":"13.2"}},"Results":[` +
+				`{"Class":"os-pkgs","Type":"debian","Packages":[{"ID":"a"}]},` +
+				`{"Class":"lang-pkgs","Type":"gobinary","Packages":[{"ID":"b"},{"ID":"c"}]}]}`,
+			wantOS:         "debian 13.2",
+			wantOSPackages: 1,
+			wantPackages:   3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rep, err := scan.ParseTrivy(strings.NewReader(tt.report))
+			if err != nil {
+				t.Fatalf("ParseTrivy() error = %v", err)
+			}
+			if rep.OS != tt.wantOS {
+				t.Errorf("OS = %q, want %q", rep.OS, tt.wantOS)
+			}
+			if rep.OSPackages != tt.wantOSPackages {
+				t.Errorf("OSPackages = %d, want %d", rep.OSPackages, tt.wantOSPackages)
+			}
+			if rep.Packages != tt.wantPackages {
+				t.Errorf("Packages = %d, want %d", rep.Packages, tt.wantPackages)
+			}
+		})
+	}
+}
+
 func TestParseTrivyRejects(t *testing.T) {
 	t.Parallel()
 

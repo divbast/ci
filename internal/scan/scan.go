@@ -38,11 +38,19 @@ type Split struct{ New, Old []Finding }
 // what was compared, or the name Trivy was given when it has none. A
 // report that saw no packages is one whose scan never looked, whatever it
 // found; deciding that is the caller's.
+//
+// OS is the operating system Trivy identified, as "<family> <name>", such
+// as "debian 13.2", or "" when it identified none; OSPackages is how many
+// of the packages are the OS's. An image whose OS Trivy does not know
+// still has its language packages, so a report with no OS or no OS
+// packages is blind to the OS, which Packages alone does not show.
 type Report struct {
-	Findings []Finding
-	Packages int
-	Arch     string
-	Ref      string
+	Findings   []Finding
+	Packages   int
+	OS         string
+	OSPackages int
+	Arch       string
+	Ref        string
 }
 
 // trivyJSON is what the scan reads of a Trivy JSON report.
@@ -53,6 +61,7 @@ type trivyJSON struct {
 			Architecture string `json:"architecture"`
 		}
 		RepoDigests []string
+		OS          struct{ Family, Name string }
 	}
 	Results []struct {
 		Target, Class, Type string
@@ -78,8 +87,14 @@ func ParseTrivy(r io.Reader) (Report, error) {
 	if len(raw.Metadata.RepoDigests) > 0 {
 		rep.Ref = raw.Metadata.RepoDigests[0]
 	}
+	if os := raw.Metadata.OS; os.Family != "" {
+		rep.OS = os.Family + " " + os.Name
+	}
 	for _, res := range raw.Results {
 		rep.Packages += len(res.Packages)
+		if res.Class == "os-pkgs" {
+			rep.OSPackages += len(res.Packages)
+		}
 		where := res.Target
 		if res.Class == "os-pkgs" {
 			where = res.Type + " package"
