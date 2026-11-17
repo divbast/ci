@@ -5,6 +5,8 @@ package verify_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os/exec"
 	"strings"
@@ -18,7 +20,17 @@ var (
 	frankenphp = verify.Ref{Name: "ghcr.io/divbast/frankenphp", Tag: "librespeed", Digest: digest, Line: 8}
 	distroless = verify.Ref{Name: "gcr.io/distroless/cc-debian13", Tag: "nonroot", Digest: other, Line: 7}
 	golang     = verify.Ref{Name: "golang", Tag: "1.27.4-trixie", Digest: other, Line: 1}
+	dhi        = verify.Ref{Name: "dhi.io/aspnetcore", Tag: "10.0.15-debian13", Digest: digest, Line: 2}
 )
+
+// dhiKey is the path Tools.DHIKey names in these tests.
+const dhiKey = "/keys/dhi-2.pub"
+
+// dhiArgv is the one cosign command that verifies dhi, in full.
+var dhiArgv = []string{
+	"cosign", "verify", "--key", dhiKey, "--experimental-oci11",
+	"dhi.io/aspnetcore:10.0.15-debian13@" + digest,
+}
 
 // attestArgv is the one gh command that verifies frankenphp, in full.
 var attestArgv = []string{
@@ -53,6 +65,11 @@ func cosign(code int, stderr string) execx.Call {
 	return execx.Call{Argv: cosignArgv, Result: execx.Result{Code: code, Stderr: []byte(stderr)}}
 }
 
+// dhiCosign is cosign verify --key answering with code and stderr.
+func dhiCosign(code int, stderr string) execx.Call {
+	return execx.Call{Argv: dhiArgv, Result: execx.Result{Code: code, Stderr: []byte(stderr)}}
+}
+
 func TestVerify(t *testing.T) {
 	t.Parallel()
 
@@ -68,6 +85,8 @@ func TestVerify(t *testing.T) {
 		// wantMsg lists what the error message must contain.
 		wantMsg []string
 		wantLog string
+		// noKey leaves Tools.DHIKey empty.
+		noKey bool
 	}{
 		{
 			name:  "frankenphp-attested",
@@ -177,6 +196,37 @@ func TestVerify(t *testing.T) {
 			wantErr: verify.ErrUnlisted,
 		},
 		{
+			name:  "dhi-signed",
+			refs:  []verify.Ref{dhi},
+			calls: []execx.Call{dhiCosign(0, "")},
+		},
+		{
+			// An image with no signature is exit 10
+			name:    "dhi-not-signed",
+			refs:    []verify.Ref{dhi},
+			calls:   []execx.Call{dhiCosign(10, mismatch)},
+			wantErr: verify.ErrNotVerified,
+			wantMsg: []string{"exited 10", "dhi-2.pub", "dhi.io/aspnetcore"},
+			wantLog: mismatch,
+		},
+		{
+			name:    "dhi-without-a-key",
+			refs:    []verify.Ref{dhi},
+			noKey:   true,
+			wantMsg: []string{"dhi-2.pub", "dhi.io/aspnetcore"},
+		},
+		{
+			// One verification for a digest named twice
+			name:  "dhi-twice",
+			refs:  []verify.Ref{dhi, {Name: dhi.Name, Tag: dhi.Tag, Digest: dhi.Digest, Line: 5}},
+			calls: []execx.Call{dhiCosign(0, "")},
+		},
+		{
+			name:  "dhi-and-distroless",
+			refs:  []verify.Ref{dhi, distroless},
+			calls: []execx.Call{dhiCosign(0, ""), cosign(0, "")},
+		},
+		{
 			// Pinned and outside the table: nothing to run
 			name: "third-party-only",
 			refs: []verify.Ref{golang},
@@ -189,7 +239,11 @@ func TestVerify(t *testing.T) {
 
 			var log strings.Builder
 			fake := execx.NewFake(t, tt.calls...)
-			err := verify.Verify(t.Context(), fake, fake, tt.refs, &log)
+			tools := verify.Tools{GH: fake, Cosign: fake, DHIKey: dhiKey}
+			if tt.noKey {
+				tools.DHIKey = ""
+			}
+			err := verify.Verify(t.Context(), tools, tt.refs, &log)
 			if tt.wantErr == nil && tt.wantMsg == nil {
 				if err != nil {
 					t.Fatalf("Verify() error = %v, want nil", err)
@@ -224,6 +278,9 @@ func TestListed(t *testing.T) {
 		{frankenphp, true},
 		{distroless, true},
 		{golang, false},
+		{dhi, true},
+		{verify.Ref{Name: "dhi.io/dotnet", Tag: "10", Digest: digest}, true},
+		{verify.Ref{Name: "dhi.io/"}, false},
 		{verify.Ref{Name: "GCR.io/distroless/static-debian13"}, true},
 		{verify.Ref{Name: "gcr.io/distroless-other/x"}, false},
 	} {
@@ -242,8 +299,36 @@ func TestVerifyUnwritableLog(t *testing.T) {
 	t.Parallel()
 
 	fake := execx.NewFake(t, ghVersion("2.103.3"), attest(0, ""))
-	err := verify.Verify(t.Context(), fake, fake, []verify.Ref{frankenphp}, failingWriter{})
+	err := verify.Verify(t.Context(), verify.Tools{GH: fake, Cosign: fake}, []verify.Ref{frankenphp}, failingWriter{})
 	if err == nil || !strings.Contains(err.Error(), "log gone") {
 		t.Fatalf("Verify() error = %v, want the failed write", err)
+	}
+}
+
+func TestNeedsDHI(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		refs []verify.Ref
+		want bool
+	}{
+		{"none", nil, false},
+		{"others", []verify.Ref{frankenphp, distroless, golang}, false},
+		{"one", []verify.Ref{golang, dhi}, true},
+		{"upper-case", []verify.Ref{{Name: "DHI.io/dotnet", Tag: "10", Digest: digest}}, true},
+	} {
+		if got := verify.NeedsDHI(tt.refs); got != tt.want {
+			t.Errorf("%s: NeedsDHI() = %t, want %t", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestDHIPublicKey(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256(verify.DHIPublicKey)
+	if got := hex.EncodeToString(sum[:]); got != verify.DHIPublicKeySHA256 {
+		t.Errorf("sha256 of DHIPublicKey = %s, want %s", got, verify.DHIPublicKeySHA256)
 	}
 }

@@ -6,6 +6,7 @@ package verify
 import (
 	"bytes"
 	"context"
+	_ "embed" // for the key Docker signs its images with
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +26,16 @@ type Rule struct {
 	// Once is whether a Containerfile may name such an image only once.
 	Once bool
 	// Check verifies r, writing what the tool reports to log.
-	Check func(ctx context.Context, gh, cosign execx.Runner, r Ref, log io.Writer) error
+	Check func(ctx context.Context, t Tools, r Ref, log io.Writer) error
+}
+
+// Tools is what a [Rule] verifies with.
+type Tools struct {
+	// GH and Cosign run gh and cosign.
+	GH, Cosign execx.Runner
+	// DHIKey is the path to a file holding [DHIPublicKey], which cosign
+	// verifies a dhi.io image against.
+	DHIKey string
 }
 
 // under reports whether the rule's Prefix names every repository under it.
@@ -43,18 +53,21 @@ func (rule Rule) matches(name string) bool {
 
 // Table is every image a Containerfile may build from that is verified,
 // and how: divbast's own FrankenPHP by GitHub's attestation of the main
-// build that made it, and Google's distroless images by their keyless
-// cosign signature. A divbast image the table does not name is refused,
-// and any other image passes once it is pinned.
+// build that made it, Google's distroless images by their keyless cosign
+// signature, and Docker Hardened Images by cosign against Docker's public
+// key. A divbast image the table does not name is refused, and any other
+// image passes once it is pinned.
 var Table = []Rule{
 	{Prefix: FrankenPHP, Once: true, Check: attested},
 	{Prefix: Distroless, Check: signed},
+	{Prefix: DHI, Check: dhiSigned},
 }
 
 // The images [Table] names, and the registry divbast publishes under.
 const (
 	FrankenPHP = "ghcr.io/divbast/frankenphp"
 	Distroless = "gcr.io/distroless/"
+	DHI        = "dhi.io/"
 	divbast    = "ghcr.io/divbast/"
 )
 
@@ -77,6 +90,17 @@ const (
 	DistrolessIdentity = "keyless@distroless.iam.gserviceaccount.com"
 	DistrolessIssuer   = "https://accounts.google.com"
 )
+
+// DHIPublicKey is Docker's public key for Docker Hardened Images,
+// dhi-2.pub as github.com/docker-hardened-images/keyring publishes it. It
+// is committed, and verified against, rather than fetched: a key fetched
+// at verify time is whatever the network serves.
+//
+//go:embed dhi-2.pub
+var DHIPublicKey []byte
+
+// DHIPublicKeySHA256 is the SHA-256 of [DHIPublicKey], in hex.
+const DHIPublicKeySHA256 = "1d02bbccf149283ae6288d96264dcad3fb23ee1911d90324a48eab28e4cb8a5f"
 
 // MinGH is the oldest gh whose attestation verify is trusted. 2.102.0
 // fixed two ways the wrong attestation could pass: --signer-workflow was
@@ -114,15 +138,24 @@ func ruleFor(name string) (Rule, bool) {
 	return Rule{}, false
 }
 
+// NeedsDHI reports whether any of refs is a dhi.io image, which only a
+// login to dhi.io can verify.
+func NeedsDHI(refs []Ref) bool {
+	return slices.ContainsFunc(refs, func(r Ref) bool { return dhiRule.matches(r.Name) })
+}
+
+// dhiRule is the rule for dhi.io's images.
+var dhiRule = Rule{Prefix: DHI}
+
 // Verify verifies every one of refs that [Table] names, once each, and
 // returns nil only when each passes. It refuses a divbast image the table
 // does not name, and an image a Rule allows once that refs name more than
-// once. gh runs gh, and cosign runs cosign; whatever each reports, on its
-// stderr and then its stdout, goes to log.
+// once. t.GH runs gh, and t.Cosign runs cosign; whatever each reports, on
+// its stderr and then its stdout, goes to log.
 //
 // The error wraps [ErrUnlisted], [ErrManyRefs], [ErrOldGH] or
 // [ErrNotVerified] where one applies.
-func Verify(ctx context.Context, gh, cosign execx.Runner, refs []Ref, log io.Writer) error {
+func Verify(ctx context.Context, t Tools, refs []Ref, log io.Writer) error {
 	for _, r := range refs {
 		if !Listed(r) && strings.HasPrefix(strings.ToLower(r.Name), divbast) {
 			return fmt.Errorf("%w: line %d has %s, and no way to verify it is known", ErrUnlisted, r.Line, r)
@@ -148,7 +181,7 @@ func Verify(ctx context.Context, gh, cosign execx.Runner, refs []Ref, log io.Wri
 		if !ok || slices.Contains(done, r.String()) {
 			continue
 		}
-		if err := rule.Check(ctx, gh, cosign, r, log); err != nil {
+		if err := rule.Check(ctx, t, r, log); err != nil {
 			return fmt.Errorf("%s: %w", r, err)
 		}
 		done = append(done, r.String())
@@ -159,11 +192,11 @@ func Verify(ctx context.Context, gh, cosign execx.Runner, refs []Ref, log io.Wri
 // attested asks gh whether divbast/frankenphp's build workflow, run from
 // its main branch, attested r's digest. gh reads the attestation through
 // the GitHub API, which needs a token that can read attestations.
-func attested(ctx context.Context, gh, _ execx.Runner, r Ref, log io.Writer) error {
-	if err := checkGH(ctx, gh); err != nil {
+func attested(ctx context.Context, t Tools, r Ref, log io.Writer) error {
+	if err := checkGH(ctx, t.GH); err != nil {
 		return err
 	}
-	return report(ctx, gh, log, "gh did not verify that divbast/frankenphp's main build attested it",
+	return report(ctx, t.GH, log, "gh did not verify that divbast/frankenphp's main build attested it",
 		"gh", "attestation", "verify", "oci://"+r.Image(),
 		"--repo", SourceRepository,
 		"--signer-workflow", SignerWorkflow,
@@ -173,11 +206,22 @@ func attested(ctx context.Context, gh, _ execx.Runner, r Ref, log io.Writer) err
 // signed asks cosign whether the distroless project's keyless signing
 // signed r's digest. Any status but 0 is a refusal: cosign exits 10 for an
 // image with no signature and 12 for one signed by someone else.
-func signed(ctx context.Context, _, cosign execx.Runner, r Ref, log io.Writer) error {
-	return report(ctx, cosign, log, "cosign did not verify that the distroless project signed it",
+func signed(ctx context.Context, t Tools, r Ref, log io.Writer) error {
+	return report(ctx, t.Cosign, log, "cosign did not verify that the distroless project signed it",
 		"cosign", "verify", r.Image(),
 		"--certificate-identity", DistrolessIdentity,
 		"--certificate-oidc-issuer", DistrolessIssuer)
+}
+
+// dhiSigned asks cosign whether Docker signed r with dhi-2.pub. It refuses
+// when t.DHIKey names no file; cosign exits 10 for an image with no
+// signature.
+func dhiSigned(ctx context.Context, t Tools, r Ref, log io.Writer) error {
+	if t.DHIKey == "" {
+		return errors.New("no path to dhi-2.pub, the key that verifies a dhi.io image")
+	}
+	return report(ctx, t.Cosign, log, "cosign did not verify that Docker signed it with dhi-2.pub",
+		"cosign", "verify", "--key", t.DHIKey, "--experimental-oci11", r.String())
 }
 
 // report runs a verification through runner, writes what it reported to

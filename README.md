@@ -1074,10 +1074,11 @@ each image in its table is verified:
 |---|---|
 | `ghcr.io/divbast/frankenphp` | Its attestation, by divbast/frankenphp's build workflow from main, named once: `gh attestation verify oci://ghcr.io/divbast/frankenphp@sha256:<digest> --repo divbast/frankenphp --signer-workflow divbast/frankenphp/.github/workflows/build.yml@refs/heads/main --source-ref refs/heads/main` |
 | `gcr.io/distroless/*` | Its keyless signature, by the distroless project: `cosign verify gcr.io/distroless/<image>@sha256:<digest> --certificate-identity keyless@distroless.iam.gserviceaccount.com --certificate-oidc-issuer https://accounts.google.com` |
+| `dhi.io/*` | Its signature, by Docker's key: `cosign verify --key dhi-2.pub --experimental-oci11 dhi.io/<image>:<tag>@sha256:<digest>`. `dhi-2.pub` is the copy of Docker's key that ci commits and embeds, never fetched, and dhi.io answers nothing without a login: `DHI_USERNAME` and `DHI_TOKEN`, a Docker ID and its personal access token with "Public Repo Read-only", written for dhi.io alone to the command's temporary Docker configuration, and only when a `dhi.io` image is named |
 
 So only a FrankenPHP binary that divbast/frankenphp's build made from its
-main branch, and only a distroless base the distroless project signed,
-is built into an app. A divbast image the table does not name is
+main branch, only a distroless base the distroless project signed, and
+only a Docker Hardened Image Docker signed, is built into an app. A divbast image the table does not name is
 refused, and an image in it may stand only in a `FROM`, a `COPY --from=`
 or the default of a build argument a `FROM` uses: named anywhere else, a
 `LABEL` or a `RUN` among them, it is a way in no verification sees. Any
@@ -1087,7 +1088,8 @@ moves is what holds it.
 
 A local `just build` verifies nothing. It builds from whatever digests
 the Containerfile names. To check a Containerfile by hand, with gh
-2.102.0 or newer logged in and cosign from `mise.toml`:
+2.102.0 or newer logged in and cosign from `mise.toml`, and, for a
+`dhi.io` image, `DHI_USERNAME` and `DHI_TOKEN` in the environment:
 
 ```sh
 just ci-tools && .ci/bin/divbast-verify-images
@@ -1142,7 +1144,7 @@ the token was found.
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
-| `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old, or a verification failed |
+| `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table (FrankenPHP, distroless, `dhi.io`) its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old; a `dhi.io` image with no `DHI_USERNAME` and `DHI_TOKEN`; or a verification failed |
 | `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
 ## Shared configuration
