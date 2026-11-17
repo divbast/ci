@@ -99,9 +99,10 @@ func (e Engine) Serve(ctx context.Context, tb testing.TB, sp *ServeSpec) (*Servi
 // without waiting for the server in it, and without the probe:
 // [Serving.Wait] waits for both. It publishes sp.AppPort, and
 // sp.HealthPort unless that is 0, each as -p 127.0.0.1::<port>, and reads
-// back the host port the engine picked from [Container.Inspect]. A
-// container that stopped before its ports could be read is an error
-// carrying its log.
+// back the host port the engine picked from [Container.Inspect]. A start
+// that failed only because a port the engine picked was taken before it
+// was bound is tried again, up to three times in all. A container that
+// stopped before its ports could be read is an error carrying its log.
 func (e Engine) StartServing(ctx context.Context, tb testing.TB, sp *ServeSpec) (*Serving, error) {
 	tb.Helper()
 	if err := sp.validate(); err != nil {
@@ -122,7 +123,7 @@ func (e Engine) StartServing(ctx context.Context, tb testing.TB, sp *ServeSpec) 
 		run.Publish = append(run.Publish, loopback(sp.HealthPort))
 	}
 
-	c, err := e.Start(ctx, tb, &run)
+	c, err := e.startPublished(ctx, tb, &run)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +137,44 @@ func (e Engine) StartServing(ctx context.Context, tb testing.TB, sp *ServeSpec) 
 		return nil, err
 	}
 	return s, nil
+}
+
+// startAttempts is how many times startPublished starts a container whose
+// engine-picked host port was taken before the engine could bind it.
+const startAttempts = 3
+
+// startPublished starts run, whose published ports are at host ports the
+// engine picks, and starts it again, up to startAttempts times in all,
+// while the engine reports that a port it picked was taken first: rootless
+// Podman picks a free port and binds it later, through rootlessport, so a
+// container starting beside it can take the port in between. That race is
+// the harness's, not the app's. A run without a name gets a new one each
+// time; one with a name has the container the failed run made removed
+// before the name is used again. Each retry is logged.
+func (e Engine) startPublished(ctx context.Context, tb testing.TB, run *RunSpec) (*Container, error) {
+	tb.Helper()
+	for attempt := 1; ; attempt++ {
+		c, err := e.Start(ctx, tb, run)
+		if err == nil || attempt == startAttempts || !portTaken(err) {
+			return c, err
+		}
+		tb.Logf("starting again, attempt %d of %d, since a host port the engine picked was taken: %v", attempt+1, startAttempts, err)
+		if run.Name != "" {
+			e.remove(ctx, tb, "rm", "-f", "-v", run.Name)
+		}
+	}
+}
+
+// portTaken reports whether err is a run that started nothing because a
+// host port the engine picked for it was taken, in the words of
+// rootlessport or of Docker's own bind (bind: address already in use) or
+// of Docker's port allocator (port is already allocated).
+func portTaken(err error) bool {
+	if !errors.Is(err, ErrNeverStarted) && !errors.Is(err, ErrRefused) {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "bind: address already in use") || strings.Contains(msg, "port is already allocated")
 }
 
 // validate refuses a spec Serve would run as something other than it

@@ -467,7 +467,10 @@ image and check what it answers, so no suite carries its own copy:
   environment, mounts, network and health command; `Serve` publishes
   `AppPort`, and `HealthPort` unless it is 0, each on `127.0.0.1` at a
   host port the engine picks, and reads it back from `Inspect`, so no
-  two suites on one host collide. A spec with no network gets one of
+  two suites on one host collide. Rootless Podman binds the port it
+  picked a moment later, so a container starting beside it can take the
+  port first; a start that fails only for that is tried again, up to
+  three times in all, and logged. A spec with no network gets one of
   its own. `Serve` then asks for `ReadyPath`, `/` by default, from the
   host until any status comes back, for up to `ServeWithin`, a minute,
   and attaches the probe: the core probe always, and the app's own
