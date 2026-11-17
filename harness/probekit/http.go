@@ -6,6 +6,7 @@ package probekit
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,7 +16,9 @@ import (
 	"time"
 )
 
-// httpTimeout bounds the connection and the whole exchange.
+// httpTimeout bounds the connection, and then the request's write and
+// each read of the answer, each on its own, as the PHP probe's
+// stream_set_timeout does.
 const httpTimeout = 10 * time.Second
 
 var (
@@ -41,9 +44,20 @@ type Response struct {
 // "Name: value" lines, and a body goes form-encoded. HTTP/1.0 keeps the
 // answer unchunked, ending where the server closes the connection.
 //
-// A method, URL or header it cannot send is refused before anything is
-// sent. The error is for a request that got no answer.
+// It allows ten seconds to connect, and then ten seconds for the write
+// and for each read of the answer, so a slow answer arrives whole while a
+// silent server breaks the exchange off. A method, URL or header it cannot
+// send is refused before anything is sent. The error is for a request
+// that got no answer.
 func Request(ctx context.Context, method, url string, headers []string, body string) (Response, error) {
+	return request(ctx, (&net.Dialer{}).DialContext, method, url, headers, body)
+}
+
+// dialFunc makes a connection, as net.Dialer.DialContext does.
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// request is [Request], over a connection dial makes.
+func request(ctx context.Context, dial dialFunc, method, url string, headers []string, body string) (Response, error) {
 	if !methodPattern.MatchString(method) {
 		return Response{}, fmt.Errorf("'%s' is not a method", method)
 	}
@@ -67,23 +81,17 @@ func Request(ctx context.Context, method, url string, headers []string, body str
 	if body != "" || method == "POST" {
 		lines = append(lines, "Content-Length: "+strconv.Itoa(len(body)))
 	}
-	request := strings.Join(lines, "\r\n") + "\r\n\r\n" + body
+	msg := strings.Join(lines, "\r\n") + "\r\n\r\n" + body
 
-	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
+	dialCtx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
 	addr := net.JoinHostPort(strings.Trim(host, "[]"), port)
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	conn, err := dial(dialCtx, "tcp", addr)
 	if err != nil {
 		return Response{}, fmt.Errorf("cannot connect to %s: %w", addr, err)
 	}
 	defer func() { _ = conn.Close() }()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-	if _, err = io.WriteString(conn, request); err != nil {
-		return Response{}, fmt.Errorf("the exchange with %s broke off: %w", addr, err)
-	}
-	answer, err := io.ReadAll(conn)
+	answer, err := exchange(ctx, conn, msg)
 	if err != nil {
 		return Response{}, fmt.Errorf("the exchange with %s broke off: %w", addr, err)
 	}
@@ -98,6 +106,45 @@ func Request(ctx context.Context, method, url string, headers []string, body str
 		return Response{}, fmt.Errorf("no HTTP status line in the answer: %w", err)
 	}
 	return Response{Status: status, Body: rest}, nil
+}
+
+// exchange sends msg over conn and reads the answer until the server
+// closes the connection. The write, and each read, has httpTimeout from
+// when it starts, never past ctx's own deadline, so an answer that comes
+// in pieces arrives however long it takes in all, while a silence of
+// httpTimeout breaks the exchange off.
+func exchange(ctx context.Context, conn net.Conn, msg string) ([]byte, error) {
+	if err := conn.SetDeadline(nextDeadline(ctx)); err != nil {
+		return nil, err
+	}
+	if _, err := io.WriteString(conn, msg); err != nil {
+		return nil, err
+	}
+	var answer bytes.Buffer
+	buf := make([]byte, 32<<10)
+	for {
+		if err := conn.SetReadDeadline(nextDeadline(ctx)); err != nil {
+			return nil, err
+		}
+		n, err := conn.Read(buf)
+		answer.Write(buf[:n])
+		switch {
+		case errors.Is(err, io.EOF):
+			return answer.Bytes(), nil
+		case err != nil:
+			return nil, err
+		}
+	}
+}
+
+// nextDeadline is httpTimeout from now, or ctx's own deadline when that
+// comes first.
+func nextDeadline(ctx context.Context) time.Time {
+	next := time.Now().Add(httpTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(next) {
+		return d
+	}
+	return next
 }
 
 // splitURL returns an http:// URL's host, as the Host header carries it,
