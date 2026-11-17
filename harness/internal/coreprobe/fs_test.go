@@ -4,9 +4,11 @@
 package coreprobe
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/fstest"
 )
@@ -175,11 +177,26 @@ func TestIsFile(t *testing.T) {
 	}{
 		{name: "a-file", root: func(t *testing.T) string { t.Helper(); return tree(t, map[string]string{"etc/passwd": "x"}) }, path: "/etc/passwd", want: "present\n"},
 		{name: "a-directory", root: func(t *testing.T) string { t.Helper(); return tree(t, nil, "etc") }, path: "/etc", want: "present\n"},
-		{name: "a-dangling-link", root: func(t *testing.T) string { t.Helper(); return tree(t, map[string]string{"x": "->/nowhere"}) }, path: "/x", want: "present\n"},
+		{name: "a-link-to-a-file", root: func(t *testing.T) string {
+			t.Helper()
+			return tree(t, map[string]string{"etc/passwd": "x", "x": "->etc/passwd"})
+		}, path: "/x", want: "present\n"},
+		{name: "a-link-to-a-link-to-a-file", root: func(t *testing.T) string {
+			t.Helper()
+			return tree(t, map[string]string{"etc/passwd": "x", "y": "->etc/passwd", "x": "->y"})
+		}, path: "/x", want: "present\n"},
+		// A link to nothing is no file: what wants the path there must find
+		// what it leads to
+		{name: "a-dangling-link", root: func(t *testing.T) string { t.Helper(); return tree(t, map[string]string{"x": "->nowhere"}) }, path: "/x", want: "a symbolic link whose target is absent\n"},
+		{
+			name: "a-link-loop", root: func(t *testing.T) string { t.Helper(); return tree(t, map[string]string{"x": "->y", "y": "->x"}) }, path: "/x",
+			want: fmt.Sprintf("a symbolic link not followed (errno %d: %s), so its target may be there\n", int(syscall.ELOOP), errnoText(syscall.ELOOP)),
+		},
 		{name: "nothing", root: func(t *testing.T) string { t.Helper(); return tree(t, nil) }, path: "/nothing", want: "absent\n"},
 		{name: "through-a-file", root: func(t *testing.T) string { t.Helper(); return tree(t, map[string]string{"etc/passwd": "x"}) }, path: "/etc/passwd/x", want: "absent\n"},
 		{
-			// What may not be looked up may still be there
+			// What may not be looked up may still be there, but the probe
+			// did not see it, so it is not present either
 			name: "under-an-unsearchable-directory",
 			root: func(t *testing.T) string {
 				t.Helper()
@@ -188,7 +205,7 @@ func TestIsFile(t *testing.T) {
 				return root
 			},
 			path: "/secret/x",
-			want: "present\n",
+			want: "not looked up (errno 13: Permission denied), so it may be there\n",
 		},
 	}
 	for _, tt := range tests {

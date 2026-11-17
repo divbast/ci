@@ -255,6 +255,21 @@ func TestIsFile(t *testing.T) {
 			wantErrs: [][]string{{`FAIL the file: got "absent", want "present"`}},
 		},
 		{
+			// The probe could not tell: that is neither answer
+			name: "cannot-tell-not-present",
+			want: "present",
+			calls: []execx.Call{{Argv: exec, Result: execx.Result{
+				Stdout: []byte("not looked up (errno 13: Permission denied), so it may be there\n"),
+			}}},
+			wantErrs: [][]string{{`FAIL the file: got "not looked up (errno 13: Permission denied), so it may be there", want "present"`}},
+		},
+		{
+			name:     "cannot-tell-not-absent",
+			want:     "absent",
+			calls:    []execx.Call{{Argv: exec, Result: execx.Result{Stdout: []byte("a symbolic link whose target is absent\n")}}},
+			wantErrs: [][]string{{`FAIL the file: got "a symbolic link whose target is absent", want "absent"`}},
+		},
+		{
 			name:     "probe-fails",
 			want:     "absent",
 			calls:    []execx.Call{{Argv: exec, Result: execx.Result{Code: 2, Stderr: []byte("unknown subcommand 'is-file'\n")}}},

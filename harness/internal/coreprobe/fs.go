@@ -77,14 +77,34 @@ func (env *Env) assertReadOnly(_ context.Context, out *probekit.Output, _ []stri
 	return nil
 }
 
-// isFile prints present or absent, as anything is at path or not, for
-// the container's user. A lookup it may not make counts as present, as
-// [Env.presence] says why.
+// isFile prints present or absent, as something is at path or not, for
+// the container's user, or why it cannot say. Present means the probe saw
+// it, and for a symbolic link, saw what the link leads to: a lookup it may
+// not make, and a link to nothing, are neither present nor absent, so a
+// check that wants either fails on them, with the reason.
 func (env *Env) isFile(_ context.Context, out *probekit.Output, args []string) error {
 	found := env.presence(args[0])
-	if found != absent {
-		found = present
+	if found == present {
+		found = env.leadsSomewhere(args[0])
 	}
 	_, err := fmt.Fprintln(out, found)
 	return err
+}
+
+// leadsSomewhere says whether p, a path the probe found, is there once
+// any symbolic link at it is followed to its end: present, or why not.
+func (env *Env) leadsSomewhere(p string) string {
+	_, err := os.Stat(env.path(p))
+	if err == nil {
+		return present
+	}
+	var errno syscall.Errno
+	switch {
+	case !errors.As(err, &errno):
+		return fmt.Sprintf("a symbolic link not followed (%v), so its target may be there", err)
+	case errno == syscall.ENOENT || errno == syscall.ENOTDIR:
+		return "a symbolic link whose target is absent"
+	default:
+		return fmt.Sprintf("a symbolic link not followed (errno %d: %s), so its target may be there", int(errno), errnoText(errno))
+	}
 }

@@ -103,8 +103,10 @@ const (
 // IsFile checks that path is in p's container or not, as want says:
 // "present" or "absent". It asks the core probe, which finds a path
 // whatever it is, a file or a directory, as the container's user looks
-// it up: one the user may not look up counts as present, since it may
-// be there. A nil p fails: a probe never installed.
+// it up, and follows a symbolic link to what it leads to. When the probe
+// cannot tell, as for a path the user may not look up or a link to
+// nothing, it says why, and that fails either want. A nil p fails: a
+// probe never installed.
 func IsFile(tb testing.TB, p *Probe, what, want, path string) {
 	tb.Helper()
 	checks := NewChecks(tb)
