@@ -492,7 +492,8 @@ image and check what it answers, so no suite carries its own copy:
 - Each assertion is a named check, through `Checks`: `StatusIs` and
   `Answers` for an exact status, `Contains` and `Lacks` for text,
   `LogContains` and `LogLacks` for a container's log, `IsFile` for a
-  path present or absent, which the core probe looks up, `RunRecords`,
+  path present or absent, which the core probe looks up, following any
+  link, and which fails when the probe cannot tell, `RunRecords`,
   `RunAppRecords` and `RunPHPRecords` for the records of a core, Go app
   or PHP app subcommand, and `Refuses` for a container that must exit
   with exactly the status given within `ServeWithin`, and say why in its

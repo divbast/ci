@@ -596,17 +596,27 @@ const noNewPrivilegesRecordWhat = "the engine sets no-new-privileges (HostConfig
 
 // noNewPrivileges reports whether opts, as either engine records them,
 // set no-new-privileges and never unset it: Docker keeps the option as it
-// was typed, the bare word or with ":true" or "=true", and Podman writes
-// the bare word for each and drops one set false.
+// was typed, the bare word or with a value after ":" or "=", which it
+// reads with strconv.ParseBool, and Podman writes the bare word for each
+// and drops one set false. A value Docker could not read proves nothing,
+// so it fails as one set false does.
 func noNewPrivileges(opts []string) bool {
 	set := false
 	for _, opt := range opts {
-		switch opt {
-		case "no-new-privileges", "no-new-privileges:true", "no-new-privileges=true":
+		value, ok := strings.CutPrefix(opt, "no-new-privileges")
+		switch {
+		case !ok:
+			continue
+		case value == "":
 			set = true
-		case "no-new-privileges:false", "no-new-privileges=false":
+			continue
+		case value[0] != ':' && value[0] != '=':
+			continue
+		}
+		if on, err := strconv.ParseBool(value[1:]); err != nil || !on {
 			return false
 		}
+		set = true
 	}
 	return set
 }

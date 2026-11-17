@@ -6,13 +6,17 @@ package probekit_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/textproto"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/divbast/ci/harness/probekit"
 )
@@ -190,5 +194,68 @@ func TestRequestNoServer(t *testing.T) {
 	_ = ln.Close()
 	if _, err := probekit.Request(t.Context(), "GET", "http://"+addr+"/", nil, ""); err == nil || !strings.Contains(err.Error(), "cannot connect to "+addr) {
 		t.Errorf("Request() error = %v, want cannot connect to %s", err, addr)
+	}
+}
+
+// TestRequestTimesEachRead allows each read of the answer ten seconds from
+// the last, as the PHP probe's stream_set_timeout does, not ten seconds
+// for the whole exchange: an answer that comes in pieces arrives whole
+// however long it takes in all, and a silence longer than that breaks the
+// exchange off. The clock is synctest's.
+func TestRequestTimesEachRead(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		gap     time.Duration
+		pieces  int
+		wantErr bool
+		// within, when set, is the caller's own deadline, which still
+		// bounds everything
+		within time.Duration
+	}{
+		{name: "pieces-6s-apart-for-18s", gap: 6 * time.Second, pieces: 3},
+		{name: "silent-for-11s", gap: 11 * time.Second, pieces: 1, wantErr: true},
+		{name: "past-the-callers-deadline", gap: 2 * time.Second, pieces: 3, within: 5 * time.Second, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				client, server := net.Pipe()
+				dial := func(context.Context, string, string) (net.Conn, error) { return client, nil }
+				// The server's goroutine must end inside the bubble, so the
+				// test waits for it once the request is done
+				var wg sync.WaitGroup
+				defer wg.Wait()
+				wg.Go(func() {
+					defer func() { _ = server.Close() }()
+					readRequest(server)
+					if _, err := io.WriteString(server, "HTTP/1.0 200 OK\r\n\r\n"); err != nil {
+						return
+					}
+					for range tt.pieces {
+						time.Sleep(tt.gap)
+						if _, err := io.WriteString(server, "x"); err != nil {
+							return
+						}
+					}
+				})
+
+				ctx := t.Context()
+				if tt.within > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tt.within)
+					defer cancel()
+				}
+				resp, err := probekit.RequestVia(ctx, dial, "GET", "http://app:8080/", nil, "")
+				switch {
+				case tt.wantErr && (err == nil || !strings.Contains(err.Error(), "broke off")):
+					t.Errorf("Request() = %d %q, %v; want the exchange broken off", resp.Status, resp.Body, err)
+				case !tt.wantErr && (err != nil || resp.Status != 200 || string(resp.Body) != strings.Repeat("x", tt.pieces)):
+					t.Errorf("Request() = %d %q, %v; want 200 %q", resp.Status, resp.Body, err, strings.Repeat("x", tt.pieces))
+				}
+			})
+		})
 	}
 }
