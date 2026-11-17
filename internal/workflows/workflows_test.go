@@ -532,6 +532,75 @@ func logsInToDHI(workflow string) error {
 	return nil
 }
 
+// TestRenovateHostRuleForDHI checks that renovate.yml gives Renovate a
+// docker host rule for dhi.io, which answers nothing without a login, when
+// the caller passes a username, and the JSON array [] otherwise, since
+// Renovate parses RENOVATE_HOST_RULES as JSON and an empty string would
+// fail the parse; and that the input and the secret are optional, so no
+// caller breaks. Against renovate.yml as it is, then with each of those
+// broken.
+func TestRenovateHostRuleForDHI(t *testing.T) {
+	t.Parallel()
+	renovate := readWorkflows(t)["renovate.yml"]
+	if err := hostRuleForDHI(renovate); err != nil {
+		t.Errorf("renovate.yml: %v", err)
+	}
+	for name, mutant := range map[string]string{
+		"an empty string without credentials": strings.Replace(renovate, "|| '[]' }}", "|| '' }}", 1),
+		"another host":                        strings.Replace(renovate, `"matchHost":"dhi.io"`, `"matchHost":"docker.io"`, 1),
+		"the secret is not JSON":              strings.Replace(renovate, "toJSON(secrets.DHI_TOKEN)", "secrets.DHI_TOKEN", 1),
+		"the secret is required":              replaceAfter(renovate, "      DHI_TOKEN:\n", "required: false", "required: true"),
+		"the input has a default":             replaceAfter(renovate, "      dhi-username:\n", "default: ''", "default: someone"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == renovate {
+				t.Fatal("the change changed nothing")
+			}
+			if hostRuleForDHI(mutant) == nil {
+				t.Error("passes renovate.yml with " + name)
+			}
+		})
+	}
+}
+
+// hostRuleForDHI returns an error unless the dhi-username input defaults
+// to the empty string, the DHI_TOKEN secret is not required, and the
+// renovatebot/github-action step's env sets RENOVATE_HOST_RULES to
+// hostRulesExpr.
+func hostRuleForDHI(workflow string) error {
+	lines := linesOf(workflow)
+	if !slices.Contains(declaration(lines, "dhi-username"), "default: ''") {
+		return errors.New("the dhi-username input does not default to ''")
+	}
+	if !slices.Contains(declaration(lines, "DHI_TOKEN"), "required: false") {
+		return errors.New("the DHI_TOKEN secret is not declared optional")
+	}
+	var found []int
+	for _, job := range jobsOf(lines) {
+		st := steps(job)
+		for _, i := range stepsWhere(st, isUses("renovatebot/github-action")) {
+			env, err := stepMapping(st[i], "env")
+			if err != nil {
+				return err
+			}
+			if !slices.Contains(env, "RENOVATE_HOST_RULES: "+hostRulesExpr) {
+				return errors.New("the Renovate step's env does not set RENOVATE_HOST_RULES to the dhi.io host rule, or to [] without credentials")
+			}
+			found = append(found, i)
+		}
+	}
+	if len(found) != 1 {
+		return fmt.Errorf("%d renovatebot/github-action steps, want one", len(found))
+	}
+	return nil
+}
+
+// hostRulesExpr is RENOVATE_HOST_RULES: the dhi.io docker host rule with
+// the username and the token as JSON strings when the caller passes a
+// username, and [] otherwise.
+const hostRulesExpr = `${{ inputs.dhi-username != '' && format('[{{"matchHost":"dhi.io","hostType":"docker","username":{0},"password":{1}}}]', toJSON(inputs.dhi-username), toJSON(secrets.DHI_TOKEN)) || '[]' }}`
+
 // scanReadsPackages returns an error unless the workflow's scan job grants
 // packages: read, saying why, and no other job grants packages at all;
 // and unless, in the scan job, GH_TOKEN is ${{ github.token }} in the env

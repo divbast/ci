@@ -11,6 +11,14 @@
 # manages that environment, its client ID and key, and the kill switch the
 # caller passes as `automerge`.
 #
+# Docker Hardened Images answer nothing without a login, so Renovate sees
+# no tag or digest of a dhi.io image unless it has credentials. A caller
+# that passes the input dhi-username and the secret DHI_TOKEN gives Renovate
+# a docker host rule for dhi.io; both are optional, and a caller that passes
+# neither runs Renovate with no host rule, as before. DHI_TOKEN is a repo
+# secret, and a repo secret reaches this job although it runs in an
+# environment.
+#
 # Renovate merges its own pull requests, through the API with a squash, once
 # every check on one has passed, and only while `automerge` is true. A
 # squash, because main requires signed commits and GitHub signs the commit a
@@ -26,10 +34,19 @@ on:
         description: The kill switch, true only while the caller's automerge variable is `enabled`
         type: boolean
         required: true
+      dhi-username:
+        description: >-
+          The Docker Hardened Images (dhi.io) username that DHI_TOKEN
+          belongs to. When set, Renovate gets a host rule for dhi.io
+        type: string
+        default: ''
     secrets:
       RENOVATE_APP_PRIVATE_KEY:
         description: The divbast-renovate App's private key, the caller's `renovate` environment secret
         required: true
+      DHI_TOKEN:
+        description: The access token for dhi-username on dhi.io, a repo secret
+        required: false
 
 permissions: {}
 
@@ -105,3 +122,8 @@ jobs:
           # renovate.json and every packageRule. It acts from the next run
           # and cannot recall a merge already made.
           RENOVATE_FORCE: ${{ case(inputs.automerge, '', '{"automerge":false}') }}
+          # dhi.io answers nothing without a login. Renovate parses this as
+          # JSON, so without credentials it is [], no rules, where an empty
+          # string would fail the parse. toJSON quotes the username and the
+          # token, so a quote or a backslash in either stays inside its string.
+          RENOVATE_HOST_RULES: ${{ inputs.dhi-username != '' && format('[{{"matchHost":"dhi.io","hostType":"docker","username":{0},"password":{1}}}]', toJSON(inputs.dhi-username), toJSON(secrets.DHI_TOKEN)) || '[]' }}

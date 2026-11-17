@@ -978,6 +978,7 @@ is true.
 | Input | Type | What |
 |---|---|---|
 | `automerge` | boolean, required | The kill switch: true only while the caller's automerge variable is `enabled` |
+| `dhi-username` | string, default `''` | The Docker Hardened Images (`dhi.io`) username that `DHI_TOKEN` belongs to. When set, Renovate gets a docker host rule for `dhi.io`, which answers nothing without a login |
 
 The calling job grants nothing (`permissions: {}`): Renovate works through
 the App's token. The App's client ID and private key are the caller's
@@ -987,6 +988,7 @@ the App's token. The App's client ID and private key are the caller's
 | Secret | Required | What |
 |---|---|---|
 | `RENOVATE_APP_PRIVATE_KEY` | yes | The App's private key |
+| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`. A repo secret, which reaches the job although it runs in the `renovate` environment |
 
 The called job reads the caller's `renovate` environment, but an
 environment secret is not handed to a called workflow on its own: the
@@ -1003,6 +1005,12 @@ jobs:
       RENOVATE_APP_PRIVATE_KEY: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
     permissions: {}
 ```
+
+A caller whose repository builds from `dhi.io` also passes
+`with: dhi-username: ${{ vars.DHI_USERNAME }}` and
+`secrets: DHI_TOKEN: ${{ secrets.DHI_TOKEN }}`, the same as for
+`app-check.yml`. Both are optional, so a caller that passes neither works
+as before, with Renovate given no host rule.
 
 Do not use `secrets: inherit`: it hands the called workflow every secret
 the caller can see, where one is all it needs.
