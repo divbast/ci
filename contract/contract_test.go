@@ -1019,8 +1019,10 @@ func TestMountsRecord(t *testing.T) {
 
 // TestHostConfigNoNewPrivileges reads no-new-privileges as each engine
 // records it: Docker keeps the option as it was typed, the bare word or
-// with ":true" or "=true", and Podman 5.7 writes the bare word for each
-// and drops one set false. Set false, or not there at all, fails.
+// with a value after ":" or "=", which it reads with strconv.ParseBool,
+// and Podman 5.7 writes the bare word for each and drops one set false.
+// Set false anywhere, a value Docker could not read, or not there at all,
+// fails.
 func TestHostConfigNoNewPrivileges(t *testing.T) {
 	t.Parallel()
 
@@ -1035,6 +1037,12 @@ func TestHostConfigNoNewPrivileges(t *testing.T) {
 		{opts: []string{"no-new-privileges=false"}},
 		{opts: []string{"no-new-privileges:false"}},
 		{opts: []string{"no-new-privileges", "no-new-privileges=false"}},
+		{opts: []string{"no-new-privileges:1"}, ok: true},
+		{opts: []string{"no-new-privileges=TRUE"}, ok: true},
+		{opts: []string{"no-new-privileges", "no-new-privileges=0"}},
+		{opts: []string{"no-new-privileges:F"}},
+		{opts: []string{"no-new-privileges:yes"}},
+		{opts: []string{"no-new-privileges="}},
 		{opts: []string{}},
 		{opts: nil},
 	}
