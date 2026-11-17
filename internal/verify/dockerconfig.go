@@ -12,7 +12,8 @@ import (
 
 // ErrNoDHILogin means a dhi.io image is named, and no login for dhi.io is
 // given.
-var ErrNoDHILogin = errors.New("dhi.io answers nothing without a login: set DHI_USERNAME and DHI_TOKEN")
+var ErrNoDHILogin = errors.New("dhi.io answers nothing without a login: set DHI_USERNAME and DHI_TOKEN " +
+	"(in CI, pass app-check.yml the dhi-username input and the DHI_TOKEN secret)")
 
 // WriteDockerConfig writes dir/config.json, readable by its owner alone,
 // with a login for dhi.io and no other registry. It refuses an empty
