@@ -287,14 +287,14 @@ func TestRun(t *testing.T) {
 			candidate:    blindReport(t, "amd64", "", 3, "CVE-1"),
 			layoutResult: &execx.Result{},
 			wantCode:     1,
-			wantStderr:   []string{"LAYOUT: Trivy recognised no operating system or saw no OS package, so the scan cannot see OS packages and nothing shows they are clean\n"},
+			wantStderr:   []string{"LAYOUT: Trivy recognised no operating system and saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
 		},
 		{
 			name:         "no-os-packages",
 			candidate:    noOSPackagesReport(t, "amd64", "", 3, "CVE-1"),
 			layoutResult: &execx.Result{},
 			wantCode:     1,
-			wantStderr:   []string{"LAYOUT: Trivy recognised no operating system or saw no OS package, so the scan cannot see OS packages and nothing shows they are clean\n"},
+			wantStderr:   []string{"LAYOUT: Trivy recognised debian 13.2 but saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
 		},
 		{
 			name:           "no-os-packages-published",
@@ -305,7 +305,7 @@ func TestRun(t *testing.T) {
 			sarifResult:    &execx.Result{},
 			baselineResult: &execx.Result{},
 			wantCode:       1,
-			wantStderr:     []string{published + ": Trivy recognised no operating system or saw no OS package, so the scan cannot see OS packages and nothing shows they are clean\n"},
+			wantStderr:     []string{published + ": Trivy recognised debian 13.2 but saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
 		},
 		{
 			name:           "no-os-recognised-published",
@@ -316,7 +316,7 @@ func TestRun(t *testing.T) {
 			sarifResult:    &execx.Result{},
 			baselineResult: &execx.Result{},
 			wantCode:       1,
-			wantStderr:     []string{published + ": Trivy recognised no operating system or saw no OS package, so the scan cannot see OS packages and nothing shows they are clean\n"},
+			wantStderr:     []string{published + ": Trivy recognised no operating system and saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
 		},
 		{
 			name:           "registry-failed",

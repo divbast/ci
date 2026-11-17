@@ -157,7 +157,7 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		return 1
 	}
 	if blindToOS(&candidate) {
-		complain(stderr, "%s: %s", *layout, noOS)
+		complain(stderr, "%s: %s", *layout, noOS(&candidate))
 		return 1
 	}
 	if err = trivy.SARIF(ctx, *report, *sarif); err != nil {
@@ -297,16 +297,24 @@ func readBaseline(path, image string) (shipped []scan.Finding, ref string, err e
 		return nil, "", fmt.Errorf("no packages in %s: the scan found nothing to scan, not nothing wrong", image)
 	}
 	if blindToOS(&rep) {
-		return nil, "", fmt.Errorf("%s: %s", image, noOS)
+		return nil, "", fmt.Errorf("%s: %s", image, noOS(&rep))
 	}
 	return rep.Findings, rep.Ref, nil
 }
 
-// noOS is why a report blind to the OS is refused. An image whose OS
-// Trivy does not know still has its language packages, which count as
-// packages, so only the OS says whether the scan looked at the rest.
-const noOS = "Trivy recognised no operating system or saw no OS package, so the scan cannot see OS packages " +
-	"and nothing shows they are clean"
+// noOS says why a report blind to the OS is refused, and what Trivy
+// reported, since an OS it did not recognise and an OS it saw no packages
+// of need different fixes. An image whose OS Trivy does not know still has
+// its language packages, which count as packages, so only the OS says
+// whether the scan looked at the rest.
+func noOS(rep *scan.Report) string {
+	saw := "recognised no operating system and saw"
+	if rep.OS != "" {
+		saw = "recognised " + rep.OS + " but saw"
+	}
+	return fmt.Sprintf("Trivy %s %d OS packages, so the scan cannot see OS packages and nothing shows they are clean",
+		saw, rep.OSPackages)
+}
 
 // blindToOS reports whether rep identified no OS or saw no OS package.
 func blindToOS(rep *scan.Report) bool { return rep.OS == "" || rep.OSPackages == 0 }
