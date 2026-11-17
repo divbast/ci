@@ -766,6 +766,17 @@ workflow runs on:
 |---|---|---|---|
 | `php` | boolean | `false` | Install PHP 8.5 and Composer for the lint job, for a lint that runs PHPStan: a PHP app passes `true` |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
+| `dhi-username` | string | `''` | The Docker Hardened Images (`dhi.io`) username that `DHI_TOKEN` belongs to. When set, `lint` and `build` log in to `dhi.io` with it before they read a base image |
+
+| Secret | Required | What |
+|---|---|---|
+| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`, which answers nothing without a login. `build` also hands both to `divbast-verify-images` |
+
+Both are optional, so a caller that passes neither works as before. A
+caller passes them as `with: dhi-username: ${{ vars.DHI_USERNAME }}` and
+`secrets: DHI_TOKEN: ${{ secrets.DHI_TOKEN }}`. A pull request from a fork
+gets no secrets, so it cannot lint or build an image that builds from
+`dhi.io`.
 
 The calling job grants `contents: read`, `attestations: read`,
 `packages: read` and `security-events: write`. `build` installs the

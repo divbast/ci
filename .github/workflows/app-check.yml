@@ -11,6 +11,13 @@
 # The images it builds are the ones app-publish.yml pushes: the build job
 # uploads each as the artifact image-<arch>.
 #
+# A Containerfile may build from Docker Hardened Images, which dhi.io
+# answers nothing about without a login. A caller that passes the input
+# dhi-username and the secret DHI_TOKEN has the lint and build jobs log in
+# first; both are optional, and a caller that passes neither lints and
+# builds as before. A pull request from a fork gets no secrets, so it
+# cannot lint or build a DHI image.
+#
 # The caller's job grants contents: read, attestations: read,
 # packages: read and security-events: write. The build job installs the
 # caller's whole mise.toml, which must declare cosign as
@@ -36,6 +43,16 @@ on:
           caller passing it keeps working
         type: string
         default: ''
+      dhi-username:
+        description: >-
+          The Docker Hardened Images (dhi.io) username that DHI_TOKEN
+          belongs to. When set, lint and build log in to dhi.io with it
+        type: string
+        default: ''
+    secrets:
+      DHI_TOKEN:
+        description: The access token for dhi-username on dhi.io
+        required: false
 
 permissions: {}
 
@@ -94,6 +111,16 @@ jobs:
           php-version: '8.5'
           coverage: none
 
+      # dhi.io answers nothing without a login, `docker build --check` reads
+      # each base's metadata from it, and a fork's pull request has no secret.
+      - name: Log in to dhi.io
+        if: inputs.dhi-username != ''
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: dhi.io
+          username: ${{ inputs.dhi-username }}
+          password: ${{ secrets.DHI_TOKEN }}
+
       - run: just setup
       - run: just lint
         env:
@@ -146,6 +173,16 @@ jobs:
           go -C .ci build -o "${GITHUB_WORKSPACE}/.ci/bin/" ./cmd/...
           .ci/bin/divbast-pin -expect "${WORKFLOW_SHA}"
 
+      # dhi.io answers nothing without a login, and the verification and the
+      # build both read each base from it. A fork's pull request has no secret.
+      - name: Log in to dhi.io
+        if: inputs.dhi-username != ''
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: dhi.io
+          username: ${{ inputs.dhi-username }}
+          password: ${{ secrets.DHI_TOKEN }}
+
       # Before anything is built from them: every image the Containerfile
       # names must be pinned by digest, and each whose publisher signs it
       # verified as theirs, divbast/frankenphp by its main build's
@@ -154,6 +191,8 @@ jobs:
       - name: Verify the images the Containerfile builds from
         env:
           GH_TOKEN: ${{ github.token }}
+          DHI_USERNAME: ${{ inputs.dhi-username }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
         run: .ci/bin/divbast-verify-images
 
       # The default docker driver cannot write an image index
