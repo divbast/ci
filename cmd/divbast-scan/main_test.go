@@ -425,7 +425,7 @@ func TestRun(t *testing.T) {
 			getenv := func(key string) string { return env[key] }
 
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), args, runner, getenv, &stdout, &stderr)
+			code := run(t.Context(), args, runner, offline(t), getenv, &stdout, &stderr)
 			// Every message names its paths by flag, so the scratch
 			// directory reads as the flag that put it there.
 			errText := strings.ReplaceAll(stderr.String(), paths["layout"], "LAYOUT")
@@ -689,7 +689,7 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-			code := run(t.Context(), args, runner, getenv, &stdout, &stderr)
+			code := run(t.Context(), args, runner, offline(t), getenv, &stdout, &stderr)
 			if code != tt.wantCode {
 				t.Errorf("run() = %d, want %d; stderr: %s", code, tt.wantCode, stderr.String())
 			}
@@ -820,7 +820,7 @@ func TestRunOutsideActions(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 	args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-	if code := run(t.Context(), args, runner, func(string) string { return "" }, &stdout, &stderr); code != 0 {
+	if code := run(t.Context(), args, runner, offline(t), func(string) string { return "" }, &stdout, &stderr); code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
 	}
 	if want := "nothing new against what is published (0 advisory)\n"; !strings.HasSuffix(stdout.String(), want) {
@@ -867,7 +867,7 @@ func TestRunUnwritableSummary(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 	args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-	if code := run(t.Context(), args, runner, getenv, &stdout, &stderr); code != 1 {
+	if code := run(t.Context(), args, runner, offline(t), getenv, &stdout, &stderr); code != 1 {
 		t.Errorf("run() = %d, want 1; stderr: %s", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "write the run summary") {
@@ -902,7 +902,7 @@ func TestRunBaselineStaysInItsDirectory(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 	args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-	if code := run(t.Context(), args, runner, func(string) string { return "" }, &stdout, &stderr); code != 1 {
+	if code := run(t.Context(), args, runner, offline(t), func(string) string { return "" }, &stdout, &stderr); code != 1 {
 		t.Errorf("run() = %d, want 1; stderr: %s", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "write the baseline") {
@@ -943,7 +943,7 @@ func TestRunUsage(t *testing.T) {
 			t.Parallel()
 			var stdout, stderr bytes.Buffer
 			// No call is scripted: a usage error runs nothing
-			code := run(t.Context(), tt.args, execx.NewFake(t), func(string) string { return "" }, &stdout, &stderr)
+			code := run(t.Context(), tt.args, execx.NewFake(t), offline(t), func(string) string { return "" }, &stdout, &stderr)
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d", tt.args, code, tt.wantCode)
 			}
@@ -994,7 +994,7 @@ func TestScanAgainstItself(t *testing.T) {
 		"-baseline", filepath.Join(dir, "baseline.json"), "-sarif", filepath.Join(dir, "report.sarif"),
 	}
 	var stdout, stderr bytes.Buffer
-	code := run(t.Context(), args, execx.OS{}, getenv, &stdout, &stderr)
+	code := run(t.Context(), args, execx.OS{}, offline(t), getenv, &stdout, &stderr)
 	t.Logf("stdout:\n%s", stdout.String())
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr:\n%s", code, stderr.String())

@@ -424,8 +424,9 @@ func TestTrivy(t *testing.T) {
 	sarifArgv := []string{"trivy", "convert", "--format", "sarif", "--output", "/w/report.sarif", "/w/report.json"}
 
 	tests := []struct {
-		name    string
-		vex     string
+		name string
+		// vex is Trivy's VEX, each document both scans apply, in order.
+		vex     []string
 		call    execx.Call
 		do      func(context.Context, scan.Trivy) error
 		wantErr bool
@@ -442,10 +443,20 @@ func TestTrivy(t *testing.T) {
 		},
 		{
 			name:    "layout-vex",
-			vex:     "baikal.openvex.json",
+			vex:     []string{"baikal.openvex.json"},
 			call:    execx.Call{Argv: layoutArgv("--vex", "baikal.openvex.json"), Result: execx.Result{Stderr: logged}},
 			do:      func(ctx context.Context, tr scan.Trivy) error { return tr.Layout(ctx, "/w/layout", "/w/report.json") },
 			wantLog: logged,
+		},
+		{
+			// The app's own, then DHI's, each a --vex of its own, which
+			// Trivy reads as a list
+			name: "layout-several-vex",
+			vex:  []string{"openvex.json", "/tmp/v/dhi-aspnetcore.vex.json", "/tmp/v/dhi-node.vex.json"},
+			call: execx.Call{
+				Argv: layoutArgv("--vex", "openvex.json", "--vex", "/tmp/v/dhi-aspnetcore.vex.json", "--vex", "/tmp/v/dhi-node.vex.json"),
+			},
+			do: func(ctx context.Context, tr scan.Trivy) error { return tr.Layout(ctx, "/w/layout", "/w/report.json") },
 		},
 		{
 			name:    "layout-fails",
@@ -471,10 +482,18 @@ func TestTrivy(t *testing.T) {
 		},
 		{
 			name: "published-vex",
-			vex:  "baikal.openvex.json",
+			vex:  []string{"baikal.openvex.json"},
 			call: execx.Call{Argv: publishedArgv("amd64", "--vex", "baikal.openvex.json")},
 			do: func(ctx context.Context, tr scan.Trivy) error {
 				return tr.Published(ctx, latest, "amd64", "/w/baseline.json")
+			},
+		},
+		{
+			name: "published-several-vex",
+			vex:  []string{"/tmp/v/dhi-aspnetcore.vex.json", "/tmp/v/dhi-node.vex.json"},
+			call: execx.Call{Argv: publishedArgv("arm64", "--vex", "/tmp/v/dhi-aspnetcore.vex.json", "--vex", "/tmp/v/dhi-node.vex.json")},
+			do: func(ctx context.Context, tr scan.Trivy) error {
+				return tr.Published(ctx, latest, "arm64", "/w/baseline.json")
 			},
 		},
 		{

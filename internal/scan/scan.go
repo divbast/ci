@@ -141,17 +141,18 @@ func Compare(candidate, published []Finding) Split {
 type Trivy struct {
 	// Run runs trivy.
 	Run execx.Runner
-	// VEX, when set, names an OpenVEX document both scans apply.
-	VEX string
+	// VEX names the OpenVEX documents both scans apply, each given Trivy
+	// as a --vex of its own, in order.
+	VEX []string
 	// Log is where Trivy's own messages go, which Layout and SARIF always
 	// write there, and Published only when it fails. Nil drops them.
 	Log io.Writer
 }
 
 func (t Trivy) scanArgs() []string {
-	var vex []string
-	if t.VEX != "" {
-		vex = []string{"--vex", t.VEX}
+	vex := make([]string, 0, 2*len(t.VEX))
+	for _, doc := range t.VEX {
+		vex = append(vex, "--vex", doc)
 	}
 	return slices.Concat(vex, []string{"--severity", "HIGH,CRITICAL", "--format", "json"})
 }
