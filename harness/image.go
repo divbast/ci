@@ -184,7 +184,8 @@ func (e Engine) savedConfig(ctx context.Context, tb testing.TB, image, id string
 
 // saved returns what a save of the image with ID id holds, saving it only
 // the first time it is asked for that ID. A save that failed is tried
-// again the next time.
+// again the next time, as is one whose layers a caller's context stopped
+// it reading.
 func (e Engine) saved(ctx context.Context, tb testing.TB, image, id string) (*saveRead, error) {
 	tb.Helper()
 	if e.saves == nil {
@@ -230,6 +231,11 @@ func (e Engine) save(ctx context.Context, tb testing.TB, image, id string) (*sav
 	blob, blobErr, read, err := readSave(ctx, e.run, dir, "image.tar")
 	if err != nil {
 		return nil, fmt.Errorf("%s save of %s: %w", e.name, image, err)
+	}
+	// A layer read that ctx cut short, zstd's on its way through, says
+	// nothing about the image: a failed save, which saved keeps for no one
+	if errors.Is(read.capsErr, context.Canceled) || errors.Is(read.capsErr, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("%s save of %s: %w", e.name, image, read.capsErr)
 	}
 	switch {
 	case e.name != "podman":
@@ -422,7 +428,7 @@ const fileCapabilityRecord = ".xattr.security.capability"
 // carries a file capability, in the layer's order. r is the layer as the
 // archive holds it: a tar, or one compressed with gzip, as Docker's
 // containerd store keeps a layer it built, or with zstd, as it keeps one
-// it pulled so, which zstd decompresses.
+// pulled or loaded so, which zstd decompresses.
 func layerCapabilities(ctx context.Context, zstd execx.StreamRunner, r io.Reader) (caps []string, err error) {
 	layer, how, err := decompress.Reader(ctx, zstd, r)
 	if err != nil {

@@ -7,10 +7,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"slices"
@@ -731,6 +734,96 @@ func TestFileCapabilities(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("FileCapabilities() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// liveZstd is a runFunc whose zstd runs only while its context lives, as
+// execx.OS's does: once the context is done, it runs nothing and says why.
+type liveZstd struct{ runFunc }
+
+func (l liveZstd) RunStream(ctx context.Context, stdin io.Reader, stdout io.Writer, name string, args ...string) (execx.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return execx.Result{}, fmt.Errorf("run %s: %w", name, err)
+	}
+	return l.runFunc.RunStream(ctx, stdin, stdout, name, args...)
+}
+
+// TestFileCapabilitiesRetriesACancelledRead has the first caller's
+// context end while zstd reads a layer, cancelled or past its deadline,
+// and shows that read kept for no one: it says nothing about the image,
+// so the next caller, whose context lives, saves the image again and
+// reads its layers through.
+func TestFileCapabilitiesRetriesACancelledRead(t *testing.T) {
+	t.Parallel()
+
+	capped := layerTar(t, entry{"usr/local/bin/frankenphp", map[string]string{capabilityPAX: capabilityValue}})
+	archive := savedArchive(t, slices.Concat(zstdFrameMagic, []byte("compressed")))
+	for _, tt := range []struct {
+		name string
+		// ends returns the first caller's context, and what ends it once
+		// the image is saved, before zstd reads its layer
+		ends func(*testing.T) (context.Context, func())
+		want error
+	}{
+		{
+			name: "cancelled",
+			ends: func(t *testing.T) (context.Context, func()) {
+				t.Helper()
+				ctx, cancel := context.WithCancel(t.Context())
+				t.Cleanup(cancel)
+				return ctx, cancel
+			},
+			want: context.Canceled,
+		},
+		{
+			// Past it from the start: of the commands here, only zstd
+			// looks, as only it would run long
+			name: "past-its-deadline",
+			ends: func(t *testing.T) (context.Context, func()) {
+				t.Helper()
+				ctx, cancel := context.WithDeadline(t.Context(), time.Unix(0, 0))
+				t.Cleanup(cancel)
+				return ctx, func() {}
+			},
+			want: context.DeadlineExceeded,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, end := tt.ends(t)
+			var saves atomic.Int32
+			e := newEngine("docker", liveZstd{func(argv []string) execx.Result {
+				switch {
+				case slices.Equal(argv, []string{"docker", "image", "inspect", "--format", "{{.Id}}", "img"}):
+					return execx.Result{Stdout: []byte("sha256:abc\n")}
+				case len(argv) == 5 && slices.Equal(argv[:3], []string{"docker", "save", "-o"}) && argv[4] == "sha256:abc":
+					if err := os.WriteFile(argv[3], archive, 0o600); err != nil {
+						t.Errorf("writing the archive: %v", err)
+						return execx.Result{Code: 1}
+					}
+					saves.Add(1)
+					end()
+					return execx.Result{}
+				case slices.Equal(argv, []string{"zstd", "-dcq"}):
+					return execx.Result{Stdout: capped}
+				default:
+					t.Errorf("unexpected command %q", argv)
+					return execx.Result{Code: 125}
+				}
+			}})
+
+			if got, err := e.FileCapabilities(ctx, t, "img"); !errors.Is(err, tt.want) {
+				t.Fatalf("FileCapabilities() with its context ended mid-read = %q, %v; want %v", got, err, tt.want)
+			}
+			got, err := e.FileCapabilities(t.Context(), t, "img")
+			if err != nil || !slices.Equal(got, []string{"/usr/local/bin/frankenphp"}) {
+				t.Errorf("FileCapabilities() after a cut-short read = %q, %v; want the layer read again, and its capability found", got, err)
+			}
+			if n := saves.Load(); n != 2 {
+				t.Errorf("docker save ran %d times, want twice: a read a context cut short is never kept", n)
 			}
 		})
 	}
