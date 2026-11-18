@@ -442,12 +442,14 @@ func TestAppCheckLogsInToDHI(t *testing.T) {
 		t.Errorf("app-check.yml: %v", err)
 	}
 	const (
-		login  = "      - name: Log in to dhi.io\n"
-		setup  = "      - run: just setup\n"
-		verify = "      - name: Verify the images the Containerfile builds from\n"
+		login    = "      - name: Log in to dhi.io\n"
+		setup    = "      - run: just setup\n"
+		verify   = "      - name: Verify the images the Containerfile builds from\n"
+		username = "          DHI_USERNAME: ${{ inputs.dhi-username }}\n"
 	)
 	// onBuild applies f to the workflow from the build job on, so that it
-	// reaches the build job's login rather than the lint job's.
+	// reaches the build job's login and verify step rather than the lint
+	// job's, which are written the same.
 	onBuild := func(f func(string) string) string {
 		head, tail, _ := strings.Cut(check, "\n  build:\n")
 		return head + "\n  build:\n" + f(tail)
@@ -458,7 +460,7 @@ func TestAppCheckLogsInToDHI(t *testing.T) {
 		"no if":                         strings.Replace(check, "        if: inputs.dhi-username != ''\n", "", 1),
 		"another registry":              strings.Replace(check, "registry: dhi.io", "registry: docker.io", 1),
 		"the secret is required":        replaceAfter(check, "      DHI_TOKEN:\n", "required: false", "required: true"),
-		"no env on verify":              strings.Replace(check, "          DHI_USERNAME: ${{ inputs.dhi-username }}\n", "", 1),
+		"no env on verify":              onBuild(func(tail string) string { return strings.Replace(tail, username, "", 1) }),
 		"the input has a default":       replaceAfter(check, "      dhi-username:\n", "default: ''", "default: someone"),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -531,6 +533,172 @@ func logsInToDHI(workflow string) error {
 		}
 	}
 	return nil
+}
+
+// TestAppCheckVerifiesListedContainerfiles checks that app-check.yml's
+// lint job verifies the images of each Containerfile the caller lists in
+// verify-containerfiles before just setup and just lint, which may run
+// them: a template layer's SDK image, say, which the build job never
+// sees. The input is optional, so no caller breaks. Against app-check.yml
+// as it is, then with each of those broken.
+func TestAppCheckVerifiesListedContainerfiles(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := verifiesListed(check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		input  = "      verify-containerfiles:\n"
+		listed = "      - name: Verify the images the listed Containerfiles build from\n"
+		grant  = "      attestations: read # a listed Containerfile may name divbast/frankenphp, whose attestation it checks\n"
+	)
+	for name, mutant := range map[string]string{
+		"no input default":                replaceAfter(check, input, "        default: ''\n", ""),
+		"no if":                           strings.Replace(check, "        if: inputs.verify-containerfiles != ''\n", "", 1),
+		"no DHI_TOKEN in env":             replaceAfter(check, listed, "          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}\n", ""),
+		"the step moved after just setup": moveStep(check, listed, "      - run: just lint\n"),
+		"the step deleted":                dropStep(check, listed),
+		"the permission removed":          strings.Replace(check, grant, "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if verifiesListed(mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// verifiesListed returns an error unless the verify-containerfiles input
+// defaults to the empty string, the lint job's permissions include
+// attestations: read, and the lint job has exactly one step whose run:
+// invokes .ci/bin/divbast-verify-images -containerfile, which runs only
+// when the input is set, has the list and the build job's verify step's
+// credentials in its env, and comes after the pin check and before the
+// step that runs just setup.
+func verifiesListed(workflow string) error {
+	lines := linesOf(workflow)
+	if !slices.Contains(declaration(lines, "verify-containerfiles"), "default: ''") {
+		return errors.New("the verify-containerfiles input does not default to ''")
+	}
+	lint := jobsOf(lines)["lint"]
+	perms, err := mappingOf(lint, 4, "permissions")
+	if err != nil {
+		return err
+	}
+	if !slices.ContainsFunc(perms, func(p string) bool {
+		k, v, ok := strings.Cut(p, ":")
+		return ok && k == "attestations" && unquote(v) == "read"
+	}) {
+		return errors.New("the lint job's permissions lack attestations: read")
+	}
+	st := steps(lint)
+	named := func(name string) func(line) bool {
+		return func(l line) bool { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") == "name: "+name }
+	}
+	var verify []int
+	for i, s := range st {
+		// A step with no run: script runs no tool, and reads as "".
+		if script, _ := runScript(s); strings.Contains(script, ".ci/bin/divbast-verify-images -containerfile") {
+			verify = append(verify, i)
+		}
+	}
+	pins := stepsWhere(st, named("Check the caller pins this commit of divbast/ci"))
+	setup := stepsWhere(st, func(l line) bool { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") == "run: just setup" })
+	switch {
+	case len(verify) != 1:
+		return fmt.Errorf("the lint job runs .ci/bin/divbast-verify-images -containerfile in %d steps, want one", len(verify))
+	case len(pins) != 1:
+		return fmt.Errorf("the lint job has %d pin checks, want one", len(pins))
+	case len(setup) != 1:
+		return fmt.Errorf("the lint job runs just setup in %d steps, want one", len(setup))
+	case verify[0] < pins[0]:
+		return fmt.Errorf("the lint job verifies the listed images in step %d, before the pin check builds the tools in step %d", verify[0]+1, pins[0]+1)
+	case verify[0] > setup[0]:
+		return fmt.Errorf("the lint job verifies the listed images in step %d, after just setup in step %d", verify[0]+1, setup[0]+1)
+	}
+	step := st[verify[0]]
+	if i := stepKey(step, "if"); i < 0 || strings.TrimPrefix(strings.TrimSpace(step[i].text), "- ") != "if: inputs.verify-containerfiles != ''" {
+		return errors.New("the lint job's verify step does not run exactly when verify-containerfiles is set")
+	}
+	env, err := stepMapping(step, "env")
+	if err != nil {
+		return err
+	}
+	for _, want := range []string{
+		"VERIFY_CONTAINERFILES: ${{ inputs.verify-containerfiles }}",
+		"GH_TOKEN: ${{ github.token }}",
+		"DHI_USERNAME: ${{ inputs.dhi-username }}",
+		"DHI_TOKEN: ${{ secrets.DHI_TOKEN }}",
+	} {
+		if !slices.Contains(env, want) {
+			return fmt.Errorf("the lint job's verify step's env lacks %s", want)
+		}
+	}
+	return nil
+}
+
+// TestAppCheckVerifiesEachListedContainerfile runs the lint job's step
+// that verifies the listed Containerfiles as GitHub runs a step that names
+// no shell, bash -e, with a stand-in divbast-verify-images that records
+// each Containerfile it is given and refuses one. The step must hand it
+// each line that is not blank, in order, and stop and fail at a refusal.
+func TestAppCheckVerifiesEachListedContainerfile(t *testing.T) {
+	t.Parallel()
+	st := steps(jobsOf(linesOf(readWorkflows(t)["app-check.yml"]))["lint"])
+	at := stepsWhere(st, func(l line) bool {
+		return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") == "name: Verify the images the listed Containerfiles build from"
+	})
+	if len(at) != 1 {
+		t.Fatalf("the lint job has %d steps verifying the listed Containerfiles, want one", len(at))
+	}
+	script, err := runScript(st[at[0]])
+	if err != nil {
+		t.Fatal(err)
+	}
+	const stub = "#!/usr/bin/env bash\n[ \"$1\" = -containerfile ] && [ \"$#\" = 2 ] || exit 2\n" +
+		"printf '[%s]' \"$2\" >>calls\n[ \"$2\" != \"${REFUSE}\" ]\n"
+	for _, tt := range []struct {
+		name, list, refuse, want string
+		fails                    bool
+	}{
+		{name: "each line not blank", list: "\nlayers/dotnet/Containerfile\n\n  \nlayers/go/Container file\n", want: "[layers/dotnet/Containerfile][layers/go/Container file]"},
+		{name: "a last line with no newline", list: "a/Containerfile\nb/Containerfile", want: "[a/Containerfile][b/Containerfile]"},
+		{name: "a refusal", list: "a/Containerfile\nb/Containerfile\nc/Containerfile\n", refuse: "b/Containerfile", want: "[a/Containerfile][b/Containerfile]", fails: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			writeFile(t, dir, "step.sh", script)
+			if err := os.MkdirAll(filepath.Join(dir, ".ci", "bin"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, dir, ".ci/bin/divbast-verify-images", stub)
+			run := execx.OS{Env: []string{"BASH_ENV=", "VERIFY_CONTAINERFILES=" + tt.list, "REFUSE=" + tt.refuse}}
+			res, err := run.Run(t.Context(), "bash", "-c", `cd -- "$1" && bash -e ./step.sh`, "bash", dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if failed := res.Code != 0; failed != tt.fails {
+				t.Errorf("the step exits %d, want a failure %t: %s", res.Code, tt.fails, res.Stderr)
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			calls, err := root.ReadFile("calls")
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if string(calls) != tt.want {
+				t.Errorf("the step verifies %s, want %s", calls, tt.want)
+			}
+		})
+	}
 }
 
 // TestAppCheckLoadsWithDockerLoad checks that app-check.yml's test job

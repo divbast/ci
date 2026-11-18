@@ -758,9 +758,11 @@ The calling job grants `contents: read`.
 Lint, build, test and scan for an app repository, on every event its build
 workflow runs on:
 
-- `lint` repeats `lint.yml`'s steps. Only its pin check's skip differs:
-  it names divbast/ci, which never calls `app-check.yml`, so an app's pin
-  is always checked.
+- `lint` repeats `lint.yml`'s steps. Its pin check's skip names
+  divbast/ci, which never calls `app-check.yml`, so an app's pin is
+  always checked. Before `just setup`, it verifies the images of each
+  Containerfile `verify-containerfiles` lists, as `build` verifies the
+  root one's.
 - `build` verifies every image the Containerfile builds from
   ([below](#verified-inputs)), then builds the image for amd64 and
   arm64 with BuildKit's provenance and SBOM, as an OCI archive. A pull
@@ -784,10 +786,11 @@ workflow runs on:
 | `php` | boolean | `false` | Install PHP 8.5 and Composer for the lint job, for a lint that runs PHPStan: a PHP app passes `true` |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
 | `dhi-username` | string | `''` | The Docker Hardened Images (`dhi.io`) username that `DHI_TOKEN` belongs to. When set, `lint` and `build` log in to `dhi.io` with it before they read a base image |
+| `verify-containerfiles` | string | `''` | Containerfiles besides the root one, one path per line from the caller's root, whose images `lint` verifies with `divbast-verify-images` ([Verified inputs](#verified-inputs)) before `just lint` runs: a template layer whose images the lint runs, say, as `build` verifies the root one's |
 
 | Secret | Required | What |
 |---|---|---|
-| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`, which answers nothing without a login. `build` also hands both to `divbast-verify-images` |
+| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`, which answers nothing without a login. `build`, and `lint` for `verify-containerfiles`, also hand both to `divbast-verify-images` |
 
 Both are optional, so a caller that passes neither works as before. A
 caller passes them as `with: dhi-username: ${{ vars.DHI_USERNAME }}` and
@@ -796,8 +799,8 @@ gets no secrets, so it cannot lint or build an image that builds from
 `dhi.io`.
 
 The calling job grants `contents: read`, `attestations: read`,
-`packages: read` and `security-events: write`. `build` installs the
-caller's whole `mise.toml`, which declares cosign as
+`packages: read` and `security-events: write`. `lint` and `build`
+install the caller's whole `mise.toml`, which declares cosign as
 `"aqua:sigstore/cosign"` for `divbast-verify-images`.
 
 `scan`, which can change code scanning alerts, installs only Go, just,
