@@ -400,3 +400,102 @@ func TestRefString(t *testing.T) {
 		t.Errorf("String() = %q, want %q", got, pinned)
 	}
 }
+
+// TestBase checks which image a Containerfile's final stage builds on,
+// the one whose filesystem is the image built: its last FROM's image,
+// with build arguments resolved to their defaults, or, where that FROM
+// names an earlier stage, that stage's base, followed back to an image;
+// none for scratch. Build stages' bases never count, however many name
+// the same kind of image.
+func TestBase(t *testing.T) {
+	t.Parallel()
+
+	const (
+		aspnetcore = "dhi.io/aspnetcore:10.0.15-debian13@" + digest
+		node       = "dhi.io/node:24.22.3-debian13-dev@" + other
+		dotnet     = "dhi.io/dotnet:10.0.404-sdk-debian13@" + other
+	)
+	tests := []struct {
+		name          string
+		containerfile string
+		// want is "<ref> line <NN>", or "" for none.
+		want    string
+		wantErr error
+	}{
+		{name: "one-stage", containerfile: "FROM " + aspnetcore + "\n", want: aspnetcore + " line 01"},
+		{name: "app", containerfile: app(), want: runtime + " line 07"},
+		{
+			// Prowlarr's: build stages from dhi.io, the runtime from a
+			// build argument naming another
+			name: "build-stages-then-an-arg",
+			containerfile: "ARG RUNTIME_IMAGE=" + aspnetcore + "\n" +
+				"FROM " + node + " AS fetch\n" +
+				"FROM " + node + " AS frontend\n" +
+				"FROM " + dotnet + " AS backend\n" +
+				"FROM ${RUNTIME_IMAGE}\n" +
+				"COPY --from=backend /app /app\n",
+			want: aspnetcore + " line 05",
+		},
+		{
+			name:          "a-build-stage-and-another-runtime",
+			containerfile: "FROM " + node + " AS build\nFROM " + runtime + "\nCOPY --from=build /out /out\n",
+			want:          runtime + " line 02",
+		},
+		{
+			name:          "an-earlier-stage",
+			containerfile: "FROM " + aspnetcore + " AS base\nFROM " + node + " AS build\nFROM base\n",
+			want:          aspnetcore + " line 01",
+		},
+		{
+			// Stage names are read without regard to case, as BuildKit
+			// reads them
+			name: "a-chain-of-stages",
+			containerfile: "FROM " + aspnetcore + " AS Base\n" +
+				"FROM base AS runtime\n" +
+				"FROM " + dotnet + " AS build\n" +
+				"FROM RUNTIME\n",
+			want: aspnetcore + " line 01",
+		},
+		{
+			name: "an-arg-naming-a-stage",
+			containerfile: "ARG FINAL=runtime\n" +
+				"FROM " + aspnetcore + " AS runtime\n" +
+				"FROM " + node + " AS build\n" +
+				"FROM ${FINAL}\n",
+			want: aspnetcore + " line 02",
+		},
+		{name: "scratch", containerfile: "FROM " + node + " AS build\nFROM scratch\nCOPY --from=build /out /\n"},
+		{name: "a-stage-on-scratch", containerfile: "FROM scratch AS empty\nFROM " + node + " AS build\nFROM empty\n"},
+		{
+			// It reads, and refuses, as Refs does
+			name:          "an-unpinned-build-stage",
+			containerfile: "FROM dhi.io/node:24 AS build\nFROM " + aspnetcore + "\n",
+			wantErr:       verify.ErrUnpinned,
+		},
+		{name: "no-from", containerfile: "ARG X=1\n", wantErr: verify.ErrNoFrom},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok, err := verify.Base(strings.NewReader(tt.containerfile))
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Base() = %s, %t, %v; want an error wrapping %v", got, ok, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Base() error = %v", err)
+			}
+			if tt.want == "" {
+				if ok {
+					t.Errorf("Base() = %s, true; want none, since the final stage builds on scratch", got)
+				}
+				return
+			}
+			if !ok || names([]verify.Ref{got})[0] != tt.want {
+				t.Errorf("Base() = %s line %02d, %t; want %s", got, got.Line, ok, tt.want)
+			}
+		})
+	}
+}
