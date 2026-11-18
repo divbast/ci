@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -47,9 +49,14 @@ const (
 )
 
 // vexDocument and vexBundle are what the advisories serve for name, each
-// its own so that a mix-up shows.
+// its own so that a mix-up shows. The document's one statement names its
+// image, among its products, in the three forms Docker's own do.
 func vexDocument(name string) string {
-	return `{"@context":"https://openvex.dev/ns/v0.2.0","@id":"https://dhi.docker.com/vex/` + name + `","statements":[]}` + "\n"
+	return `{"@context":"https://openvex.dev/ns/v0.2.0","@id":"https://dhi.docker.com/vex/vex-` + name + `",` +
+		`"statements":[{"vulnerability":{"name":"CVE-2026-1"},"products":[` +
+		`{"@id":"pkg:deb/debian/libc6@2.41-12%2Bdhi1"},{"@id":"pkg:docker/dhi/` + name + `"},` +
+		`{"@id":"pkg:oci/` + name + `?repository_url=dhi.io"},{"@id":"pkg:oci/dhi.io%2F` + name + `"}],` +
+		`"status":"not_affected","justification":"vulnerable_code_cannot_be_controlled_by_adversary"}]}` + "\n"
 }
 
 func vexBundle(name string) string {
@@ -58,10 +65,13 @@ func vexBundle(name string) string {
 
 // advisories serves the document and bundle of each of names where
 // Docker's repository keeps them, a 404 for anything else, and keeps every
-// path asked for. A request with credentials fails the test.
+// path asked for. as names, for an image, another whose document is
+// served in its place, signed as Docker signs every one. A request with
+// credentials fails the test.
 type advisories struct {
 	t     *testing.T
 	names []string
+	as    map[string]string
 
 	mu    sync.Mutex
 	asked []string
@@ -79,7 +89,7 @@ func (a *advisories) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var body string
 		switch r.URL.Path {
 		case doc:
-			body = vexDocument(name)
+			body = vexDocument(cmp.Or(a.as[name], name))
 		case doc + ".sig":
 			body = vexBundle(name)
 		default:
@@ -157,8 +167,10 @@ func TestRunDHIVEX(t *testing.T) {
 	tests := []struct {
 		name          string
 		containerfile string
-		// served are the images whose documents the advisories hold.
+		// served are the images whose documents the advisories hold, and
+		// as any served in another's place.
 		served []string
+		as     map[string]string
 		// own are the -vex flags, the app's own documents.
 		own []string
 		// cosign are the verifications run, in order.
@@ -170,9 +182,10 @@ func TestRunDHIVEX(t *testing.T) {
 		wantAsked []string
 		wantCode  int
 		// wantStdout is what stdout must start with, wantStderr what
-		// stderr must hold.
-		wantStdout string
-		wantStderr []string
+		// stderr must hold, and notInStderr what it must not.
+		wantStdout  string
+		wantStderr  []string
+		notInStderr []string
 	}{
 		{
 			name:          "one",
@@ -300,15 +313,59 @@ func TestRunDHIVEX(t *testing.T) {
 			wantStderr:    []string{"dhi.io/aspnetcore: could not fetch", "dhi-aspnetcore.vex.json: it answered 404 Not Found"},
 		},
 		{
+			// cosign that cannot start answers no exit status at all,
+			// which must not read as its 0
+			name:          "cosign-missing",
+			containerfile: "FROM " + aspnetcore + "\n",
+			served:        []string{"aspnetcore"},
+			cosign: []execx.Call{{
+				Argv: verifyBlob("aspnetcore", 0).Argv,
+				Err:  exec.ErrNotFound,
+			}},
+			wantAsked:  []string{"/vex/aspnetcore/dhi-aspnetcore.vex.json", "/vex/aspnetcore/dhi-aspnetcore.vex.json.sig"},
+			wantCode:   1,
+			wantStderr: []string{"could not apply DHI's signed VEX", "dhi.io/aspnetcore: cosign verify-blob: executable file not found"},
+		},
+		{
+			// Signed by Docker, and verified, but node's
+			name:          "another-images-document",
+			containerfile: "FROM " + aspnetcore + "\n",
+			served:        []string{"aspnetcore", "node"},
+			as:            map[string]string{"aspnetcore": "node"},
+			cosign:        []execx.Call{verifyBlob("aspnetcore", 0)},
+			wantAsked:     []string{"/vex/aspnetcore/dhi-aspnetcore.vex.json", "/vex/aspnetcore/dhi-aspnetcore.vex.json.sig"},
+			wantCode:      1,
+			wantStderr: []string{
+				"could not apply DHI's signed VEX",
+				"dhi.io/aspnetcore: dhi-aspnetcore.vex.json is not that image's document: statement 1 is for dhi.io/node, not dhi.io/aspnetcore",
+			},
+		},
+		{
+			// A Containerfile refused says so, and nothing of DHI's
 			name:          "unpinned",
 			containerfile: "FROM dhi.io/aspnetcore:10.0.15-debian13\n",
 			wantCode:      1,
-			wantStderr:    []string{"CONTAINERFILE: could not apply DHI's signed VEX", "line 1 has dhi.io/aspnetcore:10.0.15-debian13"},
+			wantStderr: []string{
+				"CONTAINERFILE: cannot tell which image the final stage builds on, so nothing is scanned",
+				"line 1 has dhi.io/aspnetcore:10.0.15-debian13",
+			},
+			notInStderr: []string{"DHI"},
 		},
 		{
-			name:       "no-containerfile",
-			wantCode:   1,
-			wantStderr: []string{"CONTAINERFILE: could not apply DHI's signed VEX"},
+			name:          "unpinned-other-base",
+			containerfile: "FROM gcr.io/distroless/static-debian13:nonroot\n",
+			wantCode:      1,
+			wantStderr: []string{
+				"CONTAINERFILE: cannot tell which image the final stage builds on, so nothing is scanned",
+				"line 1 has gcr.io/distroless/static-debian13:nonroot",
+			},
+			notInStderr: []string{"DHI"},
+		},
+		{
+			name:        "no-containerfile",
+			wantCode:    1,
+			wantStderr:  []string{"CONTAINERFILE: cannot tell which image the final stage builds on, so nothing is scanned"},
+			notInStderr: []string{"DHI"},
 		},
 	}
 
@@ -316,11 +373,18 @@ func TestRunDHIVEX(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			a := &advisories{t: t, names: tt.served}
+			a := &advisories{t: t, names: tt.served, as: tt.as}
 			srv := httptest.NewServer(a)
 			t.Cleanup(srv.Close)
 
 			dir := t.TempDir()
+			// Where run makes its temporary directory, through TMPDIR as
+			// the environment gives it, so that whatever it leaves there,
+			// failing or not, shows
+			tmp := filepath.Join(dir, "tmp")
+			if err := os.Mkdir(tmp, 0o700); err != nil {
+				t.Fatal(err)
+			}
 			paths := map[string]string{}
 			for _, p := range []string{"layout", "report.json", "baseline.json", "report.sarif", "Containerfile"} {
 				paths[p] = filepath.Join(dir, p)
@@ -367,7 +431,13 @@ func TestRunDHIVEX(t *testing.T) {
 			src := dhivex.Source{Client: srv.Client(), Base: srv.URL + "/vex/"}
 
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), args, runner, src, func(string) string { return "" }, &stdout, &stderr)
+			getenv := func(key string) string {
+				if key == "TMPDIR" {
+					return tmp
+				}
+				return ""
+			}
+			code := run(t.Context(), args, runner, src, getenv, &stdout, &stderr)
 			errText := strings.ReplaceAll(stderr.String(), paths["Containerfile"], "CONTAINERFILE")
 
 			if code != tt.wantCode {
@@ -380,6 +450,14 @@ func TestRunDHIVEX(t *testing.T) {
 				if !strings.Contains(errText, want) {
 					t.Errorf("stderr = %q, want it to contain %q", errText, want)
 				}
+			}
+			for _, unwanted := range tt.notInStderr {
+				if strings.Contains(errText, unwanted) {
+					t.Errorf("stderr = %q, want no %q", errText, unwanted)
+				}
+			}
+			if left, err := os.ReadDir(tmp); err != nil || len(left) != 0 {
+				t.Errorf("run() left %v in its TMPDIR (error %v), want nothing", left, err)
 			}
 			a.mu.Lock()
 			asked := slices.Clone(a.asked)
@@ -394,8 +472,8 @@ func TestRunDHIVEX(t *testing.T) {
 			// cosign verified against the embedded key, and every call
 			// that named a document, cosign's and both of Trivy's, saw
 			// what was served; all of it gone once run returns
-			if runner.dir == "" {
-				t.Fatal("cosign never named the key's directory")
+			if runner.dir == "" || filepath.Dir(runner.dir) != tmp {
+				t.Fatalf("cosign named the key's directory %q, want one in the TMPDIR %s", runner.dir, tmp)
 			}
 			for _, held := range runner.held["dhi-2.pub"] {
 				if held != string(verify.DHIPublicKey) {
@@ -404,9 +482,10 @@ func TestRunDHIVEX(t *testing.T) {
 			}
 			for _, name := range tt.served {
 				base := "dhi-" + name + ".vex.json"
+				served := vexDocument(cmp.Or(tt.as[name], name))
 				for _, held := range runner.held[base] {
-					if held != vexDocument(name) {
-						t.Errorf("%s held %q when a call ran, want %q as served", base, held, vexDocument(name))
+					if held != served {
+						t.Errorf("%s held %q when a call ran, want %q as served", base, held, served)
 					}
 				}
 				for _, held := range runner.held[base+".sig"] {

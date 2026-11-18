@@ -873,9 +873,12 @@ anonymously, and verifies the one with the other against the
 cosign verify-blob --key dhi-2.pub --bundle dhi-<name>.vex.json.sig dhi-<name>.vex.json
 ```
 
+Docker signs every image's document with the same key, so each of the
+verified document's statements must also name `dhi.io/<name>`, and no
+other image, among its products, as every statement of Docker's does.
 Both of Trivy's scans then apply the verified document, after the app's
-own. A document that cannot be fetched, or that cosign does not verify,
-fails the scan, naming the image. A build stage's document is never
+own. A document that cannot be fetched, that cosign does not verify, or
+that is another image's, fails the scan, naming the image. A build stage's document is never
 applied, though its image is `dhi.io`'s too: a build stage's packages
 never ship, a document is Docker's assessment of its own image, and some
 of its statements name a package with no version, so applied to the
@@ -1213,7 +1216,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched or not verified; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched, not verified, or not that image's; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

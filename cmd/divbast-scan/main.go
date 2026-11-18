@@ -37,13 +37,16 @@
 //
 //	cosign verify-blob --key dhi-2.pub --bundle dhi-<name>.vex.json.sig dhi-<name>.vex.json
 //
-// Both scans then apply the verified document, after any -vex. One that
-// cannot be fetched or is not verified fails the scan, naming the image.
-// A build stage's document is never fetched: its packages do not ship,
-// and its document answers for its own image alone. A final stage on any
-// other base, or on scratch, fetches nothing. The document and the key go
-// in a temporary directory, removed once the scans are done. Without
-// -containerfile, no document of Docker's is applied.
+// Each of the document's statements must then name that image, and no
+// other, among its products, as each of Docker's does: Docker signs every
+// image's document with the same key. Both scans then apply the verified
+// document, after any -vex. One that cannot be fetched, is not verified,
+// or is not that image's fails the scan, naming the image. A build
+// stage's document is never fetched: its packages do not ship, and its
+// document answers for its own image alone. A final stage on any other
+// base, or on scratch, fetches nothing. The document and the key go in a
+// temporary directory, in $TMPDIR, removed once the scans are done.
+// Without -containerfile, no document of Docker's is applied.
 //
 // It lists every finding on stdout and, when GitHub Actions sets it,
 // appends them as tables to $GITHUB_STEP_SUMMARY.
@@ -78,12 +81,12 @@
 //	   because the registry refused to show it
 //	1  a finding IMAGE lacks; a Containerfile that cannot be read, or
 //	   that names an image unpinned; the final stage's dhi.io base's VEX
-//	   document not fetched or not verified; a scan that failed or
-//	   saw no packages; a report, of the layout or of IMAGE, that
-//	   recognised no operating system or saw no OS package; IMAGE not a
-//	   ghcr.io image, unreadable, or refused though public for any reason
-//	   but a missing tag; the GitHub API not answering, or refusing the
-//	   token; or the summary not written
+//	   document not fetched, not verified, or not that image's; a scan
+//	   that failed or saw no packages; a report, of the layout or of
+//	   IMAGE, that recognised no operating system or saw no OS package;
+//	   IMAGE not a ghcr.io image, unreadable, or refused though public for
+//	   any reason but a missing tag; the GitHub API not answering, or
+//	   refusing the token; or the summary not written
 //	2  the command line is wrong
 package main
 
@@ -170,9 +173,18 @@ func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, 
 
 	docs := slices.Clone(vex)
 	if *containerfile != "" {
-		dhi, done, err := dhiVEX(ctx, *containerfile, src, r, stdout, stderr)
+		base, ok, err := finalBase(*containerfile)
 		if err != nil {
-			complain(stderr, "%s: could not apply DHI's signed VEX, so nothing is scanned: %v", *containerfile, err)
+			complain(stderr, "%s: cannot tell which image the final stage builds on, so nothing is scanned: %v", *containerfile, err)
+			return 1
+		}
+		var dhi string
+		done := func() {}
+		if ok {
+			dhi, done, err = dhiVEX(ctx, base, src, r, getenv("TMPDIR"), stdout, stderr)
+		}
+		if err != nil {
+			complain(stderr, "could not apply DHI's signed VEX for the final stage's base, so nothing is scanned: %v", err)
 			return 1
 		}
 		defer done()
@@ -305,28 +317,29 @@ func (f *files) Set(path string) error {
 	return nil
 }
 
-// dhiVEX reads the Containerfile at path and, when its final stage builds
-// on a dhi.io image, fetches that image's VEX document from src, with
-// dhi-2.pub beside it in a directory it makes, and has cosign, through r,
-// verify it. It says on stdout what it applies, and returns the
-// document's path, "" for none, and what removes the directory, which the
-// caller runs once the scans are done; on an error, it leaves nothing
-// behind.
-func dhiVEX(ctx context.Context, path string, src dhivex.Source, r execx.Runner, stdout, stderr io.Writer) (doc string, done func(), err error) {
+// finalBase reads the Containerfile at path, and returns the image its
+// final stage builds on, as [verify.Base] does.
+func finalBase(path string) (base verify.Ref, ok bool, err error) {
 	data, err := readFile(path)
 	if err != nil {
-		return "", nil, err
+		return verify.Ref{}, false, err
 	}
-	base, ok, err := verify.Base(bytes.NewReader(data))
-	if err != nil || !ok {
-		return "", func() {}, err
-	}
+	return verify.Base(bytes.NewReader(data))
+}
+
+// dhiVEX, when base is a dhi.io image, fetches its VEX document from src,
+// with dhi-2.pub beside it in a directory it makes in tmp, or the system's
+// temporary directory when tmp is "", and has cosign, through r, verify
+// it. It says on stdout what it applies, and returns the document's path,
+// "" for none, and what removes the directory, which the caller runs once
+// the scans are done; on an error, it leaves nothing behind.
+func dhiVEX(ctx context.Context, base verify.Ref, src dhivex.Source, r execx.Runner, tmp string, stdout, stderr io.Writer) (doc string, done func(), err error) {
 	image, ok, err := dhivex.Name(base)
 	if err != nil || !ok {
 		return "", func() {}, err
 	}
 
-	dir, err := os.MkdirTemp("", name+"-")
+	dir, err := os.MkdirTemp(tmp, name+"-")
 	if err != nil {
 		return "", nil, fmt.Errorf("make a directory for the document: %w", err)
 	}

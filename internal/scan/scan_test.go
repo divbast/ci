@@ -449,12 +449,13 @@ func TestTrivy(t *testing.T) {
 			wantLog: logged,
 		},
 		{
-			// The app's own, then DHI's, each a --vex of its own, which
-			// Trivy reads as a list
+			// Trivy takes any list, each a --vex of its own, in order.
+			// divbast-scan gives it the app's own, as many as -vex names,
+			// then the one document of Docker's for the final stage's base
 			name: "layout-several-vex",
-			vex:  []string{"openvex.json", "/tmp/v/dhi-aspnetcore.vex.json", "/tmp/v/dhi-node.vex.json"},
+			vex:  []string{"openvex.json", "more.openvex.json", "/tmp/v/dhi-aspnetcore.vex.json"},
 			call: execx.Call{
-				Argv: layoutArgv("--vex", "openvex.json", "--vex", "/tmp/v/dhi-aspnetcore.vex.json", "--vex", "/tmp/v/dhi-node.vex.json"),
+				Argv: layoutArgv("--vex", "openvex.json", "--vex", "more.openvex.json", "--vex", "/tmp/v/dhi-aspnetcore.vex.json"),
 			},
 			do: func(ctx context.Context, tr scan.Trivy) error { return tr.Layout(ctx, "/w/layout", "/w/report.json") },
 		},
@@ -489,9 +490,10 @@ func TestTrivy(t *testing.T) {
 			},
 		},
 		{
+			// The same list as the layout's scan, so the two compare
 			name: "published-several-vex",
-			vex:  []string{"/tmp/v/dhi-aspnetcore.vex.json", "/tmp/v/dhi-node.vex.json"},
-			call: execx.Call{Argv: publishedArgv("arm64", "--vex", "/tmp/v/dhi-aspnetcore.vex.json", "--vex", "/tmp/v/dhi-node.vex.json")},
+			vex:  []string{"openvex.json", "/tmp/v/dhi-aspnetcore.vex.json"},
+			call: execx.Call{Argv: publishedArgv("arm64", "--vex", "openvex.json", "--vex", "/tmp/v/dhi-aspnetcore.vex.json")},
 			do: func(ctx context.Context, tr scan.Trivy) error {
 				return tr.Published(ctx, latest, "arm64", "/w/baseline.json")
 			},

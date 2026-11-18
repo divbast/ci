@@ -251,10 +251,11 @@ func TestBuildFormat(t *testing.T) {
 
 // TestScanPassesVEXWhenPresent checks app.just's scan in a justfile set up
 // as an app's: it always gives divbast-scan the app's Containerfile, whose
-// dhi.io images' VEX documents both scans then apply; with an openvex.json
-// beside the justfile, at the app's root, it gives -vex openvex.json too;
-// without one, no -vex at all, since trivy refuses a --vex file that is not
-// there. A file of that name anywhere else is not the app's.
+// final stage's base, when a dhi.io image, has its VEX document applied
+// by both scans; with an openvex.json beside the justfile, at the app's
+// root, it gives -vex openvex.json too; without one, no -vex at all, since
+// trivy refuses a --vex file that is not there. A file of that name
+// anywhere else is not the app's.
 func TestScanPassesVEXWhenPresent(t *testing.T) {
 	t.Parallel()
 	needJustAndMise(t)
