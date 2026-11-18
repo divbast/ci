@@ -550,15 +550,17 @@ func TestAppCheckVerifiesListedContainerfiles(t *testing.T) {
 	const (
 		input  = "      verify-containerfiles:\n"
 		listed = "      - name: Verify the images the listed Containerfiles build from\n"
+		pins   = "      - name: Check the caller pins this commit of divbast/ci\n"
 		grant  = "      attestations: read # a listed Containerfile may name divbast/frankenphp, whose attestation it checks\n"
 	)
 	for name, mutant := range map[string]string{
-		"no input default":                replaceAfter(check, input, "        default: ''\n", ""),
-		"no if":                           strings.Replace(check, "        if: inputs.verify-containerfiles != ''\n", "", 1),
-		"no DHI_TOKEN in env":             replaceAfter(check, listed, "          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}\n", ""),
-		"the step moved after just setup": moveStep(check, listed, "      - run: just lint\n"),
-		"the step deleted":                dropStep(check, listed),
-		"the permission removed":          strings.Replace(check, grant, "", 1),
+		"no input default":                    replaceAfter(check, input, "        default: ''\n", ""),
+		"no if":                               strings.Replace(check, "        if: inputs.verify-containerfiles != ''\n", "", 1),
+		"no DHI_TOKEN in env":                 replaceAfter(check, listed, "          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}\n", ""),
+		"the step moved before the pin check": moveStep(check, listed, pins),
+		"the step moved after just setup":     moveStep(check, listed, "      - run: just lint\n"),
+		"the step deleted":                    dropStep(check, listed),
+		"the permission removed":              strings.Replace(check, grant, "", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

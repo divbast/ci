@@ -22,11 +22,11 @@
 # packages: read and security-events: write. The lint and build jobs
 # install the caller's whole mise.toml, which must declare cosign as
 # "aqua:sigstore/cosign", for divbast-verify-images: build runs it on the
-# root Containerfile, and lint on each the optional verify-containerfiles
-# lists. Of the caller's
-# mise.toml, the scan job installs only Go, just, Trivy and cosign, each
-# declared at one version: Go as "core:go" (mise reads the short "go" the
-# same way), and just, Trivy and cosign as exactly "aqua:casey/just",
+# root Containerfile, and lint on each Containerfile the optional
+# verify-containerfiles input lists. Of the caller's mise.toml, the scan
+# job installs only Go, just, Trivy and cosign, each declared at one
+# version: Go as "core:go" (mise reads the short "go" the same way), and
+# just, Trivy and cosign as exactly "aqua:casey/just",
 # "aqua:aquasecurity/trivy" and "aqua:sigstore/cosign".
 name: app-check
 
@@ -55,8 +55,9 @@ on:
         description: >-
           Containerfiles besides the root one, one path per line from the
           caller's root, whose images the lint job verifies before just
-          lint runs: a template layer whose images the lint runs, say, as
-          the build job verifies the root one's
+          lint runs, as the build job verifies the root one's. A caller
+          lists each Containerfile whose images its lint runs, such as a
+          template layer's
         type: string
         default: ''
     secrets:
@@ -72,10 +73,13 @@ env:
   MISE_VERSION: 2026.11.9
 
 jobs:
-  # lint.yml's steps, but for the pin check's skip, which names divbast/ci:
-  # ci never calls this workflow, so a caller's pin is always checked. A
-  # job calling lint.yml would be a reusable workflow nested in this one,
-  # and its check would be named `<caller> / lint / lint`.
+  # lint.yml's steps, and what an app's lint needs besides. The pin
+  # check's skip names divbast/ci, which never calls this workflow, so a
+  # caller's pin is always checked. The job also logs in to dhi.io, and
+  # verifies the images of the Containerfiles verify-containerfiles
+  # lists, for which it asks attestations: read. A job calling lint.yml
+  # would be a reusable workflow nested in this one, and its check would
+  # be named `<caller> / lint / lint`.
   lint:
     name: lint
     runs-on: ubuntu-26.04

@@ -786,7 +786,7 @@ workflow runs on:
 | `php` | boolean | `false` | Install PHP 8.5 and Composer for the lint job, for a lint that runs PHPStan: a PHP app passes `true` |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
 | `dhi-username` | string | `''` | The Docker Hardened Images (`dhi.io`) username that `DHI_TOKEN` belongs to. When set, `lint` and `build` log in to `dhi.io` with it before they read a base image |
-| `verify-containerfiles` | string | `''` | Containerfiles besides the root one, one path per line from the caller's root, whose images `lint` verifies with `divbast-verify-images` ([Verified inputs](#verified-inputs)) before `just lint` runs: a template layer whose images the lint runs, say, as `build` verifies the root one's |
+| `verify-containerfiles` | string | `''` | Containerfiles besides the root one, one path per line from the caller's root, whose images `lint` verifies with `divbast-verify-images` ([Verified inputs](#verified-inputs)) before `just lint` runs, as `build` verifies the root one's. A caller lists each Containerfile whose images its lint runs, such as a template layer's |
 
 | Secret | Required | What |
 |---|---|---|
@@ -1131,10 +1131,12 @@ The calling job grants `contents: read`, `pull-requests: read`,
 
 Every image a Containerfile builds from is pinned, and every one whose
 publisher signs it is verified as theirs, before `app-check.yml` builds
-anything. `divbast-verify-images` reads each image a `FROM`, a
-`COPY --from=` or a `RUN --mount from=` takes, a `FROM`'s build argument
-resolved to its default, and the frontend a `# syntax=` directive names,
-which BuildKit runs as the build itself:
+anything. Its lint job also verifies each Containerfile a caller lists
+in `verify-containerfiles`, before the lint runs any of their images.
+`divbast-verify-images` reads each image a `FROM`, a `COPY --from=` or a
+`RUN --mount from=` takes, a `FROM`'s build argument resolved to its
+default, and the frontend a `# syntax=` directive names, which BuildKit
+runs as the build itself:
 
 ```dockerfile
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:<digest>
