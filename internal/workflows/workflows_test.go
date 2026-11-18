@@ -777,6 +777,85 @@ func scanReadsPackages(workflow string) error {
 	return nil
 }
 
+// TestScanPinsWhatItInstalls checks that app-check.yml's scan job
+// installs cosign, which divbast-scan runs to verify Docker's VEX
+// documents for the dhi.io images a Containerfile builds from, and that
+// its check of the caller's mise.toml covers exactly the tools the job
+// installs, core:go under the go mise lists it as: a tool installed and
+// not checked could be one the caller never pinned. Against app-check.yml
+// as it is, then with each broken.
+func TestScanPinsWhatItInstalls(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := scanPinsWhatItInstalls(check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		install = "          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign\n"
+		loop    = "          for tool in go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign; do\n"
+		pins    = "      - name: Check the caller's mise.toml pins each tool installed above\n"
+	)
+	for name, mutant := range map[string]string{
+		"cosign neither installed nor checked": strings.Replace(strings.Replace(check, install, strings.Replace(install, " aqua:sigstore/cosign", "", 1), 1),
+			loop, strings.Replace(loop, " aqua:sigstore/cosign", "", 1), 1),
+		"cosign installed, not checked": strings.Replace(check, loop, strings.Replace(loop, " aqua:sigstore/cosign", "", 1), 1),
+		"cosign checked, not installed": strings.Replace(check, install, strings.Replace(install, " aqua:sigstore/cosign", "", 1), 1),
+		"cosign by another name":        strings.Replace(check, install, strings.Replace(install, "aqua:sigstore/cosign", "cosign", 1), 1),
+		"no check":                      dropStep(check, pins),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if scanPinsWhatItInstalls(mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// scanPinsWhatItInstalls returns an error unless the scan job has one
+// jdx/mise-action step, whose install_args name aqua:sigstore/cosign, and
+// one step that checks the caller's mise.toml pins each tool, whose
+// for tool in … loop names exactly what that step installs, with core:go
+// read as go.
+func scanPinsWhatItInstalls(workflow string) error {
+	st := steps(jobsOf(linesOf(workflow))["scan"])
+	mise := stepsWhere(st, isUses("jdx/mise-action"))
+	if len(mise) != 1 {
+		return fmt.Errorf("the scan job has %d jdx/mise-action steps, want one", len(mise))
+	}
+	installed := strings.Fields(value(st[mise[0]], "install_args"))
+	if !slices.Contains(installed, "aqua:sigstore/cosign") {
+		return fmt.Errorf("the scan job installs %q, without aqua:sigstore/cosign, which divbast-scan runs to verify DHI's VEX documents", installed)
+	}
+	checks := stepsWhere(st, contains("name: Check the caller's mise.toml pins each tool installed above"))
+	if len(checks) != 1 {
+		return fmt.Errorf("the scan job checks the caller's pins in %d steps, want one", len(checks))
+	}
+	script, err := runScript(st[checks[0]])
+	if err != nil {
+		return err
+	}
+	var checked []string
+	for l := range strings.Lines(script) {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(l), "for tool in "); ok {
+			list, _, _ := strings.Cut(rest, ";")
+			checked = strings.Fields(list)
+		}
+	}
+	want := make([]string, 0, len(installed))
+	for _, tool := range installed {
+		want = append(want, strings.TrimPrefix(tool, "core:"))
+	}
+	slices.Sort(want)
+	if got := slices.Sorted(slices.Values(checked)); !slices.Equal(got, want) {
+		return fmt.Errorf("the scan job checks the pins of %q, and installs %q", got, want)
+	}
+	return nil
+}
+
 // TestRenovateTokenReadsDependabotAlerts checks that renovate.yml's App
 // token asks to read Dependabot alerts. Renovate reads a repository's
 // alerts to raise its security updates, and given a token that cannot, it

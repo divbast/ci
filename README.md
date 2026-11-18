@@ -798,13 +798,14 @@ The calling job grants `contents: read`, `attestations: read`,
 caller's whole `mise.toml`, which declares cosign as
 `"aqua:sigstore/cosign"` for `divbast-verify-images`.
 
-`scan`, which can change code scanning alerts, installs only Go, just and
-Trivy from the caller's `mise.toml`, and turns mise's auto-install off. The
-caller declares each at one version: Go as `"core:go"` (mise reads the
-short `go` the same way), and just and Trivy as exactly
-`"aqua:casey/just"` and `"aqua:aquasecurity/trivy"`. mise would install a
-name that `mise.toml` does not declare at its latest version, so `scan`
-fails unless all three are there.
+`scan`, which can change code scanning alerts, installs only Go, just,
+Trivy and cosign from the caller's `mise.toml`, and turns mise's
+auto-install off. The caller declares each at one version: Go as
+`"core:go"` (mise reads the short `go` the same way), and just, Trivy and
+cosign as exactly `"aqua:casey/just"`, `"aqua:aquasecurity/trivy"` and
+`"aqua:sigstore/cosign"`, the cosign `build` already needs. mise would
+install a name that `mise.toml` does not declare at its latest version,
+so `scan` fails unless all four are there.
 
 #### Scan
 
