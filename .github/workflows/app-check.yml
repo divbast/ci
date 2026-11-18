@@ -423,9 +423,9 @@ jobs:
       # Before the pin check, which needs the caller's pinned Go, and only
       # what the scan runs: Go for the pin check and ci's tools, just for
       # the recipe, Trivy, and cosign, which verifies Docker's VEX document
-      # for each dhi.io image the Containerfile builds from. An install
-      # runs code from outside the repository, and this job can dismiss
-      # code scanning alerts.
+      # for the Containerfile's final stage's base, when it is a dhi.io
+      # image. An install runs code from outside the repository, and this
+      # job can dismiss code scanning alerts.
       - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: ${{ env.MISE_VERSION }}
@@ -469,7 +469,7 @@ jobs:
       # registry refuses to show the published image, divbast-scan asks
       # GitHub, through gh and this job's token, whether it is absent,
       # private, or public and failing. Only gh gets the token: trivy,
-      # skopeo and cosign run without it, and DHI's VEX documents are
+      # skopeo and cosign run without it, and DHI's VEX document is
       # fetched anonymously.
       - name: Vulnerability scan
         env:

@@ -779,7 +779,7 @@ func scanReadsPackages(workflow string) error {
 
 // TestScanPinsWhatItInstalls checks that app-check.yml's scan job
 // installs cosign, which divbast-scan runs to verify Docker's VEX
-// documents for the dhi.io images a Containerfile builds from, and that
+// document for a Containerfile's final stage's dhi.io base, and that
 // its check of the caller's mise.toml covers exactly the tools the job
 // installs, core:go under the go mise lists it as: a tool installed and
 // not checked could be one the caller never pinned. Against app-check.yml
@@ -828,7 +828,7 @@ func scanPinsWhatItInstalls(workflow string) error {
 	}
 	installed := strings.Fields(value(st[mise[0]], "install_args"))
 	if !slices.Contains(installed, "aqua:sigstore/cosign") {
-		return fmt.Errorf("the scan job installs %q, without aqua:sigstore/cosign, which divbast-scan runs to verify DHI's VEX documents", installed)
+		return fmt.Errorf("the scan job installs %q, without aqua:sigstore/cosign, which divbast-scan runs to verify DHI's VEX document", installed)
 	}
 	checks := stepsWhere(st, contains("name: Check the caller's mise.toml pins each tool installed above"))
 	if len(checks) != 1 {
