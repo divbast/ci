@@ -324,6 +324,31 @@ func TestNeedsDHI(t *testing.T) {
 	}
 }
 
+// TestIsDHI checks the one ref at a time that NeedsDHI asks about, which
+// divbast-scan asks too, to know whose VEX documents to fetch: a dhi.io
+// image in any case, and nothing that only starts or ends like one.
+func TestIsDHI(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		ref  verify.Ref
+		want bool
+	}{
+		{"dhi", dhi, true},
+		{"upper-case", verify.Ref{Name: "DHI.io/dotnet", Tag: "10", Digest: digest}, true},
+		{"distroless", distroless, false},
+		{"docker-hub", golang, false},
+		{"registry-alone", verify.Ref{Name: "dhi.io/", Tag: "10", Digest: digest}, false},
+		{"another-host", verify.Ref{Name: "notdhi.io/aspnetcore", Tag: "10", Digest: digest}, false},
+		{"a-path-under-another-host", verify.Ref{Name: "ghcr.io/dhi.io/aspnetcore", Tag: "10", Digest: digest}, false},
+	} {
+		if got := verify.IsDHI(tt.ref); got != tt.want {
+			t.Errorf("%s: IsDHI(%s) = %t, want %t", tt.name, tt.ref, got, tt.want)
+		}
+	}
+}
+
 func TestDHIPublicKey(t *testing.T) {
 	t.Parallel()
 

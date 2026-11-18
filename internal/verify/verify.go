@@ -140,9 +140,11 @@ func ruleFor(name string) (Rule, bool) {
 
 // NeedsDHI reports whether any of refs is a dhi.io image, which only a
 // login to dhi.io can verify.
-func NeedsDHI(refs []Ref) bool {
-	return slices.ContainsFunc(refs, func(r Ref) bool { return dhiRule.matches(r.Name) })
-}
+func NeedsDHI(refs []Ref) bool { return slices.ContainsFunc(refs, IsDHI) }
+
+// IsDHI reports whether r is a dhi.io image, a Docker Hardened Image,
+// without regard to case.
+func IsDHI(r Ref) bool { return dhiRule.matches(r.Name) }
 
 // dhiRule is the rule for dhi.io's images.
 var dhiRule = Rule{Prefix: DHI}

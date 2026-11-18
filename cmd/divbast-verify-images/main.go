@@ -135,7 +135,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, tools f
 			complain(stderr, "%s: %v", *containerfile, err)
 			return 1
 		}
-		if dhiKey, err = writeKey(dockerConfig); err != nil {
+		if dhiKey, err = verify.WriteDHIKey(dockerConfig); err != nil {
 			complain(stderr, "write dhi-2.pub: %v", err)
 			return 1
 		}
@@ -162,24 +162,6 @@ func run(ctx context.Context, args []string, getenv func(string) string, tools f
 		}
 	}
 	return 0
-}
-
-// writeKey writes Docker's public key into dir, and returns its path.
-func writeKey(dir string) (path string, err error) {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return "", err
-	}
-	defer func() { err = errors.Join(err, root.Close()) }()
-	f, err := root.OpenFile("dhi-2.pub", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return "", err
-	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-	if _, err = f.Write(verify.DHIPublicKey); err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "dhi-2.pub"), nil
 }
 
 // read reads the Containerfile at path, through an [os.Root] on its
