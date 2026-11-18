@@ -23,6 +23,12 @@
 // with no version, so a build stage's document, applied to the runtime,
 // would answer for packages Docker never assessed there.
 //
+// Docker signs every image's document with the same key, so a signature
+// says only that Docker wrote it, not which image it is for. Once
+// verified, every statement of the document must name the image, and no
+// other, among its products, as every statement Docker publishes does;
+// the URL alone does not decide whose it is.
+//
 // Documents are read from main, not a pinned commit: the signature is the
 // trust, and a pin would need a person or a Renovate rule to move it.
 package dhivex
@@ -30,6 +36,7 @@ package dhivex
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +44,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
@@ -71,11 +80,21 @@ var (
 	// ErrNotVerified means cosign did not verify a document against
 	// dhi-2.pub, or could not tell.
 	ErrNotVerified = errors.New("not verified against dhi-2.pub")
+	// ErrWrongImage means a verified document does not say it is the
+	// image's: Docker signs every image's document with the same key, so
+	// the signature alone cannot say whose it is.
+	ErrWrongImage = errors.New("is not that image's document")
 )
 
 // segment is one path segment of an image's name, as the OCI distribution
 // spec allows one.
 var segment = regexp.MustCompile(`^[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*$`)
+
+// imagePURL is a product that names a dhi.io image, in any of the three
+// forms Docker's statements name theirs: pkg:docker/dhi/<name>,
+// pkg:oci/dhi.io%2F<name>, and pkg:oci/<name>?repository_url=dhi.io, each
+// with any version and other qualifiers.
+var imagePURL = regexp.MustCompile(`^pkg:(?:docker/dhi/([^@?#/]+)|oci/dhi\.io%2[Ff]([^@?#/]+)|oci/([^@?#/%]+)(?:@[^?#]*)?\?(?:[^#]*&)?repository_url=dhi\.io(?:[&#]|$))`)
 
 // cosignWithin bounds a verification. cosign may fetch Sigstore's trusted
 // root before it can verify, and one that hangs must not hold the scan
@@ -145,6 +164,7 @@ func document(ctx context.Context, src Source, v Verifier, dir, name string) (st
 	}
 	file := "dhi-" + name + ".vex.json"
 	under := cmp.Or(src.Base, Advisories) + name + "/"
+	var text []byte
 	for _, f := range []string{file, file + ".sig"} {
 		data, err := fetch(ctx, cmp.Or(src.Client, http.DefaultClient), under+f)
 		if err != nil {
@@ -153,12 +173,57 @@ func document(ctx context.Context, src Source, v Verifier, dir, name string) (st
 		if err := write(dir, f, data); err != nil {
 			return "", err
 		}
+		if f == file {
+			text = data
+		}
 	}
 	doc := filepath.Join(dir, file)
 	if err := v.verify(ctx, doc); err != nil {
 		return "", err
 	}
+	// Read only once verified: what is checked is what Docker signed
+	if err := forImage(text, name); err != nil {
+		return "", fmt.Errorf("%s %w: %w", file, ErrWrongImage, err)
+	}
 	return doc, nil
+}
+
+// forImage returns an error, saying why, unless every statement of the OpenVEX document text names dhi.io/<name>, and no
+// other image, among its products, as every statement of every document
+// Docker publishes does. Without it, any image's document, signed by
+// Docker with the same key, would verify as name's, and a statement that
+// names no image would hold for any. A document with no statements says
+// nothing, and passes.
+func forImage(text []byte, name string) error {
+	var doc struct {
+		Statements []struct {
+			Products []struct {
+				ID string `json:"@id"`
+			} `json:"products"`
+		} `json:"statements"`
+	}
+	if err := json.Unmarshal(text, &doc); err != nil {
+		return fmt.Errorf("it is not JSON: %w", err)
+	}
+	for i, st := range doc.Statements {
+		var images []string
+		for _, p := range st.Products {
+			if m := imagePURL.FindStringSubmatch(p.ID); m != nil {
+				if image := verify.DHI + m[1] + m[2] + m[3]; !slices.Contains(images, image) {
+					images = append(images, image)
+				}
+			}
+		}
+		switch {
+		case len(images) == 0:
+			return fmt.Errorf("statement %d names no image", i+1)
+		case len(images) > 1:
+			return fmt.Errorf("statement %d is for %s, not %s%s alone", i+1, strings.Join(images, " and "), verify.DHI, name)
+		case images[0] != verify.DHI+name:
+			return fmt.Errorf("statement %d is for %s, not %s%s", i+1, images[0], verify.DHI, name)
+		}
+	}
+	return nil
 }
 
 // fetch returns the body of url, trying again while a try fails in a way

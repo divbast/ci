@@ -38,9 +38,29 @@ const (
 
 // document and bundle are what the advisories serve for name: an OpenVEX
 // document and its Sigstore bundle, each its own so that a mix-up shows.
+// Each of the document's statements names its image among its products,
+// in the three forms every statement of Docker's own does.
 func document(name string) string {
-	return `{"@context":"https://openvex.dev/ns/v0.2.0","@id":"https://dhi.docker.com/vex/` + name + `",` +
-		`"author":"Docker Hardened Images <dhi@docker.com>","statements":[]}` + "\n"
+	return vexWith(statement("CVE-2026-1", "pkg:deb/debian/libc6@2.41-12%2Bdhi1", "pkg:docker/dhi/"+name,
+		"pkg:oci/"+name+"?repository_url=dhi.io", "pkg:oci/dhi.io%2F"+name),
+		statement("CVE-2026-2", "pkg:deb/debian/zlib1g", "pkg:oci/dhi.io%2F"+name))
+}
+
+// vexWith is an OpenVEX document of Docker's with statements.
+func vexWith(statements ...string) string {
+	return `{"@context":"https://openvex.dev/ns/v0.2.0","@id":"https://dhi.docker.com/vex/vex-821d005b",` +
+		`"author":"Docker Hardened Images <dhi@docker.com>","statements":[` + strings.Join(statements, ",") + `]}` + "\n"
+}
+
+// statement is a not_affected statement on cve, whose products are
+// purls.
+func statement(cve string, purls ...string) string {
+	products := make([]string, 0, len(purls))
+	for _, p := range purls {
+		products = append(products, `{"@id":"`+p+`"}`)
+	}
+	return `{"vulnerability":{"name":"` + cve + `"},"products":[` + strings.Join(products, ",") + `],` +
+		`"status":"not_affected","justification":"vulnerable_code_cannot_be_controlled_by_adversary"}`
 }
 
 func bundle(name string) string {
@@ -189,10 +209,11 @@ func TestDocument(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		// image is the name asked for; served are the images whose
-		// documents the advisories hold, and status overrides the answer
-		// for a path.
+		// documents the advisories hold; files overrides what is served
+		// at a path, and status the answer.
 		image  string
 		served []string
+		files  map[string]string
 		status map[string]int
 		// cosign returns the cosign calls scripted for dir.
 		cosign func(dir string) []execx.Call
@@ -213,6 +234,17 @@ func TestDocument(t *testing.T) {
 			},
 			wantAsked: []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
 			wantLog:   []string{"Verified OK\n"},
+		},
+		{
+			// A name with a hyphen, as many of Docker's have, read whole
+			// in every form its statements name it
+			name:   "verified-hyphenated",
+			image:  "alpine-base",
+			served: []string{"alpine-base", "alpine"},
+			cosign: func(dir string) []execx.Call {
+				return []execx.Call{verifyBlob(dir, "alpine-base", 0, "")}
+			},
+			wantAsked: []string{documentPath("alpine-base"), bundlePath("alpine-base")},
 		},
 		{
 			name:   "not-verified",
@@ -269,6 +301,77 @@ func TestDocument(t *testing.T) {
 			wantErrText: []string{"dhi.io/aspnetcore", "cosign verify-blob"},
 		},
 		{
+			// Docker signed it, so it verifies, but for node
+			name:   "another-images-document",
+			image:  "aspnetcore",
+			served: []string{"aspnetcore"},
+			files:  map[string]string{documentPath("aspnetcore"): document("node")},
+			cosign: func(dir string) []execx.Call {
+				return []execx.Call{verifyBlob(dir, "aspnetcore", 0, "")}
+			},
+			wantAsked:   []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
+			wantErr:     dhivex.ErrWrongImage,
+			wantErrText: []string{"dhi.io/aspnetcore: dhi-aspnetcore.vex.json is not that image's document: statement 1 is for dhi.io/node, not dhi.io/aspnetcore"},
+		},
+		{
+			// One statement of the image's, the next of another's
+			name:   "a-statement-for-another-image",
+			image:  "aspnetcore",
+			served: []string{"aspnetcore"},
+			files: map[string]string{documentPath("aspnetcore"): vexWith(
+				statement("CVE-2026-1", "pkg:deb/debian/libc6", "pkg:docker/dhi/aspnetcore"),
+				statement("CVE-2026-2", "pkg:deb/debian/libc6", "pkg:oci/node?repository_url=dhi.io"),
+			)},
+			cosign: func(dir string) []execx.Call {
+				return []execx.Call{verifyBlob(dir, "aspnetcore", 0, "")}
+			},
+			wantAsked:   []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
+			wantErr:     dhivex.ErrWrongImage,
+			wantErrText: []string{"statement 2 is for dhi.io/node, not dhi.io/aspnetcore"},
+		},
+		{
+			name:   "a-statement-for-two-images",
+			image:  "aspnetcore",
+			served: []string{"aspnetcore"},
+			files: map[string]string{documentPath("aspnetcore"): vexWith(
+				statement("CVE-2026-1", "pkg:docker/dhi/aspnetcore", "pkg:oci/dhi.io%2fdotnet"),
+			)},
+			cosign: func(dir string) []execx.Call {
+				return []execx.Call{verifyBlob(dir, "aspnetcore", 0, "")}
+			},
+			wantAsked:   []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
+			wantErr:     dhivex.ErrWrongImage,
+			wantErrText: []string{"statement 1 is for dhi.io/aspnetcore and dhi.io/dotnet, not dhi.io/aspnetcore alone"},
+		},
+		{
+			// A statement that names no image would hold for any
+			name:   "a-statement-for-no-image",
+			image:  "aspnetcore",
+			served: []string{"aspnetcore"},
+			files: map[string]string{documentPath("aspnetcore"): vexWith(
+				statement("CVE-2026-1", "pkg:deb/debian/libc6", "pkg:docker/dhi/aspnetcore"),
+				statement("CVE-2026-2", "pkg:deb/debian/libc6", "pkg:oci/aspnetcore?repository_url=docker.io"),
+			)},
+			cosign: func(dir string) []execx.Call {
+				return []execx.Call{verifyBlob(dir, "aspnetcore", 0, "")}
+			},
+			wantAsked:   []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
+			wantErr:     dhivex.ErrWrongImage,
+			wantErrText: []string{"statement 2 names no image"},
+		},
+		{
+			name:   "not-json",
+			image:  "aspnetcore",
+			served: []string{"aspnetcore"},
+			files:  map[string]string{documentPath("aspnetcore"): "not a document\n"},
+			cosign: func(dir string) []execx.Call {
+				return []execx.Call{verifyBlob(dir, "aspnetcore", 0, "")}
+			},
+			wantAsked:   []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
+			wantErr:     dhivex.ErrWrongImage,
+			wantErrText: []string{"not JSON"},
+		},
+		{
 			// Name reaches here already checked; anything else names a
 			// path outside dir, and is asked for nowhere
 			name:        "not-a-name",
@@ -282,6 +385,7 @@ func TestDocument(t *testing.T) {
 			t.Parallel()
 
 			a := serving(t, tt.served...)
+			maps.Copy(a.files, tt.files)
 			maps.Copy(a.status, tt.status)
 			srv := httptest.NewServer(a)
 			t.Cleanup(srv.Close)
