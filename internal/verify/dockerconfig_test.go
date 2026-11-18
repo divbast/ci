@@ -4,10 +4,13 @@
 package verify_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/divbast/ci/internal/verify"
@@ -81,5 +84,49 @@ func TestWriteDockerConfigRefuses(t *testing.T) {
 				t.Errorf("WriteDockerConfig() left %v in %s (error %v), want nothing", entries, dir, rerr)
 			}
 		})
+	}
+}
+
+// TestWriteDHIKey checks that the key divbast-verify-images and
+// divbast-scan hand cosign is the embedded one, at the path returned,
+// readable by its owner alone, and that a file already there is refused
+// rather than written over or trusted.
+func TestWriteDHIKey(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path, err := verify.WriteDHIKey(dir)
+	if err != nil {
+		t.Fatalf("WriteDHIKey() error = %v", err)
+	}
+	if want := filepath.Join(dir, "dhi-2.pub"); path != want {
+		t.Errorf("WriteDHIKey() = %s, want %s", path, want)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := root.Close(); cerr != nil {
+			t.Error(cerr)
+		}
+	})
+	got, err := root.ReadFile("dhi-2.pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, verify.DHIPublicKey) {
+		t.Errorf("dhi-2.pub = %q, want DHIPublicKey", got)
+	}
+	info, err := root.Stat("dhi-2.pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("dhi-2.pub mode = %o, want 600", got)
+	}
+
+	if _, err = verify.WriteDHIKey(dir); !errors.Is(err, fs.ErrExist) {
+		t.Errorf("WriteDHIKey() over a dhi-2.pub already there: error = %v, want fs.ErrExist", err)
 	}
 }

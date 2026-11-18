@@ -22,10 +22,10 @@
 # packages: read and security-events: write. The build job installs the
 # caller's whole mise.toml, which must declare cosign as
 # "aqua:sigstore/cosign", for divbast-verify-images. Of the caller's
-# mise.toml, the scan job installs only Go, just and Trivy, each declared
-# at one version: Go as "core:go" (mise reads the short "go" the same
-# way), and just and Trivy as exactly "aqua:casey/just" and
-# "aqua:aquasecurity/trivy".
+# mise.toml, the scan job installs only Go, just, Trivy and cosign, each
+# declared at one version: Go as "core:go" (mise reads the short "go" the
+# same way), and just, Trivy and cosign as exactly "aqua:casey/just",
+# "aqua:aquasecurity/trivy" and "aqua:sigstore/cosign".
 name: app-check
 
 on:
@@ -346,18 +346,35 @@ jobs:
           # systemd here, not cgroupfs, or the healthcheck timer never fires.
           podman info --format '{{.Host.CgroupManager}}'
 
+      # docker load keeps the OCI archive as it is, its zstd layers, index
+      # and attestations, only in Docker's containerd image store: the
+      # default for a fresh install of Docker 29, as the runner's is.
+      - name: Check Docker keeps its images in the containerd store
+        if: matrix.engine == 'docker'
+        run: |
+          status=$(docker info -f '{{json .DriverStatus}}')
+          if [[ "${status}" != *'["driver-type","io.containerd.snapshotter.v1"]'* ]]; then
+            echo "Docker is not on its containerd image store (driver status ${status}), which docker load below needs" >&2
+            exit 1
+          fi
+
+      # Docker loads the archive itself, under the name the build's -t gave
+      # it, which is IMAGE: skopeo's docker-daemon: transport refuses a zstd
+      # layer, and every layer of a Docker Hardened Image is one. Podman
+      # takes it through skopeo, into containers-storage.
       - name: Load the image under test
         env:
           ENGINE: ${{ matrix.engine }}
         run: |
           image=$(just --evaluate IMAGE)
           case "${ENGINE}" in
-            docker) dest="docker-daemon:${image}" ;;
-            podman) dest="containers-storage:${image}" ;;
+            docker) docker load -i /tmp/image.tar ;;
+            podman)
+              skopeo --version
+              skopeo copy "oci-archive:/tmp/image.tar" "containers-storage:${image}"
+              ;;
             *) echo "unknown engine ${ENGINE}" >&2; exit 1 ;;
           esac
-          skopeo --version
-          skopeo copy "oci-archive:/tmp/image.tar" "${dest}"
           "${ENGINE}" image inspect "${image}" >/dev/null
           "${ENGINE}" --version
 
@@ -405,21 +422,23 @@ jobs:
 
       # Before the pin check, which needs the caller's pinned Go, and only
       # what the scan runs: Go for the pin check and ci's tools, just for
-      # the recipe, and Trivy. An install runs code from outside the
-      # repository, and this job can dismiss code scanning alerts.
+      # the recipe, Trivy, and cosign, which verifies Docker's VEX document
+      # for the Containerfile's final stage's base, when it is a dhi.io
+      # image. An install runs code from outside the repository, and this
+      # job can dismiss code scanning alerts.
       - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: ${{ env.MISE_VERSION }}
-          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy
+          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign
 
       # mise installs a name that mise.toml does not declare, or declares
       # under another name, at its latest version, and succeeds. So that a
-      # scan never runs a Trivy the caller did not pin, each must be the
-      # caller's, at the one version it names.
+      # scan never runs a Trivy or a cosign the caller did not pin, each
+      # must be the caller's, at the one version it names.
       - name: Check the caller's mise.toml pins each tool installed above
         run: |
           current=$(mise ls --current --json)
-          for tool in go aqua:casey/just aqua:aquasecurity/trivy; do
+          for tool in go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign; do
             if ! jq -e --arg tool "${tool}" \
               '.[$tool] // [] | any(.installed and .version == .requested_version)' \
               <<<"${current}" >/dev/null; then
@@ -449,8 +468,9 @@ jobs:
       # finding, blocking or not, lands on the run's summary page. When the
       # registry refuses to show the published image, divbast-scan asks
       # GitHub, through gh and this job's token, whether it is absent,
-      # private, or public and failing. Only gh gets the token: trivy and
-      # skopeo run without it.
+      # private, or public and failing. Only gh gets the token: trivy,
+      # skopeo and cosign run without it, and DHI's VEX document is
+      # fetched anonymously.
       - name: Vulnerability scan
         env:
           ARCHIVE: /tmp/image.tar

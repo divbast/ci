@@ -13,6 +13,7 @@
 package workflows_test
 
 import (
+	"bytes"
 	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
@@ -532,6 +533,123 @@ func logsInToDHI(workflow string) error {
 	return nil
 }
 
+// TestAppCheckLoadsWithDockerLoad checks that app-check.yml's test job
+// loads the image under test into Docker with docker load, from the OCI
+// archive the build made, once a step before it has checked that Docker
+// keeps its images in the containerd image store, and into Podman with
+// skopeo, as before. skopeo's docker-daemon: transport refuses a zstd
+// layer, and every layer of a Docker Hardened Image is one. Both steps run
+// with bash and stand-ins for docker, podman, skopeo and just. Against
+// app-check.yml as it is, then with each broken.
+func TestAppCheckLoadsWithDockerLoad(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := loadsWithDockerLoad(t, check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		store = "      - name: Check Docker keeps its images in the containerd store\n"
+		load  = "      - name: Load the image under test\n"
+	)
+	for name, mutant := range map[string]string{
+		"skopeo into docker-daemon": strings.Replace(check, "docker) docker load -i /tmp/image.tar ;;",
+			`docker) skopeo copy "oci-archive:/tmp/image.tar" "docker-daemon:${image}" ;;`, 1),
+		"no store check":              dropStep(check, store),
+		"the store checked after":     moveStep(check, store, "      - name: Acceptance suite\n"),
+		"the store checked on podman": replaceAfter(check, store, "if: matrix.engine == 'docker'", "if: matrix.engine == 'podman'"),
+		"any store will do":           replaceAfter(check, store, "exit 1", "true"),
+		"no inspect of the name":      replaceAfter(check, load, `"${ENGINE}" image inspect "${image}" >/dev/null`, "true"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if loadsWithDockerLoad(t, mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// loadsWithDockerLoad returns an error unless the test job has one step
+// that runs docker info, on the docker leg alone, before the one step
+// named "Load the image under test"; the first exits 0 when docker info
+// reports the containerd snapshotter and non-zero, saying why, when it
+// reports overlay2; and the second, as the docker leg, runs docker load
+// on /tmp/image.tar and inspects IMAGE, with no skopeo, and as the podman
+// leg copies the archive into containers-storage under IMAGE with skopeo
+// and inspects it there.
+func loadsWithDockerLoad(t *testing.T, workflow string) error {
+	t.Helper()
+	st := steps(jobsOf(linesOf(workflow))["test"])
+	stores := stepsWhere(st, contains("docker info"))
+	loads := stepsWhere(st, func(l line) bool { return strings.TrimSpace(l.text) == "- name: Load the image under test" })
+	switch {
+	case len(stores) != 1:
+		return fmt.Errorf("the test job runs docker info in %d steps, want one", len(stores))
+	case len(loads) != 1:
+		return fmt.Errorf("the test job has %d steps loading the image, want one", len(loads))
+	case stores[0] > loads[0]:
+		return fmt.Errorf("the test job checks Docker's store in step %d, after it loads the image in step %d", stores[0]+1, loads[0]+1)
+	case !slices.ContainsFunc(st[stores[0]], func(l line) bool { return strings.TrimSpace(l.text) == "if: matrix.engine == 'docker'" }):
+		return errors.New("the store check does not run on the docker leg alone")
+	}
+
+	script, err := runScript(st[stores[0]])
+	if err != nil {
+		return err
+	}
+	for _, tt := range []struct {
+		name, status string
+		ok           bool
+	}{
+		{name: "containerd", status: `[["driver-type","io.containerd.snapshotter.v1"]]`, ok: true},
+		{name: "overlay2", status: `[["Backing Filesystem","extfs"],["Supports d_type","true"],["Using metacopy","false"],["Native Overlay Diff","true"],["userxattr","false"]]`},
+	} {
+		dir := withBin(t)
+		writeFile(t, dir, "bin/docker", "#!/usr/bin/env bash\n[ \"$1\" = info ] || exit 3\nprintf '%s\\n' \"${STATUS}\"\n")
+		res := runStep(t, dir, script, "PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"), "STATUS="+tt.status)
+		switch {
+		case (res.Code == 0) != tt.ok:
+			return fmt.Errorf("with Docker on %s, the store check exits %d: %s", tt.name, res.Code, res.Stderr)
+		case !tt.ok && len(bytes.TrimSpace(res.Stderr)) == 0:
+			return fmt.Errorf("with Docker on %s, the store check fails saying nothing", tt.name)
+		}
+	}
+
+	if script, err = runScript(st[loads[0]]); err != nil {
+		return err
+	}
+	const image = "localhost/app:dev"
+	for engine, want := range map[string][]string{
+		"docker": {"docker load -i /tmp/image.tar", "docker image inspect " + image, "docker --version"},
+		"podman": {
+			"skopeo --version", "skopeo copy oci-archive:/tmp/image.tar containers-storage:" + image,
+			"podman image inspect " + image, "podman --version",
+		},
+	} {
+		dir := withBin(t)
+		for _, tool := range []string{"docker", "podman", "skopeo"} {
+			writeFile(t, dir, "bin/"+tool, "#!/usr/bin/env bash\nprintf '%s %s\\n' "+tool+" \"$*\" >> \"${CALLS}\"\n")
+		}
+		writeFile(t, dir, "bin/just", "#!/usr/bin/env bash\n[ \"$*\" = '--evaluate IMAGE' ] || exit 3\necho "+image+"\n")
+		calls := filepath.Join(dir, "calls")
+		res := runStep(t, dir, script, "PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"), "ENGINE="+engine, "CALLS="+calls)
+		if res.Code != 0 {
+			return fmt.Errorf("on the %s leg, the load exits %d: %s", engine, res.Code, res.Stderr)
+		}
+		got, err := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
+		if err != nil {
+			return fmt.Errorf("on the %s leg, the load runs nothing: %w", engine, err)
+		}
+		if g := strings.Split(strings.TrimSuffix(string(got), "\n"), "\n"); !slices.Equal(g, want) {
+			return fmt.Errorf("on the %s leg, the load runs %q, want %q", engine, g, want)
+		}
+	}
+	return nil
+}
+
 // TestRenovateHostRuleForDHI checks that renovate.yml gives Renovate a
 // docker host rule for dhi.io, which answers nothing without a login, when
 // the caller passes a username, and the JSON array [] otherwise, since
@@ -655,6 +773,85 @@ func scanReadsPackages(workflow string) error {
 	}
 	if len(given) != 1 {
 		return fmt.Errorf("job scan gives GH_TOKEN to the steps %q, want the one that runs just scan", given)
+	}
+	return nil
+}
+
+// TestScanPinsWhatItInstalls checks that app-check.yml's scan job
+// installs cosign, which divbast-scan runs to verify Docker's VEX
+// document for a Containerfile's final stage's dhi.io base, and that
+// its check of the caller's mise.toml covers exactly the tools the job
+// installs, core:go under the go mise lists it as: a tool installed and
+// not checked could be one the caller never pinned. Against app-check.yml
+// as it is, then with each broken.
+func TestScanPinsWhatItInstalls(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := scanPinsWhatItInstalls(check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		install = "          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign\n"
+		loop    = "          for tool in go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign; do\n"
+		pins    = "      - name: Check the caller's mise.toml pins each tool installed above\n"
+	)
+	for name, mutant := range map[string]string{
+		"cosign neither installed nor checked": strings.Replace(strings.Replace(check, install, strings.Replace(install, " aqua:sigstore/cosign", "", 1), 1),
+			loop, strings.Replace(loop, " aqua:sigstore/cosign", "", 1), 1),
+		"cosign installed, not checked": strings.Replace(check, loop, strings.Replace(loop, " aqua:sigstore/cosign", "", 1), 1),
+		"cosign checked, not installed": strings.Replace(check, install, strings.Replace(install, " aqua:sigstore/cosign", "", 1), 1),
+		"cosign by another name":        strings.Replace(check, install, strings.Replace(install, "aqua:sigstore/cosign", "cosign", 1), 1),
+		"no check":                      dropStep(check, pins),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if scanPinsWhatItInstalls(mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// scanPinsWhatItInstalls returns an error unless the scan job has one
+// jdx/mise-action step, whose install_args name aqua:sigstore/cosign, and
+// one step that checks the caller's mise.toml pins each tool, whose
+// for tool in … loop names exactly what that step installs, with core:go
+// read as go.
+func scanPinsWhatItInstalls(workflow string) error {
+	st := steps(jobsOf(linesOf(workflow))["scan"])
+	mise := stepsWhere(st, isUses("jdx/mise-action"))
+	if len(mise) != 1 {
+		return fmt.Errorf("the scan job has %d jdx/mise-action steps, want one", len(mise))
+	}
+	installed := strings.Fields(value(st[mise[0]], "install_args"))
+	if !slices.Contains(installed, "aqua:sigstore/cosign") {
+		return fmt.Errorf("the scan job installs %q, without aqua:sigstore/cosign, which divbast-scan runs to verify DHI's VEX document", installed)
+	}
+	checks := stepsWhere(st, contains("name: Check the caller's mise.toml pins each tool installed above"))
+	if len(checks) != 1 {
+		return fmt.Errorf("the scan job checks the caller's pins in %d steps, want one", len(checks))
+	}
+	script, err := runScript(st[checks[0]])
+	if err != nil {
+		return err
+	}
+	var checked []string
+	for l := range strings.Lines(script) {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(l), "for tool in "); ok {
+			list, _, _ := strings.Cut(rest, ";")
+			checked = strings.Fields(list)
+		}
+	}
+	want := make([]string, 0, len(installed))
+	for _, tool := range installed {
+		want = append(want, strings.TrimPrefix(tool, "core:"))
+	}
+	slices.Sort(want)
+	if got := slices.Sorted(slices.Values(checked)); !slices.Equal(got, want) {
+		return fmt.Errorf("the scan job checks the pins of %q, and installs %q", got, want)
 	}
 	return nil
 }
@@ -3062,15 +3259,9 @@ func replaceAfter(s, marker, old, replacement string) string {
 // line at its indent, a step's or a comment's, so the comments above each
 // stay where they were.
 func moveStep(workflow, what, before string) string {
-	i := strings.Index(workflow, what)
-	if i < 0 {
+	i, end, ok := stepSpan(workflow, what)
+	if !ok {
 		return workflow
-	}
-	end := len(workflow)
-	for _, next := range []string{"\n      - ", "\n      #"} {
-		if j := strings.Index(workflow[i+len(what):], next); j >= 0 {
-			end = min(end, i+len(what)+j+1)
-		}
 	}
 	step, rest := workflow[i:end], workflow[:i]+workflow[end:]
 	k := strings.Index(rest, before)
@@ -3078,6 +3269,44 @@ func moveStep(workflow, what, before string) string {
 		return workflow
 	}
 	return rest[:k] + step + rest[k:]
+}
+
+// withBin returns a fresh directory with an empty bin in it, for a step's
+// stand-ins.
+func withBin(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// dropStep returns workflow without the step that starts with the text
+// what, as moveStep reads a step, or workflow as it is when it is missing.
+func dropStep(workflow, what string) string {
+	i, end, ok := stepSpan(workflow, what)
+	if !ok {
+		return workflow
+	}
+	return workflow[:i] + workflow[end:]
+}
+
+// stepSpan returns where the step that starts with the text what starts
+// and ends in workflow: from its first line to the next line at its
+// indent, a step's or a comment's.
+func stepSpan(workflow, what string) (start, end int, ok bool) {
+	start = strings.Index(workflow, what)
+	if start < 0 {
+		return 0, 0, false
+	}
+	end = len(workflow)
+	for _, next := range []string{"\n      - ", "\n      #"} {
+		if j := strings.Index(workflow[start+len(what):], next); j >= 0 {
+			end = min(end, start+len(what)+j+1)
+		}
+	}
+	return start, end, true
 }
 
 // TestRunScript checks that runScript reads a step's own run: key, at the

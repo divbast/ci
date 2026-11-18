@@ -6,14 +6,15 @@
 //
 // Usage:
 //
-//	divbast-scan -layout DIR -report FILE -published IMAGE -baseline FILE -sarif FILE [-vex FILE]
+//	divbast-scan -layout DIR -report FILE -published IMAGE -baseline FILE -sarif FILE
+//	    [-containerfile FILE] [-vex FILE]...
 //
 // A repository that checks divbast/ci out at .ci runs it from its own root
 // as .ci/bin/divbast-scan, once `just ci-tools` has built it:
 //
 //	.ci/bin/divbast-scan -layout /tmp/image.tar.layout -report /tmp/image.tar.report.json \
 //	    -published ghcr.io/divbast/librespeed:latest -baseline /tmp/image.tar.published.json \
-//	    -sarif /tmp/image.tar.sarif
+//	    -sarif /tmp/image.tar.sarif -containerfile Containerfile
 //
 // It scans the OCI layout in DIR with trivy, writing the JSON report to
 // -report and its SARIF, for code scanning, to -sarif. It then scans IMAGE
@@ -21,7 +22,31 @@
 // same vulnerability database, writing that report to -baseline. A finding
 // IMAGE has too, the same vulnerability in the same package at any
 // version, is reported as an advisory. -vex names an OpenVEX document both
-// scans apply.
+// scans apply, the app's own; it may be given more than once.
+//
+// -containerfile names the Containerfile the image was built from. When
+// its final stage builds on a dhi.io image, a Docker Hardened Image (its
+// last FROM's image, a build argument resolved to its default, or the
+// base of the earlier stage that FROM names), Docker publishes an
+// OpenVEX document of the vulnerabilities its Debian builds there are not
+// affected by, which Trivy, reading them as Debian's own, would otherwise
+// report. Before either scan, the command fetches it from the main branch
+// of github.com/docker-hardened-images/advisories, with the Sigstore
+// bundle beside it, as an anonymous client, and has cosign verify it
+// against Docker's key, dhi-2.pub, which the command embeds:
+//
+//	cosign verify-blob --key dhi-2.pub --bundle dhi-<name>.vex.json.sig dhi-<name>.vex.json
+//
+// Each of the document's statements must then name that image, and no
+// other, among its products, as each of Docker's does: Docker signs every
+// image's document with the same key. Both scans then apply the verified
+// document, after any -vex. One that cannot be fetched, is not verified,
+// or is not that image's fails the scan, naming the image. A build
+// stage's document is never fetched: its packages do not ship, and its
+// document answers for its own image alone. A final stage on any other
+// base, or on scratch, fetches nothing. The document and the key go in a
+// temporary directory, in $TMPDIR, removed once the scans are done.
+// Without -containerfile, no document of Docker's is applied.
 //
 // It lists every finding on stdout and, when GitHub Actions sets it,
 // appends them as tables to $GITHUB_STEP_SUMMARY.
@@ -46,7 +71,7 @@
 // packages. A refusal is then an advisory too, with a warning that only
 // CI can tell what it means.
 //
-// Only gh gets the token: trivy and skopeo run with GH_TOKEN and
+// Only gh gets the token: trivy, skopeo and cosign run with GH_TOKEN and
 // GITHUB_TOKEN empty.
 //
 // Exit codes:
@@ -54,12 +79,14 @@
 //	0  nothing IMAGE lacks; or every finding is an advisory, because IMAGE
 //	   is not published yet or is private, or, outside GitHub Actions,
 //	   because the registry refused to show it
-//	1  a finding IMAGE lacks; a scan that failed or saw no packages; a
-//	   report, of the layout or of IMAGE, that recognised no operating
-//	   system or saw no OS package; IMAGE not a ghcr.io image, unreadable,
-//	   or refused though public for any reason but a missing tag; the
-//	   GitHub API not answering, or refusing the token; or the summary not
-//	   written
+//	1  a finding IMAGE lacks; a Containerfile that cannot be read, or
+//	   that names an image unpinned; the final stage's dhi.io base's VEX
+//	   document not fetched, not verified, or not that image's; a scan
+//	   that failed or saw no packages; a report, of the layout or of
+//	   IMAGE, that recognised no operating system or saw no OS package;
+//	   IMAGE not a ghcr.io image, unreadable, or refused though public for
+//	   any reason but a missing tag; the GitHub API not answering, or
+//	   refusing the token; or the summary not written
 //	2  the command line is wrong
 package main
 
@@ -73,27 +100,31 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 
+	"github.com/divbast/ci/internal/dhivex"
 	"github.com/divbast/ci/internal/execx"
 	"github.com/divbast/ci/internal/ghapi"
 	"github.com/divbast/ci/internal/registry"
 	"github.com/divbast/ci/internal/scan"
+	"github.com/divbast/ci/internal/verify"
 )
 
 const name = "divbast-scan"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := run(ctx, os.Args[1:], tokenOnlyForGH{}, os.Getenv, os.Stdout, os.Stderr)
+	code := run(ctx, os.Args[1:], tokenOnlyForGH{}, dhivex.Source{}, os.Getenv, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
 
 // tokenOnlyForGH runs commands on the host, and only gh with the token
-// the environment holds: every other command, trivy and skopeo, gets
-// GH_TOKEN and GITHUB_TOKEN empty. They read registries anonymously, and
-// trivy parses whatever an image holds.
+// the environment holds: every other command, trivy, skopeo and cosign,
+// gets GH_TOKEN and GITHUB_TOKEN empty. They read registries anonymously,
+// and trivy parses whatever an image holds.
 type tokenOnlyForGH struct{}
 
 // Run implements [execx.Runner].
@@ -104,7 +135,9 @@ func (tokenOnlyForGH) Run(ctx context.Context, name string, args ...string) (exe
 	return execx.OS{Env: []string{"GH_TOKEN=", "GITHUB_TOKEN="}}.Run(ctx, name, args...)
 }
 
-func run(ctx context.Context, args []string, r execx.Runner, getenv func(string) string, stdout, stderr io.Writer) int {
+// run is the command. r runs every command it runs, and src is where
+// DHI's VEX documents are fetched from.
+func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, getenv func(string) string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	layout := flags.String("layout", "", "the OCI layout `DIR` of the image to scan")
@@ -112,7 +145,10 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 	published := flags.String("published", "", "the published `IMAGE` to compare it with")
 	baseline := flags.String("baseline", "", "the `FILE` to write the report on the published image to")
 	sarif := flags.String("sarif", "", "the `FILE` to write the SARIF for code scanning to")
-	vex := flags.String("vex", "", "an OpenVEX `FILE` both scans apply, if any")
+	var vex files
+	flags.Var(&vex, "vex", "an OpenVEX `FILE` of the app's own both scans apply; repeat for more")
+	containerfile := flags.String("containerfile", "", "the Containerfile `FILE` the image was built from, "+
+		"whose final stage's base, when a dhi.io image, has its signed VEX document applied by both scans")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -135,7 +171,29 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		}
 	}
 
-	trivy := scan.Trivy{Run: r, VEX: *vex, Log: stderr}
+	docs := slices.Clone(vex)
+	if *containerfile != "" {
+		base, ok, err := finalBase(*containerfile)
+		if err != nil {
+			complain(stderr, "%s: cannot tell which image the final stage builds on, so nothing is scanned: %v", *containerfile, err)
+			return 1
+		}
+		var dhi string
+		done := func() {}
+		if ok {
+			dhi, done, err = dhiVEX(ctx, base, src, r, getenv("TMPDIR"), stdout, stderr)
+		}
+		if err != nil {
+			complain(stderr, "could not apply DHI's signed VEX for the final stage's base, so nothing is scanned: %v", err)
+			return 1
+		}
+		defer done()
+		if dhi != "" {
+			docs = append(docs, dhi)
+		}
+	}
+
+	trivy := scan.Trivy{Run: r, VEX: docs, Log: stderr}
 	if err := trivy.Layout(ctx, *layout, *report); err != nil {
 		complain(stderr, "trivy could not scan %s: %v", *layout, err)
 		return 1
@@ -229,8 +287,8 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		_, err = fmt.Fprintf(stdout, "%s %s, so all %d finding(s) are advisory\n", *published, advisory.reason, len(split.New))
 	case len(split.New) > 0:
 		move := "Move what carries them"
-		if *vex != "" {
-			move += ", or argue reachability in " + *vex
+		if len(vex) > 0 {
+			move += ", or argue reachability in " + strings.Join(vex, " or ")
 		}
 		complain(stderr, "%d finding(s) the published image does not have. %s.", len(split.New), move)
 		return 1
@@ -242,6 +300,68 @@ func run(ctx context.Context, args []string, r execx.Runner, getenv func(string)
 		return 1
 	}
 	return 0
+}
+
+// files is a flag that may be given more than once, each a file. An
+// empty one names none, as an empty -vex always has.
+type files []string
+
+// String implements [flag.Value].
+func (f *files) String() string { return strings.Join(*f, ", ") }
+
+// Set implements [flag.Value].
+func (f *files) Set(path string) error {
+	if path != "" {
+		*f = append(*f, path)
+	}
+	return nil
+}
+
+// finalBase reads the Containerfile at path, and returns the image its
+// final stage builds on, as [verify.Base] does.
+func finalBase(path string) (base verify.Ref, ok bool, err error) {
+	data, err := readFile(path)
+	if err != nil {
+		return verify.Ref{}, false, err
+	}
+	return verify.Base(bytes.NewReader(data))
+}
+
+// dhiVEX, when base is a dhi.io image, fetches its VEX document from src,
+// with dhi-2.pub beside it in a directory it makes in tmp, or the system's
+// temporary directory when tmp is "", and has cosign, through r, verify
+// it. It says on stdout what it applies, and returns the document's path,
+// "" for none, and what removes the directory, which the caller runs once
+// the scans are done; on an error, it leaves nothing behind.
+func dhiVEX(ctx context.Context, base verify.Ref, src dhivex.Source, r execx.Runner, tmp string, stdout, stderr io.Writer) (doc string, done func(), err error) {
+	image, ok, err := dhivex.Name(base)
+	if err != nil || !ok {
+		return "", func() {}, err
+	}
+
+	dir, err := os.MkdirTemp(tmp, name+"-")
+	if err != nil {
+		return "", nil, fmt.Errorf("make a directory for the document: %w", err)
+	}
+	// What a directory left behind holds is public, Docker's document and
+	// key, so it is reported without changing the verdict.
+	done = func() {
+		if rerr := os.RemoveAll(dir); rerr != nil {
+			complain(stderr, "remove %s: %v", dir, rerr)
+		}
+	}
+	key, err := verify.WriteDHIKey(dir)
+	if err == nil {
+		doc, err = dhivex.Document(ctx, src, dhivex.Verifier{Cosign: r, Key: key, Log: stderr}, dir, image)
+	}
+	if err == nil {
+		_, err = fmt.Fprintf(stdout, "applying the VEX document of %s%s, the final stage's base, verified against dhi-2.pub\n", verify.DHI, image)
+	}
+	if err != nil {
+		done()
+		return "", nil, err
+	}
+	return doc, done, nil
 }
 
 // unshipped says why nothing is shipped to compare with, so that every

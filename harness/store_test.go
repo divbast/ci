@@ -323,7 +323,7 @@ func TestRemovalHasItsTimeOnceItCanRun(t *testing.T) {
 		// with no deadline
 		var mu sync.Mutex
 		var removals []time.Duration
-		e := newEngine("podman", contextRun(func(ctx context.Context, argv []string) execx.Result {
+		e := newEngine("podman", stdinOnly{contextRun(func(ctx context.Context, argv []string) execx.Result {
 			if slices.Equal(argv[1:4], []string{"image", "rm", "-f"}) {
 				left := time.Duration(0)
 				if deadline, ok := ctx.Deadline(); ok {
@@ -334,7 +334,7 @@ func TestRemovalHasItsTimeOnceItCanRun(t *testing.T) {
 				mu.Unlock()
 			}
 			return execx.Result{}
-		}))
+		})})
 		e.store = newStoreLock(lock)
 		scope := &cleanups{TB: t}
 		if _, err := e.Build(t.Context(), scope, "testdata/mutant/Containerfile", nil); err != nil {

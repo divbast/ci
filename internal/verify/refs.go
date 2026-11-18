@@ -91,6 +91,33 @@ var (
 // The error wraps [ErrNoFrom], [ErrUnpinned], [ErrNotLiteral] or
 // [ErrStray], and names the line involved.
 func Refs(containerfile io.Reader) ([]Ref, error) {
+	r, err := readAll(containerfile)
+	if err != nil {
+		return nil, err
+	}
+	return r.refs, nil
+}
+
+// Base returns the image the Containerfile read from containerfile builds
+// its final stage on, the stage whose filesystem is the image built: its
+// last FROM's image, a build argument resolved to its default, or, where
+// that FROM names an earlier stage, that stage's base, followed back to
+// an image. ok is false when that is scratch. No other stage's base
+// counts: what a build stage holds ships only as far as the final stage
+// copies it. It reads, and refuses, the Containerfile as [Refs] does,
+// with the same errors.
+func Base(containerfile io.Reader) (base Ref, ok bool, err error) {
+	r, err := readAll(containerfile)
+	if err != nil {
+		return Ref{}, false, err
+	}
+	final := r.bases[len(r.bases)-1]
+	return final.ref, final.ok, nil
+}
+
+// readAll reads every instruction of the Containerfile read from
+// containerfile, and refuses it as [Refs] says.
+func readAll(containerfile io.Reader) (*reader, error) {
 	r := &reader{args: map[string]arg{}}
 	var lines []instruction
 	if err := instructions(containerfile, r.directive, func(line int, text string) error {
@@ -111,13 +138,20 @@ func Refs(containerfile io.Reader) ([]Ref, error) {
 	if err := r.stray(lines); err != nil {
 		return nil, err
 	}
-	return r.refs, nil
+	return r, nil
 }
 
 // instruction is one instruction and the line it starts on.
 type instruction struct {
 	line int
 	text string
+}
+
+// base is the image a stage builds on, followed back through any earlier
+// stage its FROM names: ok is false for scratch.
+type base struct {
+	ref Ref
+	ok  bool
 }
 
 // arg is a build argument declared before the first FROM: its default,
@@ -133,6 +167,7 @@ type arg struct {
 type reader struct {
 	args   map[string]arg
 	stages []string // each stage's name, lower-cased, empty for none
+	bases  []base   // each stage's base, in the same order
 	refs   []Ref
 	// explained counts, by line, the mentions of a Table image in the
 	// places one may stand.
@@ -223,9 +258,14 @@ func (r *reader) from(line int, words []string) error {
 	if len(words) >= 3 && strings.EqualFold(words[1], "AS") {
 		name = strings.ToLower(words[2])
 	}
-	isStage := slices.Contains(r.stages, strings.ToLower(image))
+	earlier := slices.Index(r.stages, strings.ToLower(image))
 	r.stages = append(r.stages, name)
-	if strings.EqualFold(image, "scratch") || isStage {
+	switch {
+	case strings.EqualFold(image, "scratch"):
+		r.bases = append(r.bases, base{})
+		return nil
+	case earlier >= 0:
+		r.bases = append(r.bases, r.bases[earlier])
 		return nil
 	}
 	ref, err := parseRef(line, image)
@@ -233,6 +273,7 @@ func (r *reader) from(line int, words []string) error {
 		return err
 	}
 	r.refs = append(r.refs, ref)
+	r.bases = append(r.bases, base{ref: ref, ok: true})
 	return nil
 }
 

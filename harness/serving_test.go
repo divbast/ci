@@ -332,7 +332,7 @@ func probeFor(app []byte) *ProbeSpec {
 // probedEngine is a docker engine over run whose probe volume for img is
 // made already.
 func probedEngine(run execx.StdinRunner) Engine {
-	e := newEngine("docker", run)
+	e := newEngine("docker", stdinOnly{run})
 	probed(e, "", "probe-vol")
 	return e
 }

@@ -221,7 +221,7 @@ func TestProbeVolumeRetriesAfterCancel(t *testing.T) {
 	t.Parallel()
 
 	runner := &cancelledOnce{volumeMaker: newVolumeMaker(t, execx.Result{Stdout: []byte("present\n")})}
-	e := newEngine("docker", runner)
+	e := newEngine("docker", stdinOnly{runner})
 	if _, err := e.probeVolume(t.Context(), t, "arm64", ""); !errors.Is(err, context.Canceled) {
 		t.Fatalf("probeVolume() with its context gone = %v, want context.Canceled", err)
 	}

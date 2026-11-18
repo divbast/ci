@@ -186,7 +186,7 @@ just IMAGE=ghcr.io/divbast/librespeed:latest acceptance
 | `acceptance` | `go test -json ./test/acceptance/...` against `IMAGE` under `ENGINE`, through `divbast-testcount` |
 | `test` | `build`, then `acceptance` |
 | `archive` | Writes `IMAGE` to `ARCHIVE` as an OCI archive |
-| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED`, with `-vex openvex.json` when the app has one ([VEX](#vex)) |
+| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED`, with the Containerfile, for Docker's VEX document of the final stage's base, and `-vex openvex.json` when the app has one ([VEX](#vex)) |
 | `app-lint` | hadolint, and BuildKit's own `docker build --check`, over the Containerfile |
 
 `go test` exits 0 when every test skipped, and prints only `ok`, so an
@@ -370,6 +370,16 @@ The probe volume carries the harness's label and outlives the test that
 made it, since every later test of the process mounts it. A suite's
 `TestMain` removes it with `Engine.RemoveProbeVolumes` once `m.Run` has
 returned, or else the next run's `Engine.Sweep` does.
+
+The contract's `no-file-capability-xattr` check, `Engine.FileCapabilities`,
+reads each layer of the image as the engine saves it: a gzip layer in Go,
+and a zstd layer, as every layer of a Docker Hardened Image is, through
+the `zstd` command, since Go's standard library has no zstd reader yet.
+So a host that runs such an image's suite under Docker needs `zstd` on its
+`PATH`, and without it the check fails naming the layer and the command.
+GitHub's Ubuntu runners carry it; a Mac gets it with `brew install zstd`.
+Podman saves every layer uncompressed, and an image with no zstd layer
+never runs it.
 
 The harness labels every container, image, network and volume it makes
 `divbast.harness=<module>`, the path of the main module of the test
@@ -757,8 +767,13 @@ workflow runs on:
   `docker/setup-buildx-action` has just made for the job, so every stage
   builds from scratch. Each image is uploaded as the artifact
   `image-<arch>`.
-- `test` loads each image into Docker and into rootless Podman and runs
-  `just acceptance` against it, on both architectures.
+- `test` loads each image into Docker, with `docker load` on Docker's
+  containerd image store, which the job checks Docker is on, and into
+  rootless Podman, with skopeo, and runs `just acceptance` against it, on
+  both architectures. Each layer stays as the build wrote it: skopeo's
+  `docker-daemon:` transport refuses a zstd layer, and every layer of a
+  Docker Hardened Image is one, which the harness reads through the
+  `zstd` command ([Go](#go)).
 - `scan` runs `just scan` over each image, and on main uploads its
   findings to code scanning: [Scan](#scan), below.
 
@@ -783,13 +798,14 @@ The calling job grants `contents: read`, `attestations: read`,
 caller's whole `mise.toml`, which declares cosign as
 `"aqua:sigstore/cosign"` for `divbast-verify-images`.
 
-`scan`, which can change code scanning alerts, installs only Go, just and
-Trivy from the caller's `mise.toml`, and turns mise's auto-install off. The
-caller declares each at one version: Go as `"core:go"` (mise reads the
-short `go` the same way), and just and Trivy as exactly
-`"aqua:casey/just"` and `"aqua:aquasecurity/trivy"`. mise would install a
-name that `mise.toml` does not declare at its latest version, so `scan`
-fails unless all three are there.
+`scan`, which can change code scanning alerts, installs only Go, just,
+Trivy and cosign from the caller's `mise.toml`, and turns mise's
+auto-install off. The caller declares each at one version: Go as
+`"core:go"` (mise reads the short `go` the same way), and just, Trivy and
+cosign as exactly `"aqua:casey/just"`, `"aqua:aquasecurity/trivy"` and
+`"aqua:sigstore/cosign"`, the cosign `build` already needs. mise would
+install a name that `mise.toml` does not declare at its latest version,
+so `scan` fails unless all four are there.
 
 #### Scan
 
@@ -837,6 +853,41 @@ of Trivy's scans when it is there, and passes no `-vex` when it is not.
 Each statement names one advisory and the product, with its version, that
 it was argued against, so that a bump that moves the product brings the
 finding back, to be argued again.
+
+Trivy reads a Docker Hardened Image's Debian packages, Docker's own
+builds versioned `…+dhiN`, as Debian's, and reports every vulnerability
+Debian has not fixed in them. Docker states which of those its builds
+are not affected by in a signed OpenVEX document per image, keyed by
+package URL, so the statements hold in an app built on the image.
+`scan` gives `divbast-scan` the Containerfile. When the final stage's
+base is a `dhi.io/<name>` image (the last `FROM`'s image, a build
+argument resolved to its default, or the base of the earlier stage that
+`FROM` names), the tool fetches
+`vex/<name>/dhi-<name>.vex.json` and its Sigstore bundle, `.sig`, from
+the main branch of
+[docker-hardened-images/advisories](https://github.com/docker-hardened-images/advisories),
+anonymously, and verifies the one with the other against the
+`dhi-2.pub` it embeds ([Verified inputs](#verified-inputs)):
+
+```sh
+cosign verify-blob --key dhi-2.pub --bundle dhi-<name>.vex.json.sig dhi-<name>.vex.json
+```
+
+Docker signs every image's document with the same key, so each of the
+verified document's statements must also name `dhi.io/<name>`, and no
+other image, among its products, as every statement of Docker's does.
+Both of Trivy's scans then apply the verified document, after the app's
+own. A document that cannot be fetched, that cosign does not verify, or
+that is another image's, fails the scan, naming the image. A build stage's document is never
+applied, though its image is `dhi.io`'s too: a build stage's packages
+never ship, a document is Docker's assessment of its own image, and some
+of its statements name a package with no version, so applied to the
+runtime it would answer for packages Docker never assessed there. A
+final stage on any other base, or on `scratch`, fetches nothing. The
+document comes from main rather than a pinned commit, since the
+signature is the trust, and a pin would need a person or a Renovate rule
+to move it. A local `just scan` does the same, with cosign from
+`mise.toml`.
 
 ### `app-publish.yml`
 
@@ -1165,7 +1216,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched, not verified, or not that image's; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

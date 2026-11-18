@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // ErrNoDHILogin means a dhi.io image is named, and no login for dhi.io is
@@ -35,4 +36,25 @@ func WriteDockerConfig(dir, username, token string) (err error) {
 	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + token))
 	_, err = fmt.Fprintf(f, `{"auths":{"dhi.io":{"auth":%q}}}`, auth)
 	return err
+}
+
+// WriteDHIKey writes [DHIPublicKey] to dir/dhi-2.pub, readable by its
+// owner alone, for cosign to verify against, and returns its path. It
+// refuses a file already there, with an error wrapping [io/fs.ErrExist],
+// rather than write over or trust what someone else put in dir.
+func WriteDHIKey(dir string) (path string, err error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", err
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	f, err := root.OpenFile("dhi-2.pub", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	if _, err = f.Write(DHIPublicKey); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "dhi-2.pub"), nil
 }

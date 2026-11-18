@@ -57,13 +57,16 @@ archive:
 # An app that argues a finding unreachable does so in an OpenVEX document
 # at its root, openvex.json, which scan passes to both of Trivy's scans
 # when it is there. trivy refuses a --vex file that is missing, so with no
-# such file there is no -vex at all.
+# such file there is no -vex at all. scan also passes the Containerfile,
+# so that both scans apply Docker's signed VEX document for the final
+# stage's base, when it is a dhi.io image, fetched and then verified with
+# cosign from the app's mise.toml; on any other base, nothing is fetched.
 
 # Fail on a HIGH or CRITICAL vulnerability the published image does not have
 scan: ci-tools
     rm -rf {{ LAYOUT }} && mkdir {{ LAYOUT }} && tar xf {{ ARCHIVE }} -C {{ LAYOUT }}
     {{ ci_dir }}/bin/divbast-scan -layout {{ LAYOUT }} -report {{ REPORT }} -published {{ PUBLISHED }} \
-        -baseline {{ BASELINE }} -sarif {{ SARIF }}{{ if path_exists(justfile_directory() / "openvex.json") == "true" { " -vex openvex.json" } else { "" } }}
+        -baseline {{ BASELINE }} -sarif {{ SARIF }} -containerfile Containerfile{{ if path_exists(justfile_directory() / "openvex.json") == "true" { " -vex openvex.json" } else { "" } }}
 
 # hadolint and BuildKit's own checks over the Containerfile
 app-lint:
