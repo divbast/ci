@@ -767,8 +767,13 @@ workflow runs on:
   `docker/setup-buildx-action` has just made for the job, so every stage
   builds from scratch. Each image is uploaded as the artifact
   `image-<arch>`.
-- `test` loads each image into Docker and into rootless Podman and runs
-  `just acceptance` against it, on both architectures.
+- `test` loads each image into Docker, with `docker load` on Docker's
+  containerd image store, which the job checks Docker is on, and into
+  rootless Podman, with skopeo, and runs `just acceptance` against it, on
+  both architectures. Each layer stays as the build wrote it: skopeo's
+  `docker-daemon:` transport refuses a zstd layer, and every layer of a
+  Docker Hardened Image is one, which the harness reads through the
+  `zstd` command ([Go](#go)).
 - `scan` runs `just scan` over each image, and on main uploads its
   findings to code scanning: [Scan](#scan), below.
 
