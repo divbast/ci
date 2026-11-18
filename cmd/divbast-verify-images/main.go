@@ -31,6 +31,9 @@
 //	  cosign verify gcr.io/distroless/<image>@sha256:<digest> \
 //	      --certificate-identity keyless@distroless.iam.gserviceaccount.com \
 //	      --certificate-oidc-issuer https://accounts.google.com
+//	dhi.io/*, by Docker's key, dhi-2.pub, which the command embeds:
+//	  cosign verify --key dhi-2.pub --experimental-oci11 \
+//	      dhi.io/<image>:<tag>@sha256:<digest>
 //
 // A divbast image the table does not name is refused, and an image in it
 // may stand only in a FROM, a COPY --from= or a build argument a FROM
@@ -43,6 +46,12 @@
 // registry login Docker's configuration holds, and a stale one is refused
 // even for a public image.
 //
+// dhi.io answers nothing without a login, so a Containerfile that names a
+// dhi.io image needs DHI_USERNAME and DHI_TOKEN, a Docker ID and its
+// personal access token. They are written, for dhi.io alone, to that
+// directory's config.json, beside dhi-2.pub, and only when a dhi.io image
+// is named. The key is the one committed to the command, never fetched.
+//
 // It prints "verified: <image>" for each image in the table, and
 // "pinned: <image>" for each other.
 //
@@ -51,8 +60,8 @@
 //	0  every image is pinned, and every one in the table verified
 //	1  one is not, or that could not be told: the Containerfile cannot be
 //	   read, names an image unpinned or where it may not, gh is too old,
-//	   or a verification failed; stderr says which, with the tool's own
-//	   report
+//	   a dhi.io image is named with no DHI_USERNAME and DHI_TOKEN, or a
+//	   verification failed; stderr says which, with the tool's own report
 //	2  the command line is wrong
 package main
 
@@ -77,15 +86,15 @@ const name = "divbast-verify-images"
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	tools := func(env []string) execx.Runner { return execx.OS{Env: env} }
-	code := run(ctx, os.Args[1:], tools, os.Stdout, os.Stderr)
+	code := run(ctx, os.Args[1:], os.Getenv, tools, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
 
-// run is the command. tools returns the runner for gh and cosign, given
-// the environment entries every one of their commands must get on top of
-// the caller's.
-func run(ctx context.Context, args []string, tools func(env []string) execx.Runner, stdout, stderr io.Writer) int {
+// run is the command. getenv reads its environment. tools returns the
+// runner for gh and cosign, given the environment entries every one of
+// their commands must get on top of the caller's.
+func run(ctx context.Context, args []string, getenv func(string) string, tools func(env []string) execx.Runner, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	containerfile := flags.String("containerfile", "Containerfile", "the Containerfile `FILE` to check")
@@ -120,8 +129,20 @@ func run(ctx context.Context, args []string, tools func(env []string) execx.Runn
 		}
 	}()
 
+	var dhiKey string
+	if verify.NeedsDHI(refs) {
+		if err = verify.WriteDockerConfig(dockerConfig, getenv("DHI_USERNAME"), getenv("DHI_TOKEN")); err != nil {
+			complain(stderr, "%s: %v", *containerfile, err)
+			return 1
+		}
+		if dhiKey, err = writeKey(dockerConfig); err != nil {
+			complain(stderr, "write dhi-2.pub: %v", err)
+			return 1
+		}
+	}
+
 	r := tools([]string{"DOCKER_CONFIG=" + dockerConfig})
-	if err = verify.Verify(ctx, r, r, refs, stderr); err != nil {
+	if err = verify.Verify(ctx, verify.Tools{GH: r, Cosign: r, DHIKey: dhiKey}, refs, stderr); err != nil {
 		complain(stderr, "%s: %v", *containerfile, err)
 		return 1
 	}
@@ -141,6 +162,24 @@ func run(ctx context.Context, args []string, tools func(env []string) execx.Runn
 		}
 	}
 	return 0
+}
+
+// writeKey writes Docker's public key into dir, and returns its path.
+func writeKey(dir string) (path string, err error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", err
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	f, err := root.OpenFile("dhi-2.pub", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	if _, err = f.Write(verify.DHIPublicKey); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "dhi-2.pub"), nil
 }
 
 // read reads the Containerfile at path, through an [os.Root] on its

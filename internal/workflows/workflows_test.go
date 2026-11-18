@@ -428,6 +428,179 @@ func verifiesImagesFirst(workflow string) error {
 	return nil
 }
 
+// TestAppCheckLogsInToDHI checks that app-check.yml's lint and build jobs
+// log in to dhi.io, which answers nothing without a login, before the
+// step that first reads a base image from it, when the caller passes a
+// username; that the verify step has both credentials in its env; and
+// that the input and the secret are optional, so no caller breaks.
+// Against app-check.yml as it is, then with each of those broken.
+func TestAppCheckLogsInToDHI(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := logsInToDHI(check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		login  = "      - name: Log in to dhi.io\n"
+		setup  = "      - run: just setup\n"
+		verify = "      - name: Verify the images the Containerfile builds from\n"
+	)
+	// onBuild applies f to the workflow from the build job on, so that it
+	// reaches the build job's login rather than the lint job's.
+	onBuild := func(f func(string) string) string {
+		head, tail, _ := strings.Cut(check, "\n  build:\n")
+		return head + "\n  build:\n" + f(tail)
+	}
+	for name, mutant := range map[string]string{
+		"lint logs in after just setup": moveStep(check, setup, login),
+		"build logs in after verify":    onBuild(func(tail string) string { return moveStep(tail, verify, login) }),
+		"no if":                         strings.Replace(check, "        if: inputs.dhi-username != ''\n", "", 1),
+		"another registry":              strings.Replace(check, "registry: dhi.io", "registry: docker.io", 1),
+		"the secret is required":        replaceAfter(check, "      DHI_TOKEN:\n", "required: false", "required: true"),
+		"no env on verify":              strings.Replace(check, "          DHI_USERNAME: ${{ inputs.dhi-username }}\n", "", 1),
+		"the input has a default":       replaceAfter(check, "      dhi-username:\n", "default: ''", "default: someone"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if logsInToDHI(mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// logsInToDHI returns an error unless the dhi-username input defaults to
+// the empty string and the DHI_TOKEN secret is not required, and each of the lint and
+// build jobs has exactly one docker/login-action step, for dhi.io with the
+// input and the secret, that runs only when the input is set: in lint
+// before the step that runs just setup, and in build before the one that
+// runs .ci/bin/divbast-verify-images, whose env has both credentials.
+func logsInToDHI(workflow string) error {
+	lines := linesOf(workflow)
+	if !slices.Contains(declaration(lines, "dhi-username"), "default: ''") {
+		return errors.New("the dhi-username input does not default to ''")
+	}
+	if !slices.Contains(declaration(lines, "DHI_TOKEN"), "required: false") {
+		return errors.New("the DHI_TOKEN secret is not declared optional")
+	}
+	runs := func(script string) func(line) bool {
+		return func(l line) bool { return strings.TrimPrefix(strings.TrimSpace(l.text), "- ") == "run: "+script }
+	}
+	jobs := jobsOf(lines)
+	for job, first := range map[string]func(line) bool{
+		"lint":  runs("just setup"),
+		"build": runs(".ci/bin/divbast-verify-images"),
+	} {
+		st := steps(jobs[job])
+		logins := stepsWhere(st, isUses("docker/login-action"))
+		firsts := stepsWhere(st, first)
+		if len(logins) != 1 {
+			return fmt.Errorf("the %s job has %d docker/login-action steps, want one", job, len(logins))
+		}
+		if len(firsts) != 1 {
+			return fmt.Errorf("the %s job has %d steps running the one the login must precede, want one", job, len(firsts))
+		}
+		login := st[logins[0]]
+		switch {
+		case withInput(login, "registry") != "dhi.io":
+			return fmt.Errorf("the %s job's login is for %q, not dhi.io", job, withInput(login, "registry"))
+		case !slices.ContainsFunc(login, func(l line) bool { return strings.TrimSpace(l.text) == "if: inputs.dhi-username != ''" }):
+			return fmt.Errorf("the %s job's login does not run exactly when the username is set", job)
+		case withInput(login, "username") != "${{ inputs.dhi-username }}":
+			return fmt.Errorf("the %s job's login has username %q", job, withInput(login, "username"))
+		case withInput(login, "password") != "${{ secrets.DHI_TOKEN }}":
+			return fmt.Errorf("the %s job's login has password %q", job, withInput(login, "password"))
+		case logins[0] > firsts[0]:
+			return fmt.Errorf("the %s job logs in at step %d, after the step %d that reads the images", job, logins[0]+1, firsts[0]+1)
+		}
+		if job != "build" {
+			continue
+		}
+		env, err := stepMapping(st[firsts[0]], "env")
+		if err != nil {
+			return err
+		}
+		for _, want := range []string{"DHI_USERNAME: ${{ inputs.dhi-username }}", "DHI_TOKEN: ${{ secrets.DHI_TOKEN }}"} {
+			if !slices.Contains(env, want) {
+				return fmt.Errorf("the verify step's env lacks %s", want)
+			}
+		}
+	}
+	return nil
+}
+
+// TestRenovateHostRuleForDHI checks that renovate.yml gives Renovate a
+// docker host rule for dhi.io, which answers nothing without a login, when
+// the caller passes a username, and the JSON array [] otherwise, since
+// Renovate parses RENOVATE_HOST_RULES as JSON and an empty string would
+// fail the parse; and that the input and the secret are optional, so no
+// caller breaks. Against renovate.yml as it is, then with each of those
+// broken.
+func TestRenovateHostRuleForDHI(t *testing.T) {
+	t.Parallel()
+	renovate := readWorkflows(t)["renovate.yml"]
+	if err := hostRuleForDHI(renovate); err != nil {
+		t.Errorf("renovate.yml: %v", err)
+	}
+	for name, mutant := range map[string]string{
+		"an empty string without credentials": strings.Replace(renovate, "|| '[]' }}", "|| '' }}", 1),
+		"another host":                        strings.Replace(renovate, `"matchHost":"dhi.io"`, `"matchHost":"docker.io"`, 1),
+		"the secret is not JSON":              strings.Replace(renovate, "toJSON(secrets.DHI_TOKEN)", "secrets.DHI_TOKEN", 1),
+		"the secret is required":              replaceAfter(renovate, "      DHI_TOKEN:\n", "required: false", "required: true"),
+		"the input has a default":             replaceAfter(renovate, "      dhi-username:\n", "default: ''", "default: someone"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == renovate {
+				t.Fatal("the change changed nothing")
+			}
+			if hostRuleForDHI(mutant) == nil {
+				t.Error("passes renovate.yml with " + name)
+			}
+		})
+	}
+}
+
+// hostRuleForDHI returns an error unless the dhi-username input defaults
+// to the empty string, the DHI_TOKEN secret is not required, and the
+// renovatebot/github-action step's env sets RENOVATE_HOST_RULES to
+// hostRulesExpr.
+func hostRuleForDHI(workflow string) error {
+	lines := linesOf(workflow)
+	if !slices.Contains(declaration(lines, "dhi-username"), "default: ''") {
+		return errors.New("the dhi-username input does not default to ''")
+	}
+	if !slices.Contains(declaration(lines, "DHI_TOKEN"), "required: false") {
+		return errors.New("the DHI_TOKEN secret is not declared optional")
+	}
+	var found []int
+	for _, job := range jobsOf(lines) {
+		st := steps(job)
+		for _, i := range stepsWhere(st, isUses("renovatebot/github-action")) {
+			env, err := stepMapping(st[i], "env")
+			if err != nil {
+				return err
+			}
+			if !slices.Contains(env, "RENOVATE_HOST_RULES: "+hostRulesExpr) {
+				return errors.New("the Renovate step's env does not set RENOVATE_HOST_RULES to the dhi.io host rule, or to [] without credentials")
+			}
+			found = append(found, i)
+		}
+	}
+	if len(found) != 1 {
+		return fmt.Errorf("%d renovatebot/github-action steps, want one", len(found))
+	}
+	return nil
+}
+
+// hostRulesExpr is RENOVATE_HOST_RULES: the dhi.io docker host rule with
+// the username and the token as JSON strings when the caller passes a
+// username, and [] otherwise.
+const hostRulesExpr = `${{ inputs.dhi-username != '' && format('[{{"matchHost":"dhi.io","hostType":"docker","username":{0},"password":{1}}}]', toJSON(inputs.dhi-username), toJSON(secrets.DHI_TOKEN)) || '[]' }}`
+
 // scanReadsPackages returns an error unless the workflow's scan job grants
 // packages: read, saying why, and no other job grants packages at all;
 // and unless, in the scan job, GH_TOKEN is ${{ github.token }} in the env

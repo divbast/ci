@@ -5,14 +5,18 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/verify"
 )
 
 const (
@@ -21,6 +25,7 @@ const (
 	pinned = "ghcr.io/divbast/frankenphp:librespeed@" + digest
 	static = "gcr.io/distroless/static-debian13:nonroot@" + other
 	golang = "golang:1.27.4-trixie@" + other
+	dhiRef = "dhi.io/aspnetcore:10.0.15-debian13@" + digest
 	denied = "\nError: the provided token was denied access to the requested resource\n"
 )
 
@@ -35,6 +40,11 @@ var (
 		"--signer-workflow", "divbast/frankenphp/.github/workflows/build.yml@refs/heads/main",
 		"--source-ref", "refs/heads/main",
 	}
+	// dhiArgv names the key in the temporary directory as {DIR}/dhi-2.pub:
+	// the directory is only known once run has made it.
+	dhiArgv = []string{
+		"cosign", "verify", "--key", "{DIR}/dhi-2.pub", "--experimental-oci11", dhiRef,
+	}
 	cosignArgv = []string{
 		"cosign", "verify", "gcr.io/distroless/static-debian13@" + other,
 		"--certificate-identity", "keyless@distroless.iam.gserviceaccount.com",
@@ -43,28 +53,60 @@ var (
 )
 
 // tools hands run a Fake that replays calls, for gh and cosign alike, and
-// records what run asked it for.
+// records what run asked it for. {DIR} in a call's argv stands for the
+// directory DOCKER_CONFIG names.
 type tools struct {
 	t     *testing.T
 	calls []execx.Call
 
 	asked bool
 	env   []string
-	// dir is the directory DOCKER_CONFIG named, and empty whether it held
-	// nothing at the moment run asked for the tools.
+	// dir is the directory DOCKER_CONFIG named, and files what it held, by
+	// name, when the tools first ran, or when run asked for them if they
+	// never did.
 	dir   string
-	empty bool
+	files map[string][]byte
 }
 
 func (g *tools) runner(env []string) execx.Runner {
 	g.asked, g.env = true, env
 	if len(env) == 1 {
 		if dir, ok := strings.CutPrefix(env[0], "DOCKER_CONFIG="); ok {
-			entries, err := os.ReadDir(dir)
-			g.dir, g.empty = dir, err == nil && len(entries) == 0
+			g.dir = dir
 		}
 	}
-	return execx.NewFake(g.t, g.calls...)
+	g.snapshot()
+	calls := slices.Clone(g.calls)
+	for i := range calls {
+		calls[i].Argv = slices.Clone(calls[i].Argv)
+		for j, arg := range calls[i].Argv {
+			calls[i].Argv[j] = strings.ReplaceAll(arg, "{DIR}", g.dir)
+		}
+	}
+	return &snapshotter{g: g, Runner: execx.NewFake(g.t, calls...)}
+}
+
+// snapshot records what DOCKER_CONFIG's directory holds now.
+func (g *tools) snapshot() {
+	g.files = map[string][]byte{}
+	entries, err := os.ReadDir(g.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		g.files[e.Name()], _ = os.ReadFile(filepath.Join(g.dir, e.Name()))
+	}
+}
+
+// snapshotter notes what the directory holds as each command runs.
+type snapshotter struct {
+	g *tools
+	execx.Runner
+}
+
+func (s *snapshotter) Run(ctx context.Context, name string, args ...string) (execx.Result, error) {
+	s.g.snapshot()
+	return s.Runner.Run(ctx, name, args...)
 }
 
 func TestRun(t *testing.T) {
@@ -82,6 +124,11 @@ func TestRun(t *testing.T) {
 		wantStderr []string
 		// wantTools is whether run must ask for gh and cosign at all.
 		wantTools bool
+		// env is the environment run sees.
+		env map[string]string
+		// wantDHI is whether the directory must hold dhi.io's login and
+		// key while the tools run, and nothing else.
+		wantDHI bool
 	}{
 		{
 			name:          "frankenphp-attested",
@@ -129,6 +176,62 @@ func TestRun(t *testing.T) {
 			wantCode:   1,
 			wantStderr: []string{"older than 2.102.0", "2.101.0"},
 			wantTools:  true,
+		},
+		{
+			name:          "dhi-signed",
+			containerfile: "FROM " + dhiRef + "\n",
+			calls:         []execx.Call{{Argv: dhiArgv}},
+			env:           map[string]string{"DHI_USERNAME": "ada", "DHI_TOKEN": "s3cret"},
+			wantStdout:    "verified: " + dhiRef + "\n",
+			wantTools:     true,
+			wantDHI:       true,
+		},
+		{
+			name:          "dhi-not-signed",
+			containerfile: "FROM " + dhiRef + "\n",
+			calls:         []execx.Call{{Argv: dhiArgv, Result: execx.Result{Code: 10, Stderr: []byte("Error: no signatures found\n")}}},
+			env:           map[string]string{"DHI_USERNAME": "ada", "DHI_TOKEN": "s3cret"},
+			wantCode:      1,
+			wantStderr:    []string{"no signatures found", "Docker signed it with dhi-2.pub", dhiRef},
+			wantTools:     true,
+			wantDHI:       true,
+		},
+		{
+			name:          "dhi-and-distroless",
+			containerfile: "FROM " + dhiRef + " AS build\nFROM " + static + "\n",
+			calls:         []execx.Call{{Argv: dhiArgv}, {Argv: cosignArgv}},
+			env:           map[string]string{"DHI_USERNAME": "ada", "DHI_TOKEN": "s3cret"},
+			wantStdout:    "verified: " + dhiRef + "\nverified: " + static + "\n",
+			wantTools:     true,
+			wantDHI:       true,
+		},
+		{
+			name:          "dhi-without-a-login",
+			containerfile: "FROM " + dhiRef + "\n",
+			wantCode:      1,
+			wantStderr:    []string{verify.ErrNoDHILogin.Error()},
+		},
+		{
+			name:          "dhi-without-a-token",
+			containerfile: "FROM " + dhiRef + "\n",
+			env:           map[string]string{"DHI_USERNAME": "ada"},
+			wantCode:      1,
+			wantStderr:    []string{verify.ErrNoDHILogin.Error()},
+		},
+		{
+			name:          "dhi-without-a-username",
+			containerfile: "FROM " + dhiRef + "\n",
+			env:           map[string]string{"DHI_TOKEN": "s3cret"},
+			wantCode:      1,
+			wantStderr:    []string{verify.ErrNoDHILogin.Error()},
+		},
+		{
+			// No dhi.io image, no login needed, and none written
+			name:          "login-set-but-not-needed",
+			containerfile: "FROM " + golang + "\n",
+			env:           map[string]string{"DHI_USERNAME": "ada", "DHI_TOKEN": "s3cret"},
+			wantStdout:    "pinned: " + golang + "\n",
+			wantTools:     true,
 		},
 		{
 			name:          "unpinned",
@@ -185,7 +288,8 @@ func TestRun(t *testing.T) {
 
 			g := &tools{t: t, calls: tt.calls}
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), args, g.runner, &stdout, &stderr)
+			getenv := func(key string) string { return tt.env[key] }
+			code := run(t.Context(), args, getenv, g.runner, &stdout, &stderr)
 
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d; stderr:\n%s", args, code, tt.wantCode, stderr.String())
@@ -211,8 +315,24 @@ func TestRun(t *testing.T) {
 			if g.dir == "" || len(g.env) != 1 {
 				t.Fatalf("run(%q) gave the tools the environment %q, want only DOCKER_CONFIG", args, g.env)
 			}
-			if !g.empty {
-				t.Errorf("run(%q): DOCKER_CONFIG=%s was not an empty directory when the tools ran", args, g.dir)
+			if !tt.wantDHI {
+				if len(g.files) != 0 {
+					t.Errorf("run(%q): DOCKER_CONFIG=%s was not an empty directory when the tools ran", args, g.dir)
+				}
+			} else {
+				auth := base64.StdEncoding.EncodeToString([]byte("ada:s3cret"))
+				if got, want := string(g.files["config.json"]), `{"auths":{"dhi.io":{"auth":"`+auth+`"}}}`; got != want {
+					t.Errorf("run(%q): config.json = %q when the tools ran, want %q", args, got, want)
+				}
+				if !bytes.Equal(g.files["dhi-2.pub"], verify.DHIPublicKey) {
+					t.Errorf("run(%q): dhi-2.pub = %q when the tools ran, want DHIPublicKey", args, g.files["dhi-2.pub"])
+				}
+				if len(g.files) != 2 {
+					t.Errorf("run(%q): DOCKER_CONFIG held %d files when the tools ran, want config.json and dhi-2.pub", args, len(g.files))
+				}
+			}
+			if strings.Contains(stdout.String()+stderr.String(), "s3cret") {
+				t.Errorf("run(%q) printed the token", args)
 			}
 			if _, err := os.Stat(g.dir); !errors.Is(err, fs.ErrNotExist) {
 				t.Errorf("run(%q) left DOCKER_CONFIG=%s behind: stat error = %v", args, g.dir, err)

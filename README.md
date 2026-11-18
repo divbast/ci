@@ -766,6 +766,17 @@ workflow runs on:
 |---|---|---|---|
 | `php` | boolean | `false` | Install PHP 8.5 and Composer for the lint job, for a lint that runs PHPStan: a PHP app passes `true` |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
+| `dhi-username` | string | `''` | The Docker Hardened Images (`dhi.io`) username that `DHI_TOKEN` belongs to. When set, `lint` and `build` log in to `dhi.io` with it before they read a base image |
+
+| Secret | Required | What |
+|---|---|---|
+| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`, which answers nothing without a login. `build` also hands both to `divbast-verify-images` |
+
+Both are optional, so a caller that passes neither works as before. A
+caller passes them as `with: dhi-username: ${{ vars.DHI_USERNAME }}` and
+`secrets: DHI_TOKEN: ${{ secrets.DHI_TOKEN }}`. A pull request from a fork
+gets no secrets, so it cannot lint or build an image that builds from
+`dhi.io`.
 
 The calling job grants `contents: read`, `attestations: read`,
 `packages: read` and `security-events: write`. `build` installs the
@@ -803,6 +814,12 @@ is what `packages: read` is for. It reads `PUBLISHED` with `skopeo`, from
 
 Each warning is a GitHub Actions warning and a callout on the run's
 summary. Only gh gets the token: Trivy and skopeo run without it.
+
+It also refuses a report, of the build or of `PUBLISHED`, in which Trivy
+recognised no operating system or saw no OS package. An image whose OS
+Trivy does not know still has its language packages, which would pass
+the check for a scan that saw no packages, yet the scan could then not
+see the OS packages, and nothing would show they are clean.
 
 Outside GitHub Actions the tool never asks GitHub, since the token a
 person gives the recipes, a fine-grained one, cannot read packages: the
@@ -967,6 +984,7 @@ is true.
 | Input | Type | What |
 |---|---|---|
 | `automerge` | boolean, required | The kill switch: true only while the caller's automerge variable is `enabled` |
+| `dhi-username` | string, default `''` | The Docker Hardened Images (`dhi.io`) username that `DHI_TOKEN` belongs to. When set, Renovate gets a docker host rule for `dhi.io`, which answers nothing without a login |
 
 The calling job grants nothing (`permissions: {}`): Renovate works through
 the App's token. The App's client ID and private key are the caller's
@@ -976,6 +994,7 @@ the App's token. The App's client ID and private key are the caller's
 | Secret | Required | What |
 |---|---|---|
 | `RENOVATE_APP_PRIVATE_KEY` | yes | The App's private key |
+| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`. A repo secret, which reaches the job although it runs in the `renovate` environment |
 
 The called job reads the caller's `renovate` environment, but an
 environment secret is not handed to a called workflow on its own: the
@@ -992,6 +1011,12 @@ jobs:
       RENOVATE_APP_PRIVATE_KEY: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
     permissions: {}
 ```
+
+A caller whose repository builds from `dhi.io` also passes
+`with: dhi-username: ${{ vars.DHI_USERNAME }}` and
+`secrets: DHI_TOKEN: ${{ secrets.DHI_TOKEN }}`, the same as for
+`app-check.yml`. Both are optional, so a caller that passes neither works
+as before, with Renovate given no host rule.
 
 Do not use `secrets: inherit`: it hands the called workflow every secret
 the caller can see, where one is all it needs.
@@ -1074,10 +1099,11 @@ each image in its table is verified:
 |---|---|
 | `ghcr.io/divbast/frankenphp` | Its attestation, by divbast/frankenphp's build workflow from main, named once: `gh attestation verify oci://ghcr.io/divbast/frankenphp@sha256:<digest> --repo divbast/frankenphp --signer-workflow divbast/frankenphp/.github/workflows/build.yml@refs/heads/main --source-ref refs/heads/main` |
 | `gcr.io/distroless/*` | Its keyless signature, by the distroless project: `cosign verify gcr.io/distroless/<image>@sha256:<digest> --certificate-identity keyless@distroless.iam.gserviceaccount.com --certificate-oidc-issuer https://accounts.google.com` |
+| `dhi.io/*` | Its signature, by Docker's key: `cosign verify --key dhi-2.pub --experimental-oci11 dhi.io/<image>:<tag>@sha256:<digest>`. `dhi-2.pub` is the copy of Docker's key that ci commits and embeds, never fetched, and dhi.io answers nothing without a login: `DHI_USERNAME` and `DHI_TOKEN`, a Docker ID and its personal access token with "Public Repo Read-only", written for dhi.io alone to the command's temporary Docker configuration, and only when a `dhi.io` image is named |
 
 So only a FrankenPHP binary that divbast/frankenphp's build made from its
-main branch, and only a distroless base the distroless project signed,
-is built into an app. A divbast image the table does not name is
+main branch, only a distroless base the distroless project signed, and
+only a Docker Hardened Image Docker signed, is built into an app. A divbast image the table does not name is
 refused, and an image in it may stand only in a `FROM`, a `COPY --from=`
 or the default of a build argument a `FROM` uses: named anywhere else, a
 `LABEL` or a `RUN` among them, it is a way in no verification sees. Any
@@ -1087,7 +1113,8 @@ moves is what holds it.
 
 A local `just build` verifies nothing. It builds from whatever digests
 the Containerfile names. To check a Containerfile by hand, with gh
-2.102.0 or newer logged in and cosign from `mise.toml`:
+2.102.0 or newer logged in and cosign from `mise.toml`, and, for a
+`dhi.io` image, `DHI_USERNAME` and `DHI_TOKEN` in the environment:
 
 ```sh
 just ci-tools && .ci/bin/divbast-verify-images
@@ -1138,11 +1165,11 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-vex F]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
-| `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old, or a verification failed |
+| `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table (FrankenPHP, distroless, `dhi.io`) its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old; a `dhi.io` image with no `DHI_USERNAME` and `DHI_TOKEN`; or a verification failed |
 | `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
 ## Shared configuration
@@ -1206,7 +1233,9 @@ first. The mutants under `contract/testdata/mutants` each break one thing
 in the LibreSpeed image or the minimal fixture, and exactly the records
 for that one thing must fail. The Go fixture's mutants are configurations
 instead: an extra listener the configuration names, and the same one
-unnamed.
+unnamed; and with the fixture serving its health route on the app port
+alone (`MINIMAL_ONE_PORT`), the route that fixture does not serve, and a
+health port opened anyway.
 Renovate's dockerfile manager moves the digests every one of those
 Containerfiles pins, and `just lint` runs hadolint over them, and PHPStan
 over the fixture's PHP and the mutants'. The contract package's

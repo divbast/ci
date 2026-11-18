@@ -51,10 +51,30 @@ func (tr trivy) Run(ctx context.Context, name string, args ...string) (execx.Res
 	return res, nil
 }
 
-// report is a Trivy report on an image of arch with packages packages and
-// a HIGH finding in stdlib for each of ids. repoDigest is its repository
-// digest, which a layout has none of.
+// report is a Trivy report on a Debian image of arch with packages
+// packages in the OS and as many in a Go binary, and a HIGH finding in
+// stdlib for each of ids. repoDigest is its repository digest, which a
+// layout has none of.
 func report(t *testing.T, arch, repoDigest string, packages int, ids ...string) string {
+	t.Helper()
+	return trivyReport(t, true, true, arch, repoDigest, packages, ids...)
+}
+
+// blindReport is report's, as Trivy writes it for an image whose OS it did
+// not recognise: no OS, no OS packages, only the Go binary's.
+func blindReport(t *testing.T, arch, repoDigest string, packages int, ids ...string) string {
+	t.Helper()
+	return trivyReport(t, false, false, arch, repoDigest, packages, ids...)
+}
+
+// noOSPackagesReport is report's, for an image whose OS Trivy named but
+// found no packages of.
+func noOSPackagesReport(t *testing.T, arch, repoDigest string, packages int, ids ...string) string {
+	t.Helper()
+	return trivyReport(t, true, false, arch, repoDigest, packages, ids...)
+}
+
+func trivyReport(t *testing.T, withOS, withOSPackages bool, arch, repoDigest string, packages int, ids ...string) string {
 	t.Helper()
 	pkgs := make([]map[string]string, packages)
 	for i := range pkgs {
@@ -70,14 +90,19 @@ func report(t *testing.T, arch, repoDigest string, packages int, ids ...string) 
 	if repoDigest != "" {
 		metadata["RepoDigests"] = []string{repoDigest}
 	}
-	data, err := json.Marshal(map[string]any{
-		"ArtifactName": "image",
-		"Metadata":     metadata,
-		"Results": []map[string]any{{
-			"Target": "usr/local/bin/frankenphp", "Class": "lang-pkgs", "Type": "gobinary",
-			"Packages": pkgs, "Vulnerabilities": vulns,
-		}},
-	})
+	results := []map[string]any{{
+		"Target": "usr/local/bin/frankenphp", "Class": "lang-pkgs", "Type": "gobinary",
+		"Packages": pkgs, "Vulnerabilities": vulns,
+	}}
+	if withOS {
+		metadata["OS"] = map[string]string{"Family": "debian", "Name": "13.2"}
+	}
+	if withOSPackages {
+		results = append(results, map[string]any{
+			"Target": "image (debian 13.2)", "Class": "os-pkgs", "Type": "debian", "Packages": pkgs,
+		})
+	}
+	data, err := json.Marshal(map[string]any{"ArtifactName": "image", "Metadata": metadata, "Results": results})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,6 +281,42 @@ func TestRun(t *testing.T) {
 			baselineResult: &execx.Result{},
 			wantCode:       1,
 			wantStderr:     []string{"no packages in " + published + ": the scan found nothing to scan, not nothing wrong\n"},
+		},
+		{
+			name:         "no-os-recognised",
+			candidate:    blindReport(t, "amd64", "", 3, "CVE-1"),
+			layoutResult: &execx.Result{},
+			wantCode:     1,
+			wantStderr:   []string{"LAYOUT: Trivy recognised no operating system and saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
+		},
+		{
+			name:         "no-os-packages",
+			candidate:    noOSPackagesReport(t, "amd64", "", 3, "CVE-1"),
+			layoutResult: &execx.Result{},
+			wantCode:     1,
+			wantStderr:   []string{"LAYOUT: Trivy recognised debian 13.2 but saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
+		},
+		{
+			name:           "no-os-packages-published",
+			skopeo:         index,
+			candidate:      report(t, "amd64", "", 3, "CVE-1"),
+			baseline:       noOSPackagesReport(t, "amd64", digest, 3),
+			layoutResult:   &execx.Result{},
+			sarifResult:    &execx.Result{},
+			baselineResult: &execx.Result{},
+			wantCode:       1,
+			wantStderr:     []string{published + ": Trivy recognised debian 13.2 but saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
+		},
+		{
+			name:           "no-os-recognised-published",
+			skopeo:         index,
+			candidate:      report(t, "amd64", "", 3, "CVE-1"),
+			baseline:       blindReport(t, "amd64", digest, 3),
+			layoutResult:   &execx.Result{},
+			sarifResult:    &execx.Result{},
+			baselineResult: &execx.Result{},
+			wantCode:       1,
+			wantStderr:     []string{published + ": Trivy recognised no operating system and saw 0 OS packages, so the scan cannot see OS packages and nothing shows they are clean\n"},
 		},
 		{
 			name:           "registry-failed",
