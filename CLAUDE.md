@@ -108,7 +108,12 @@ purpose and see the test catch it.
   `go` line moves only on approval from the Dependency Dashboard, since
   vet's checks ride on it.
 - **Standard library only.** A third-party module needs a justification in
-  `go.mod` beside it.
+  `go.mod` beside it, and becomes a requirement of every caller that
+  imports `harness` or `contract`: they build ci through
+  `replace … => ./.ci` with no go.sum of their own, so adding one breaks
+  them. zstd, which the standard library cannot read yet, goes through the
+  `zstd` command in `internal/decompress`, until Go ships `compress/zstd`
+  (golang/go#62513).
 - **The gates** (`just go-lint`, `just go-test`): the compiler, `go vet`,
   `go fix -diff` and `go mod tidy -diff` with nothing to change,
   `golangci-lint fmt --diff` and `golangci-lint run` under
