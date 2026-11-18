@@ -510,8 +510,10 @@ image and check what it answers, so no suite carries its own copy:
   log.
 - `PHPIn` runs PHP in a container, through the PHP binary given,
   `WithLog` adds a container's log to an error, `Pause` waits, or stops
-  when the context ends, and `Clip` quotes a text for a check's detail,
-  cut short past 600 bytes.
+  when the context ends, `Poll` calls a check at once and then at an
+  interval until it passes, its budget runs out or the context ends, and
+  `NotYet` marks the failures that `Poll` should try again after. `Clip`
+  quotes a text for a check's detail, cut short past 600 bytes.
 
 ### ci's tools in `.ci/bin`
 
@@ -756,9 +758,11 @@ The calling job grants `contents: read`.
 Lint, build, test and scan for an app repository, on every event its build
 workflow runs on:
 
-- `lint` repeats `lint.yml`'s steps. Only its pin check's skip differs:
-  it names divbast/ci, which never calls `app-check.yml`, so an app's pin
-  is always checked.
+- `lint` repeats `lint.yml`'s steps. Its pin check's skip names
+  divbast/ci, which never calls `app-check.yml`, so an app's pin is
+  always checked. Before `just setup`, it verifies the images of each
+  Containerfile `verify-containerfiles` lists, as `build` verifies the
+  root one's.
 - `build` verifies every image the Containerfile builds from
   ([below](#verified-inputs)), then builds the image for amd64 and
   arm64 with BuildKit's provenance and SBOM, as an OCI archive. A pull
@@ -782,10 +786,11 @@ workflow runs on:
 | `php` | boolean | `false` | Install PHP 8.5 and Composer for the lint job, for a lint that runs PHPStan: a PHP app passes `true` |
 | `no-cache-filters` | string | `''` | No effect. The daily slot and a manual run already build every stage from scratch, so the stages named here change nothing. A caller that passes it keeps working |
 | `dhi-username` | string | `''` | The Docker Hardened Images (`dhi.io`) username that `DHI_TOKEN` belongs to. When set, `lint` and `build` log in to `dhi.io` with it before they read a base image |
+| `verify-containerfiles` | string | `''` | Containerfiles besides the root one, one path per line from the caller's root, whose images `lint` verifies with `divbast-verify-images` ([Verified inputs](#verified-inputs)) before `just lint` runs, as `build` verifies the root one's. A caller lists each Containerfile whose images its lint runs, such as a template layer's |
 
 | Secret | Required | What |
 |---|---|---|
-| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`, which answers nothing without a login. `build` also hands both to `divbast-verify-images` |
+| `DHI_TOKEN` | no | The access token for `dhi-username` on `dhi.io`, which answers nothing without a login. `build`, and `lint` for `verify-containerfiles`, also hand both to `divbast-verify-images` |
 
 Both are optional, so a caller that passes neither works as before. A
 caller passes them as `with: dhi-username: ${{ vars.DHI_USERNAME }}` and
@@ -794,8 +799,8 @@ gets no secrets, so it cannot lint or build an image that builds from
 `dhi.io`.
 
 The calling job grants `contents: read`, `attestations: read`,
-`packages: read` and `security-events: write`. `build` installs the
-caller's whole `mise.toml`, which declares cosign as
+`packages: read` and `security-events: write`. `lint` and `build`
+install the caller's whole `mise.toml`, which declares cosign as
 `"aqua:sigstore/cosign"` for `divbast-verify-images`.
 
 `scan`, which can change code scanning alerts, installs only Go, just,
@@ -1126,10 +1131,12 @@ The calling job grants `contents: read`, `pull-requests: read`,
 
 Every image a Containerfile builds from is pinned, and every one whose
 publisher signs it is verified as theirs, before `app-check.yml` builds
-anything. `divbast-verify-images` reads each image a `FROM`, a
-`COPY --from=` or a `RUN --mount from=` takes, a `FROM`'s build argument
-resolved to its default, and the frontend a `# syntax=` directive names,
-which BuildKit runs as the build itself:
+anything. Its lint job also verifies each Containerfile a caller lists
+in `verify-containerfiles`, before the lint runs any of their images.
+`divbast-verify-images` reads each image a `FROM`, a `COPY --from=` or a
+`RUN --mount from=` takes, a `FROM`'s build argument resolved to its
+default, and the frontend a `# syntax=` directive names, which BuildKit
+runs as the build itself:
 
 ```dockerfile
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:<digest>

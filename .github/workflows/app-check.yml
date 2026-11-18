@@ -19,12 +19,14 @@
 # cannot lint or build a DHI image.
 #
 # The caller's job grants contents: read, attestations: read,
-# packages: read and security-events: write. The build job installs the
-# caller's whole mise.toml, which must declare cosign as
-# "aqua:sigstore/cosign", for divbast-verify-images. Of the caller's
-# mise.toml, the scan job installs only Go, just, Trivy and cosign, each
-# declared at one version: Go as "core:go" (mise reads the short "go" the
-# same way), and just, Trivy and cosign as exactly "aqua:casey/just",
+# packages: read and security-events: write. The lint and build jobs
+# install the caller's whole mise.toml, which must declare cosign as
+# "aqua:sigstore/cosign", for divbast-verify-images: build runs it on the
+# root Containerfile, and lint on each Containerfile the optional
+# verify-containerfiles input lists. Of the caller's mise.toml, the scan
+# job installs only Go, just, Trivy and cosign, each declared at one
+# version: Go as "core:go" (mise reads the short "go" the same way), and
+# just, Trivy and cosign as exactly "aqua:casey/just",
 # "aqua:aquasecurity/trivy" and "aqua:sigstore/cosign".
 name: app-check
 
@@ -49,6 +51,15 @@ on:
           belongs to. When set, lint and build log in to dhi.io with it
         type: string
         default: ''
+      verify-containerfiles:
+        description: >-
+          Containerfiles besides the root one, one path per line from the
+          caller's root, whose images the lint job verifies before just
+          lint runs, as the build job verifies the root one's. A caller
+          lists each Containerfile whose images its lint runs, such as a
+          template layer's
+        type: string
+        default: ''
     secrets:
       DHI_TOKEN:
         description: The access token for dhi-username on dhi.io
@@ -62,16 +73,20 @@ env:
   MISE_VERSION: 2026.11.9
 
 jobs:
-  # lint.yml's steps, but for the pin check's skip, which names divbast/ci:
-  # ci never calls this workflow, so a caller's pin is always checked. A
-  # job calling lint.yml would be a reusable workflow nested in this one,
-  # and its check would be named `<caller> / lint / lint`.
+  # lint.yml's steps, and what an app's lint needs besides. The pin
+  # check's skip names divbast/ci, which never calls this workflow, so a
+  # caller's pin is always checked. The job also logs in to dhi.io, and
+  # verifies the images of the Containerfiles verify-containerfiles
+  # lists, for which it asks attestations: read. A job calling lint.yml
+  # would be a reusable workflow nested in this one, and its check would
+  # be named `<caller> / lint / lint`.
   lint:
     name: lint
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
+      attestations: read # a listed Containerfile may name divbast/frankenphp, whose attestation it checks
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -120,6 +135,25 @@ jobs:
           registry: dhi.io
           username: ${{ inputs.dhi-username }}
           password: ${{ secrets.DHI_TOKEN }}
+
+      # Before anything the lint runs from them, each listed Containerfile's
+      # images are verified as the build job verifies the root one's. The
+      # pin check above has built the tool. divbast-verify-images keeps its
+      # own empty DOCKER_CONFIG, so it needs the DHI credentials in its
+      # environment, not the job's login.
+      - name: Verify the images the listed Containerfiles build from
+        if: inputs.verify-containerfiles != ''
+        env:
+          VERIFY_CONTAINERFILES: ${{ inputs.verify-containerfiles }}
+          GH_TOKEN: ${{ github.token }}
+          DHI_USERNAME: ${{ inputs.dhi-username }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          while read -r f; do
+            [ -n "${f}" ] || continue
+            echo "${f}:"
+            .ci/bin/divbast-verify-images -containerfile "${f}"
+          done <<<"${VERIFY_CONTAINERFILES}"
 
       - run: just setup
       - run: just lint
