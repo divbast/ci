@@ -510,8 +510,10 @@ image and check what it answers, so no suite carries its own copy:
   log.
 - `PHPIn` runs PHP in a container, through the PHP binary given,
   `WithLog` adds a container's log to an error, `Pause` waits, or stops
-  when the context ends, and `Clip` quotes a text for a check's detail,
-  cut short past 600 bytes.
+  when the context ends, `Poll` calls a check at once and then at an
+  interval until it passes, its budget runs out or the context ends, and
+  `NotYet` marks the failures that `Poll` should try again after. `Clip`
+  quotes a text for a check's detail, cut short past 600 bytes.
 
 ### ci's tools in `.ci/bin`
 
