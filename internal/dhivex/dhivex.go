@@ -77,6 +77,11 @@ var (
 // spec allows one.
 var segment = regexp.MustCompile(`^[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*$`)
 
+// cosignWithin bounds a verification. cosign may fetch Sigstore's trusted
+// root before it can verify, and one that hangs must not hold the scan
+// until the job's own time limit.
+const cosignWithin = 2 * time.Minute
+
 // Name returns the name of the dhi.io image r is, aspnetcore for
 // dhi.io/aspnetcore, and whether it is one. The error wraps [ErrName],
 // and names r's line.
@@ -236,8 +241,11 @@ func write(dir, name string, data []byte) (err error) {
 
 // verify asks cosign whether Docker signed the document at doc, with the
 // bundle beside it, with the key at v.Key, and passes on what it said.
-// Any status but 0 is a refusal.
+// Any status but 0 is a refusal, and so is a cosign that could not start,
+// or ran past cosignWithin, whose Result holds no status at all.
 func (v Verifier) verify(ctx context.Context, doc string) error {
+	ctx, cancel := context.WithTimeout(ctx, cosignWithin)
+	defer cancel()
 	res, err := v.Cosign.Run(ctx, "cosign", "verify-blob", "--key", v.Key, "--bundle", doc+".sig", doc)
 	if err != nil {
 		return fmt.Errorf("cosign verify-blob: %w", err)

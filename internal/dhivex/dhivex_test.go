@@ -7,17 +7,20 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"testing/synctest"
 	"time"
 
@@ -253,6 +256,19 @@ func TestDocument(t *testing.T) {
 			wantErrText: []string{"dhi.io/aspnetcore", "403"},
 		},
 		{
+			// cosign that cannot start leaves a Result whose Code reads
+			// 0: only its error says nothing was verified
+			name:   "cosign-missing",
+			image:  "aspnetcore",
+			served: []string{"aspnetcore"},
+			cosign: func(dir string) []execx.Call {
+				return []execx.Call{{Argv: verifyBlob(dir, "aspnetcore", 0, "").Argv, Err: exec.ErrNotFound}}
+			},
+			wantAsked:   []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
+			wantErr:     exec.ErrNotFound,
+			wantErrText: []string{"dhi.io/aspnetcore", "cosign verify-blob"},
+		},
+		{
 			// Name reaches here already checked; anything else names a
 			// path outside dir, and is asked for nowhere
 			name:        "not-a-name",
@@ -392,6 +408,13 @@ func status(code int, body string) answer {
 var (
 	errReset = errors.New("connection reset by peer")
 	reset    = func(*http.Request) (*http.Response, error) { return nil, errReset }
+	// cutShort answers 200 with a body that breaks off partway.
+	cutShort = func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Request: r, Header: http.Header{},
+			Body: io.NopCloser(io.MultiReader(strings.NewReader(`{"statements":[`), iotest.ErrReader(errReset))),
+		}, nil
+	}
 	// hang answers nothing until the request's context ends.
 	hang = func(r *http.Request) (*http.Response, error) {
 		<-r.Context().Done()
@@ -436,6 +459,19 @@ func TestDocumentRetries(t *testing.T) {
 			answers:     []answer{reset, status(200, document("aspnetcore"))},
 			wantTries:   2,
 			wantElapsed: 2 * time.Second,
+		},
+		{
+			name:        "cut-short-once",
+			answers:     []answer{cutShort, status(200, document("aspnetcore"))},
+			wantTries:   2,
+			wantElapsed: 2 * time.Second,
+		},
+		{
+			name:        "always-cut-short",
+			answers:     []answer{cutShort},
+			wantTries:   3,
+			wantElapsed: 6 * time.Second,
+			wantErr:     errReset,
 		},
 		{
 			name:        "always-failing",
@@ -536,6 +572,46 @@ func TestDocumentStopsWithTheCaller(t *testing.T) {
 		}
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("Document() error = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// hangingCosign is cosign that never finishes, until its context ends,
+// as execx.OS's does then: it is killed, and says why.
+type hangingCosign struct{ started *int }
+
+func (h hangingCosign) Run(ctx context.Context, name string, _ ...string) (execx.Result, error) {
+	*h.started++
+	<-ctx.Done()
+	return execx.Result{}, fmt.Errorf("run %s: %w", name, ctx.Err())
+}
+
+// TestDocumentBoundsCosign has cosign hang, under a caller that would
+// wait ten minutes, and sees it stopped after two, on synctest's clock,
+// with the document refused: cosign may fetch Sigstore's trusted root,
+// and one that hangs must not hold the scan until the job's own limit.
+func TestDocumentBoundsCosign(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Minute)
+		defer cancel()
+		client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, ".sig") {
+				return status(200, bundle("aspnetcore"))(r)
+			}
+			return status(200, document("aspnetcore"))(r)
+		})}
+		var started int
+		v := dhivex.Verifier{Cosign: hangingCosign{&started}, Key: key, Log: io.Discard}
+		src := dhivex.Source{Client: client, Base: "https://advisories.test/vex/"}
+
+		start := time.Now()
+		got, err := dhivex.Document(ctx, src, v, t.TempDir(), "aspnetcore")
+		if elapsed := time.Since(start); started != 1 || elapsed != 2*time.Minute {
+			t.Errorf("cosign ran %d times, stopped after %s; want once, stopped after 2m0s", started, elapsed)
+		}
+		if got != "" || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "dhi.io/aspnetcore") {
+			t.Errorf("Document() = %q, %v; want nothing, and an error naming dhi.io/aspnetcore past its deadline", got, err)
 		}
 	})
 }
