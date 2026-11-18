@@ -67,10 +67,18 @@ func labelFor(bi *debug.BuildInfo, ok bool) string {
 // context is done by then.
 const cleanupTimeout = 2 * time.Minute
 
+// runner runs what the harness runs: the engine's CLI, fed a stdin when
+// it reads one, and the zstd command, whose output a layer's reader reads
+// as it writes it.
+type runner interface {
+	execx.StdinRunner
+	execx.StreamRunner
+}
+
 // Engine is the container engine's CLI: docker or podman.
 type Engine struct {
 	name string
-	run  execx.StdinRunner
+	run  runner
 	// label is the module's label, except in the test of Sweep itself,
 	// which must not remove what tests running beside it made.
 	label string
@@ -101,7 +109,7 @@ func EngineFromEnv() (Engine, error) {
 	}
 }
 
-func newEngine(name string, run execx.StdinRunner) Engine {
+func newEngine(name string, run runner) Engine {
 	return Engine{name: name, run: run, label: moduleLabel(), saves: newSaveCache(), store: newStoreLock(""), probes: newProbeRegistry()}
 }
 

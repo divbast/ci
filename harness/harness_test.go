@@ -1551,12 +1551,43 @@ func TestEngineHealthyWindow(t *testing.T) {
 	}
 }
 
-// runFunc is an execx.StdinRunner that answers every command from a
-// function, for tests that cannot know an argv in advance.
+// runFunc is an execx.StdinRunner and execx.StreamRunner that answers
+// every command from a function, for tests that cannot know an argv in
+// advance. It never reads stdin.
 type runFunc func(argv []string) execx.Result
 
 func (f runFunc) RunStdin(_ context.Context, _ io.Reader, name string, args ...string) (execx.Result, error) {
 	return f(append([]string{name}, args...)), nil
+}
+
+// RunStream writes the Result's Stdout to stdout, and returns the Result
+// without it, as a command that streams would.
+func (f runFunc) RunStream(_ context.Context, _ io.Reader, stdout io.Writer, name string, args ...string) (execx.Result, error) {
+	res := f(append([]string{name}, args...))
+	if _, err := stdout.Write(res.Stdout); err != nil {
+		return execx.Result{}, fmt.Errorf("run %s: %w", name, err)
+	}
+	res.Stdout = nil
+	return res, nil
+}
+
+// stdinOnly gives a test's execx.StdinRunner the RunStream an Engine's
+// runner has, for tests that read no zstd layer: one that does fails.
+type stdinOnly struct{ execx.StdinRunner }
+
+func (stdinOnly) RunStream(_ context.Context, _ io.Reader, _ io.Writer, name string, _ ...string) (execx.Result, error) {
+	return execx.Result{}, fmt.Errorf("run %s: this test streams no command", name)
+}
+
+// withoutZstd is a runFunc on a host with no zstd command: running it
+// fails as execx.OS fails a command missing from PATH.
+type withoutZstd struct{ runFunc }
+
+func (w withoutZstd) RunStream(ctx context.Context, stdin io.Reader, stdout io.Writer, name string, args ...string) (execx.Result, error) {
+	if name == "zstd" {
+		return execx.Result{}, fmt.Errorf("run %s: %w", name, exec.ErrNotFound)
+	}
+	return w.runFunc.RunStream(ctx, stdin, stdout, name, args...)
 }
 
 func TestParseRecords(t *testing.T) {

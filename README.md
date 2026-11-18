@@ -371,6 +371,16 @@ made it, since every later test of the process mounts it. A suite's
 `TestMain` removes it with `Engine.RemoveProbeVolumes` once `m.Run` has
 returned, or else the next run's `Engine.Sweep` does.
 
+The contract's `no-file-capability-xattr` check, `Engine.FileCapabilities`,
+reads each layer of the image as the engine saves it: a gzip layer in Go,
+and a zstd layer, as every layer of a Docker Hardened Image is, through
+the `zstd` command, since Go's standard library has no zstd reader yet.
+So a host that runs such an image's suite under Docker needs `zstd` on its
+`PATH`, and without it the check fails naming the layer and the command.
+GitHub's Ubuntu runners carry it; a Mac gets it with `brew install zstd`.
+Podman saves every layer uncompressed, and an image with no zstd layer
+never runs it.
+
 The harness labels every container, image, network and volume it makes
 `divbast.harness=<module>`, the path of the main module of the test
 binary running it. A repository's acceptance suite is a test of its own

@@ -5,9 +5,7 @@ package harness
 
 import (
 	"archive/tar"
-	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,6 +21,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/divbast/ci/internal/decompress"
+	"github.com/divbast/ci/internal/execx"
 )
 
 // ImageConfig returns the architecture, the user, the HEALTHCHECK and the
@@ -94,8 +95,11 @@ func (e Engine) imageID(ctx context.Context, image string) (string, error) {
 // layer holds it, even one a later layer replaces or removes, since that
 // layer ships in the image all the same.
 //
-// A layer it cannot read is an error, never a layer with nothing in it:
-// one compressed with zstd, say, which the standard library cannot read.
+// A layer is read as [decompress.Reader] reads it: gzip in process, and
+// zstd, which every layer of a Docker Hardened Image is, through the zstd
+// command, which only a zstd layer needs. A layer it cannot read is an
+// error, never a layer with nothing in it: one compressed with zstd on a
+// host with no zstd command, say, which the error names.
 func (e Engine) FileCapabilities(ctx context.Context, tb testing.TB, image string) ([]string, error) {
 	tb.Helper()
 	id, err := e.imageID(ctx, image)
@@ -223,7 +227,7 @@ func (e Engine) save(ctx context.Context, tb testing.TB, image, id string) (*sav
 	if _, err := e.output(ctx, argv...); err != nil {
 		return nil, err
 	}
-	blob, blobErr, read, err := readSave(dir, "image.tar")
+	blob, blobErr, read, err := readSave(ctx, e.run, dir, "image.tar")
 	if err != nil {
 		return nil, fmt.Errorf("%s save of %s: %w", e.name, image, err)
 	}
@@ -254,11 +258,12 @@ func savedImageConfig(blob []byte, image, id string) (Config, error) {
 
 // readSave reads the docker-archive file name, in dir, for its
 // configuration blob, unless blobErr says why it could not, and the file
-// capabilities in its layers. Only Podman's save is read for its
-// configuration: Docker 29 names its own with no .json, and readIndex
-// keeps none that lacks one. It reads the file twice, since
-// manifest.json, which names the rest, may come last, as Podman writes it.
-func readSave(dir, name string) (blob []byte, blobErr error, read *saveRead, err error) {
+// capabilities in its layers, running zstd for a zstd layer. Only
+// Podman's save is read for its configuration: Docker 29 names its own
+// with no .json, and readIndex keeps none that lacks one. It reads the
+// file twice, since manifest.json, which names the rest, may come last,
+// as Podman writes it.
+func readSave(ctx context.Context, zstd execx.StreamRunner, dir, name string) (blob []byte, blobErr error, read *saveRead, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, nil, nil, err
@@ -279,7 +284,7 @@ func readSave(dir, name string) (blob []byte, blobErr error, read *saveRead, err
 		return nil, nil, nil, err
 	}
 	read = &saveRead{}
-	read.caps, read.capsErr = archiveCapabilities(f, idx.layers)
+	read.caps, read.capsErr = archiveCapabilities(ctx, zstd, f, idx.layers)
 	return blob, blobErr, read, nil
 }
 
@@ -364,8 +369,9 @@ func archiveConfig(r io.Reader) ([]byte, error) {
 
 // archiveCapabilities returns the path of every file in layers, entries
 // of the docker-archive r, that carries a file capability, sorted and each
-// once. A layer the archive lacks is an error, as is one it cannot read.
-func archiveCapabilities(r io.Reader, layers []string) ([]string, error) {
+// once, running zstd for a zstd layer. A layer the archive lacks is an
+// error, as is one it cannot read.
+func archiveCapabilities(ctx context.Context, zstd execx.StreamRunner, r io.Reader, layers []string) ([]string, error) {
 	want := make(map[string]bool, len(layers))
 	for _, l := range layers {
 		want[l] = true
@@ -390,7 +396,7 @@ func archiveCapabilities(r io.Reader, layers []string) ([]string, error) {
 		if hdr.Typeflag != tar.TypeReg {
 			return nil, fmt.Errorf("the layer %s is not a regular file, the one kind of layer this reads", name)
 		}
-		found, err := layerCapabilities(tr)
+		found, err := layerCapabilities(ctx, zstd, tr)
 		if err != nil {
 			return nil, fmt.Errorf("the layer %s: %w", name, err)
 		}
@@ -412,34 +418,23 @@ func archiveCapabilities(r io.Reader, layers []string) ([]string, error) {
 // with its value in base64.
 const fileCapabilityRecord = ".xattr.security.capability"
 
-// gzipMagic and zstdMagic open a layer compressed with gzip or zstd.
-var (
-	gzipMagic = []byte{0x1f, 0x8b}
-	zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
-)
-
 // layerCapabilities returns the path of every file in the layer r that
 // carries a file capability, in the layer's order. r is the layer as the
 // archive holds it: a tar, or one compressed with gzip, as Docker's
-// containerd store keeps a layer.
-func layerCapabilities(r io.Reader) (caps []string, err error) {
-	br := bufio.NewReader(r)
-	magic, err := br.Peek(len(zstdMagic))
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
+// containerd store keeps a layer it built, or with zstd, as it keeps one
+// it pulled so, which zstd decompresses.
+func layerCapabilities(ctx context.Context, zstd execx.StreamRunner, r io.Reader) (caps []string, err error) {
+	layer, how, err := decompress.Reader(ctx, zstd, r)
+	if err != nil {
+		return nil, readingIt(how, err)
 	}
-	var layer io.Reader = br
-	switch {
-	case bytes.HasPrefix(magic, zstdMagic):
-		return nil, errors.New("it is compressed with zstd, which this cannot read")
-	case bytes.HasPrefix(magic, gzipMagic):
-		zr, err := gzip.NewReader(br)
-		if err != nil {
-			return nil, err
+	defer func() {
+		// zstd's verdict on the whole layer, once it has run to its end,
+		// which counts only when nothing else failed first
+		if closeErr := layer.Close(); err == nil && closeErr != nil {
+			caps, err = nil, readingIt(how, closeErr)
 		}
-		defer func() { err = errors.Join(err, zr.Close()) }()
-		layer = zr
-	}
+	}()
 	tr := tar.NewReader(layer)
 	for {
 		hdr, err := tr.Next()
@@ -447,7 +442,7 @@ func layerCapabilities(r io.Reader) (caps []string, err error) {
 			return caps, nil
 		}
 		if err != nil {
-			return nil, err
+			return nil, readingIt(how, err)
 		}
 		for key := range hdr.PAXRecords {
 			if strings.HasSuffix(key, fileCapabilityRecord) {
@@ -456,6 +451,15 @@ func layerCapabilities(r io.Reader) (caps []string, err error) {
 			}
 		}
 	}
+}
+
+// readingIt is err, which reading a layer gave, saying how the layer was
+// read when it was decompressed.
+func readingIt(how string, err error) error {
+	if how == "" {
+		return err
+	}
+	return fmt.Errorf("reading it %s: %w", how, err)
 }
 
 // Build builds containerfile, with its directory as the context and args

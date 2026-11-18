@@ -530,14 +530,25 @@ func gzipped(t *testing.T, b []byte) []byte {
 	return out.Bytes()
 }
 
+// zstdFrameMagic opens every zstd frame, and so every zstd layer.
+var zstdFrameMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+
 func TestLayerCapabilities(t *testing.T) {
 	t.Parallel()
 
 	capped := entry{"usr/local/bin/frankenphp", map[string]string{capabilityPAX: capabilityValue}}
 	plain := entry{"usr/local/bin/other", nil}
+	// A zstd layer, every layer of a Docker Hardened Image among them, as
+	// zstd is fed it, and what zstd writes back
+	zstdLayer := slices.Concat(zstdFrameMagic, []byte("compressed"))
+	unzstd := func(res execx.Result) []execx.Call {
+		return []execx.Call{{Argv: []string{"zstd", "-dcq"}, Stdin: zstdLayer, Result: res}}
+	}
 	tests := []struct {
-		name    string
-		layer   []byte
+		name  string
+		layer []byte
+		// zstd is every run of the zstd command the layer takes
+		zstd    []execx.Call
 		want    []string
 		wantErr bool
 	}{
@@ -558,10 +569,26 @@ func TestLayerCapabilities(t *testing.T) {
 		},
 		{name: "empty", layer: []byte{}},
 		{
-			// zstd, which the standard library cannot read: a layer that
-			// cannot be read must not pass for one with nothing in it
-			name:    "zstd",
-			layer:   []byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0},
+			// Read through the zstd command, fed the layer on its stdin
+			name:  "zstd",
+			layer: zstdLayer,
+			zstd:  unzstd(execx.Result{Stdout: layerTar(t, plain, capped)}),
+			want:  []string{"/usr/local/bin/frankenphp"},
+		},
+		{
+			// The tar ends before what zstd writes does, as GNU tar pads
+			// an archive out to a whole record: zstd still runs to its end
+			name:  "zstd-padded-past-the-tar",
+			layer: zstdLayer,
+			zstd:  unzstd(execx.Result{Stdout: slices.Concat(layerTar(t, capped), make([]byte, 20<<10))}),
+			want:  []string{"/usr/local/bin/frankenphp"},
+		},
+		{
+			// zstd failing after a whole tar is still a layer it could
+			// not read, never one with that tar's files alone
+			name:    "zstd-fails",
+			layer:   zstdLayer,
+			zstd:    unzstd(execx.Result{Stdout: layerTar(t, plain), Stderr: []byte("zstd: corrupted block"), Code: 1}),
 			wantErr: true,
 		},
 		{name: "not-a-tar", layer: []byte(strings.Repeat("not a tar archive ", 40)), wantErr: true},
@@ -570,7 +597,7 @@ func TestLayerCapabilities(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := layerCapabilities(bytes.NewReader(tt.layer))
+			got, err := layerCapabilities(t.Context(), execx.NewFake(t, tt.zstd...), bytes.NewReader(tt.layer))
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("layerCapabilities() = %q, nil; want an error", got)
@@ -615,11 +642,18 @@ func TestFileCapabilities(t *testing.T) {
 	again := layerTar(t, entry{"usr/local/bin/frankenphp", map[string]string{capabilityPAX: capabilityValue}},
 		entry{"usr/local/bin/helper", map[string]string{capabilityPAX: capabilityValue}})
 
+	// A zstd layer as Docker's containerd store saves it, every layer of
+	// a Docker Hardened Image among them: what zstd is fed. The zstd the
+	// engine runs writes capped back.
+	zstdLayer := slices.Concat(zstdFrameMagic, []byte("compressed"))
+
 	tests := []struct {
 		name    string
 		archive []byte
+		// noZstd runs on a host with no zstd command
+		noZstd  bool
 		want    []string
-		wantErr string
+		wantErr []string
 	}{
 		{name: "none", archive: savedArchive(t, plain, gzipped(t, plain))},
 		{
@@ -629,15 +663,28 @@ func TestFileCapabilities(t *testing.T) {
 			want:    []string{"/usr/local/bin/frankenphp", "/usr/local/bin/helper"},
 		},
 		{
+			name:    "zstd",
+			archive: savedArchive(t, plain, zstdLayer),
+			want:    []string{"/usr/local/bin/frankenphp"},
+		},
+		{
 			name: "a-layer-missing",
 			archive: tarball(t, file{"blobs/sha256/config", configBlob},
 				file{"manifest.json", `[{"Config":"blobs/sha256/config","Layers":["blobs/sha256/gone"]}]`}),
-			wantErr: "does not hold",
+			wantErr: []string{"does not hold"},
 		},
 		{
 			name:    "a-layer-it-cannot-read",
-			archive: savedArchive(t, plain, []byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0}),
-			wantErr: "zstd",
+			archive: savedArchive(t, plain, []byte(strings.Repeat("not a tar archive ", 40))),
+			wantErr: []string{"blobs/sha256/layer1"},
+		},
+		{
+			// Never a layer with nothing in it: the error names the layer,
+			// and the command it needs
+			name:    "zstd-with-no-zstd-command",
+			archive: savedArchive(t, plain, zstdLayer),
+			noZstd:  true,
+			wantErr: []string{"the layer blobs/sha256/layer1", "zstd -dcq", "a zstd blob needs the zstd command on PATH"},
 		},
 	}
 	for _, tt := range tests {
@@ -646,7 +693,7 @@ func TestFileCapabilities(t *testing.T) {
 
 			// Docker saves by the ID it gives, which with its containerd
 			// store is the index's digest, not the configuration's.
-			e := newEngine("docker", runFunc(func(argv []string) execx.Result {
+			run := runFunc(func(argv []string) execx.Result {
 				switch {
 				case slices.Equal(argv, []string{"docker", "image", "inspect", "--format", "{{.Id}}", "img"}):
 					return execx.Result{Stdout: []byte("sha256:abc\n")}
@@ -656,15 +703,26 @@ func TestFileCapabilities(t *testing.T) {
 						return execx.Result{Code: 1}
 					}
 					return execx.Result{}
+				case slices.Equal(argv, []string{"zstd", "-dcq"}):
+					return execx.Result{Stdout: capped}
 				default:
 					t.Errorf("unexpected command %q", argv)
 					return execx.Result{Code: 125}
 				}
-			}))
+			})
+			e := newEngine("docker", run)
+			if tt.noZstd {
+				e = newEngine("docker", withoutZstd{run})
+			}
 			got, err := e.FileCapabilities(t.Context(), t, "img")
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("FileCapabilities() = %q, %v; want an error saying %q", got, err, tt.wantErr)
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("FileCapabilities() = %q, nil; want an error saying %q", got, tt.wantErr)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("FileCapabilities() error = %v, want one saying %q", err, want)
+					}
 				}
 				return
 			}
