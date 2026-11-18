@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
-// Package dhivex fetches the OpenVEX documents Docker publishes for its
-// Hardened Images, and verifies each against Docker's key before a scan
-// may apply it.
+// Package dhivex fetches the OpenVEX document Docker publishes for a
+// Hardened Image, and verifies it against Docker's key before a scan may
+// apply it.
 //
 // Trivy reads a Docker Hardened Image's Debian packages, Docker's own
 // builds versioned …+dhiN, as Debian's, and reports every vulnerability
 // Debian has not fixed in them. Docker states, in a document per image,
 // which of those its builds are not affected by, keyed by package URL, so
-// the statements hold in any image built from one. It publishes them in
+// the statements hold in an image built on one. It publishes them in
 // github.com/docker-hardened-images/advisories, each with a Sigstore
 // bundle that signs it with the key divbast-verify-images verifies the
 // images themselves with:
@@ -17,7 +17,13 @@
 //	vex/<name>/dhi-<name>.vex.json
 //	vex/<name>/dhi-<name>.vex.json.sig
 //
-// They are read from main, not a pinned commit: the signature is the
+// A scan applies only the document of the image its final stage builds
+// on, [verify.Base], the one whose packages ship. A document is Docker's
+// assessment of its own image, and some of its statements name a package
+// with no version, so a build stage's document, applied to the runtime,
+// would answer for packages Docker never assessed there.
+//
+// Documents are read from main, not a pinned commit: the signature is the
 // trust, and a pin would need a person or a Renovate rule to move it.
 package dhivex
 
@@ -31,7 +37,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
@@ -72,24 +77,18 @@ var (
 // spec allows one.
 var segment = regexp.MustCompile(`^[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*$`)
 
-// Names returns the name of every dhi.io image refs name, aspnetcore for
-// dhi.io/aspnetcore, once each, in the order refs first name them. The
-// error wraps [ErrName], and names the line involved.
-func Names(refs []verify.Ref) ([]string, error) {
-	var names []string
-	for _, r := range refs {
-		if !verify.IsDHI(r) {
-			continue
-		}
-		name := r.Name[len(verify.DHI):]
-		if !segment.MatchString(name) {
-			return nil, fmt.Errorf("%w: line %d has %s", ErrName, r.Line, r)
-		}
-		if !slices.Contains(names, name) {
-			names = append(names, name)
-		}
+// Name returns the name of the dhi.io image r is, aspnetcore for
+// dhi.io/aspnetcore, and whether it is one. The error wraps [ErrName],
+// and names r's line.
+func Name(r verify.Ref) (name string, ok bool, err error) {
+	if !verify.IsDHI(r) {
+		return "", false, nil
 	}
-	return names, nil
+	name = r.Name[len(verify.DHI):]
+	if !segment.MatchString(name) {
+		return "", false, fmt.Errorf("%w: line %d has %s", ErrName, r.Line, r)
+	}
+	return name, true, nil
 }
 
 // Source is where [Documents] fetches from.
@@ -114,37 +113,28 @@ type Verifier struct {
 	Log io.Writer
 }
 
-// Documents fetches the document of each of names, and its bundle, from
-// src into dir, verifies each with v, and returns the documents' paths,
-// in names' order. Only documents that all verified are returned: any
-// failure returns nil and an error that names the image, wrapping
-// [ErrName], [ErrFetch] or [ErrNotVerified] where one applies, or the
-// error the last try failed with.
+// Document fetches the document of dhi.io/<name>, and its bundle, from
+// src into dir, verifies the one with the other with v, and returns the
+// document's path. Any failure returns "" and an error that names the
+// image, wrapping [ErrName], [ErrFetch] or [ErrNotVerified] where one
+// applies, or the error the last try failed with.
 //
 // A fetch is tried again, up to three tries in all, while a try gets no
 // answer, takes over a minute, or is answered 429 or 5xx. Any other
 // answer but 200 is final, and so is a file over 64 MiB.
-func Documents(ctx context.Context, src Source, v Verifier, dir string, names []string) ([]string, error) {
-	if len(names) == 0 {
-		return nil, nil
+func Document(ctx context.Context, src Source, v Verifier, dir, name string) (string, error) {
+	path, err := document(ctx, src, v, dir, name)
+	if err != nil {
+		return "", fmt.Errorf("%s%s: %w", verify.DHI, name, err)
 	}
-	if v.Key == "" {
-		return nil, errors.New("no path to dhi-2.pub, the key that verifies DHI's VEX documents")
-	}
-	paths := make([]string, 0, len(names))
-	for _, name := range names {
-		path, err := document(ctx, src, v, dir, name)
-		if err != nil {
-			return nil, fmt.Errorf("%s%s: %w", verify.DHI, name, err)
-		}
-		paths = append(paths, path)
-	}
-	return paths, nil
+	return path, nil
 }
 
-// document fetches name's document and bundle into dir, verifies the
-// document, and returns its path.
+// document is [Document], with errors that do not name the image.
 func document(ctx context.Context, src Source, v Verifier, dir, name string) (string, error) {
+	if v.Key == "" {
+		return "", errors.New("no path to dhi-2.pub, the key that verifies DHI's VEX documents")
+	}
 	if !segment.MatchString(name) {
 		return "", fmt.Errorf("%w: %q", ErrName, name)
 	}

@@ -186,7 +186,7 @@ just IMAGE=ghcr.io/divbast/librespeed:latest acceptance
 | `acceptance` | `go test -json ./test/acceptance/...` against `IMAGE` under `ENGINE`, through `divbast-testcount` |
 | `test` | `build`, then `acceptance` |
 | `archive` | Writes `IMAGE` to `ARCHIVE` as an OCI archive |
-| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED`, with the Containerfile, for Docker's VEX documents, and `-vex openvex.json` when the app has one ([VEX](#vex)) |
+| `scan` | `divbast-scan` over `ARCHIVE`, against `PUBLISHED`, with the Containerfile, for Docker's VEX document of the final stage's base, and `-vex openvex.json` when the app has one ([VEX](#vex)) |
 | `app-lint` | hadolint, and BuildKit's own `docker build --check`, over the Containerfile |
 
 `go test` exits 0 when every test skipped, and prints only `ok`, so an
@@ -859,8 +859,10 @@ builds versioned `…+dhiN`, as Debian's, and reports every vulnerability
 Debian has not fixed in them. Docker states which of those its builds
 are not affected by in a signed OpenVEX document per image, keyed by
 package URL, so the statements hold in an app built on the image.
-`scan` gives `divbast-scan` the Containerfile, and for each
-`dhi.io/<name>` image it builds from, the tool fetches
+`scan` gives `divbast-scan` the Containerfile. When the final stage's
+base is a `dhi.io/<name>` image (the last `FROM`'s image, a build
+argument resolved to its default, or the base of the earlier stage that
+`FROM` names), the tool fetches
 `vex/<name>/dhi-<name>.vex.json` and its Sigstore bundle, `.sig`, from
 the main branch of
 [docker-hardened-images/advisories](https://github.com/docker-hardened-images/advisories),
@@ -871,13 +873,18 @@ anonymously, and verifies the one with the other against the
 cosign verify-blob --key dhi-2.pub --bundle dhi-<name>.vex.json.sig dhi-<name>.vex.json
 ```
 
-Both of Trivy's scans then apply every verified document, after the
-app's own. A document that cannot be fetched, or that cosign does not
-verify, fails the scan, naming the image. The documents come from main
-rather than a pinned commit, since the signature is the trust, and a pin
-would need a person or a Renovate rule to move it. A Containerfile with
-no `dhi.io` image fetches nothing. A local `just scan` does the same,
-with cosign from `mise.toml`.
+Both of Trivy's scans then apply the verified document, after the app's
+own. A document that cannot be fetched, or that cosign does not verify,
+fails the scan, naming the image. A build stage's document is never
+applied, though its image is `dhi.io`'s too: a build stage's packages
+never ship, a document is Docker's assessment of its own image, and some
+of its statements name a package with no version, so applied to the
+runtime it would answer for packages Docker never assessed there. A
+final stage on any other base, or on `scratch`, fetches nothing. The
+document comes from main rather than a pinned commit, since the
+signature is the trust, and a pin would need a person or a Renovate rule
+to move it. A local `just scan` does the same, with cosign from
+`mise.toml`.
 
 ### `app-publish.yml`
 
@@ -1206,7 +1213,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for each `dhi.io` image the Containerfile builds from | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; a `dhi.io` image's VEX document not fetched or not verified; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched or not verified; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

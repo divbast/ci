@@ -58,9 +58,9 @@ archive:
 # at its root, openvex.json, which scan passes to both of Trivy's scans
 # when it is there. trivy refuses a --vex file that is missing, so with no
 # such file there is no -vex at all. scan also passes the Containerfile,
-# so that both scans apply Docker's signed VEX document for each dhi.io
-# image it builds from, fetched and then verified with cosign from the
-# app's mise.toml; one that builds from none fetches nothing.
+# so that both scans apply Docker's signed VEX document for the final
+# stage's base, when it is a dhi.io image, fetched and then verified with
+# cosign from the app's mise.toml; on any other base, nothing is fetched.
 
 # Fail on a HIGH or CRITICAL vulnerability the published image does not have
 scan: ci-tools

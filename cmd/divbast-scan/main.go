@@ -24,23 +24,26 @@
 // version, is reported as an advisory. -vex names an OpenVEX document both
 // scans apply, the app's own; it may be given more than once.
 //
-// -containerfile names the Containerfile the image was built from. For
-// every dhi.io image it builds from, a Docker Hardened Image, Docker
-// publishes an OpenVEX document of the vulnerabilities its Debian builds
-// are not affected by, which Trivy, reading them as Debian's own, would
-// otherwise report. Before either scan, the command fetches each from
-// github.com/docker-hardened-images/advisories's main branch, with the
-// Sigstore bundle beside it, as an anonymous client, and has cosign
-// verify it against Docker's key, dhi-2.pub, which the command embeds:
+// -containerfile names the Containerfile the image was built from. When
+// its final stage builds on a dhi.io image, a Docker Hardened Image (its
+// last FROM's image, a build argument resolved to its default, or the
+// base of the earlier stage that FROM names), Docker publishes an
+// OpenVEX document of the vulnerabilities its Debian builds there are not
+// affected by, which Trivy, reading them as Debian's own, would otherwise
+// report. Before either scan, the command fetches it from the main branch
+// of github.com/docker-hardened-images/advisories, with the Sigstore
+// bundle beside it, as an anonymous client, and has cosign verify it
+// against Docker's key, dhi-2.pub, which the command embeds:
 //
 //	cosign verify-blob --key dhi-2.pub --bundle dhi-<name>.vex.json.sig dhi-<name>.vex.json
 //
-// Both scans then apply each verified document, after any -vex. One that
+// Both scans then apply the verified document, after any -vex. One that
 // cannot be fetched or is not verified fails the scan, naming the image.
-// A Containerfile that names no dhi.io image fetches nothing. The
-// documents and the key go in a temporary directory, removed once the
-// scans are done. Without -containerfile, no document of Docker's is
-// applied.
+// A build stage's document is never fetched: its packages do not ship,
+// and its document answers for its own image alone. A final stage on any
+// other base, or on scratch, fetches nothing. The document and the key go
+// in a temporary directory, removed once the scans are done. Without
+// -containerfile, no document of Docker's is applied.
 //
 // It lists every finding on stdout and, when GitHub Actions sets it,
 // appends them as tables to $GITHUB_STEP_SUMMARY.
@@ -74,8 +77,8 @@
 //	   is not published yet or is private, or, outside GitHub Actions,
 //	   because the registry refused to show it
 //	1  a finding IMAGE lacks; a Containerfile that cannot be read, or
-//	   that names an image unpinned; a dhi.io image's VEX document that
-//	   could not be fetched or was not verified; a scan that failed or
+//	   that names an image unpinned; the final stage's dhi.io base's VEX
+//	   document not fetched or not verified; a scan that failed or
 //	   saw no packages; a report, of the layout or of IMAGE, that
 //	   recognised no operating system or saw no OS package; IMAGE not a
 //	   ghcr.io image, unreadable, or refused though public for any reason
@@ -142,7 +145,7 @@ func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, 
 	var vex files
 	flags.Var(&vex, "vex", "an OpenVEX `FILE` of the app's own both scans apply; repeat for more")
 	containerfile := flags.String("containerfile", "", "the Containerfile `FILE` the image was built from, "+
-		"whose dhi.io images' signed VEX documents both scans apply")
+		"whose final stage's base, when a dhi.io image, has its signed VEX document applied by both scans")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -173,7 +176,9 @@ func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, 
 			return 1
 		}
 		defer done()
-		docs = append(docs, dhi...)
+		if dhi != "" {
+			docs = append(docs, dhi)
+		}
 	}
 
 	trivy := scan.Trivy{Run: r, VEX: docs, Log: stderr}
@@ -300,31 +305,32 @@ func (f *files) Set(path string) error {
 	return nil
 }
 
-// dhiVEX reads the Containerfile at path and, when it builds from any
-// dhi.io image, fetches the VEX document of each from src, with dhi-2.pub
-// beside them in a directory it makes, and has cosign, through r, verify
-// each. It says on stdout which it applies, and returns their paths and
-// what removes the directory, which the caller runs once the scans are
-// done; on an error, it leaves nothing behind.
-func dhiVEX(ctx context.Context, path string, src dhivex.Source, r execx.Runner, stdout, stderr io.Writer) (docs []string, done func(), err error) {
+// dhiVEX reads the Containerfile at path and, when its final stage builds
+// on a dhi.io image, fetches that image's VEX document from src, with
+// dhi-2.pub beside it in a directory it makes, and has cosign, through r,
+// verify it. It says on stdout what it applies, and returns the
+// document's path, "" for none, and what removes the directory, which the
+// caller runs once the scans are done; on an error, it leaves nothing
+// behind.
+func dhiVEX(ctx context.Context, path string, src dhivex.Source, r execx.Runner, stdout, stderr io.Writer) (doc string, done func(), err error) {
 	data, err := readFile(path)
 	if err != nil {
-		return nil, nil, err
+		return "", nil, err
 	}
-	refs, err := verify.Refs(bytes.NewReader(data))
-	if err != nil {
-		return nil, nil, err
+	base, ok, err := verify.Base(bytes.NewReader(data))
+	if err != nil || !ok {
+		return "", func() {}, err
 	}
-	names, err := dhivex.Names(refs)
-	if err != nil || len(names) == 0 {
-		return nil, func() {}, err
+	image, ok, err := dhivex.Name(base)
+	if err != nil || !ok {
+		return "", func() {}, err
 	}
 
 	dir, err := os.MkdirTemp("", name+"-")
 	if err != nil {
-		return nil, nil, fmt.Errorf("make a directory for the documents: %w", err)
+		return "", nil, fmt.Errorf("make a directory for the document: %w", err)
 	}
-	// What a directory left behind holds is public, Docker's documents and
+	// What a directory left behind holds is public, Docker's document and
 	// key, so it is reported without changing the verdict.
 	done = func() {
 		if rerr := os.RemoveAll(dir); rerr != nil {
@@ -333,20 +339,16 @@ func dhiVEX(ctx context.Context, path string, src dhivex.Source, r execx.Runner,
 	}
 	key, err := verify.WriteDHIKey(dir)
 	if err == nil {
-		docs, err = dhivex.Documents(ctx, src, dhivex.Verifier{Cosign: r, Key: key, Log: stderr}, dir, names)
+		doc, err = dhivex.Document(ctx, src, dhivex.Verifier{Cosign: r, Key: key, Log: stderr}, dir, image)
 	}
 	if err == nil {
-		var said strings.Builder
-		for _, n := range names {
-			fmt.Fprintf(&said, "applying %s%s's VEX document, verified against dhi-2.pub\n", verify.DHI, n)
-		}
-		_, err = io.WriteString(stdout, said.String())
+		_, err = fmt.Fprintf(stdout, "applying the VEX document of %s%s, the final stage's base, verified against dhi-2.pub\n", verify.DHI, image)
 	}
 	if err != nil {
 		done()
-		return nil, nil, err
+		return "", nil, err
 	}
-	return docs, done, nil
+	return doc, done, nil
 }
 
 // unshipped says why nothing is shipped to compare with, so that every

@@ -139,7 +139,11 @@ func (s *seeing) Run(ctx context.Context, name string, args ...string) (execx.Re
 	return s.fake.Run(ctx, name, args...)
 }
 
-func TestNames(t *testing.T) {
+// TestName checks the one image whose document a scan applies, the
+// final stage's base: a dhi.io image in any case gives its name, any
+// other image none, and a name that is not one path segment is refused,
+// naming its line.
+func TestName(t *testing.T) {
 	t.Parallel()
 
 	ref := func(name string, line int) verify.Ref {
@@ -147,97 +151,69 @@ func TestNames(t *testing.T) {
 	}
 	for _, tt := range []struct {
 		name    string
-		refs    []verify.Ref
-		want    []string
+		ref     verify.Ref
+		want    string
+		wantOK  bool
 		wantErr string
 	}{
-		{name: "none", refs: nil},
-		{name: "no-dhi", refs: []verify.Ref{ref("gcr.io/distroless/cc-debian13", 1), ref("golang", 2)}},
-		{name: "one", refs: []verify.Ref{ref("golang", 1), ref("dhi.io/aspnetcore", 2)}, want: []string{"aspnetcore"}},
-		{
-			// Prowlarr's: one image for two stages, then others, each
-			// once and in the order the Containerfile first names them
-			name: "several",
-			refs: []verify.Ref{
-				ref("dhi.io/aspnetcore", 18), ref("dhi.io/node", 21), ref("dhi.io/node", 52),
-				ref("dhi.io/dotnet", 59), ref("dhi.io/golang", 109),
-			},
-			want: []string{"aspnetcore", "node", "dotnet", "golang"},
-		},
-		{name: "upper-case-host", refs: []verify.Ref{ref("DHI.io/dotnet", 3)}, want: []string{"dotnet"}},
-		{name: "nested", refs: []verify.Ref{ref("dhi.io/aspnetcore", 2), ref("dhi.io/library/node", 5)}, wantErr: "line 5"},
-		{name: "upper-case-name", refs: []verify.Ref{ref("dhi.io/AspNetCore", 4)}, wantErr: "line 4"},
-		{name: "dots-alone", refs: []verify.Ref{ref("dhi.io/..", 6)}, wantErr: "line 6"},
+		{name: "dhi", ref: ref("dhi.io/aspnetcore", 2), want: "aspnetcore", wantOK: true},
+		{name: "upper-case-host", ref: ref("DHI.io/dotnet", 3), want: "dotnet", wantOK: true},
+		{name: "distroless", ref: ref("gcr.io/distroless/cc-debian13", 1)},
+		{name: "docker-hub", ref: ref("golang", 1)},
+		{name: "nested", ref: ref("dhi.io/library/node", 5), wantErr: "line 5"},
+		{name: "upper-case-name", ref: ref("dhi.io/AspNetCore", 4), wantErr: "line 4"},
+		{name: "dots-alone", ref: ref("dhi.io/..", 6), wantErr: "line 6"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := dhivex.Names(tt.refs)
+			got, ok, err := dhivex.Name(tt.ref)
 			if tt.wantErr != "" {
 				if !errors.Is(err, dhivex.ErrName) || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("Names() = %q, %v; want ErrName naming %s", got, err, tt.wantErr)
+					t.Fatalf("Name() = %q, %t, %v; want ErrName naming %s", got, ok, err, tt.wantErr)
 				}
 				return
 			}
-			if err != nil || !slices.Equal(got, tt.want) {
-				t.Errorf("Names() = %q, %v; want %q", got, err, tt.want)
+			if err != nil || got != tt.want || ok != tt.wantOK {
+				t.Errorf("Name() = %q, %t, %v; want %q, %t", got, ok, err, tt.want, tt.wantOK)
 			}
 		})
 	}
 }
 
-func TestDocuments(t *testing.T) {
+func TestDocument(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct {
 		name string
-		// names are the images asked for, and served those the
-		// advisories hold; status overrides the answer for a path.
-		names, served []string
-		status        map[string]int
+		// image is the name asked for; served are the images whose
+		// documents the advisories hold, and status overrides the answer
+		// for a path.
+		image  string
+		served []string
+		status map[string]int
 		// cosign returns the cosign calls scripted for dir.
 		cosign func(dir string) []execx.Call
 		// wantAsked is every path the advisories must be asked for, in
-		// order; want the documents' names in dir, on success.
+		// order.
 		wantAsked []string
-		want      []string
 		wantErr   error
 		// wantErrText is what the error must say, and wantLog what cosign's
 		// report, passed on, must hold.
 		wantErrText, wantLog []string
 	}{
 		{
-			name:   "one",
-			names:  []string{"aspnetcore"},
-			served: []string{"aspnetcore"},
+			name:   "verified",
+			image:  "aspnetcore",
+			served: []string{"aspnetcore", "node"},
 			cosign: func(dir string) []execx.Call {
 				return []execx.Call{verifyBlob(dir, "aspnetcore", 0, "Verified OK\n")}
 			},
 			wantAsked: []string{documentPath("aspnetcore"), bundlePath("aspnetcore")},
-			want:      []string{"dhi-aspnetcore.vex.json"},
 			wantLog:   []string{"Verified OK\n"},
 		},
 		{
-			name:   "several",
-			names:  []string{"aspnetcore", "node", "dotnet"},
-			served: []string{"aspnetcore", "node", "dotnet", "golang"},
-			cosign: func(dir string) []execx.Call {
-				return []execx.Call{
-					verifyBlob(dir, "aspnetcore", 0, ""), verifyBlob(dir, "node", 0, ""), verifyBlob(dir, "dotnet", 0, ""),
-				}
-			},
-			wantAsked: []string{
-				documentPath("aspnetcore"), bundlePath("aspnetcore"), documentPath("node"), bundlePath("node"),
-				documentPath("dotnet"), bundlePath("dotnet"),
-			},
-			want: []string{"dhi-aspnetcore.vex.json", "dhi-node.vex.json", "dhi-dotnet.vex.json"},
-		},
-		{
-			name:   "none",
-			cosign: func(string) []execx.Call { return nil },
-		},
-		{
 			name:   "not-verified",
-			names:  []string{"aspnetcore"},
+			image:  "aspnetcore",
 			served: []string{"aspnetcore"},
 			cosign: func(dir string) []execx.Call {
 				return []execx.Call{verifyBlob(dir, "aspnetcore", 1, "Error: failed to verify signature: invalid signature\n")}
@@ -248,23 +224,9 @@ func TestDocuments(t *testing.T) {
 			wantLog:     []string{"invalid signature"},
 		},
 		{
-			// The first passes, and is still not passed on
-			name:   "second-not-verified",
-			names:  []string{"aspnetcore", "node"},
-			served: []string{"aspnetcore", "node"},
-			cosign: func(dir string) []execx.Call {
-				return []execx.Call{verifyBlob(dir, "aspnetcore", 0, ""), verifyBlob(dir, "node", 1, "")}
-			},
-			wantAsked: []string{
-				documentPath("aspnetcore"), bundlePath("aspnetcore"), documentPath("node"), bundlePath("node"),
-			},
-			wantErr:     dhivex.ErrNotVerified,
-			wantErrText: []string{"dhi.io/node"},
-		},
-		{
 			// Asked for once: a 404 is an answer, not a failure to answer
 			name:        "no-document",
-			names:       []string{"aspnetcore"},
+			image:       "aspnetcore",
 			cosign:      func(string) []execx.Call { return nil },
 			wantAsked:   []string{documentPath("aspnetcore")},
 			wantErr:     dhivex.ErrFetch,
@@ -272,7 +234,7 @@ func TestDocuments(t *testing.T) {
 		},
 		{
 			name:        "no-bundle",
-			names:       []string{"aspnetcore"},
+			image:       "aspnetcore",
 			served:      []string{"aspnetcore"},
 			status:      map[string]int{bundlePath("aspnetcore"): http.StatusNotFound},
 			cosign:      func(string) []execx.Call { return nil },
@@ -282,7 +244,7 @@ func TestDocuments(t *testing.T) {
 		},
 		{
 			name:        "refused",
-			names:       []string{"aspnetcore"},
+			image:       "aspnetcore",
 			served:      []string{"aspnetcore"},
 			status:      map[string]int{documentPath("aspnetcore"): http.StatusForbidden},
 			cosign:      func(string) []execx.Call { return nil },
@@ -291,19 +253,10 @@ func TestDocuments(t *testing.T) {
 			wantErrText: []string{"dhi.io/aspnetcore", "403"},
 		},
 		{
-			name:        "second-missing",
-			names:       []string{"aspnetcore", "node"},
-			served:      []string{"aspnetcore"},
-			cosign:      func(dir string) []execx.Call { return []execx.Call{verifyBlob(dir, "aspnetcore", 0, "")} },
-			wantAsked:   []string{documentPath("aspnetcore"), bundlePath("aspnetcore"), documentPath("node")},
-			wantErr:     dhivex.ErrFetch,
-			wantErrText: []string{"dhi.io/node", "404"},
-		},
-		{
-			// Names reaches here already checked; anything else names a
+			// Name reaches here already checked; anything else names a
 			// path outside dir, and is asked for nowhere
 			name:        "not-a-name",
-			names:       []string{"../aspnetcore"},
+			image:       "../aspnetcore",
 			cosign:      func(string) []execx.Call { return nil },
 			wantErr:     dhivex.ErrName,
 			wantErrText: []string{"../aspnetcore"},
@@ -321,7 +274,7 @@ func TestDocuments(t *testing.T) {
 			cosign := &seeing{t: t, fake: execx.NewFake(t, tt.cosign(dir)...), saw: map[string]string{}}
 			var log bytes.Buffer
 			src := dhivex.Source{Client: srv.Client(), Base: srv.URL + "/vex/"}
-			got, err := dhivex.Documents(t.Context(), src, dhivex.Verifier{Cosign: cosign, Key: key, Log: &log}, dir, tt.names)
+			got, err := dhivex.Document(t.Context(), src, dhivex.Verifier{Cosign: cosign, Key: key, Log: &log}, dir, tt.image)
 
 			if asked := a.paths(); !slices.Equal(asked, tt.wantAsked) {
 				t.Errorf("asked the advisories for %q, want %q", asked, tt.wantAsked)
@@ -333,51 +286,44 @@ func TestDocuments(t *testing.T) {
 			}
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("Documents() = %q, %v; want an error wrapping %v", got, err, tt.wantErr)
+					t.Fatalf("Document() = %q, %v; want an error wrapping %v", got, err, tt.wantErr)
 				}
 				for _, want := range tt.wantErrText {
 					if !strings.Contains(err.Error(), want) {
-						t.Errorf("Documents() error = %q, want it to say %q", err, want)
+						t.Errorf("Document() error = %q, want it to say %q", err, want)
 					}
 				}
-				if got != nil {
-					t.Errorf("Documents() = %q with its error, want nothing to apply", got)
+				if got != "" {
+					t.Errorf("Document() = %q with its error, want nothing to apply", got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("Documents() error = %v", err)
+				t.Fatalf("Document() error = %v", err)
 			}
-			want := make([]string, 0, len(tt.want))
-			for _, name := range tt.want {
-				want = append(want, filepath.Join(dir, name))
+			base := "dhi-" + tt.image + ".vex.json"
+			if want := filepath.Join(dir, base); got != want {
+				t.Errorf("Document() = %q, want %q", got, want)
 			}
-			if !slices.Equal(got, want) {
-				t.Errorf("Documents() = %q, want %q", got, want)
-			}
-			// Each document passed on is, byte for byte, what was served
+			// The document passed on is, byte for byte, what was served
 			// and what cosign verified, beside the bundle it verified with
-			for i, path := range got {
-				name := tt.names[i]
-				data, err := os.ReadFile(path) //nolint:gosec // G304: a path in the test's own directory
-				if err != nil {
-					t.Fatal(err)
-				}
-				base := filepath.Base(path)
-				if string(data) != document(name) || cosign.saw[base] != document(name) {
-					t.Errorf("%s holds %q, and cosign verified %q; want %q served", base, data, cosign.saw[base], document(name))
-				}
-				if cosign.saw[base+".sig"] != bundle(name) {
-					t.Errorf("cosign verified %s with %q, want %q served", base, cosign.saw[base+".sig"], bundle(name))
-				}
+			data, err := os.ReadFile(got) //nolint:gosec // G304: a path in the test's own directory
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != document(tt.image) || cosign.saw[base] != document(tt.image) {
+				t.Errorf("%s holds %q, and cosign verified %q; want %q served", base, data, cosign.saw[base], document(tt.image))
+			}
+			if cosign.saw[base+".sig"] != bundle(tt.image) {
+				t.Errorf("cosign verified %s with %q, want %q served", base, cosign.saw[base+".sig"], bundle(tt.image))
 			}
 		})
 	}
 }
 
-// TestDocumentsTooLarge sends one byte more than a fetch reads, and sees
+// TestDocumentTooLarge sends one byte more than a fetch reads, and sees
 // it refused unread rather than cut short and passed on.
-func TestDocumentsTooLarge(t *testing.T) {
+func TestDocumentTooLarge(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -391,10 +337,10 @@ func TestDocumentsTooLarge(t *testing.T) {
 
 	src := dhivex.Source{Client: srv.Client(), Base: srv.URL + "/vex/"}
 	v := dhivex.Verifier{Cosign: execx.NewFake(t), Key: key, Log: io.Discard}
-	got, err := dhivex.Documents(t.Context(), src, v, t.TempDir(), []string{"golang"})
+	got, err := dhivex.Document(t.Context(), src, v, t.TempDir(), "golang")
 	if !errors.Is(err, dhivex.ErrFetch) || !strings.Contains(err.Error(), "dhi.io/golang") ||
 		!strings.Contains(err.Error(), strconv.Itoa(dhivex.MaxSize>>20)+" MiB") {
-		t.Fatalf("Documents() = %q, %v; want ErrFetch for dhi.io/golang, saying the limit", got, err)
+		t.Fatalf("Document() = %q, %v; want ErrFetch for dhi.io/golang, saying the limit", got, err)
 	}
 }
 
@@ -406,9 +352,9 @@ func (zeros) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestDocumentsNoKey refuses a Verifier with no key before anything is
+// TestDocumentNoKey refuses a Verifier with no key before anything is
 // fetched: cosign with no --key would look for a signer elsewhere.
-func TestDocumentsNoKey(t *testing.T) {
+func TestDocumentNoKey(t *testing.T) {
 	t.Parallel()
 
 	a := serving(t, "aspnetcore")
@@ -416,9 +362,9 @@ func TestDocumentsNoKey(t *testing.T) {
 	t.Cleanup(srv.Close)
 	src := dhivex.Source{Client: srv.Client(), Base: srv.URL + "/vex/"}
 	v := dhivex.Verifier{Cosign: execx.NewFake(t), Log: io.Discard}
-	if got, err := dhivex.Documents(t.Context(), src, v, t.TempDir(), []string{"aspnetcore"}); err == nil ||
+	if got, err := dhivex.Document(t.Context(), src, v, t.TempDir(), "aspnetcore"); err == nil ||
 		!strings.Contains(err.Error(), "dhi-2.pub") {
-		t.Errorf("Documents() = %q, %v; want an error naming the missing dhi-2.pub", got, err)
+		t.Errorf("Document() = %q, %v; want an error naming the missing dhi-2.pub", got, err)
 	}
 	if asked := a.paths(); len(asked) != 0 {
 		t.Errorf("asked the advisories for %q with no key to verify against, want nothing", asked)
@@ -453,13 +399,13 @@ var (
 	}
 )
 
-// TestDocumentsRetries scripts how the advisories answer each try at the
+// TestDocumentRetries scripts how the advisories answer each try at the
 // document, the bundle always being there, and checks how many tries a
 // fetch makes and how long they take on synctest's clock: one minute at
 // most per try, a pause of two seconds before the second and four before
 // the third, and no more. Only what a retry could fix is retried: no
 // answer, a timeout, 429 and 5xx; any other answer is final.
-func TestDocumentsRetries(t *testing.T) {
+func TestDocumentRetries(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct {
@@ -542,7 +488,7 @@ func TestDocumentsRetries(t *testing.T) {
 				src := dhivex.Source{Client: client, Base: "https://advisories.test/vex/"}
 
 				start := time.Now()
-				_, err := dhivex.Documents(t.Context(), src, v, dir, []string{"aspnetcore"})
+				_, err := dhivex.Document(t.Context(), src, v, dir, "aspnetcore")
 				elapsed := time.Since(start)
 
 				if tries != tt.wantTries {
@@ -553,23 +499,23 @@ func TestDocumentsRetries(t *testing.T) {
 				}
 				switch {
 				case tt.wantErr == nil && err != nil:
-					t.Errorf("Documents() error = %v", err)
+					t.Errorf("Document() error = %v", err)
 				case tt.wantErr != nil && !errors.Is(err, tt.wantErr):
-					t.Errorf("Documents() error = %v, want one wrapping %v", err, tt.wantErr)
+					t.Errorf("Document() error = %v, want one wrapping %v", err, tt.wantErr)
 				case tt.wantErr != nil && !strings.Contains(err.Error(), "dhi.io/aspnetcore"):
-					t.Errorf("Documents() error = %q, want it to name dhi.io/aspnetcore", err)
+					t.Errorf("Document() error = %q, want it to name dhi.io/aspnetcore", err)
 				case tt.wantErr != nil && !strings.Contains(err.Error(), tt.wantErrText):
-					t.Errorf("Documents() error = %q, want it to say %q", err, tt.wantErrText)
+					t.Errorf("Document() error = %q, want it to say %q", err, tt.wantErrText)
 				}
 			})
 		})
 	}
 }
 
-// TestDocumentsStopsWithTheCaller ends the caller's context during the
+// TestDocumentStopsWithTheCaller ends the caller's context during the
 // pause after a failed try, and sees the fetch stop there with the
 // caller's error, not try again or wait out the pause.
-func TestDocumentsStopsWithTheCaller(t *testing.T) {
+func TestDocumentStopsWithTheCaller(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -584,12 +530,12 @@ func TestDocumentsStopsWithTheCaller(t *testing.T) {
 		src := dhivex.Source{Client: client, Base: "https://advisories.test/vex/"}
 
 		start := time.Now()
-		_, err := dhivex.Documents(ctx, src, v, t.TempDir(), []string{"aspnetcore"})
+		_, err := dhivex.Document(ctx, src, v, t.TempDir(), "aspnetcore")
 		if elapsed := time.Since(start); tries != 1 || elapsed != time.Second {
 			t.Errorf("tried %d times in %s, want once, stopping after a second", tries, elapsed)
 		}
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("Documents() error = %v, want context.Canceled", err)
+			t.Errorf("Document() error = %v, want context.Canceled", err)
 		}
 	})
 }

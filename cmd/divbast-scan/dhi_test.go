@@ -141,13 +141,16 @@ func verifyBlob(name string, code int) execx.Call {
 
 func dhiDoc(name string) string { return "{DIR}/dhi-" + name + ".vex.json" }
 
-// TestRunDHIVEX gives the scan a Containerfile, and checks that for every
-// dhi.io image it builds from, the scan fetches Docker's VEX document and
-// its bundle, has cosign verify the one with the other against the
-// embedded dhi-2.pub, and passes each verified document, after the app's
-// own, to both of Trivy's scans; that a document that cannot be fetched or
-// verified fails the scan, naming the image, before Trivy runs; and that a
-// Containerfile with no dhi.io image fetches nothing and changes nothing.
+// TestRunDHIVEX gives the scan a Containerfile, and checks that when its
+// final stage builds on a dhi.io image, followed back through any stage
+// it names and with build arguments resolved, the scan fetches that
+// image's VEX document and its bundle, has cosign verify the one with the
+// other against the embedded dhi-2.pub, and passes the verified document,
+// after the app's own, to both of Trivy's scans; that no build stage's
+// document is fetched, its packages never shipping; that a document that
+// cannot be fetched or verified fails the scan, naming the image, before
+// Trivy runs; and that a final stage on any other base fetches nothing
+// and changes nothing.
 func TestRunDHIVEX(t *testing.T) {
 	t.Parallel()
 
@@ -179,32 +182,77 @@ func TestRunDHIVEX(t *testing.T) {
 			wantVEX:       []string{dhiDoc("aspnetcore")},
 			scans:         true,
 			wantAsked:     []string{"/vex/aspnetcore/dhi-aspnetcore.vex.json", "/vex/aspnetcore/dhi-aspnetcore.vex.json.sig"},
-			wantStdout:    "applying dhi.io/aspnetcore's VEX document, verified against dhi-2.pub\ncompared with " + digest + "\n",
-			wantStderr:    []string{"Verified OK\n"},
+			wantStdout: "applying the VEX document of dhi.io/aspnetcore, the final stage's base, verified against dhi-2.pub\n" +
+				"compared with " + digest + "\n",
+			wantStderr: []string{"Verified OK\n"},
 		},
 		{
-			// Prowlarr's shape: a build stage twice, another, then the
-			// runtime from a build argument, each document once, in the
-			// order the Containerfile first names each image
-			name: "several",
+			// Prowlarr's shape: dhi.io build stages, one of them twice,
+			// then the runtime from a build argument naming another
+			// dhi.io image, whose document alone is fetched
+			name: "dhi-build-stages-and-runtime",
 			containerfile: "ARG RUNTIME_IMAGE=" + aspnetcore + "\n" +
 				"FROM " + node + " AS fetch\n" +
 				"FROM " + node + " AS frontend\n" +
 				"FROM " + dotnet + " AS backend\n" +
-				"FROM ${RUNTIME_IMAGE}\n",
-			served:  []string{"aspnetcore", "node", "dotnet"},
-			cosign:  []execx.Call{verifyBlob("node", 0), verifyBlob("dotnet", 0), verifyBlob("aspnetcore", 0)},
-			wantVEX: []string{dhiDoc("node"), dhiDoc("dotnet"), dhiDoc("aspnetcore")},
-			scans:   true,
-			wantAsked: []string{
-				"/vex/node/dhi-node.vex.json", "/vex/node/dhi-node.vex.json.sig",
-				"/vex/dotnet/dhi-dotnet.vex.json", "/vex/dotnet/dhi-dotnet.vex.json.sig",
-				"/vex/aspnetcore/dhi-aspnetcore.vex.json", "/vex/aspnetcore/dhi-aspnetcore.vex.json.sig",
-			},
-			wantStdout: "applying dhi.io/node's VEX document, verified against dhi-2.pub\n" +
-				"applying dhi.io/dotnet's VEX document, verified against dhi-2.pub\n" +
-				"applying dhi.io/aspnetcore's VEX document, verified against dhi-2.pub\n" +
-				"compared with " + digest + "\n",
+				"FROM ${RUNTIME_IMAGE}\n" +
+				"COPY --from=backend /app /app\n",
+			served:     []string{"aspnetcore", "node", "dotnet"},
+			cosign:     []execx.Call{verifyBlob("aspnetcore", 0)},
+			wantVEX:    []string{dhiDoc("aspnetcore")},
+			scans:      true,
+			wantAsked:  []string{"/vex/aspnetcore/dhi-aspnetcore.vex.json", "/vex/aspnetcore/dhi-aspnetcore.vex.json.sig"},
+			wantStdout: "applying the VEX document of dhi.io/aspnetcore, the final stage's base, verified against dhi-2.pub\ncompared with",
+		},
+		{
+			name:          "dhi-build-stage-and-another-runtime",
+			containerfile: "FROM " + node + " AS build\nFROM " + distroless + "\nCOPY --from=build /out /out\n",
+			served:        []string{"node"},
+			scans:         true,
+			wantStdout:    "compared with " + digest + "\n",
+		},
+		{
+			name: "an-earlier-stage",
+			containerfile: "FROM " + aspnetcore + " AS base\n" +
+				"FROM " + node + " AS build\n" +
+				"FROM base\n" +
+				"COPY --from=build /out /out\n",
+			served:    []string{"aspnetcore", "node"},
+			cosign:    []execx.Call{verifyBlob("aspnetcore", 0)},
+			wantVEX:   []string{dhiDoc("aspnetcore")},
+			scans:     true,
+			wantAsked: []string{"/vex/aspnetcore/dhi-aspnetcore.vex.json", "/vex/aspnetcore/dhi-aspnetcore.vex.json.sig"},
+		},
+		{
+			// A build argument naming a stage, built on another dhi.io
+			// image, while a dhi.io build stage comes after it
+			name: "an-arg-naming-a-stage",
+			containerfile: "ARG FINAL=runtime\n" +
+				"FROM " + node + " AS runtime\n" +
+				"FROM " + dotnet + " AS build\n" +
+				"FROM ${FINAL}\n" +
+				"COPY --from=build /app /app\n",
+			served:     []string{"node", "dotnet"},
+			cosign:     []execx.Call{verifyBlob("node", 0)},
+			wantVEX:    []string{dhiDoc("node")},
+			scans:      true,
+			wantAsked:  []string{"/vex/node/dhi-node.vex.json", "/vex/node/dhi-node.vex.json.sig"},
+			wantStdout: "applying the VEX document of dhi.io/node, the final stage's base, verified against dhi-2.pub\n",
+		},
+		{
+			name: "a-chain-of-stages-to-another-runtime",
+			containerfile: "FROM " + distroless + " AS base\n" +
+				"FROM base AS runtime\n" +
+				"FROM " + aspnetcore + " AS build\n" +
+				"FROM runtime\n",
+			served: []string{"aspnetcore"},
+			scans:  true,
+		},
+		{
+			name:          "scratch",
+			containerfile: "FROM " + node + " AS build\nFROM scratch\nCOPY --from=build /out /\n",
+			served:        []string{"node"},
+			scans:         true,
 		},
 		{
 			// The app's own first, as given, then Docker's
@@ -242,16 +290,14 @@ func TestRunDHIVEX(t *testing.T) {
 			wantStderr:    []string{"invalid signature", "dhi.io/aspnetcore: dhi-aspnetcore.vex.json not verified against dhi-2.pub"},
 		},
 		{
-			// The first verified, the second missing: nothing applied
+			// A build stage's document there is no stand-in for the
+			// runtime's
 			name:          "not-found",
 			containerfile: "FROM " + node + " AS build\nFROM " + aspnetcore + "\n",
 			served:        []string{"node"},
-			cosign:        []execx.Call{verifyBlob("node", 0)},
-			wantAsked: []string{
-				"/vex/node/dhi-node.vex.json", "/vex/node/dhi-node.vex.json.sig", "/vex/aspnetcore/dhi-aspnetcore.vex.json",
-			},
-			wantCode:   1,
-			wantStderr: []string{"dhi.io/aspnetcore: could not fetch", "dhi-aspnetcore.vex.json: it answered 404 Not Found"},
+			wantAsked:     []string{"/vex/aspnetcore/dhi-aspnetcore.vex.json"},
+			wantCode:      1,
+			wantStderr:    []string{"dhi.io/aspnetcore: could not fetch", "dhi-aspnetcore.vex.json: it answered 404 Not Found"},
 		},
 		{
 			name:          "unpinned",
