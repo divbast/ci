@@ -216,7 +216,7 @@ that runs it.
 
 The tools these recipes call come from the repository's `mise.toml`:
 pinact, zizmor, actionlint, ShellCheck, shfmt, Go, golangci-lint, reuse and
-just, and for an app hadolint and trivy as well. `ci/mise.toml` holds the
+just, and for an app hadolint, trivy, grype and cosign as well. `ci/mise.toml` holds the
 versions ci itself is tested with.
 
 ### A repository that builds no image
@@ -281,7 +281,7 @@ jobs:
     name: stall
     uses: divbast/ci/.github/workflows/stall.yml@<commit> # vX.Y.Z
     with:
-      checks: '["open","stuck","renovate"]'
+      checks: '["open","stuck","renovate","lookups"]'
     permissions:
       contents: read
       pull-requests: read
@@ -289,6 +289,7 @@ jobs:
       checks: read
       statuses: read
       packages: read
+      issues: read
 ```
 
 `renovate.yml` is called as [below](#renovateyml).
@@ -637,7 +638,8 @@ waits for approval on each caller's Dependency Dashboard.
 
 v2.0.0 is such a release: it added a permission a calling job must grant,
 and made a run that passed fail. [Moving to v2](#moving-to-v2) says what
-a caller changes. v3.0.0 is another: [Moving to v3](#moving-to-v3).
+a caller changes. v3.0.0 is another: [Moving to v3](#moving-to-v3). And
+v4.0.0: [Moving to v4](#moving-to-v4).
 
 ### Moving to v2
 
@@ -734,6 +736,34 @@ changes these.
 `lint.yml`, `app-publish.yml`, `renovate.yml` and `stall.yml` take the
 same inputs and permissions as in v2.
 
+### Moving to v4
+
+v4.0.0 scans an image whose base says `ID=dhi`, Docker's own model for
+its Hardened Images, with Grype ([Scan](#scan)), and adds stall's
+`lookups` check ([`stall.yml`](#stallyml)). A v3 caller changes these,
+and can make the first two before it moves, since v3 asks for less:
+
+- **`stall.yml`'s calling job grants `issues: read`**, which `lookups`
+  needs to read the Dependency Dashboard. A called job that asks for
+  more than its caller grants fails, even for a check the caller leaves
+  out.
+- **An app's `mise.toml` pins Grype** as `"aqua:anchore/grype"`, at one
+  version, beside Trivy: `app-check.yml`'s scan job installs it and holds
+  it to the caller's pin, whatever the image's base.
+- **A caller with its own `checks` list adds `"lookups"`** to it, with
+  the move to v4, since v3's stall refuses a check it does not know. One
+  that takes the default gets it with the move.
+- **Code scanning's category** moves from `trivy-<arch>` to
+  `scan-<arch>`, so alerts under the old category stay open until someone
+  closes them.
+- **An app's `openvex.json`** that names a CVE for a language package,
+  if its base says `ID=dhi`, lists the GHSA Grype reports it under as one
+  of its `aliases` ([VEX](#vex)).
+
+`divbast-scan` gains one optional flag, `-cache`, and `divbast-stall` one
+check; every v3 command line runs as it did. The other workflows take
+the same inputs and permissions.
+
 ## Workflows
 
 The caller grants each called job its permissions. A called job gets no
@@ -804,13 +834,16 @@ install the caller's whole `mise.toml`, which declares cosign as
 `"aqua:sigstore/cosign"` for `divbast-verify-images`.
 
 `scan`, which can change code scanning alerts, installs only Go, just,
-Trivy and cosign from the caller's `mise.toml`, and turns mise's
+Trivy, Grype and cosign from the caller's `mise.toml`, and turns mise's
 auto-install off. The caller declares each at one version: Go as
-`"core:go"` (mise reads the short `go` the same way), and just, Trivy and
-cosign as exactly `"aqua:casey/just"`, `"aqua:aquasecurity/trivy"` and
+`"core:go"` (mise reads the short `go` the same way), and just, Trivy,
+Grype and cosign as exactly `"aqua:casey/just"`,
+`"aqua:aquasecurity/trivy"`, `"aqua:anchore/grype"` and
 `"aqua:sigstore/cosign"`, the cosign `build` already needs. mise would
 install a name that `mise.toml` does not declare at its latest version,
-so `scan` fails unless all four are there.
+so `scan` fails unless all five are there. Grype runs only for an image
+that says `ID=dhi` ([Scan](#scan)), but every caller pins it, so a base
+that switches needs no change in the caller.
 
 #### Scan
 
@@ -827,7 +860,7 @@ between the two images, as at DHI's cutover, below, where every ID
 changes. A package new to the image, or at a new version, is still judged
 by its IDs. A new advisory against something already shipped is
 reported, not blocked. Whether anything is
-published is the registry's to say, never Trivy's: the tool first reads
+published is the registry's to say, never a scanner's: the tool first reads
 `PUBLISHED` as an anonymous client, as users pull it, and when ghcr.io
 refuses, asks the GitHub API why, through gh and the job's token, which
 is what `packages: read` is for. It reads `PUBLISHED` with `skopeo`, from
@@ -836,35 +869,72 @@ is what `packages: read` is for. It reads `PUBLISHED` with `skopeo`, from
 
 | `PUBLISHED` is | The scan |
 |---|---|
-| readable | Compares with what Trivy finds in it, from the same vulnerability database. Any failure of that scan fails, whatever Trivy says about why |
+| readable | Compares with what the same scanner finds in it, from the same vulnerability database. Any failure of that scan fails, whatever the scanner says about why |
 | not published yet: no such package, or no such tag in a public one | Advisory, with a warning: nothing is shipped to compare with |
 | private | Advisory, with a warning that it stays advisory until the package is public |
 | public, but refused for any other reason | Fails: a registry failing to serve the image is not nothing published |
 | unreadable, or GitHub does not answer | Fails |
 
 Each warning is a GitHub Actions warning and a callout on the run's
-summary. Only gh gets the token: Trivy and skopeo run without it.
+summary. Only gh gets the token: Trivy, Grype and skopeo run without it.
 
-It also refuses a report, of the build or of `PUBLISHED`, in which Trivy
-recognised no operating system (its family empty, or `none`) or saw no
-OS package. An image whose OS Trivy does not know still has its language
+It also refuses a report, of the build or of `PUBLISHED`, in which the
+scanner recognised no operating system (Trivy's family empty, or `none`)
+or saw no OS package. An image whose OS a scanner does not know still has its language
 packages, which would pass the check for a scan that saw no packages, yet
 the scan could then not see the OS packages, and nothing would show they
 are clean.
 
-A scanner can also be wrong without being blind, so the tool reads the
-image's own os-release, `/etc/os-release` or else `/usr/lib/os-release`,
-from the build's OCI layout, layer by layer, and holds Trivy's report
-against it, before any SARIF is written. Docker is moving its Hardened
-Images to their own model: an image that says `ID=dhi`, judged by
-Docker's own advisories rather than Debian's. Trivy takes Debian from
-`/etc/debian_version`, which those images keep, so it reads a switched
-image as plain Debian and scans it against the wrong advisories, with a
-report that looks like any other. The scan refuses a build that says
-`ID=dhi` when Trivy's OS family is anything but `dhi`, naming both. Until
-ci scans that model, the first switched base's digest bump fails here,
-with that reason. An image with no os-release is left to the checks
-above.
+A scanner can also be wrong without being blind. Before either scan,
+the tool reads the image's architecture and its own os-release,
+`/etc/os-release` or else `/usr/lib/os-release`, from the build's OCI
+layout, layer by layer, and the os-release picks the scanner. Docker is
+moving its Hardened Images to their own model: an image that says
+`ID=dhi`, judged by Docker's own advisories rather than Debian's. Trivy
+takes Debian from `/etc/debian_version`, which those images keep, so it
+would read a switched image as plain Debian and scan it against the wrong
+advisories, with a report that looks like any other. So an image that
+says `ID=dhi` is scanned by [Grype](https://github.com/anchore/grype),
+which reads that model, and any other image by Trivy. `PUBLISHED` is
+scanned by the candidate's scanner, so both sides share one model and
+one database: a published image from before its base switched reads as
+Debian, and the version rule above carries the comparison across. For
+Grype, the tool:
+
+- writes Grype's configuration itself, into the directory `-cache` names,
+  by default `divbast-scan/grype` in the user's cache directory so that a
+  local scan keeps the database between runs, and names it on every
+  call, so a `.grype.yaml` in the caller's repository is never read; and
+  it clears every `GRYPE_` variable, which would beat even that;
+- updates the vulnerability database once, with `grype db update`, about
+  200 MB, and lets neither scan update it again. Grype's own checks of
+  the database's age and checksum stay on; the database carries no
+  signature;
+- asks the database about a package a record in DHI's own namespace is
+  known to match, kept in a table in `cmd/divbast-scan` by the image's
+  `ID_LIKE` and `VERSION_ID`, and refuses to scan unless the match comes
+  from there, since a database without DHI's advisories would read every
+  DHI image as clean. A release with no entry, or a record that is gone,
+  fails, naming `grype db search --provider dhi --distro dhi-<VERSION_ID>`
+  to find another;
+- refuses a report not of the image's own model, naming what it found:
+  a distro other than `dhi` at the image's `VERSION_ID`, an OS package
+  keyed outside `dhi`, or a match from Debian's or Alpine's advisories;
+- refuses two reports from different databases, or without the `dhi`
+  provider.
+
+Grype reports some of DHI's findings with no severity: a new one is
+listed, on stdout and the summary, and never blocks, as Trivy's
+`HIGH,CRITICAL` filter leaves such findings out altogether. The SARIF
+holds the HIGH and CRITICAL findings alone, whichever scanner wrote it,
+and `app-check.yml` uploads it under the code scanning category
+`scan-<arch>`. A report the tool refuses leaves no SARIF behind, since
+`app-check.yml` uploads one from main even when the scan fails.
+
+Grype does not check that an `ID=dhi` image's packages are DHI's own: a
+Debian package installed on a DHI base is judged by DHI's advisories,
+which do not cover it, and reads clean. No divbast image adds OS
+packages to a DHI base.
 
 Trivy reads `.trivyignore` and `trivy.yaml` from its working directory,
 which is the caller's repository, and a `TRIVY_` variable for each of its
@@ -890,7 +960,11 @@ with an `openvex.json.license` sidecar for REUSE. `scan` passes it to both
 of Trivy's scans when it is there, and passes no `-vex` when it is not.
 Each statement names one advisory and the product, with its version, that
 it was argued against, so that a bump that moves the product brings the
-finding back, to be argued again.
+finding back, to be argued again. Grype, which scans an image that says
+`ID=dhi`, matches a statement on its own IDs, and keys a language
+package's finding by its GitHub advisory, `GHSA-…`: a statement naming
+the CVE lists the GHSA under its vulnerability's `aliases` too, or Grype
+applies none of it.
 
 Trivy reads a Docker Hardened Image's Debian packages, Docker's own
 builds versioned `…+dhiN`, as Debian's, and reports every vulnerability
@@ -1118,7 +1192,7 @@ by `divbast-stall`.
 
 | Input | Type | Default | What |
 |---|---|---|---|
-| `checks` | string | `'["open","stuck","renovate","slots"]'` | The checks to run, as a JSON array |
+| `checks` | string | `'["open","stuck","renovate","slots","lookups"]'` | The checks to run, as a JSON array |
 | `published` | string | `''` | The image the daily slot publishes, such as `ghcr.io/divbast/librespeed:latest`; `slots` needs it |
 | `slot-workflow` | string | `build.yml` | The workflow whose scheduled runs on main are the daily slots |
 | `renovate-workflow` | string | `renovate.yml` | The workflow that runs Renovate |
@@ -1128,6 +1202,18 @@ by `divbast-stall`.
 | `lost-slots` | number | `2` | Lost daily slots that make a stall |
 | `content-gated` | boolean | `false` | The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost |
 | `slot-job` | string | `''` | With `content-gated`, the job in each slot run that publishes the image, as GitHub names it in the run, whose conclusion counts rather than the whole run's |
+
+`lookups` reads the open issues `divbast-renovate` made, keeps the one
+titled exactly `Dependency Dashboard`, and fails at once while it lists a
+dependency Renovate failed to look up: a datasource that answered
+nothing, or a digest Renovate could not resolve, leaves that dependency
+where it is, and only the dashboard says so. It names each lookup and the
+files it is in. It anchors on the sentence Renovate lists them under,
+which its other warnings never use, and a sentence it cannot read fails
+the check. With no open dashboard it fails once Renovate has succeeded,
+since Renovate remakes the dashboard on every run; before that, the
+`renovate` check owns the case. If Renovate ever rewords the sentence,
+the check goes quietly green.
 
 `content-gated` is for a repository whose daily slot runs
 `divbast-publish-decision -content-gated`, and so can succeed while it
@@ -1158,7 +1244,8 @@ the name nor an unexpanded name standing for it fails the check, as does
 conclusion.
 
 The calling job grants `contents: read`, `pull-requests: read`,
-`actions: read`, `checks: read`, `statuses: read` and `packages: read`.
+`actions: read`, `checks: read`, `statuses: read`, `packages: read` and
+`issues: read`.
 
 ## Verified inputs
 
@@ -1256,10 +1343,10 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched, not verified, or not that image's; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; the layout's os-release unreadable, or saying `ID=dhi` when Trivy read another OS; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]... [-cache DIR]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, scanning with Grype an image that says `ID=dhi` and with Trivy any other, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched, not verified, or not that image's; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; a layout that is not one linux image, or whose os-release cannot be read; for an `ID=dhi` image, Grype's database not updated, no probe for its release or the probe unanswered from DHI's namespace, a report under another model, or the two reports from different databases; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
-| `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
+| `divbast-stall open\|stuck\|renovate\|slots\|lookups`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table (FrankenPHP, distroless, `dhi.io`) its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old; a `dhi.io` image with no `DHI_USERNAME` and `DHI_TOKEN`; or a verification failed |
 | `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
