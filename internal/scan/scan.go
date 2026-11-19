@@ -34,10 +34,11 @@ import (
 // vendor's bulletins, such as a Debian security advisory, and one
 // bulletin fixes many vulnerabilities, so two different CVEs would share
 // one. With Trivy on both sides of a comparison and one database, the
-// IDs themselves agree.
+// IDs themselves agree. Namespace is where the scanner's database keeps
+// the advisory, such as dhi:distro:dhi:13, where it says; Trivy does not.
 type Finding struct {
-	ID, Pkg, Version, Fixed, Severity, URL, Where string
-	Aliases                                       []string
+	ID, Pkg, Version, Fixed, Severity, URL, Where, Namespace string
+	Aliases                                                  []string
 }
 
 // Pkg is a package an image ships, by name and version, the version
@@ -63,7 +64,12 @@ type Split struct{ New, Old []Finding }
 // alone does not show.
 //
 // Inventory is every package the report lists by name, OS and language
-// alike, with its version as a finding in it would give it.
+// alike, with its version as a finding in it would give it; OSPURLs is the
+// package URL of each OS package, where the scanner gives them.
+//
+// DB is the vulnerability database the scan used, as the scanner names
+// it, and Providers the sources of advisories it holds, where the
+// scanner says; Trivy does neither.
 type Report struct {
 	Findings   []Finding
 	Packages   int
@@ -73,6 +79,9 @@ type Report struct {
 	Arch       string
 	Ref        string
 	Inventory  []Pkg
+	OSPURLs    []string
+	DB         string
+	Providers  []string
 }
 
 // trivyJSON is what the scan reads of a Trivy JSON report.

@@ -1,0 +1,135 @@
+{
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "CVE-2026-111497",
+        "dataSource": "https://security-tracker.debian.org/tracker/CVE-2026-111497",
+        "namespace": "debian:distro:debian:13",
+        "severity": "Critical",
+        "fix": {
+          "versions": [
+            "1.1.0-2+deb13u1"
+          ],
+          "state": "fixed"
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2026-111497"
+        }
+      ],
+      "artifact": {
+        "name": "brotli",
+        "version": "1.1.0-1",
+        "type": "deb",
+        "locations": [],
+        "purl": "pkg:deb/debian/brotli@1.1.0-1?arch=arm64&distro=debian-13"
+      }
+    }
+  ],
+  "source": {
+    "type": "purl",
+    "target": "pkg:deb/debian/brotli@1.1.0-1?arch=arm64&distro=debian-13"
+  },
+  "distro": {
+    "name": "debian",
+    "version": "13",
+    "idLike": [
+      "debian"
+    ]
+  },
+  "descriptor": {
+    "name": "grype",
+    "version": "0.122.1",
+    "db": {
+      "status": {
+        "schemaVersion": "v6.1.10",
+        "from": "https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.10_2026-11-19T00:22:15Z_1795069397.tar.zst?checksum=sha256%3Acf30f15bf29c0b7addc26938fcd6e22fa8a5f8740143962a0e77666ed9747030",
+        "built": "2026-11-19T06:23:17Z"
+      },
+      "providers": {
+        "alma": {
+          "captured": "2026-11-19T00:23:03Z"
+        },
+        "alpine": {
+          "captured": "2026-11-19T00:22:28Z"
+        },
+        "amazon": {
+          "captured": "2026-11-19T00:22:41Z"
+        },
+        "arch": {
+          "captured": "2026-11-19T00:22:20Z"
+        },
+        "bitnami": {
+          "captured": "2026-11-19T00:22:26Z"
+        },
+        "chainguard": {
+          "captured": "2026-11-19T00:22:33Z"
+        },
+        "chainguard-libraries": {
+          "captured": "2026-11-19T00:22:25Z"
+        },
+        "debian": {
+          "captured": "2026-11-19T00:23:02Z"
+        },
+        "dhi": {
+          "captured": "2026-11-19T00:22:36Z"
+        },
+        "echo": {
+          "captured": "2026-11-19T00:22:53Z"
+        },
+        "eol": {
+          "captured": "2026-11-19T00:22:15Z"
+        },
+        "epss": {
+          "captured": "2026-11-19T00:22:28Z"
+        },
+        "fedora": {
+          "captured": "2026-11-19T00:22:36Z"
+        },
+        "github": {
+          "captured": "2026-11-19T00:22:38Z"
+        },
+        "govulndb": {
+          "captured": "2026-11-19T00:22:26Z"
+        },
+        "hummingbird": {
+          "captured": "2026-11-19T00:24:15Z"
+        },
+        "kev": {
+          "captured": "2026-11-19T00:22:22Z"
+        },
+        "mariner": {
+          "captured": "2026-11-19T00:22:22Z"
+        },
+        "minimos": {
+          "captured": "2026-11-19T00:22:19Z"
+        },
+        "nvd": {
+          "captured": "2026-11-19T00:22:56Z"
+        },
+        "oracle": {
+          "captured": "2026-11-19T00:22:33Z"
+        },
+        "photon": {
+          "captured": "2026-11-19T00:22:29Z"
+        },
+        "rhel": {
+          "captured": "2026-11-19T00:23:18Z"
+        },
+        "secureos": {
+          "captured": "2026-11-19T00:22:19Z"
+        },
+        "sles": {
+          "captured": "2026-11-19T00:23:46Z"
+        },
+        "ubuntu": {
+          "captured": "2026-11-19T00:22:54Z"
+        },
+        "wolfi": {
+          "captured": "2026-11-19T00:22:21Z"
+        }
+      }
+    }
+  }
+}

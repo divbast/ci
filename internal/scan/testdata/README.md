@@ -95,3 +95,71 @@ the published image is there before Trivy scans it, so the tests replay
 these as what a scan that failed prints, which fails the scan whatever it
 says. ghcr.io cannot be made to answer 429 on demand, hence the stub, a
 Python `http.server` on 127.0.0.1 that answers `/v2/` with 200.
+
+## Grype
+
+Recorded with Grype 0.122.1 on 2026-11-20, offline, against its
+vulnerability database built 2026-11-19 (the `from` in each report), with
+a configuration as `Grype.WriteConfig` writes one: no update check, the
+database's auto-update off.
+
+The inputs are synthetic, so that each has packages with known findings:
+an image of one zstd layer, written in the shape buildx's `type=oci`
+export gives (an index naming an index, which names the image beside an
+attestation manifest), for linux/arm64, holding:
+
+- `/etc/os-release` saying `ID=dhi`, `ID_LIKE=debian`, `VERSION_ID=13`,
+  and `/etc/debian_version`;
+- `/var/lib/dpkg/status` listing `curl 8.14.1-2+deb13u2dhi2`,
+  `qemu 1:10.0.11+ds-0+deb13u1+dhi0`, `brotli 1.1.0-1`,
+  `coreutils 9.7-3+dhi3` and `libc6 2.41-12+dhi1`;
+- `/app/node_modules/lodash/package.json` for lodash 4.17.15.
+
+The Debian image is the same with `ID=debian`, `VERSION_ID="13"`.
+
+```sh
+grype -c grype.yaml oci-dir:dhi-layout --platform linux/arm64 \
+    -o json=dhi.json -o cyclonedx-json=dhi.cdx.json -o sarif=dhi.sarif
+grype -c grype.yaml oci-dir:deb-layout --platform linux/arm64 \
+    -o json=deb.json -o cyclonedx-json=deb.cdx.json
+grype -c grype.yaml 'pkg:deb/dhi/brotli@1.1.0-1?arch=arm64&distro=dhi-13' -o json
+grype -c grype.yaml 'pkg:deb/dhi/brotli@1.1.0-1?arch=arm64&distro=dhi-14' -o json
+grype -c grype.yaml 'pkg:deb/debian/brotli@1.1.0-1?arch=arm64&distro=debian-13' -o json
+```
+
+The last three are the database probe's three answers, as
+`grype-probe-dhi-13.json`, `grype-probe-dhi-14.json` and
+`grype-probe-debian-13.json`: a match from DHI's own namespace, none, and
+one from Debian's.
+
+Each JSON report is trimmed to what the parser reads, with the layout's
+path replaced by `layout`, by this jq program. `grype-dhi.json` keeps 7 of
+its 92 matches (`$ids`), one of each severity, a language finding keyed by
+GHSA and one with no severity; `grype-debian.json` keeps its first 5 HIGH
+or CRITICAL ones; the probes keep everything (`$ids` null):
+
+```jq
+def keep($ks): with_entries(select(.key | IN($ks[])));
+keep(["matches", "source", "distro", "descriptor"])
+| .matches |= map(
+    select($ids == null or (.vulnerability.id | IN($ids[])))
+    | keep(["vulnerability", "relatedVulnerabilities", "artifact"])
+    | .vulnerability |= (keep(["id", "dataSource", "namespace", "severity", "fix"]) | if has("fix") then .fix |= keep(["versions", "state"]) else . end)
+    | .relatedVulnerabilities |= ((. // []) | map(keep(["id"])))
+    | .artifact |= (keep(["name", "version", "type", "locations", "purl"]) | .locations |= ((. // []) | map(keep(["path"])))))
+| .source |= (keep(["type", "target"]) | .target |= (if type == "object" then keep(["userInput", "repoDigests", "architecture"]) | .userInput = "layout" else . end))
+| .descriptor |= (keep(["name", "version", "db"]) | .db |= (.status |= keep(["schemaVersion", "from", "built"]) | .providers |= with_entries(.value |= keep(["captured"]))))
+```
+
+Each CycloneDX file keeps every component's type, name, version and PURL:
+
+```jq
+def keep($ks): with_entries(select(.key | IN($ks[])));
+keep(["bomFormat", "specVersion", "metadata", "components"])
+| .metadata |= (keep(["component"]) | .component |= (keep(["type", "name"]) | .name = "layout"))
+| .components |= map(keep(["type", "name", "version", "purl"]))
+```
+
+`grype-dhi.sarif` keeps the results and rules of those 7 matches, without
+each rule's long descriptions, and with the layout's path replaced by
+`layout`.
