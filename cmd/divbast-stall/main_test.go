@@ -50,6 +50,9 @@ func runJobs(id string) []string {
 	return []string{"gh", "run", "view", id, "--repo", repo, "--json", "jobs"}
 }
 
+// issuesAPI is the read of the Dependency Dashboard.
+var issuesAPI = []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/issues?state=open&creator=divbast-renovate%5Bbot%5D&per_page=100"}
+
 func workflowAPI(workflow string) []string {
 	return []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/actions/workflows/" + workflow}
 }
@@ -288,6 +291,44 @@ func TestRun(t *testing.T) {
 			wantStderr: []string{"PUBLISHED is not set"},
 		},
 		{
+			name: "lookups",
+			args: []string{"lookups"},
+			calls: []execx.Call{{Argv: issuesAPI, Result: apiOK(`[{"number":5,"title":"Dependency Dashboard",` +
+				`"body":"## Open\n\nNothing.\n","html_url":"https://github.com/divbast/librespeed-oci-image/issues/5"}]`)}},
+			wantStdout: "no failed Renovate lookup on the Dependency Dashboard #5\n",
+		},
+		{
+			name: "lookups-stalled",
+			args: []string{"lookups"},
+			calls: []execx.Call{{Argv: issuesAPI, Result: apiOK(`[{"number":5,"title":"Dependency Dashboard",` +
+				`"body":"> [!WARNING]\n> Renovate failed to look up the following dependencies: ` +
+				"`Failed to look up github-tags package anchore/grype: no-result`" + `.\n> \n> Files affected: ` + "`mise.toml`" + `\n",` +
+				`"html_url":"https://github.com/divbast/librespeed-oci-image/issues/5"}]`)}},
+			wantCode: 1,
+			wantStdout: "Renovate failed lookups, by the Dependency Dashboard https://github.com/divbast/librespeed-oci-image/issues/5:\n" +
+				"  Failed to look up github-tags package anchore/grype: no-result\n  files affected: mise.toml\n",
+		},
+		{
+			// With no dashboard, whether Renovate ever succeeded decides
+			name: "lookups-no-dashboard",
+			args: []string{"lookups"},
+			env:  map[string]string{"RENOVATE_WORKFLOW": "self-renovate.yml"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: apiOK("[]")},
+				{Argv: successRuns("self-renovate.yml"), Result: ok(`[{"createdAt":"1999-12-31T23:00:00Z"}]`)},
+			},
+			wantCode: 1,
+			wantStdout: "No open Dependency Dashboard by divbast-renovate, so failed lookups cannot be seen:\n" +
+				"  no open issue titled \"Dependency Dashboard\"; Renovate last succeeded 1999-12-31T23:00:00Z\n",
+		},
+		{
+			name:       "lookups-gh-fails",
+			args:       []string{"lookups"},
+			calls:      []execx.Call{{Argv: issuesAPI, Result: execx.Result{Stderr: []byte("HTTP 401: Bad credentials"), Code: 1}}},
+			wantCode:   2,
+			wantStderr: []string{"Bad credentials"},
+		},
+		{
 			name:       "gh-fails",
 			args:       []string{"open"},
 			calls:      []execx.Call{{Argv: prList, Result: execx.Result{Stderr: []byte("HTTP 401: Bad credentials"), Code: 1}}},
@@ -350,7 +391,7 @@ func TestRun(t *testing.T) {
 		{
 			name:       "help",
 			args:       []string{"-h"},
-			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots"},
+			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots|lookups"},
 		},
 	}
 

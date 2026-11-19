@@ -452,6 +452,26 @@ func TestCompareNewPackageBlocks(t *testing.T) {
 	}
 }
 
+func TestCompareListsUnknown(t *testing.T) {
+	t.Parallel()
+	unknown := scan.Finding{ID: "DHI-u", Pkg: "qemu", Version: "11", Severity: "UNKNOWN"}
+	high := scan.Finding{ID: "DHI-h", Pkg: "qemu", Version: "11", Severity: "HIGH"}
+	oldUnknown := scan.Finding{ID: "DHI-o", Pkg: "curl", Version: "8", Severity: "UNKNOWN"}
+	got := scan.Compare([]scan.Finding{unknown, high, oldUnknown}, []scan.Finding{oldUnknown}, nil)
+	if !sameFindings(got.New, []scan.Finding{high}) || !sameFindings(got.Listed, []scan.Finding{unknown}) ||
+		!sameFindings(got.Old, []scan.Finding{oldUnknown}) {
+		t.Errorf("Compare() = %+v; want the HIGH new, the new UNKNOWN listed, the published one old", got)
+	}
+	listing := scan.Listing("x", "new, so blocking", got)
+	if !strings.Contains(listing, "1 new with no severity, so listed, not blocking:\n  DHI-u UNKNOWN qemu 11") {
+		t.Errorf("Listing() = %q, want the UNKNOWN finding listed apart", listing)
+	}
+	summary := scan.Summary("amd64", "x", "New, so blocking", "", got)
+	if !strings.Contains(summary, "**New with no severity, so listed, not blocking: 1**") || !strings.Contains(summary, "DHI-u") {
+		t.Errorf("Summary() = %q, want the UNKNOWN finding in a table of its own", summary)
+	}
+}
+
 // goldens are rendered by scan.sh's own jq from the same reports; see
 // testdata/README.md.
 var goldens = []struct {

@@ -25,6 +25,13 @@ import (
 // divbast-renovate GitHub App.
 const renovate = "app/divbast-renovate"
 
+// renovateBot is the login of Renovate's issues: the divbast-renovate
+// App's bot user.
+const renovateBot = "divbast-renovate[bot]"
+
+// issueLimit is how many issues one read returns, the most GitHub gives.
+const issueLimit = 100
+
 // prLimit is how many pull requests one read returns. With commits among
 // the fields, each pull request can bring 100 commits of 100 authors, and
 // GitHub refuses a query that could return more than 500,000 nodes, so 49
@@ -286,6 +293,33 @@ func (g GH) Compare(ctx context.Context, base, head string) (string, time.Time, 
 		i = parent
 	}
 	return c.Status, c.Commits[i].Commit.Committer.Date, nil
+}
+
+// Dashboards implements [Source]. The issues API lists pull requests too,
+// which it drops. It fails, rather than read part of the list, when as
+// many come back as one read returns.
+func (g GH) Dashboards(ctx context.Context) ([]Issue, error) {
+	var raw []struct {
+		Number      int
+		Title, Body string
+		HTMLURL     string          `json:"html_url"`
+		PullRequest json.RawMessage `json:"pull_request"`
+	}
+	path := "repos/{owner}/{repo}/issues?state=open&creator=" + url.QueryEscape(renovateBot) + "&per_page=" + strconv.Itoa(issueLimit)
+	if err := g.api(ctx, path, &raw); err != nil {
+		return nil, err
+	}
+	if len(raw) >= issueLimit {
+		return nil, fmt.Errorf("%d open issues by %s in %s, as many as one read returns, so its dashboard may not be among them",
+			len(raw), renovateBot, g.Repo)
+	}
+	var out []Issue
+	for _, is := range raw {
+		if isPR := len(is.PullRequest) > 0 && string(is.PullRequest) != "null"; !isPR && is.Title == DashboardTitle {
+			out = append(out, Issue{Number: is.Number, Title: is.Title, Body: is.Body, URL: is.HTMLURL})
+		}
+	}
+	return out, nil
 }
 
 // RepoCreated implements [Source].

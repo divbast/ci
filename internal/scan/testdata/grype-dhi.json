@@ -1,0 +1,315 @@
+{
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "DHI-mucl-alvq-4tv5-5ujl",
+        "dataSource": "https://scout.docker.com/v/DHI-mucl-alvq-4tv5-5ujl",
+        "namespace": "dhi:distro:dhi:13",
+        "severity": "Critical",
+        "fix": {
+          "versions": [],
+          "state": ""
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2019-12928"
+        }
+      ],
+      "artifact": {
+        "name": "qemu",
+        "version": "1:10.0.11+ds-0+deb13u1+dhi0",
+        "type": "deb",
+        "locations": [
+          {
+            "path": "/var/lib/dpkg/status"
+          }
+        ],
+        "purl": "pkg:deb/dhi/qemu@1%3A10.0.11%2Bds-0%2Bdeb13u1%2Bdhi0?arch=arm64&distro=dhi-13&upstream=qemu"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "GHSA-35jh-r3h4-6jhm",
+        "dataSource": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+        "namespace": "github:language:javascript",
+        "severity": "High",
+        "fix": {
+          "versions": [
+            "4.17.21"
+          ],
+          "state": "fixed"
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2021-23337"
+        }
+      ],
+      "artifact": {
+        "name": "lodash",
+        "version": "4.17.15",
+        "type": "npm",
+        "locations": [
+          {
+            "path": "/app/node_modules/lodash/package.json"
+          }
+        ],
+        "purl": "pkg:npm/lodash@4.17.15"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "GHSA-29mw-wpgm-hmr9",
+        "dataSource": "https://github.com/advisories/GHSA-29mw-wpgm-hmr9",
+        "namespace": "github:language:javascript",
+        "severity": "Medium",
+        "fix": {
+          "versions": [
+            "4.17.21"
+          ],
+          "state": "fixed"
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2020-28500"
+        }
+      ],
+      "artifact": {
+        "name": "lodash",
+        "version": "4.17.15",
+        "type": "npm",
+        "locations": [
+          {
+            "path": "/app/node_modules/lodash/package.json"
+          }
+        ],
+        "purl": "pkg:npm/lodash@4.17.15"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "DHI-fwcj-m32u-e4uq-6hzy",
+        "dataSource": "https://scout.docker.com/v/DHI-fwcj-m32u-e4uq-6hzy",
+        "namespace": "dhi:distro:dhi:13",
+        "severity": "High",
+        "fix": {
+          "versions": [
+            "1.1.0-2+deb13u1+dhi1"
+          ],
+          "state": "fixed"
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2025-6176"
+        }
+      ],
+      "artifact": {
+        "name": "brotli",
+        "version": "1.1.0-1",
+        "type": "deb",
+        "locations": [
+          {
+            "path": "/var/lib/dpkg/status"
+          }
+        ],
+        "purl": "pkg:deb/dhi/brotli@1.1.0-1?arch=arm64&distro=dhi-13&upstream=brotli"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "DHI-7zzt-wwr6-mz6e-cmsq",
+        "dataSource": "https://scout.docker.com/v/DHI-7zzt-wwr6-mz6e-cmsq",
+        "namespace": "dhi:distro:dhi:13",
+        "severity": "Medium",
+        "fix": {
+          "versions": [],
+          "state": ""
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2026-6253"
+        }
+      ],
+      "artifact": {
+        "name": "curl",
+        "version": "8.14.1-2+deb13u2dhi2",
+        "type": "deb",
+        "locations": [
+          {
+            "path": "/var/lib/dpkg/status"
+          }
+        ],
+        "purl": "pkg:deb/dhi/curl@8.14.1-2%2Bdeb13u2dhi2?arch=arm64&distro=dhi-13&upstream=curl"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "DHI-wlkh-xkzw-w7hj-ak2z",
+        "dataSource": "https://scout.docker.com/v/DHI-wlkh-xkzw-w7hj-ak2z",
+        "namespace": "dhi:distro:dhi:13",
+        "severity": "Low",
+        "fix": {
+          "versions": [],
+          "state": ""
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2025-15224"
+        }
+      ],
+      "artifact": {
+        "name": "curl",
+        "version": "8.14.1-2+deb13u2dhi2",
+        "type": "deb",
+        "locations": [
+          {
+            "path": "/var/lib/dpkg/status"
+          }
+        ],
+        "purl": "pkg:deb/dhi/curl@8.14.1-2%2Bdeb13u2dhi2?arch=arm64&distro=dhi-13&upstream=curl"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "DHI-23nz-y4cq-6vsi-5jh5",
+        "dataSource": "https://scout.docker.com/v/DHI-23nz-y4cq-6vsi-5jh5",
+        "namespace": "dhi:distro:dhi:13",
+        "severity": "Unknown",
+        "fix": {
+          "versions": [],
+          "state": ""
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2026-61475"
+        }
+      ],
+      "artifact": {
+        "name": "qemu",
+        "version": "1:10.0.11+ds-0+deb13u1+dhi0",
+        "type": "deb",
+        "locations": [
+          {
+            "path": "/var/lib/dpkg/status"
+          }
+        ],
+        "purl": "pkg:deb/dhi/qemu@1%3A10.0.11%2Bds-0%2Bdeb13u1%2Bdhi0?arch=arm64&distro=dhi-13&upstream=qemu"
+      }
+    }
+  ],
+  "source": {
+    "type": "image",
+    "target": {
+      "userInput": "layout",
+      "repoDigests": [],
+      "architecture": "arm64"
+    }
+  },
+  "distro": {
+    "name": "dhi",
+    "version": "13",
+    "idLike": [
+      "debian"
+    ]
+  },
+  "descriptor": {
+    "name": "grype",
+    "version": "0.122.1",
+    "db": {
+      "status": {
+        "schemaVersion": "v6.1.10",
+        "from": "https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.10_2026-11-19T00:22:15Z_1795069397.tar.zst?checksum=sha256%3Acf30f15bf29c0b7addc26938fcd6e22fa8a5f8740143962a0e77666ed9747030",
+        "built": "2026-11-19T06:23:17Z"
+      },
+      "providers": {
+        "alma": {
+          "captured": "2026-11-19T00:23:03Z"
+        },
+        "alpine": {
+          "captured": "2026-11-19T00:22:28Z"
+        },
+        "amazon": {
+          "captured": "2026-11-19T00:22:41Z"
+        },
+        "arch": {
+          "captured": "2026-11-19T00:22:20Z"
+        },
+        "bitnami": {
+          "captured": "2026-11-19T00:22:26Z"
+        },
+        "chainguard": {
+          "captured": "2026-11-19T00:22:33Z"
+        },
+        "chainguard-libraries": {
+          "captured": "2026-11-19T00:22:25Z"
+        },
+        "debian": {
+          "captured": "2026-11-19T00:23:02Z"
+        },
+        "dhi": {
+          "captured": "2026-11-19T00:22:36Z"
+        },
+        "echo": {
+          "captured": "2026-11-19T00:22:53Z"
+        },
+        "eol": {
+          "captured": "2026-11-19T00:22:15Z"
+        },
+        "epss": {
+          "captured": "2026-11-19T00:22:28Z"
+        },
+        "fedora": {
+          "captured": "2026-11-19T00:22:36Z"
+        },
+        "github": {
+          "captured": "2026-11-19T00:22:38Z"
+        },
+        "govulndb": {
+          "captured": "2026-11-19T00:22:26Z"
+        },
+        "hummingbird": {
+          "captured": "2026-11-19T00:24:15Z"
+        },
+        "kev": {
+          "captured": "2026-11-19T00:22:22Z"
+        },
+        "mariner": {
+          "captured": "2026-11-19T00:22:22Z"
+        },
+        "minimos": {
+          "captured": "2026-11-19T00:22:19Z"
+        },
+        "nvd": {
+          "captured": "2026-11-19T00:22:56Z"
+        },
+        "oracle": {
+          "captured": "2026-11-19T00:22:33Z"
+        },
+        "photon": {
+          "captured": "2026-11-19T00:22:29Z"
+        },
+        "rhel": {
+          "captured": "2026-11-19T00:23:18Z"
+        },
+        "secureos": {
+          "captured": "2026-11-19T00:22:19Z"
+        },
+        "sles": {
+          "captured": "2026-11-19T00:23:46Z"
+        },
+        "ubuntu": {
+          "captured": "2026-11-19T00:22:54Z"
+        },
+        "wolfi": {
+          "captured": "2026-11-19T00:22:21Z"
+        }
+      }
+    }
+  }
+}

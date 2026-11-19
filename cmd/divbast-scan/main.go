@@ -7,7 +7,7 @@
 // Usage:
 //
 //	divbast-scan -layout DIR -report FILE -published IMAGE -baseline FILE -sarif FILE
-//	    [-containerfile FILE] [-vex FILE]...
+//	    [-containerfile FILE] [-vex FILE]... [-cache DIR]
 //
 // A repository that checks divbast/ci out at .ci runs it from its own root
 // as .ci/bin/divbast-scan, once `just ci-tools` has built it:
@@ -16,24 +16,44 @@
 //	    -published ghcr.io/divbast/librespeed:latest -baseline /tmp/image.tar.published.json \
 //	    -sarif /tmp/image.tar.sarif -containerfile Containerfile
 //
-// It scans the OCI layout in DIR with trivy, writing the JSON report to
-// -report and its SARIF, for code scanning, to -sarif. It then scans IMAGE
-// as the registry serves it, for the layout's architecture and from the
-// same vulnerability database, writing that report to -baseline. A finding
-// IMAGE has too is reported as an advisory: the same vulnerability, by any
-// of its IDs, in the same package at any version, or any finding in a
-// package IMAGE ships at that very version. -vex names an OpenVEX document
-// both scans apply, the app's own; it may be given more than once. Every
-// trivy call turns off the .trivyignore and trivy.yaml trivy would read
-// from the working directory, the caller's repository, and runs with
-// every TRIVY_ variable of the environment cleared.
+// DIR holds one linux image. Before any scan, the command reads its
+// architecture and its own os-release, the zstd layers with the zstd
+// command, and the os-release decides the scanner. An image that says
+// ID=dhi, a Docker Hardened Image on Docker's own advisories, is scanned
+// by grype, which reads that model; any other image by trivy, which reads
+// a DHI image as plain Debian while it keeps /etc/debian_version. The
+// published image is scanned by the same scanner, so both sides share one
+// model and one vulnerability database.
 //
-// Before the SARIF, it reads the image's own os-release from DIR, the
-// zstd layers with the zstd command, and refuses a report that read the
-// image under another model than the one it says it is: an image that
-// says ID=dhi, a Docker Hardened Image judged by Docker's own advisories,
-// that trivy read as another OS, as it reads one that keeps
-// /etc/debian_version as plain Debian.
+// It scans the OCI layout in DIR, writing the JSON report to -report and
+// its SARIF, for code scanning, to -sarif, once the report passes the
+// checks below. It then scans IMAGE as the registry serves it, for the
+// layout's architecture and from the same vulnerability database, writing
+// that report to -baseline. A finding IMAGE has too is reported as an
+// advisory: the same vulnerability, by any of its IDs, in the same package
+// at any version, or any finding in a package IMAGE ships at that very
+// version. A new finding with no severity, which DHI's advisories have, is
+// listed and never blocks. -vex names an OpenVEX document both scans
+// apply, the app's own; it may be given more than once. Every trivy call
+// turns off the .trivyignore and trivy.yaml trivy would read from the
+// working directory, the caller's repository, and every grype call names
+// a configuration of the command's own instead of a .grype.yaml there;
+// each runs with none of its TRIVY_ or GRYPE_ variables in its
+// environment.
+//
+// For grype, -cache names the directory its configuration and its
+// vulnerability database go in, by default divbast-scan's own in the
+// user's cache directory, so a local scan keeps the database between runs.
+// It updates the database once, with grype db update, then asks it about a
+// package a record in DHI's own namespace is known to match, for the
+// image's ID_LIKE and VERSION_ID, and refuses to scan unless the match
+// comes from there: a database without DHI's advisories reads every DHI
+// image as clean. The two reports, beside -report and -baseline as
+// .cdx.json, list every package, where grype's JSON lists only those with
+// findings. A report from grype must say distro dhi at the image's
+// VERSION_ID, key every OS package under dhi, and match nothing from
+// Debian's or Alpine's advisories; both must name the same database, with
+// the dhi provider in it. A report refused leaves no SARIF behind.
 //
 // -containerfile names the Containerfile the image was built from. When
 // its final stage builds on a dhi.io image, a Docker Hardened Image (its
@@ -82,7 +102,7 @@
 // packages. A refusal is then an advisory too, with a warning that only
 // CI can tell what it means.
 //
-// Only gh gets the token: trivy, skopeo, cosign and zstd run with
+// Only gh gets the token: trivy, grype, skopeo, cosign and zstd run with
 // GH_TOKEN and GITHUB_TOKEN empty.
 //
 // Exit codes:
@@ -95,8 +115,11 @@
 //	   document not fetched, not verified, or not that image's; a scan
 //	   that failed or saw no packages; a report, of the layout or of
 //	   IMAGE, that recognised no operating system or saw no OS package;
-//	   the layout's os-release unreadable, or saying ID=dhi when trivy
-//	   read another OS;
+//	   a layout that is not one linux image, or whose os-release cannot be
+//	   read; for an image that says ID=dhi, grype's database not updated,
+//	   no probe for its release or the probe unanswered from DHI's
+//	   namespace, a report under another model than dhi's, or the two
+//	   reports from different databases or without the dhi provider;
 //	   IMAGE not a ghcr.io image, unreadable, or refused though public for
 //	   any reason but a missing tag; the GitHub API not answering, or
 //	   refusing the token; or the summary not written
@@ -136,9 +159,10 @@ func main() {
 }
 
 // tokenOnlyForGH runs commands on the host, and only gh with the token
-// the environment holds: every other command, trivy, skopeo and cosign,
-// gets GH_TOKEN and GITHUB_TOKEN empty. They read registries anonymously,
-// and trivy parses whatever an image holds.
+// the environment holds: every other command, trivy, grype, skopeo, cosign
+// and zstd, gets GH_TOKEN and GITHUB_TOKEN empty. They read registries
+// anonymously, and the scanners parse whatever an image holds. trivy and
+// grype also run with none of their own variables, TRIVY_ and GRYPE_.
 type tokenOnlyForGH struct{}
 
 // Run implements [execx.Runner].
@@ -146,29 +170,17 @@ func (tokenOnlyForGH) Run(ctx context.Context, name string, args ...string) (exe
 	switch name {
 	case "gh":
 		return execx.OS{}.Run(ctx, name, args...)
-	case "trivy":
-		return execx.OS{Env: slices.Concat(noToken, trivyEnv(os.Environ()))}.Run(ctx, name, args...)
+	case "trivy", "grype":
+		// Each reads a variable for every setting it has, and the scan
+		// job's steps inherit a caller's mise.toml [env]. Left out, not
+		// emptied: grype reads an empty one as a value, false for a switch
+		return execx.OS{Env: noToken, Without: []string{strings.ToUpper(name) + "_"}}.Run(ctx, name, args...)
 	}
 	return execx.OS{Env: noToken}.Run(ctx, name, args...)
 }
 
 // noToken is the environment every command but gh runs with.
 var noToken = []string{"GH_TOKEN=", "GITHUB_TOKEN="}
-
-// trivyEnv clears every TRIVY_ variable in environ, as NAME= entries for
-// [execx.OS] to set over it: trivy takes an empty one as unset. Each is
-// one of trivy's flags, and the scan job's steps inherit a caller's
-// mise.toml [env], where TRIVY_IGNORE_UNFIXED or TRIVY_SEVERITY would
-// decide what trivy reports, as a .trivyignore would.
-func trivyEnv(environ []string) []string {
-	var cleared []string
-	for _, kv := range environ {
-		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "TRIVY_") {
-			cleared = append(cleared, name+"=")
-		}
-	}
-	return cleared
-}
 
 // run is the command. r runs every command it runs but zstd, which zstd
 // runs for the layout's zstd layers, and src is where DHI's VEX documents
@@ -185,6 +197,8 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 	flags.Var(&vex, "vex", "an OpenVEX `FILE` of the app's own both scans apply; repeat for more")
 	containerfile := flags.String("containerfile", "", "the Containerfile `FILE` the image was built from, "+
 		"whose final stage's base, when a dhi.io image, has its signed VEX document applied by both scans")
+	cache := flags.String("cache", "", "the `DIR` grype keeps its configuration and vulnerability database in, "+
+		"for an image that says ID=dhi (default: divbast-scan's own in the user's cache directory)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -229,41 +243,47 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		}
 	}
 
-	trivy := scan.Trivy{Run: r, VEX: docs, Log: stderr}
-	if err := trivy.Layout(ctx, *layout, *report); err != nil {
-		complain(stderr, "trivy could not scan %s: %v", *layout, err)
+	// What the image says it is decides which scanner reads it
+	layoutArch, err := osrelease.Arch(*layout)
+	if err != nil {
+		complain(stderr, "cannot tell which image to scan: %v", err)
 		return 1
 	}
-	data, err := readFile(*report)
+	info, hasOS, err := osrelease.Read(ctx, zstd, *layout, layoutArch)
+	if err != nil {
+		complain(stderr, "could not read the image's own os-release, so nothing says which model to scan it under: %v", err)
+		return 1
+	}
+	var sc scanner = &trivyScanner{
+		trivy:  scan.Trivy{Run: r, VEX: docs, Log: stderr},
+		layout: *layout, report: *report, sarif: *sarif, baseline: *baseline,
+	}
+	if hasOS && info.ID == "dhi" {
+		g := scan.Grype{Run: r, VEX: docs, Log: stderr}
+		var dir string
+		dir, err = grypeCache(*cache)
+		if err == nil {
+			g.Config, err = g.WriteConfig(dir)
+		}
+		if err != nil {
+			complain(stderr, "could not write grype's configuration: %v", err)
+			return 1
+		}
+		if _, err = fmt.Fprintf(stdout, "%s says ID=dhi, Docker's own model, so grype scans it, against DHI's advisories\n", *layout); err != nil {
+			complain(stderr, "write the scanner: %v", err)
+			return 1
+		}
+		sc = &grypeScanner{
+			grype: g, info: info, arch: layoutArch,
+			layout: *layout, report: *report, sarif: *sarif, baseline: *baseline,
+		}
+	}
+	candidate, err := sc.candidate(ctx)
 	if err != nil {
 		complain(stderr, "%v", err)
-		return 1
-	}
-	candidate, err := scan.ParseTrivy(bytes.NewReader(data))
-	if err != nil {
-		complain(stderr, "%s: %v", *report, err)
 		return 1
 	}
 	arch := candidate.Arch
-	// A clean report from a scan that saw no packages means it never looked
-	if candidate.Packages == 0 {
-		complain(stderr, "no packages in %s: the scan found nothing to scan, not nothing wrong", *layout)
-		return 1
-	}
-	if blindToOS(&candidate) {
-		complain(stderr, "%s: %s", *layout, noOS(&candidate))
-		return 1
-	}
-	// Before the SARIF, so findings under the wrong model never reach
-	// code scanning
-	if err = sameModel(ctx, zstd, *layout, &candidate); err != nil {
-		complain(stderr, "%v", err)
-		return 1
-	}
-	if err = trivy.SARIF(ctx, *report, *sarif); err != nil {
-		complain(stderr, "trivy could not convert %s to SARIF at %s: %v", *report, *sarif, err)
-		return 1
-	}
 	if arch == "" {
 		complain(stderr, "%s names no architecture, so nothing says which of %s to compare with", *report, *published)
 		return 1
@@ -284,14 +304,12 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		against, warning string
 	)
 	if advisory == nil {
-		if err = trivy.Published(ctx, *published, arch, *baseline); err != nil {
-			complain(stderr, "could not scan %s, so no finding can be told apart from one already published: %v", *published, err)
-			return 1
-		}
-		if shipped, inventory, against, err = readBaseline(*baseline, *published); err != nil {
+		var pub scan.Report
+		if pub, err = sc.published(ctx, *published, arch); err != nil {
 			complain(stderr, "%v", err)
 			return 1
 		}
+		shipped, inventory, against = pub.Findings, pub.Inventory, pub.Ref
 	} else {
 		// With nothing published, nothing is already shipped, and a first
 		// image could never pass a scan that blocks on what it inherits
@@ -327,7 +345,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 
 	switch {
 	case advisory != nil:
-		_, err = fmt.Fprintf(stdout, "%s %s, so all %d finding(s) are advisory\n", *published, advisory.reason, len(split.New))
+		_, err = fmt.Fprintf(stdout, "%s %s, so all %d finding(s) are advisory\n", *published, advisory.reason, len(split.New)+len(split.Listed))
 	case len(split.New) > 0:
 		move := "Move what carries them"
 		if len(vex) > 0 {
@@ -335,6 +353,8 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		}
 		complain(stderr, "%d finding(s) the published image does not have. %s.", len(split.New), move)
 		return 1
+	case len(split.Listed) > 0:
+		_, err = fmt.Fprintf(stdout, "nothing new against what is published (%d advisory, %d listed with no severity)\n", len(split.Old), len(split.Listed))
 	default:
 		_, err = fmt.Fprintf(stdout, "nothing new against what is published (%d advisory)\n", len(split.Old))
 	}
@@ -445,63 +465,24 @@ func unshippedFor(state registry.State, err error, inActions bool, published str
 	}
 }
 
-// readBaseline returns the findings in the report on the published image
-// at path, the packages it ships, and the image it names.
-func readBaseline(path, image string) (shipped []scan.Finding, inventory []scan.Pkg, ref string, err error) {
-	data, err := readFile(path)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	rep, err := scan.ParseTrivy(bytes.NewReader(data))
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("%s: %w", path, err)
-	}
-	if rep.Packages == 0 {
-		return nil, nil, "", fmt.Errorf("no packages in %s: the scan found nothing to scan, not nothing wrong", image)
-	}
-	if blindToOS(&rep) {
-		return nil, nil, "", fmt.Errorf("%s: %s", image, noOS(&rep))
-	}
-	return rep.Findings, rep.Inventory, rep.Ref, nil
-}
-
 // noOS says why a report blind to the OS is refused, and what Trivy
 // reported, since an OS it did not recognise and an OS it saw no packages
 // of need different fixes. An image whose OS Trivy does not know still has
 // its language packages, which count as packages, so only the OS says
 // whether the scan looked at the rest.
-func noOS(rep *scan.Report) string {
+func noOS(rep *scan.Report, scanner string) string {
 	saw := "recognised no operating system and saw"
 	if rep.OS != "" && rep.Family != "none" {
 		saw = "recognised " + rep.OS + " but saw"
 	}
-	return fmt.Sprintf("Trivy %s %d OS packages, so the scan cannot see OS packages and nothing shows they are clean",
-		saw, rep.OSPackages)
+	return fmt.Sprintf("%s %s %d OS packages, so the scan cannot see OS packages and nothing shows they are clean",
+		scanner, saw, rep.OSPackages)
 }
 
 // blindToOS reports whether rep identified no OS or saw no OS package.
 // Trivy names an OS it found no analyser for "none".
 func blindToOS(rep *scan.Report) bool {
 	return rep.OS == "" || rep.Family == "none" || rep.OSPackages == 0
-}
-
-// sameModel reads the os-release of the image in the layout at layout,
-// with zstd for zstd layers, and fails unless rep, Trivy's report on it,
-// read it under the model it says it is. A Docker Hardened Image that
-// says ID=dhi is judged by Docker's own advisories, and Trivy reads one
-// that keeps /etc/debian_version as plain Debian, judging it by Debian's
-// instead: findings, and an absence of them, about another image. An
-// image with no os-release leaves the decision to the blind guard.
-func sameModel(ctx context.Context, zstd execx.StreamRunner, layout string, rep *scan.Report) error {
-	info, ok, err := osrelease.Read(ctx, zstd, layout, rep.Arch)
-	if err != nil {
-		return fmt.Errorf("could not read the image's own os-release, so nothing shows Trivy read it as what it is: %w", err)
-	}
-	if ok && info.ID == "dhi" && rep.Family != "dhi" {
-		return fmt.Errorf("%s: the image says ID=dhi, VERSION_ID=%s, a Docker Hardened Image judged by Docker's own advisories, "+
-			"but Trivy read it as %s and judged it by that OS's: the wrong model, so nothing is scanned", layout, info.VersionID, rep.OS)
-	}
-	return nil
 }
 
 // readFile reads the file at path, through an [os.Root] on its directory.

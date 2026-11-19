@@ -34,10 +34,11 @@ import (
 // vendor's bulletins, such as a Debian security advisory, and one
 // bulletin fixes many vulnerabilities, so two different CVEs would share
 // one. With Trivy on both sides of a comparison and one database, the
-// IDs themselves agree.
+// IDs themselves agree. Namespace is where the scanner's database keeps
+// the advisory, such as dhi:distro:dhi:13, where it says; Trivy does not.
 type Finding struct {
-	ID, Pkg, Version, Fixed, Severity, URL, Where string
-	Aliases                                       []string
+	ID, Pkg, Version, Fixed, Severity, URL, Where, Namespace string
+	Aliases                                                  []string
 }
 
 // Pkg is a package an image ships, by name and version, the version
@@ -45,8 +46,10 @@ type Finding struct {
 type Pkg struct{ Name, Version string }
 
 // Split is a candidate image's findings, parted into those the published
-// image lacks, New, and those it has, Old.
-type Split struct{ New, Old []Finding }
+// image lacks, New, and those it has, Old. Listed are the findings the
+// published image lacks that carry no severity, UNKNOWN: reported, never
+// blocking, as Trivy's HIGH,CRITICAL filter leaves them out altogether.
+type Split struct{ New, Old, Listed []Finding }
 
 // Report is what a Trivy JSON report says: its findings, in Trivy's order;
 // how many packages it saw; the image's architecture; and what it
@@ -63,7 +66,12 @@ type Split struct{ New, Old []Finding }
 // alone does not show.
 //
 // Inventory is every package the report lists by name, OS and language
-// alike, with its version as a finding in it would give it.
+// alike, with its version as a finding in it would give it; OSPURLs is the
+// package URL of each OS package, where the scanner gives them.
+//
+// DB is the vulnerability database the scan used, as the scanner names
+// it, and Providers the sources of advisories it holds, where the
+// scanner says; Trivy does neither.
 type Report struct {
 	Findings   []Finding
 	Packages   int
@@ -73,6 +81,9 @@ type Report struct {
 	Arch       string
 	Ref        string
 	Inventory  []Pkg
+	OSPURLs    []string
+	DB         string
+	Providers  []string
 }
 
 // trivyJSON is what the scan reads of a Trivy JSON report.
@@ -179,7 +190,8 @@ func (f *Finding) ids() []string { return append([]string{f.ID}, f.Aliases...) }
 // version draws the same findings. It bites only when the model changes
 // between the published image and the candidate, as when a base image
 // moves to its vendor's own advisories and every ID changes. A package
-// new to the image, or at a new version, is still judged by its IDs.
+// new to the image, or at a new version, is still judged by its IDs. A
+// new finding with no severity goes to Listed.
 func Compare(candidate, published []Finding, shipped []Pkg) Split {
 	known := make(map[key]bool, len(published))
 	for i := range published {
@@ -195,9 +207,12 @@ func Compare(candidate, published []Finding, shipped []Pkg) Split {
 	var s Split
 	for i := range candidate {
 		f := &candidate[i]
-		if out[Pkg{f.Pkg, f.Version}] || slices.ContainsFunc(f.ids(), func(id string) bool { return known[key{id, f.Pkg}] }) {
+		switch {
+		case out[Pkg{f.Pkg, f.Version}] || slices.ContainsFunc(f.ids(), func(id string) bool { return known[key{id, f.Pkg}] }):
 			s.Old = append(s.Old, *f)
-		} else {
+		case f.Severity == "UNKNOWN":
+			s.Listed = append(s.Listed, *f)
+		default:
 			s.New = append(s.New, *f)
 		}
 	}

@@ -961,8 +961,8 @@ func TestScanPinsWhatItInstalls(t *testing.T) {
 		t.Errorf("app-check.yml: %v", err)
 	}
 	const (
-		install = "          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign\n"
-		loop    = "          for tool in go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign; do\n"
+		install = "          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:anchore/grype aqua:sigstore/cosign\n"
+		loop    = "          for tool in go aqua:casey/just aqua:aquasecurity/trivy aqua:anchore/grype aqua:sigstore/cosign; do\n"
 		pins    = "      - name: Check the caller's mise.toml pins each tool installed above\n"
 	)
 	for name, mutant := range map[string]string{
@@ -971,7 +971,11 @@ func TestScanPinsWhatItInstalls(t *testing.T) {
 		"cosign installed, not checked": strings.Replace(check, loop, strings.Replace(loop, " aqua:sigstore/cosign", "", 1), 1),
 		"cosign checked, not installed": strings.Replace(check, install, strings.Replace(install, " aqua:sigstore/cosign", "", 1), 1),
 		"cosign by another name":        strings.Replace(check, install, strings.Replace(install, "aqua:sigstore/cosign", "cosign", 1), 1),
-		"no check":                      dropStep(check, pins),
+		"grype neither installed nor checked": strings.Replace(strings.Replace(check, install, strings.Replace(install, " aqua:anchore/grype", "", 1), 1),
+			loop, strings.Replace(loop, " aqua:anchore/grype", "", 1), 1),
+		"grype installed, not checked": strings.Replace(check, loop, strings.Replace(loop, " aqua:anchore/grype", "", 1), 1),
+		"grype checked, not installed": strings.Replace(check, install, strings.Replace(install, " aqua:anchore/grype", "", 1), 1),
+		"no check":                     dropStep(check, pins),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -986,8 +990,9 @@ func TestScanPinsWhatItInstalls(t *testing.T) {
 }
 
 // scanPinsWhatItInstalls returns an error unless the scan job has one
-// jdx/mise-action step, whose install_args name aqua:sigstore/cosign, and
-// one step that checks the caller's mise.toml pins each tool, whose
+// jdx/mise-action step, whose install_args name aqua:sigstore/cosign and
+// aqua:anchore/grype, and one step that checks the caller's mise.toml pins
+// each tool, whose
 // for tool in … loop names exactly what that step installs, with core:go
 // read as go.
 func scanPinsWhatItInstalls(workflow string) error {
@@ -997,8 +1002,13 @@ func scanPinsWhatItInstalls(workflow string) error {
 		return fmt.Errorf("the scan job has %d jdx/mise-action steps, want one", len(mise))
 	}
 	installed := strings.Fields(value(st[mise[0]], "install_args"))
-	if !slices.Contains(installed, "aqua:sigstore/cosign") {
-		return fmt.Errorf("the scan job installs %q, without aqua:sigstore/cosign, which divbast-scan runs to verify DHI's VEX document", installed)
+	for tool, why := range map[string]string{
+		"aqua:sigstore/cosign": "which divbast-scan runs to verify DHI's VEX document",
+		"aqua:anchore/grype":   "which divbast-scan runs for an image that says ID=dhi",
+	} {
+		if !slices.Contains(installed, tool) {
+			return fmt.Errorf("the scan job installs %q, without %s, %s", installed, tool, why)
+		}
 	}
 	checks := stepsWhere(st, contains("name: Check the caller's mise.toml pins each tool installed above"))
 	if len(checks) != 1 {

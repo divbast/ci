@@ -4,21 +4,23 @@
 # The stall check every divbast repository calls from a daily schedule. It
 # fails, so GitHub emails someone, when updates have stopped flowing without
 # anything failing loudly: a Renovate pull request that never goes green or
-# never finishes, Renovate itself silent, or daily slots that should have
-# published and did not. A scheduled run's failure goes to whoever last
-# edited the caller's cron line. The checks are cmd/divbast-stall's.
+# never finishes, Renovate itself silent, daily slots that should have
+# published and did not, or a dependency Renovate failed to look up, which
+# only its Dependency Dashboard shows. A scheduled run's failure goes to
+# whoever last edited the caller's cron line. The checks are
+# cmd/divbast-stall's.
 #
 # The caller's job grants contents, pull-requests, actions, checks,
-# statuses and packages, all read.
+# statuses, packages and issues, all read.
 name: stall
 
 on:
   workflow_call:
     inputs:
       checks:
-        description: The checks to run, a JSON array of open, stuck, renovate and slots
+        description: The checks to run, a JSON array of open, stuck, renovate, slots and lookups
         type: string
-        default: '["open","stuck","renovate","slots"]'
+        default: '["open","stuck","renovate","slots","lookups"]'
       published:
         description: The image the daily slot publishes, such as ghcr.io/divbast/librespeed:latest; slots needs it
         type: string
@@ -80,6 +82,7 @@ jobs:
       checks: read # read each pull request's check runs
       statuses: read # and its commit statuses
       packages: read # tell a private image from an absent one
+      issues: read # read the Dependency Dashboard
     # Nothing of the caller's is checked out: every check reads the GitHub
     # API and the registry, and nothing else.
     steps:

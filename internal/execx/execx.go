@@ -73,6 +73,11 @@ type OS struct {
 	// caller's environment. An entry overrides the caller's value for its
 	// name, and a later entry an earlier one.
 	Env []string
+	// Without holds prefixes of names left out of the caller's
+	// environment, so that a command never sees a variable whose name
+	// starts with one: not even empty, which some tools read as a value.
+	// Env's own entries are added after, and kept.
+	Without []string
 }
 
 // Run implements [Runner].
@@ -101,9 +106,14 @@ func (o OS) run(ctx context.Context, stdin io.Reader, stdout io.Writer, name str
 	// Runner is for. exec runs it without a shell, so no argument can
 	// smuggle in a second command.
 	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: running the caller's command is the point, with no shell
-	if len(o.Env) > 0 {
+	if len(o.Env) > 0 || len(o.Without) > 0 {
+		env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+			key, _, _ := strings.Cut(kv, "=")
+			return slices.ContainsFunc(o.Without, func(prefix string) bool { return strings.HasPrefix(key, prefix) })
+		})
 		// exec keeps the last value it is given for a name.
-		cmd.Env = append(os.Environ(), o.Env...)
+		env = append(env, o.Env...)
+		cmd.Env = env
 	}
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout

@@ -70,7 +70,13 @@ type source struct {
 	// jobs are each run's jobs, by run ID: each job's name and its
 	// conclusion. A run with an empty map has no jobs.
 	jobs map[int64]map[string]string
-	err  error // returned by every call when set
+	// dashboards are the open Dependency Dashboards.
+	dashboards []stall.Issue
+	err        error // returned by every call when set
+}
+
+func (s *source) Dashboards(context.Context) ([]stall.Issue, error) {
+	return s.dashboards, s.err
 }
 
 func (s *source) RenovatePRs(context.Context) ([]stall.PR, error) {
@@ -1158,4 +1164,119 @@ func TestSlotsCompareError(t *testing.T) {
 			t.Fatalf("Slots() = %+v, %v; want an error naming %s", got, err, built)
 		}
 	})
+}
+
+// lookupSection is the section Renovate writes on a Dependency Dashboard
+// on GitHub for lookups that failed, as its own tests pin it
+// (dependency-dashboard.spec.ts), with each failure and file backticked.
+func lookupSection(failures, files string) string {
+	return "---\n\n> [!WARNING]\n> Renovate failed to look up the following dependencies: " + failures +
+		".\n> \n> Files affected: " + files + "\n\n---\n\n"
+}
+
+// dashboard is the clean Dependency Dashboard from testdata with section
+// where Renovate puts warnings, before the open pull requests.
+func dashboard(t *testing.T, section string) string {
+	t.Helper()
+	body := string(testdata(t, "dashboard-clean.md"))
+	if !strings.Contains(body, "## Open") {
+		t.Fatal("the clean dashboard has no ## Open to put the section before")
+	}
+	return strings.Replace(body, "## Open", section+"## Open", 1)
+}
+
+const dashboardURL = "https://github.com/divbast/baikal-oci-image/issues/94"
+
+func lookupsWith(t *testing.T, s *source) stall.Result {
+	t.Helper()
+	res, err := stall.Lookups(t.Context(), s, &config)
+	if err != nil {
+		t.Fatalf("Lookups() error = %v", err)
+	}
+	return res
+}
+
+func TestLookupsClean(t *testing.T) {
+	t.Parallel()
+	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, ""), URL: dashboardURL}}})
+	if res.Stalled || res.Headline != "no failed Renovate lookup on the Dependency Dashboard #94" {
+		t.Errorf("Lookups() = %+v, want not stalled", res)
+	}
+}
+
+func TestLookupsFailing(t *testing.T) {
+	t.Parallel()
+	body := dashboard(t, lookupSection("`Failed to look up github-tags package aquasecurity/trivy: no-result`", "`mise.toml`"))
+	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}}})
+	want := []string{"Failed to look up github-tags package aquasecurity/trivy: no-result", "files affected: mise.toml"}
+	if !res.Stalled || res.Headline != "Renovate failed lookups, by the Dependency Dashboard "+dashboardURL+":" || !slices.Equal(res.Details, want) {
+		t.Errorf("Lookups() = %+v, want stalled with %q", res, want)
+	}
+}
+
+func TestLookupsTwoItemsCRLF(t *testing.T) {
+	t.Parallel()
+	// A web edit, ticking a box say, saves the body with CRLF until
+	// Renovate's next rewrite
+	body := strings.ReplaceAll(dashboard(t, lookupSection(
+		"`Failed to look up custom.lidarr-nightly package Lidarr/Lidarr: no-result`, "+
+			"`Could not determine new digest for update (docker package dhi.io/aspnetcore)`",
+		"`Containerfile`, `mise.toml`",
+	)), "\n", "\r\n")
+	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}}})
+	want := []string{
+		"Failed to look up custom.lidarr-nightly package Lidarr/Lidarr: no-result",
+		"Could not determine new digest for update (docker package dhi.io/aspnetcore)",
+		"files affected: Containerfile, mise.toml",
+	}
+	if !res.Stalled || !slices.Equal(res.Details, want) {
+		t.Errorf("Lookups() = %+v, want stalled with %q", res, want)
+	}
+}
+
+func TestLookupsDeprecationsOnly(t *testing.T) {
+	t.Parallel()
+	// Renovate's other warnings share the [!WARNING] heading, never the
+	// sentence
+	section := "## Deprecations / Replacements\n\n> [!WARNING]\n> The following dependencies are either deprecated " +
+		"or have replacements available:\n\n| Datasource | Name | Replacement PR? |\n|---|---|---|\n| npm | `request` | unavailable |\n\n" +
+		"## Repository Problems\n\nRenovate tried to run on this repository, but found these problems.\n\n" +
+		" - WARN: Fallback to renovate.json file as a preset is deprecated, please use a default.json file instead.\n\n"
+	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, section), URL: dashboardURL}}})
+	if res.Stalled {
+		t.Errorf("Lookups() = %+v, want not stalled: no lookup failed", res)
+	}
+}
+
+func TestLookupsUnparsable(t *testing.T) {
+	t.Parallel()
+	// The sentence with nothing backticked: a format that drifted fails
+	// closed, quoting the line
+	line := "> Renovate failed to look up the following dependencies: aquasecurity/trivy."
+	body := dashboard(t, "---\n\n> [!WARNING]\n"+line+"\n\n---\n\n")
+	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}}})
+	if !res.Stalled || len(res.Details) != 1 || !strings.Contains(res.Details[0], line) {
+		t.Errorf("Lookups() = %+v, want stalled, quoting %q", res, line)
+	}
+}
+
+func TestLookupsNoDashboard(t *testing.T) {
+	t.Parallel()
+	last := time.Date(2026, 11, 19, 0, 41, 21, 0, time.UTC)
+	res := lookupsWith(t, &source{success: last})
+	if !res.Stalled || res.Headline != "No open Dependency Dashboard by divbast-renovate, so failed lookups cannot be seen:" ||
+		len(res.Details) != 1 || !strings.Contains(res.Details[0], "2026-11-19T00:41:21Z") {
+		t.Errorf("Lookups() after a success = %+v, want stalled, naming the last success", res)
+	}
+	res = lookupsWith(t, &source{})
+	if res.Stalled {
+		t.Errorf("Lookups() before any success = %+v, want not stalled: the renovate check owns that", res)
+	}
+}
+
+func TestLookupsSourceFails(t *testing.T) {
+	t.Parallel()
+	if _, err := stall.Lookups(t.Context(), &source{err: errors.New("gh: HTTP 502")}, &config); err == nil {
+		t.Error("Lookups() error = nil, want gh's")
+	}
 }

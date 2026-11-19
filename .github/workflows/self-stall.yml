@@ -30,7 +30,7 @@ jobs:
     # for is one actionlint 1.7.12 cannot parse yet.
     uses: ./.github/workflows/stall.yml # zizmor: ignore[self-repository] see above
     with:
-      checks: '["open","stuck","renovate"]'
+      checks: '["open","stuck","renovate","lookups"]'
       renovate-workflow: self-renovate.yml
     # Everything stall.yml's job asks for, since a called job gets no more
     # than its caller grants, even what a check ci skips would need.
@@ -41,3 +41,4 @@ jobs:
       checks: read # read each pull request's check runs
       statuses: read # and its commit statuses
       packages: read # tell a private image from an absent one, for slots
+      issues: read # read the Dependency Dashboard

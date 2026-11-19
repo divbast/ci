@@ -31,8 +31,14 @@ const (
 // writeLayout writes an OCI layout at dir as the scan's -layout names one:
 // one image manifest, naming no platform, as Podman's archives hold one,
 // over one uncompressed layer holding /etc/os-release with osRelease, or
-// no os-release when it is "".
+// no os-release when it is "". Its config says amd64.
 func writeLayout(t *testing.T, dir, osRelease string) {
+	t.Helper()
+	writeLayoutFor(t, dir, osRelease, "amd64")
+}
+
+// writeLayoutFor is writeLayout's, for an image whose config says arch.
+func writeLayoutFor(t *testing.T, dir, osRelease, arch string) {
 	t.Helper()
 	var layer bytes.Buffer
 	tw := tar.NewWriter(&layer)
@@ -77,7 +83,7 @@ func writeLayout(t *testing.T, dir, osRelease string) {
 	manifest := put("application/vnd.oci.image.manifest.v1+json", marshal(map[string]any{
 		"schemaVersion": 2,
 		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
-		"config":        put("application/vnd.oci.image.config.v1+json", []byte(`{"architecture":"amd64","os":"linux"}`)),
+		"config":        put("application/vnd.oci.image.config.v1+json", []byte(`{"architecture":"`+arch+`","os":"linux"}`)),
 		"layers":        []descriptor{put("application/vnd.oci.image.layer.v1.tar", layer.Bytes())},
 	}))
 	index := marshal(map[string]any{"schemaVersion": 2, "manifests": []descriptor{manifest}})

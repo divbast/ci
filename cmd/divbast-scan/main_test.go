@@ -226,34 +226,9 @@ func TestRun(t *testing.T) {
 			wantSummary: []string{"### Vulnerability scan, arm64\n", "**New, so blocking: 2**"},
 		},
 		{
-			// Trivy reads an image that says ID=dhi as Debian while it keeps
-			// /etc/debian_version, and would judge it by Debian's advisories
-			name:         "refuses-dhi-read-as-debian",
-			osRelease:    dhiRelease,
-			candidate:    report(t, "amd64", "", 3, "CVE-1"),
-			layoutResult: &execx.Result{},
-			wantCode:     1,
-			wantStderr:   []string{"ID=dhi", "debian 13.2", "LAYOUT"},
-			notInStdout:  []string{"CVE-1"},
-		},
-		{
-			// A Trivy that knows DHI's model reads it as dhi
-			name:           "dhi-family-passes",
-			osRelease:      dhiRelease,
-			skopeo:         index,
-			candidate:      withOS(t, report(t, "amd64", "", 3, "CVE-1"), "dhi", "13", "dhi"),
-			baseline:       withOS(t, report(t, "amd64", digest, 3, "CVE-1"), "dhi", "13", "dhi"),
-			layoutResult:   &execx.Result{},
-			sarifResult:    &execx.Result{},
-			baselineResult: &execx.Result{},
-			wantStdout: "compared with " + digest + "\n0 new, so blocking:\n" +
-				"1 already published, so advisory:\n" + line("CVE-1") +
-				"nothing new against what is published (1 advisory)\n",
-		},
-		{
 			// What Trivy calls an OS it does not know
 			name:         "family-none-is-blind",
-			osRelease:    dhiRelease,
+			osRelease:    withoutOSRelease,
 			candidate:    withOS(t, report(t, "amd64", "", 3, "CVE-1"), "none", "", "debian"),
 			layoutResult: &execx.Result{},
 			wantCode:     1,
@@ -273,12 +248,11 @@ func TestRun(t *testing.T) {
 				"nothing new against what is published (1 advisory)\n",
 		},
 		{
-			name:         "unreadable-layout-fails",
-			osRelease:    withoutLayout,
-			candidate:    report(t, "amd64", "", 3, "CVE-1"),
-			layoutResult: &execx.Result{},
-			wantCode:     1,
-			wantStderr:   []string{"LAYOUT", "os-release"},
+			// Read before any scanner runs, since it decides which one
+			name:       "unreadable-layout-fails",
+			osRelease:  withoutLayout,
+			wantCode:   1,
+			wantStderr: []string{"LAYOUT", "which image to scan"},
 		},
 		{
 			// The published image ships the package at the version the

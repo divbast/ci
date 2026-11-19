@@ -54,6 +54,16 @@ const (
 //	gh-run-view-jobs-baikal-failed.json  gh run view 42310287997 --repo divbast/baikal-oci-image --json jobs
 //	gh-run-view-jobs-frankenphp-skipped.json  gh run view 43481642005 --repo divbast/frankenphp --json jobs
 //
+// and with gh 2.104.0 on 2026-11-20,
+//
+//	gh-api-issues-open-baikal.txt      gh api -i 'repos/divbast/baikal-oci-image/issues?state=open&creator=divbast-renovate%5Bbot%5D&per_page=100'
+//	gh-api-issues-open-sonarr.txt      the same for divbast/sonarr-oci-image
+//
+// The issue lists hold each repository's Dependency Dashboard, #94 and
+// #4, both clean, among Renovate's open pull requests, which the issues
+// API lists too: two in Baikal's, four in Sonarr's. dashboard-clean.md is
+// Baikal's dashboard's body.
+//
 // The two slot lists hold the same runs as their recordings of the day
 // before, which lacked databaseId. The frankenphp run is a daily slot in
 // which every job succeeded; the Baikal one is the slot of 2026-11-06,
@@ -888,5 +898,86 @@ func TestGHTimeout(t *testing.T) {
 				})
 			})
 		}
+	}
+}
+
+// issuesPath is the issues GH.Dashboards reads for repo.
+func issuesPath(repo string) string {
+	return "repos/" + repo + "/issues?state=open&creator=divbast-renovate%5Bbot%5D&per_page=100"
+}
+
+// okJSON is a gh api -i answer of 200 with body.
+func okJSON(body string) []byte {
+	return []byte("HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n\r\n" + body)
+}
+
+func TestGHDashboards(t *testing.T) {
+	t.Parallel()
+	sonarr := "divbast/sonarr-oci-image"
+	tests := []struct {
+		name    string
+		repo    string
+		result  execx.Result
+		want    []int // the issues' numbers
+		wantURL string
+		wantErr bool
+	}{
+		{
+			name: "baikal", repo: baikal, result: stdout(testdata(t, "gh-api-issues-open-baikal.txt")),
+			want: []int{94}, wantURL: "https://github.com/divbast/baikal-oci-image/issues/94",
+		},
+		{
+			name: "sonarr", repo: sonarr, result: stdout(testdata(t, "gh-api-issues-open-sonarr.txt")),
+			want: []int{4}, wantURL: "https://github.com/divbast/sonarr-oci-image/issues/4",
+		},
+		{
+			// Renovate's own lookup takes the title exactly
+			name: "other-titles", repo: baikal,
+			result: stdout(okJSON(`[{"number":7,"title":"Dependency Dashboard (old)","body":"x","html_url":"u7"},` +
+				`{"number":8,"title":"dependency dashboard","body":"x","html_url":"u8"}]`)),
+		},
+		{
+			// The issues API lists pull requests too, whatever their title
+			name: "pull-request", repo: baikal,
+			result: stdout(okJSON(`[{"number":9,"title":"Dependency Dashboard","body":"x","html_url":"u9",` +
+				`"pull_request":{"url":"https://api.github.com/repos/divbast/baikal-oci-image/pulls/9"}},` +
+				`{"number":10,"title":"Dependency Dashboard","body":"x","html_url":"u10","pull_request":null}]`)),
+			want: []int{10},
+		},
+		{
+			name: "full-page", repo: baikal,
+			result:  stdout(okJSON("[" + strings.Repeat(`{"number":1,"title":"Dependency Dashboard","body":"x","html_url":"u"},`, 99) + `{"number":1,"title":"x","body":"x","html_url":"u"}]`)),
+			wantErr: true,
+		},
+		{name: "gh-fails", repo: baikal, result: ghFailed("gh: HTTP 502"), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: api(issuesPath(tt.repo)), Result: tt.result}), Repo: tt.repo}
+			got, err := gh.Dashboards(t.Context())
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("Dashboards() = %+v, want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var numbers []int
+			for _, is := range got {
+				numbers = append(numbers, is.Number)
+				if is.Title != "Dependency Dashboard" || is.Body == "" {
+					t.Errorf("issue %+v, want the dashboard's title and body", is)
+				}
+			}
+			if !slices.Equal(numbers, tt.want) {
+				t.Errorf("Dashboards() numbers = %v, want %v", numbers, tt.want)
+			}
+			if tt.wantURL != "" && got[0].URL != tt.wantURL {
+				t.Errorf("URL = %q, want %q", got[0].URL, tt.wantURL)
+			}
+		})
 	}
 }
