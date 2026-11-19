@@ -109,6 +109,26 @@ func trivyReport(t *testing.T, withOS, withOSPackages bool, arch, repoDigest str
 	return string(data)
 }
 
+// withPackage is report, a JSON report from trivyReport, with the
+// package name at version added to its Go binary's packages, as Trivy
+// lists one.
+func withPackage(t *testing.T, report, name, version string) string {
+	t.Helper()
+	var rep map[string]any
+	if err := json.Unmarshal([]byte(report), &rep); err != nil {
+		t.Fatal(err)
+	}
+	results, _ := rep["Results"].([]any)
+	first, _ := results[0].(map[string]any)
+	pkgs, _ := first["Packages"].([]any)
+	first["Packages"] = append(pkgs, map[string]string{"ID": name + "@" + version, "Name": name, "Version": version})
+	data, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
 // recorded returns a recording of Trivy's stderr from internal/scan's
 // testdata, where its README says how each was made.
 func recorded(t *testing.T, name string) []byte {
@@ -201,6 +221,20 @@ func TestRun(t *testing.T) {
 				"1 already published, so advisory:\n" + line("CVE-2"),
 			wantStderr:  []string{"2 finding(s) the published image does not have. Move what carries them.\n"},
 			wantSummary: []string{"### Vulnerability scan, arm64\n", "**New, so blocking: 2**"},
+		},
+		{
+			// The published image ships the package at the version the
+			// finding is in, so it is already out, under whatever ID
+			name:           "shipped-version-is-old",
+			skopeo:         index,
+			candidate:      report(t, "amd64", "", 3, "CVE-9"),
+			baseline:       withPackage(t, report(t, "amd64", digest, 3), "stdlib", "v1.27.3"),
+			layoutResult:   &execx.Result{},
+			sarifResult:    &execx.Result{},
+			baselineResult: &execx.Result{},
+			wantStdout: "compared with " + digest + "\n0 new, so blocking:\n" +
+				"1 already published, so advisory:\n" + line("CVE-9") +
+				"nothing new against what is published (1 advisory)\n",
 		},
 		{
 			name:           "new-blocks-with-vex",

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -61,6 +62,12 @@ func parse(t *testing.T, name string) []scan.Finding {
 		t.Fatalf("ParseTrivy(%s): %v", name, err)
 	}
 	return rep.Findings
+}
+
+// sameFindings reports whether a and b hold equal findings, in order:
+// a Finding holds its aliases in a slice, so == cannot compare two.
+func sameFindings(a, b []scan.Finding) bool {
+	return slices.EqualFunc(a, b, func(x, y scan.Finding) bool { return reflect.DeepEqual(x, y) })
 }
 
 func TestParseTrivyCountsPackages(t *testing.T) {
@@ -132,7 +139,7 @@ func TestParseTrivyCountsPackages(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseTrivy() error = %v", err)
 			}
-			if !slices.Equal(rep.Findings, tt.wantFindings) {
+			if !sameFindings(rep.Findings, tt.wantFindings) {
 				t.Errorf("findings = %+v, want %+v", rep.Findings, tt.wantFindings)
 			}
 			if rep.Packages != tt.wantPackages {
@@ -323,14 +330,100 @@ func TestCompare(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := scan.Compare(tt.candidate, tt.published)
-			if !slices.Equal(got.New, tt.want.New) {
+			got := scan.Compare(tt.candidate, tt.published, nil)
+			if !sameFindings(got.New, tt.want.New) {
 				t.Errorf("New = %+v, want %+v", got.New, tt.want.New)
 			}
-			if !slices.Equal(got.Old, tt.want.Old) {
+			if !sameFindings(got.Old, tt.want.Old) {
 				t.Errorf("Old = %+v, want %+v", got.Old, tt.want.Old)
 			}
 		})
+	}
+}
+
+func TestParseTrivyAliasesAndInventory(t *testing.T) {
+	t.Parallel()
+	// Trivy keeps a Debian package's epoch and revision apart in its list,
+	// and joins them in a finding's InstalledVersion, as dpkg writes it
+	report := `{"Metadata":{"OS":{"Family":"debian","Name":"13.2"}},"Results":[
+		{"Target":"image (debian 13.2)","Class":"os-pkgs","Type":"debian",
+		 "Packages":[
+			{"ID":"zlib1g@1:1.3.dfsg-3","Name":"zlib1g","Version":"1.3.dfsg","Release":"3","Epoch":1},
+			{"ID":"libbrotli1@1.1.0-1","Name":"libbrotli1","Version":"1.1.0","Release":"1"}],
+		 "Vulnerabilities":[{"VulnerabilityID":"DHI-x","VendorIDs":["CVE-2026-1"],"PkgName":"libbrotli1",
+			"InstalledVersion":"1.1.0-1","Severity":"HIGH"}]},
+		{"Target":"usr/local/bin/app","Class":"lang-pkgs","Type":"gobinary",
+		 "Packages":[{"ID":"stdlib@v1.27.3","Name":"stdlib","Version":"v1.27.3"},{"ID":"nameless"}]}]}`
+	rep, err := scan.ParseTrivy(strings.NewReader(report))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Findings) != 1 || !slices.Equal(rep.Findings[0].Aliases, []string{"CVE-2026-1"}) {
+		t.Errorf("findings = %+v, want one with aliases [CVE-2026-1]", rep.Findings)
+	}
+	wantInventory := []scan.Pkg{{"zlib1g", "1:1.3.dfsg-3"}, {"libbrotli1", "1.1.0-1"}, {"stdlib", "v1.27.3"}}
+	if !slices.Equal(rep.Inventory, wantInventory) {
+		t.Errorf("inventory = %+v, want %+v", rep.Inventory, wantInventory)
+	}
+	if rep.Family != "debian" {
+		t.Errorf("family = %q, want debian", rep.Family)
+	}
+	if rep.Packages != 4 {
+		t.Errorf("packages = %d, want 4: one with no name still counts", rep.Packages)
+	}
+}
+
+func TestCompareByAlias(t *testing.T) {
+	t.Parallel()
+	dhi := scan.Finding{ID: "DHI-x", Aliases: []string{"CVE-1"}, Pkg: "brotli", Version: "1.1.0-1", Severity: "HIGH"}
+	tests := []struct {
+		name      string
+		candidate scan.Finding
+		published scan.Finding
+		old       bool
+	}{
+		{"candidate-alias-meets-published-id", dhi, scan.Finding{ID: "CVE-1", Pkg: "brotli"}, true},
+		{"candidate-id-meets-published-alias", scan.Finding{ID: "CVE-1", Pkg: "brotli"}, dhi, true},
+		{"aliases-meet", dhi, scan.Finding{ID: "DSA-9", Aliases: []string{"GHSA-a", "CVE-1"}, Pkg: "brotli"}, true},
+		{"alias-in-another-package", dhi, scan.Finding{ID: "CVE-1", Pkg: "libbrotli1"}, false},
+		{"no-shared-id", dhi, scan.Finding{ID: "CVE-2", Aliases: []string{"DHI-y"}, Pkg: "brotli"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := scan.Compare([]scan.Finding{tt.candidate}, []scan.Finding{tt.published}, nil)
+			if old := len(got.Old) == 1; old != tt.old {
+				t.Errorf("Compare() = %+v, want old %v", got, tt.old)
+			}
+		})
+	}
+}
+
+func TestCompareByShippedVersion(t *testing.T) {
+	t.Parallel()
+	qemu := scan.Finding{ID: "DHI-y", Pkg: "qemu", Version: "9.2", Severity: "HIGH"}
+	got := scan.Compare([]scan.Finding{qemu}, nil, []scan.Pkg{{"qemu", "9.2"}})
+	if !sameFindings(got.Old, []scan.Finding{qemu}) || len(got.New) != 0 {
+		t.Errorf("shipped at 9.2: Compare() = %+v, want it old", got)
+	}
+	got = scan.Compare([]scan.Finding{qemu}, nil, []scan.Pkg{{"qemu", "9.1"}})
+	if !sameFindings(got.New, []scan.Finding{qemu}) || len(got.Old) != 0 {
+		t.Errorf("shipped at 9.1: Compare() = %+v, want it new", got)
+	}
+	got = scan.Compare([]scan.Finding{qemu}, nil, []scan.Pkg{{"qemu-utils", "9.2"}})
+	if !sameFindings(got.New, []scan.Finding{qemu}) {
+		t.Errorf("another package at 9.2: Compare() = %+v, want it new", got)
+	}
+}
+
+func TestCompareNewPackageBlocks(t *testing.T) {
+	t.Parallel()
+	f := scan.Finding{ID: "DHI-z", Aliases: []string{"CVE-3"}, Pkg: "libnew", Version: "1.0", Severity: "CRITICAL"}
+	published := []scan.Finding{{ID: "CVE-3", Pkg: "libold", Version: "1.0"}}
+	shipped := []scan.Pkg{{"libold", "1.0"}, {"zlib1g", "1:1.3.dfsg-3"}}
+	got := scan.Compare([]scan.Finding{f}, published, shipped)
+	if !sameFindings(got.New, []scan.Finding{f}) {
+		t.Errorf("Compare() = %+v, want the new package's finding new", got)
 	}
 }
 
@@ -384,7 +477,7 @@ func TestSummaryGolden(t *testing.T) {
 	for _, tt := range goldens {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			split := scan.Compare(parse(t, tt.candidate), parse(t, tt.published))
+			split := scan.Compare(parse(t, tt.candidate), parse(t, tt.published), nil)
 			got := scan.Summary(tt.arch, tt.against, tt.heading, tt.warning, split)
 			if want := string(readTestdata(t, tt.summaryGolden)); got != want {
 				t.Errorf("Summary() differs from %s\n got: %q\nwant: %q", tt.summaryGolden, got, want)
@@ -399,7 +492,7 @@ func TestListingGolden(t *testing.T) {
 	for _, tt := range goldens {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			split := scan.Compare(parse(t, tt.candidate), parse(t, tt.published))
+			split := scan.Compare(parse(t, tt.candidate), parse(t, tt.published), nil)
 			got := scan.Listing(tt.against, tt.verdict, split)
 			if want := string(readTestdata(t, tt.listingGolden)); got != want {
 				t.Errorf("Listing() differs from %s\n got: %q\nwant: %q", tt.listingGolden, got, want)

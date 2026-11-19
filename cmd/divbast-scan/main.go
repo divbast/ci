@@ -238,6 +238,7 @@ func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, 
 
 	var (
 		shipped          []scan.Finding
+		inventory        []scan.Pkg
 		against, warning string
 	)
 	if advisory == nil {
@@ -245,7 +246,7 @@ func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, 
 			complain(stderr, "could not scan %s, so no finding can be told apart from one already published: %v", *published, err)
 			return 1
 		}
-		if shipped, against, err = readBaseline(*baseline, *published); err != nil {
+		if shipped, inventory, against, err = readBaseline(*baseline, *published); err != nil {
 			complain(stderr, "%v", err)
 			return 1
 		}
@@ -268,7 +269,7 @@ func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, 
 		}
 	}
 
-	split := scan.Compare(candidate.Findings, shipped)
+	split := scan.Compare(candidate.Findings, shipped, inventory)
 	verdict, heading := "new, so blocking", "New, so blocking"
 	if advisory != nil {
 		verdict, heading = "advisory: "+advisory.heading, "Advisory: "+advisory.heading
@@ -403,23 +404,23 @@ func unshippedFor(state registry.State, err error, inActions bool, published str
 }
 
 // readBaseline returns the findings in the report on the published image
-// at path, and the image it names.
-func readBaseline(path, image string) (shipped []scan.Finding, ref string, err error) {
+// at path, the packages it ships, and the image it names.
+func readBaseline(path, image string) (shipped []scan.Finding, inventory []scan.Pkg, ref string, err error) {
 	data, err := readFile(path)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	rep, err := scan.ParseTrivy(bytes.NewReader(data))
 	if err != nil {
-		return nil, "", fmt.Errorf("%s: %w", path, err)
+		return nil, nil, "", fmt.Errorf("%s: %w", path, err)
 	}
 	if rep.Packages == 0 {
-		return nil, "", fmt.Errorf("no packages in %s: the scan found nothing to scan, not nothing wrong", image)
+		return nil, nil, "", fmt.Errorf("no packages in %s: the scan found nothing to scan, not nothing wrong", image)
 	}
 	if blindToOS(&rep) {
-		return nil, "", fmt.Errorf("%s: %s", image, noOS(&rep))
+		return nil, nil, "", fmt.Errorf("%s: %s", image, noOS(&rep))
 	}
-	return rep.Findings, rep.Ref, nil
+	return rep.Findings, rep.Inventory, rep.Ref, nil
 }
 
 // noOS says why a report blind to the OS is refused, and what Trivy

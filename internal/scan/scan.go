@@ -8,7 +8,9 @@
 // A new advisory against something the published image already ships is
 // not one a release can make worse. Blocking on it protects nobody and
 // holds back whatever else the release fixes. Every other finding is still
-// reported, as an advisory.
+// reported, as an advisory. "Already ships" is the same advisory, by any
+// of its IDs, in the same package, or the same package at the same
+// version: see [Compare].
 package scan
 
 import (
@@ -17,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 
 	"github.com/divbast/ci/internal/execx"
 )
@@ -26,7 +29,16 @@ import (
 // that fixes it or "" when none does, the severity, the advisory's page or
 // "", and where it was found, which is "<type> package" for an OS package,
 // such as "debian package", and the file it was found in otherwise.
-type Finding struct{ ID, Pkg, Version, Fixed, Severity, URL, Where string }
+// Aliases are the advisory's other IDs, such as the CVE a vendor's
+// advisory answers, which Trivy lists as its VendorIDs.
+type Finding struct {
+	ID, Pkg, Version, Fixed, Severity, URL, Where string
+	Aliases                                       []string
+}
+
+// Pkg is a package an image ships, by name and version, the version
+// written as a finding's is.
+type Pkg struct{ Name, Version string }
 
 // Split is a candidate image's findings, parted into those the published
 // image lacks, New, and those it has, Old.
@@ -40,17 +52,23 @@ type Split struct{ New, Old []Finding }
 // found; deciding that is the caller's.
 //
 // OS is the operating system Trivy identified, as "<family> <name>", such
-// as "debian 13.2", or "" when it identified none; OSPackages is how many
-// of the packages are the OS's. An image whose OS Trivy does not know
-// still has its language packages, so a report with no OS or no OS
-// packages is blind to the OS, which Packages alone does not show.
+// as "debian 13.2", or "" when it identified none, and Family its family
+// alone; OSPackages is how many of the packages are the OS's. An image
+// whose OS Trivy does not know still has its language packages, so a
+// report with no OS or no OS packages is blind to the OS, which Packages
+// alone does not show.
+//
+// Inventory is every package the report lists by name, OS and language
+// alike, with its version as a finding in it would give it.
 type Report struct {
 	Findings   []Finding
 	Packages   int
 	OS         string
+	Family     string
 	OSPackages int
 	Arch       string
 	Ref        string
+	Inventory  []Pkg
 }
 
 // trivyJSON is what the scan reads of a Trivy JSON report.
@@ -65,10 +83,13 @@ type trivyJSON struct {
 	}
 	Results []struct {
 		Target, Class, Type string
-		// Only how many there are is read.
-		Packages        []struct{}
+		Packages            []struct {
+			Name, Version, Release string
+			Epoch                  int
+		}
 		Vulnerabilities []struct {
 			VulnerabilityID, PkgName, InstalledVersion, FixedVersion, Severity, PrimaryURL string
+			VendorIDs                                                                      []string
 		}
 	}
 }
@@ -89,9 +110,15 @@ func ParseTrivy(r io.Reader) (Report, error) {
 	}
 	if os := raw.Metadata.OS; os.Family != "" {
 		rep.OS = os.Family + " " + os.Name
+		rep.Family = os.Family
 	}
 	for _, res := range raw.Results {
 		rep.Packages += len(res.Packages)
+		for _, p := range res.Packages {
+			if p.Name != "" {
+				rep.Inventory = append(rep.Inventory, Pkg{p.Name, trivyVersion(p.Epoch, p.Version, p.Release)})
+			}
+		}
 		if res.Class == "os-pkgs" {
 			rep.OSPackages += len(res.Packages)
 		}
@@ -108,30 +135,68 @@ func ParseTrivy(r io.Reader) (Report, error) {
 				Severity: v.Severity,
 				URL:      v.PrimaryURL,
 				Where:    where,
+				Aliases:  v.VendorIDs,
 			})
 		}
 	}
 	return rep, nil
 }
 
+// trivyVersion writes a package's version as Trivy writes a finding's
+// InstalledVersion: [epoch:]version[-release], as dpkg and rpm do.
+func trivyVersion(epoch int, version, release string) string {
+	if release != "" {
+		version += "-" + release
+	}
+	if epoch != 0 {
+		version = strconv.Itoa(epoch) + ":" + version
+	}
+	return version
+}
+
 // key is what makes two findings the same one.
 type key struct{ id, pkg string }
 
-// Compare parts candidate's findings by whether published has the same
-// vulnerability in the same package, at any version: a bump from one
-// affected version to another leaves the image no worse than what is out.
-// Both halves keep candidate's order, and its duplicates.
-func Compare(candidate, published []Finding) Split {
+// ids is f's ID and its aliases.
+func (f *Finding) ids() []string { return append([]string{f.ID}, f.Aliases...) }
+
+// Compare parts candidate's findings by whether the published image
+// already ships each, Old, or not, New. Both halves keep candidate's
+// order, and its duplicates. A candidate finding is already shipped when:
+//
+//   - a published finding is in the same package, at any version, and
+//     shares an ID with it, its own or an alias: a bump from one affected
+//     version to another leaves the image no worse than what is out, and
+//     one advisory may be filed under a vendor's ID and a CVE;
+//   - or shipped, the published image's packages, holds its package at its
+//     version: whatever the advisory, the image already ships what it is
+//     against.
+//
+// With one scanner and one database on both sides, the second rule
+// decides nothing the first does not: the same package at the same
+// version draws the same findings. It bites only when the model changes
+// between the published image and the candidate, as when a base image
+// moves to its vendor's own advisories and every ID changes. A package
+// new to the image, or at a new version, is still judged by its IDs.
+func Compare(candidate, published []Finding, shipped []Pkg) Split {
 	known := make(map[key]bool, len(published))
-	for _, f := range published {
-		known[key{f.ID, f.Pkg}] = true
+	for i := range published {
+		f := &published[i]
+		for _, id := range f.ids() {
+			known[key{id, f.Pkg}] = true
+		}
+	}
+	out := make(map[Pkg]bool, len(shipped))
+	for _, p := range shipped {
+		out[p] = true
 	}
 	var s Split
-	for _, f := range candidate {
-		if known[key{f.ID, f.Pkg}] {
-			s.Old = append(s.Old, f)
+	for i := range candidate {
+		f := &candidate[i]
+		if out[Pkg{f.Pkg, f.Version}] || slices.ContainsFunc(f.ids(), func(id string) bool { return known[key{id, f.Pkg}] }) {
+			s.Old = append(s.Old, *f)
 		} else {
-			s.New = append(s.New, f)
+			s.New = append(s.New, *f)
 		}
 	}
 	return s
