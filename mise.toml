@@ -15,6 +15,7 @@
 "pipx:reuse" = "6.3.0"
 "aqua:casey/just" = "1.59.0"
 "aqua:aquasecurity/trivy" = "0.76.2"
+"aqua:anchore/grype" = "0.122.1"
 
 [env]
 # The toolchain is the one pinned above, never one go.mod's toolchain line

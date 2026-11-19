@@ -24,10 +24,11 @@
 # "aqua:sigstore/cosign", for divbast-verify-images: build runs it on the
 # root Containerfile, and lint on each Containerfile the optional
 # verify-containerfiles input lists. Of the caller's mise.toml, the scan
-# job installs only Go, just, Trivy and cosign, each declared at one
-# version: Go as "core:go" (mise reads the short "go" the same way), and
-# just, Trivy and cosign as exactly "aqua:casey/just",
-# "aqua:aquasecurity/trivy" and "aqua:sigstore/cosign".
+# job installs only Go, just, Trivy, grype and cosign, each declared at
+# one version: Go as "core:go" (mise reads the short "go" the same way),
+# and just, Trivy, grype and cosign as exactly "aqua:casey/just",
+# "aqua:aquasecurity/trivy", "aqua:anchore/grype" and
+# "aqua:sigstore/cosign".
 name: app-check
 
 on:
@@ -456,23 +457,24 @@ jobs:
 
       # Before the pin check, which needs the caller's pinned Go, and only
       # what the scan runs: Go for the pin check and ci's tools, just for
-      # the recipe, Trivy, and cosign, which verifies Docker's VEX document
-      # for the Containerfile's final stage's base, when it is a dhi.io
-      # image. An install runs code from outside the repository, and this
-      # job can dismiss code scanning alerts.
+      # the recipe, Trivy, grype for an image that says ID=dhi, and cosign,
+      # which verifies Docker's VEX document for the Containerfile's final
+      # stage's base, when it is a dhi.io image. An install runs code from
+      # outside the repository, and this job can dismiss code scanning
+      # alerts.
       - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
           version: ${{ env.MISE_VERSION }}
-          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign
+          install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:anchore/grype aqua:sigstore/cosign
 
       # mise installs a name that mise.toml does not declare, or declares
       # under another name, at its latest version, and succeeds. So that a
-      # scan never runs a Trivy or a cosign the caller did not pin, each
-      # must be the caller's, at the one version it names.
+      # scan never runs a Trivy, a grype or a cosign the caller did not pin,
+      # each must be the caller's, at the one version it names.
       - name: Check the caller's mise.toml pins each tool installed above
         run: |
           current=$(mise ls --current --json)
-          for tool in go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign; do
+          for tool in go aqua:casey/just aqua:aquasecurity/trivy aqua:anchore/grype aqua:sigstore/cosign; do
             if ! jq -e --arg tool "${tool}" \
               '.[$tool] // [] | any(.installed and .version == .requested_version)' \
               <<<"${current}" >/dev/null; then
@@ -503,7 +505,7 @@ jobs:
       # registry refuses to show the published image, divbast-scan asks
       # GitHub, through gh and this job's token, whether it is absent,
       # private, or public and failing. Only gh gets the token: trivy,
-      # skopeo and cosign run without it, and DHI's VEX document is
+      # grype, skopeo and cosign run without it, and DHI's VEX document is
       # fetched anonymously.
       - name: Vulnerability scan
         env:
@@ -521,4 +523,6 @@ jobs:
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: /tmp/image.tar.sarif
-          category: trivy-${{ matrix.arch }}
+          # Whichever scanner wrote it: an image's alerts stay under one
+          # category when its base moves to Docker's own model
+          category: scan-${{ matrix.arch }}

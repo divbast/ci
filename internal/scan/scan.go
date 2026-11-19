@@ -46,8 +46,10 @@ type Finding struct {
 type Pkg struct{ Name, Version string }
 
 // Split is a candidate image's findings, parted into those the published
-// image lacks, New, and those it has, Old.
-type Split struct{ New, Old []Finding }
+// image lacks, New, and those it has, Old. Listed are the findings the
+// published image lacks that carry no severity, UNKNOWN: reported, never
+// blocking, as Trivy's HIGH,CRITICAL filter leaves them out altogether.
+type Split struct{ New, Old, Listed []Finding }
 
 // Report is what a Trivy JSON report says: its findings, in Trivy's order;
 // how many packages it saw; the image's architecture; and what it
@@ -188,7 +190,8 @@ func (f *Finding) ids() []string { return append([]string{f.ID}, f.Aliases...) }
 // version draws the same findings. It bites only when the model changes
 // between the published image and the candidate, as when a base image
 // moves to its vendor's own advisories and every ID changes. A package
-// new to the image, or at a new version, is still judged by its IDs.
+// new to the image, or at a new version, is still judged by its IDs. A
+// new finding with no severity goes to Listed.
 func Compare(candidate, published []Finding, shipped []Pkg) Split {
 	known := make(map[key]bool, len(published))
 	for i := range published {
@@ -204,9 +207,12 @@ func Compare(candidate, published []Finding, shipped []Pkg) Split {
 	var s Split
 	for i := range candidate {
 		f := &candidate[i]
-		if out[Pkg{f.Pkg, f.Version}] || slices.ContainsFunc(f.ids(), func(id string) bool { return known[key{id, f.Pkg}] }) {
+		switch {
+		case out[Pkg{f.Pkg, f.Version}] || slices.ContainsFunc(f.ids(), func(id string) bool { return known[key{id, f.Pkg}] }):
 			s.Old = append(s.Old, *f)
-		} else {
+		case f.Severity == "UNKNOWN":
+			s.Listed = append(s.Listed, *f)
+		default:
 			s.New = append(s.New, *f)
 		}
 	}

@@ -142,9 +142,9 @@ func (g Grype) Probe(ctx context.Context, purl, namespace string) error {
 
 // Layout scans the image for linux/arch in the OCI layout at layout, and
 // writes its report to report, its CycloneDX to cdx, which lists every
-// package where the report lists only those with findings, and its
-// SARIF, for code scanning, to sarif, holding the HIGH and CRITICAL
-// findings alone, as the verdict counts them.
+// package where the report lists only those with findings, and its SARIF,
+// for code scanning, to sarif, every finding in it until SARIF filters
+// it.
 func (g Grype) Layout(ctx context.Context, layout, arch, report, cdx, sarif string) error {
 	args, err := g.args(slices.Concat([]string{
 		"oci-dir:" + layout, "--platform", "linux/" + arch,
@@ -153,11 +153,13 @@ func (g Grype) Layout(ctx context.Context, layout, arch, report, cdx, sarif stri
 	if err != nil {
 		return err
 	}
-	if err := g.logged(ctx, args...); err != nil {
-		return err
-	}
-	return filterSARIF(report, sarif)
+	return g.logged(ctx, args...)
 }
+
+// SARIF rewrites the SARIF at sarif, from the Layout run that wrote the
+// report at report, to hold the HIGH and CRITICAL findings alone, as the
+// verdict counts them, for code scanning.
+func (Grype) SARIF(report, sarif string) error { return filterSARIF(report, sarif) }
 
 // Published scans image as its registry serves it for linux/arch, and
 // writes the report to report and its CycloneDX to cdx, from the database

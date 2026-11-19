@@ -21,13 +21,20 @@ func (f Finding) String() string {
 
 // Listing returns what the scan prints: what it compared with, then how
 // many findings the published image lacks, under verdict, and each of
-// them, then how many it has, and each of those.
+// them, then those of them with no severity, when there are any, then how
+// many it has, and each of those.
 func Listing(against, verdict string, s Split) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "compared with %s\n", against)
 	fmt.Fprintf(&b, "%d %s:\n", len(s.New), verdict)
 	for i := range s.New {
 		fmt.Fprintf(&b, "  %s\n", &s.New[i])
+	}
+	if len(s.Listed) > 0 {
+		fmt.Fprintf(&b, "%d new with no severity, so listed, not blocking:\n", len(s.Listed))
+		for i := range s.Listed {
+			fmt.Fprintf(&b, "  %s\n", &s.Listed[i])
+		}
 	}
 	fmt.Fprintf(&b, "%d already published, so advisory:\n", len(s.Old))
 	for i := range s.Old {
@@ -49,6 +56,10 @@ func Summary(arch, against, heading, warning string, s Split) string {
 	}
 	fmt.Fprintf(&b, "**%s: %d**\n\n", heading, len(s.New))
 	table(&b, s.New)
+	if len(s.Listed) > 0 {
+		fmt.Fprintf(&b, "\n**New with no severity, so listed, not blocking: %d**\n\n", len(s.Listed))
+		table(&b, s.Listed)
+	}
 	fmt.Fprintf(&b, "\n**Already published, so advisory: %d**\n\n", len(s.Old))
 	table(&b, s.Old)
 	b.WriteString("\n")

@@ -409,3 +409,43 @@ func TestReadMissingLayout(t *testing.T) {
 		t.Fatal("Read() of no layout: nil error")
 	}
 }
+
+func TestArch(t *testing.T) {
+	t.Parallel()
+	plain := simple(t, layer(t, file{name: "etc/os-release", body: dhi}))
+	if got, err := Arch(plain); err != nil || got != "amd64" {
+		t.Errorf("Arch(no platform) = %q, %v; want the config's amd64", got, err)
+	}
+
+	dir := t.TempDir()
+	image := func(arch string) desc {
+		d := writeManifest(t, dir, tarGzip, gz(t, layer(t, file{name: "etc/os-release", body: dhi})))
+		d.Platform = &platform{OS: "linux", Architecture: arch}
+		return d
+	}
+	attestation := writeManifest(t, dir, "application/vnd.in-toto+json", []byte(`{}`))
+	attestation.Platform = &platform{OS: "unknown", Architecture: "unknown"}
+	attestation.Annotations = map[string]string{"vnd.docker.reference.type": "attestation-manifest"}
+	one := writeIndex(t, dir, false, image("arm64"), attestation)
+	writeIndex(t, dir, true, one)
+	if got, err := Arch(dir); err != nil || got != "arm64" {
+		t.Errorf("Arch(buildx layout) = %q, %v; want arm64", got, err)
+	}
+
+	several := t.TempDir()
+	both := func(arch string) desc {
+		d := writeManifest(t, several, tarGzip, gz(t, layer(t, file{name: "etc/os-release", body: dhi})))
+		d.Platform = &platform{OS: "linux", Architecture: arch}
+		return d
+	}
+	writeIndex(t, several, true, both("amd64"), both("arm64"))
+	if _, err := Arch(several); err == nil || !strings.Contains(err.Error(), "2") {
+		t.Errorf("Arch(two images) error = %v, want one saying there are 2", err)
+	}
+
+	none := t.TempDir()
+	writeIndex(t, none, true, attestation)
+	if _, err := Arch(none); err == nil {
+		t.Error("Arch(no image) error = nil, want one")
+	}
+}

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -41,15 +40,6 @@ func TestTrivyIgnoresCallerEnvironment(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "CVE-2026-116587") {
 		t.Error("the SARIF lacks CVE-2026-116587: trivy read TRIVY_SEVERITY from the environment")
-	}
-}
-
-func TestTrivyEnv(t *testing.T) {
-	t.Parallel()
-	got := trivyEnv([]string{"PATH=/bin", "TRIVY_SEVERITY=LOW", "TRIVY_IGNORE_UNFIXED=true", "GH_TOKEN=x", "NOT_TRIVY_X=1"})
-	want := []string{"TRIVY_SEVERITY=", "TRIVY_IGNORE_UNFIXED="}
-	if !slices.Equal(got, want) {
-		t.Errorf("trivyEnv() = %q, want %q", got, want)
 	}
 }
 

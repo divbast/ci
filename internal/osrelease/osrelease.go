@@ -75,7 +75,7 @@ func Read(ctx context.Context, zstd execx.StreamRunner, layout, arch string) (In
 		return Info{}, false, fmt.Errorf("%s holds %d linux/%s images, so which one was built is unclear", layout, len(found), arch)
 	}
 	var m manifest
-	if err = readJSON(root, found[0], &m); err != nil {
+	if err = readJSON(root, found[0].path, &m); err != nil {
 		return Info{}, false, fmt.Errorf("%s: %w", layout, err)
 	}
 	fs := rootfs{}
@@ -91,6 +91,49 @@ func Read(ctx context.Context, zstd execx.StreamRunner, layout, arch string) (In
 	return info, ok, nil
 }
 
+// Arch returns the architecture of the one linux image in the OCI layout
+// at layout, as its index names it, or as its config says when the index
+// names no platform, as Podman's archives do. The scan builds one image
+// for one architecture, and needs to know which before any scanner runs;
+// a layout of several images, or of none, is an error.
+func Arch(layout string) (arch string, err error) {
+	root, err := os.OpenRoot(layout)
+	if err != nil {
+		return "", fmt.Errorf("open the OCI layout: %w", err)
+	}
+	defer func() { _ = root.Close() }() // read-only, so nothing to lose
+	var top index
+	if err = readJSON(root, "index.json", &top); err != nil {
+		return "", fmt.Errorf("%s: %w", layout, err)
+	}
+	found, err := images(root, top, "", 0)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", layout, err)
+	}
+	if len(found) != 1 {
+		return "", fmt.Errorf("%s holds %d linux images, where the scan needs one, so which to scan is unclear", layout, len(found))
+	}
+	if found[0].arch != "" {
+		return found[0].arch, nil
+	}
+	var m manifest
+	if err = readJSON(root, found[0].path, &m); err != nil {
+		return "", fmt.Errorf("%s: %w", layout, err)
+	}
+	p, err := blobPath(m.Config.Digest)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", layout, err)
+	}
+	var config struct{ Architecture string }
+	if err = readJSON(root, p, &config); err != nil {
+		return "", fmt.Errorf("%s: %w", layout, err)
+	}
+	if config.Architecture == "" {
+		return "", fmt.Errorf("%s: the image's config names no architecture", layout)
+	}
+	return config.Architecture, nil
+}
+
 // descriptor is what the reader uses of an OCI content descriptor.
 type descriptor struct {
 	MediaType string
@@ -104,23 +147,30 @@ type descriptor struct {
 
 type index struct{ Manifests []descriptor }
 
-type manifest struct{ Layers []descriptor }
+type manifest struct {
+	Config descriptor
+	Layers []descriptor
+}
 
-// images returns the blob paths of the image manifests in ix for
-// linux/arch, and of those that name no platform, looking into nested
-// indexes.
-func images(root *os.Root, ix index, arch string, depth int) ([]string, error) {
+// image is an image manifest an index names: its blob's path, and the
+// architecture the index gives it, or "" when it names no platform.
+type image struct{ path, arch string }
+
+// images returns the image manifests in ix for linux/arch, or for any
+// linux architecture when arch is "", and those that name no platform,
+// looking into nested indexes.
+func images(root *os.Root, ix index, arch string, depth int) ([]image, error) {
 	if depth >= maxDepth {
 		return nil, errors.New("indexes nest too deep")
 	}
-	var found []string
+	var found []image
 	for _, d := range ix.Manifests {
 		// An attestation describes an image, and is none: buildx names one
 		// beside each image, for the platform unknown/unknown
 		if d.Annotations["vnd.docker.reference.type"] == "attestation-manifest" {
 			continue
 		}
-		if d.Platform != nil && (d.Platform.OS != "linux" || d.Platform.Architecture != arch) {
+		if d.Platform != nil && (d.Platform.OS != "linux" || arch != "" && d.Platform.Architecture != arch) {
 			continue
 		}
 		p, err := blobPath(d.Digest)
@@ -139,7 +189,11 @@ func images(root *os.Root, ix index, arch string, depth int) ([]string, error) {
 			}
 			found = append(found, more...)
 		case "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json":
-			found = append(found, p)
+			img := image{path: p}
+			if d.Platform != nil {
+				img.arch = d.Platform.Architecture
+			}
+			found = append(found, img)
 		}
 	}
 	return found, nil

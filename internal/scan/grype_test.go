@@ -367,11 +367,14 @@ func TestGrypeSARIFKeepsHighAndCritical(t *testing.T) {
 		g := scan.Grype{Run: grypeOutputs{fake, map[string][]byte{
 			"json": readTestdata(t, "grype-dhi.json"), "cyclonedx-json": readTestdata(t, "grype-dhi.cdx.json"), "sarif": sarifIn,
 		}}, Config: "/ci/grype.yaml"}
-		return g.Layout(t.Context(), "/w/layout", "arm64", report, cdx, sarif)
+		if err := g.Layout(t.Context(), "/w/layout", "arm64", report, cdx, sarif); err != nil {
+			return err
+		}
+		return g.SARIF(report, sarif)
 	}
 
 	if err := run(readTestdata(t, "grype-dhi.sarif")); err != nil {
-		t.Fatalf("Layout() = %v", err)
+		t.Fatalf("Layout() and SARIF() = %v", err)
 	}
 	results, rules := sarifRules(t, sarif)
 	want := []string{"DHI-mucl-alvq-4tv5-5ujl-qemu", "GHSA-35jh-r3h4-6jhm-lodash", "DHI-fwcj-m32u-e4uq-6hzy-brotli"}
@@ -386,6 +389,6 @@ func TestGrypeSARIFKeepsHighAndCritical(t *testing.T) {
 	// would otherwise come out empty, and code scanning quietly clean
 	renamed := bytes.ReplaceAll(readTestdata(t, "grype-dhi.sarif"), []byte(`-qemu"`), []byte(`/qemu"`))
 	if err := run(renamed); err == nil || !strings.Contains(err.Error(), "SARIF") {
-		t.Errorf("Layout() over a SARIF it cannot match = %v, want an error naming the SARIF", err)
+		t.Errorf("SARIF() over a SARIF it cannot match = %v, want an error naming the SARIF", err)
 	}
 }
