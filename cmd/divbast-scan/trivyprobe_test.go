@@ -8,10 +8,50 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/scan"
 )
+
+// TestTrivyIgnoresCallerEnvironment runs the real trivy convert, which
+// needs no database, through the runner divbast-scan uses, with a
+// TRIVY_ setting in the environment that would hide the fixture's one
+// finding from the SARIF: a caller's mise.toml [env] reaches every later
+// step of the scan job. The SARIF must still carry it.
+func TestTrivyIgnoresCallerEnvironment(t *testing.T) {
+	// Not parallel: it sets the environment
+	if _, err := exec.LookPath("trivy"); err != nil {
+		t.Fatalf("trivy is not on PATH: %v", err)
+	}
+	t.Setenv("TRIVY_SEVERITY", "LOW")
+	dir := t.TempDir()
+	report, sarif := filepath.Join(dir, "report.json"), filepath.Join(dir, "report.sarif")
+	if err := os.WriteFile(report, recorded(t, "trivy-librespeed.json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (scan.Trivy{Run: tokenOnlyForGH{}}).SARIF(t.Context(), report, sarif); err != nil {
+		t.Fatalf("SARIF() error = %v", err)
+	}
+	data, err := os.ReadFile(sarif) //nolint:gosec // G304: the test's own temporary file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "CVE-2026-116587") {
+		t.Error("the SARIF lacks CVE-2026-116587: trivy read TRIVY_SEVERITY from the environment")
+	}
+}
+
+func TestTrivyEnv(t *testing.T) {
+	t.Parallel()
+	got := trivyEnv([]string{"PATH=/bin", "TRIVY_SEVERITY=LOW", "TRIVY_IGNORE_UNFIXED=true", "GH_TOKEN=x", "NOT_TRIVY_X=1"})
+	want := []string{"TRIVY_SEVERITY=", "TRIVY_IGNORE_UNFIXED="}
+	if !slices.Equal(got, want) {
+		t.Errorf("trivyEnv() = %q, want %q", got, want)
+	}
+}
 
 // TestTrivyReadsDHIByDebianVersion pins what the pinned Trivy makes of a
 // Docker Hardened Image that says ID=dhi, the two facts the scan's guards

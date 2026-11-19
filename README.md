@@ -867,11 +867,13 @@ with that reason. An image with no os-release is left to the checks
 above.
 
 Trivy reads `.trivyignore` and `trivy.yaml` from its working directory,
-which is the caller's repository, and either could hide a finding from
-the verdict and from code scanning. The scan turns both off on every
-Trivy call: a finding an app argues is not reachable goes in its
-`openvex.json` ([VEX](#vex)), which the verdict and the summary both
-show.
+which is the caller's repository, and a `TRIVY_` variable for each of its
+flags from the environment, which the scan job's steps inherit from the
+caller's `mise.toml` `[env]`. Any of them could hide a finding from the
+verdict and from code scanning. The scan turns both files off on every
+Trivy call and runs Trivy with every `TRIVY_` variable cleared: a finding
+an app argues is not reachable goes in its `openvex.json`
+([VEX](#vex)), which the verdict and the summary both show.
 
 Outside GitHub Actions the tool never asks GitHub, since the token a
 person gives the recipes, a fine-grained one, cannot read packages: the

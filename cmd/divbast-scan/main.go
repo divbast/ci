@@ -25,7 +25,8 @@
 // package IMAGE ships at that very version. -vex names an OpenVEX document
 // both scans apply, the app's own; it may be given more than once. Every
 // trivy call turns off the .trivyignore and trivy.yaml trivy would read
-// from the working directory, the caller's repository.
+// from the working directory, the caller's repository, and runs with
+// every TRIVY_ variable of the environment cleared.
 //
 // Before the SARIF, it reads the image's own os-release from DIR, the
 // zstd layers with the zstd command, and refuses a report that read the
@@ -142,14 +143,32 @@ type tokenOnlyForGH struct{}
 
 // Run implements [execx.Runner].
 func (tokenOnlyForGH) Run(ctx context.Context, name string, args ...string) (execx.Result, error) {
-	if name == "gh" {
+	switch name {
+	case "gh":
 		return execx.OS{}.Run(ctx, name, args...)
+	case "trivy":
+		return execx.OS{Env: slices.Concat(noToken, trivyEnv(os.Environ()))}.Run(ctx, name, args...)
 	}
 	return execx.OS{Env: noToken}.Run(ctx, name, args...)
 }
 
 // noToken is the environment every command but gh runs with.
 var noToken = []string{"GH_TOKEN=", "GITHUB_TOKEN="}
+
+// trivyEnv clears every TRIVY_ variable in environ, as NAME= entries for
+// [execx.OS] to set over it: trivy takes an empty one as unset. Each is
+// one of trivy's flags, and the scan job's steps inherit a caller's
+// mise.toml [env], where TRIVY_IGNORE_UNFIXED or TRIVY_SEVERITY would
+// decide what trivy reports, as a .trivyignore would.
+func trivyEnv(environ []string) []string {
+	var cleared []string
+	for _, kv := range environ {
+		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "TRIVY_") {
+			cleared = append(cleared, name+"=")
+		}
+	}
+	return cleared
+}
 
 // run is the command. r runs every command it runs but zstd, which zstd
 // runs for the layout's zstd layers, and src is where DHI's VEX documents
