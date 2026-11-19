@@ -359,8 +359,8 @@ func TestParseTrivyAliasesAndInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Findings) != 1 || !slices.Equal(rep.Findings[0].Aliases, []string{"CVE-2026-1"}) {
-		t.Errorf("findings = %+v, want one with aliases [CVE-2026-1]", rep.Findings)
+	if len(rep.Findings) != 1 || rep.Findings[0].Aliases != nil {
+		t.Errorf("findings = %+v, want one with no aliases: Trivy's VendorIDs are bulletins, not aliases", rep.Findings)
 	}
 	wantInventory := []scan.Pkg{{"zlib1g", "1:1.3.dfsg-3"}, {"libbrotli1", "1.1.0-1"}, {"stdlib", "v1.27.3"}}
 	if !slices.Equal(rep.Inventory, wantInventory) {
@@ -371,6 +371,30 @@ func TestParseTrivyAliasesAndInventory(t *testing.T) {
 	}
 	if rep.Packages != 4 {
 		t.Errorf("packages = %d, want 4: one with no name still counts", rep.Packages)
+	}
+}
+
+// TestParseTrivyBulletinsAreNotAliases is two CVEs that one Debian
+// security advisory fixes: Trivy lists the DSA as each one's VendorIDs,
+// and one kernel DSA covers over a thousand CVEs. Read as aliases, the
+// candidate's CVE would match the published image's other CVE, and a
+// finding the published image lacks would pass as already shipped.
+func TestParseTrivyBulletinsAreNotAliases(t *testing.T) {
+	t.Parallel()
+	report := func(id, version string) []scan.Finding {
+		t.Helper()
+		rep, err := scan.ParseTrivy(strings.NewReader(`{"Metadata":{"OS":{"Family":"debian","Name":"13.2"}},"Results":[
+			{"Target":"image (debian 13.2)","Class":"os-pkgs","Type":"debian","Packages":[{"Name":"linux-libc-dev","Version":"` + version + `"}],
+			 "Vulnerabilities":[{"VulnerabilityID":"` + id + `","VendorIDs":["DSA-6528-1"],"PkgName":"linux-libc-dev",
+				"InstalledVersion":"` + version + `","FixedVersion":"6.12.111-1","Severity":"HIGH"}]}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep.Findings
+	}
+	got := scan.Compare(report("CVE-2026-2", "6.12.100-1"), report("CVE-2026-1", "6.12.90-1"), nil)
+	if len(got.New) != 1 || got.New[0].ID != "CVE-2026-2" {
+		t.Errorf("Compare() = %+v, want CVE-2026-2 new: the published image lacks it", got)
 	}
 }
 

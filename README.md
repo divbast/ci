@@ -817,8 +817,9 @@ so `scan` fails unless all four are there.
 `divbast-scan` fails only on a HIGH or CRITICAL finding that the published
 image, `PUBLISHED`, lacks for the same architecture. A finding is already
 shipped when `PUBLISHED` has the same vulnerability in the same package,
-at any version, matched by any of its IDs (an advisory and the CVE it
-answers, Trivy's `VendorIDs`), or when `PUBLISHED` ships that package at
+at any version, matched by any of its IDs where the scanner records
+aliases (Trivy records none: its `VendorIDs` are vendor bulletins, each
+fixing many vulnerabilities), or when `PUBLISHED` ships that package at
 that very version, whatever the advisory. With one scanner and one
 vulnerability database on both sides, the second rule decides nothing the
 first does not; it matters only when the advisories' model changes

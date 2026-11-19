@@ -29,8 +29,12 @@ import (
 // that fixes it or "" when none does, the severity, the advisory's page or
 // "", and where it was found, which is "<type> package" for an OS package,
 // such as "debian package", and the file it was found in otherwise.
-// Aliases are the advisory's other IDs, such as the CVE a vendor's
-// advisory answers, which Trivy lists as its VendorIDs.
+// Aliases are the advisory's other IDs for the same vulnerability, where
+// the scanner records them. Trivy records none: its VendorIDs are a
+// vendor's bulletins, such as a Debian security advisory, and one
+// bulletin fixes many vulnerabilities, so two different CVEs would share
+// one. With Trivy on both sides of a comparison and one database, the
+// IDs themselves agree.
 type Finding struct {
 	ID, Pkg, Version, Fixed, Severity, URL, Where string
 	Aliases                                       []string
@@ -89,7 +93,6 @@ type trivyJSON struct {
 		}
 		Vulnerabilities []struct {
 			VulnerabilityID, PkgName, InstalledVersion, FixedVersion, Severity, PrimaryURL string
-			VendorIDs                                                                      []string
 		}
 	}
 }
@@ -135,7 +138,6 @@ func ParseTrivy(r io.Reader) (Report, error) {
 				Severity: v.Severity,
 				URL:      v.PrimaryURL,
 				Where:    where,
-				Aliases:  v.VendorIDs,
 			})
 		}
 	}
@@ -167,7 +169,7 @@ func (f *Finding) ids() []string { return append([]string{f.ID}, f.Aliases...) }
 //   - a published finding is in the same package, at any version, and
 //     shares an ID with it, its own or an alias: a bump from one affected
 //     version to another leaves the image no worse than what is out, and
-//     one advisory may be filed under a vendor's ID and a CVE;
+//     one vulnerability may be filed under a vendor's ID and a CVE;
 //   - or shipped, the published image's packages, holds its package at its
 //     version: whatever the advisory, the image already ships what it is
 //     against.
