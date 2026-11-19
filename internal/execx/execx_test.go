@@ -116,6 +116,23 @@ func TestOSEnv(t *testing.T) {
 	}
 }
 
+func TestOSWithout(t *testing.T) {
+	// Not parallel: it sets the environment
+	t.Setenv("DIVBAST_EXECX_DROP_A", "1")
+	t.Setenv("DIVBAST_EXECX_DROP_B", "")
+	t.Setenv("DIVBAST_EXECX_KEEP", "3")
+	o := execx.OS{Without: []string{"DIVBAST_EXECX_DROP_"}, Env: []string{"DIVBAST_EXECX_DROP_C=added"}}
+	// ${X-unset} tells a variable that is not there from one that is empty
+	res, err := o.Run(t.Context(), "sh", "-c",
+		`printf '%s|%s|%s|%s' "${DIVBAST_EXECX_DROP_A-unset}" "${DIVBAST_EXECX_DROP_B-unset}" "${DIVBAST_EXECX_KEEP-unset}" "${DIVBAST_EXECX_DROP_C-unset}"`)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if got, want := string(res.Stdout), "unset|unset|3|added"; res.Code != 0 || got != want {
+		t.Errorf("Run() = code %d, stdout %q; want code 0, stdout %q: the caller's prefixed variables gone, Env's kept", res.Code, got, want)
+	}
+}
+
 func TestOSRunStdin(t *testing.T) {
 	t.Parallel()
 

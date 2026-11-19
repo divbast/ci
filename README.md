@@ -905,7 +905,8 @@ Grype, the tool:
   by default `divbast-scan/grype` in the user's cache directory so that a
   local scan keeps the database between runs, and names it on every
   call, so a `.grype.yaml` in the caller's repository is never read; and
-  it clears every `GRYPE_` variable, which would beat even that;
+  it runs Grype with no `GRYPE_` variable in its environment, since one
+  would beat even that, and Grype reads an empty one as a value;
 - updates the vulnerability database once, with `grype db update`, about
   200 MB, and lets neither scan update it again. Grype's own checks of
   the database's age and checksum stay on; the database carries no
@@ -941,7 +942,7 @@ which is the caller's repository, and a `TRIVY_` variable for each of its
 flags from the environment, which the scan job's steps inherit from the
 caller's `mise.toml` `[env]`. Any of them could hide a finding from the
 verdict and from code scanning. The scan turns both files off on every
-Trivy call and runs Trivy with every `TRIVY_` variable cleared: a finding
+Trivy call and runs Trivy with no `TRIVY_` variable in its environment: a finding
 an app argues is not reachable goes in its `openvex.json`
 ([VEX](#vex)), which the verdict and the summary both show.
 

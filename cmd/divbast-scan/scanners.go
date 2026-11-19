@@ -274,18 +274,3 @@ func grypeCache(dir string) (string, error) {
 	}
 	return dir, nil
 }
-
-// cleared clears every variable in environ whose name starts with prefix,
-// as NAME= entries for [execx.OS] to set over it: trivy and grype each
-// take an empty one as unset. Each is one of the tool's settings, and the
-// scan job's steps inherit a caller's mise.toml [env], where one would
-// decide what the scanner reports, as a caller's config file would.
-func cleared(prefix string, environ []string) []string {
-	var out []string
-	for _, kv := range environ {
-		if n, _, _ := strings.Cut(kv, "="); strings.HasPrefix(n, prefix) {
-			out = append(out, n+"=")
-		}
-	}
-	return out
-}

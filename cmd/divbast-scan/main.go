@@ -38,8 +38,8 @@
 // turns off the .trivyignore and trivy.yaml trivy would read from the
 // working directory, the caller's repository, and every grype call names
 // a configuration of the command's own instead of a .grype.yaml there;
-// each runs with its TRIVY_ or GRYPE_ variables of the environment
-// cleared.
+// each runs with none of its TRIVY_ or GRYPE_ variables in its
+// environment.
 //
 // For grype, -cache names the directory its configuration and its
 // vulnerability database go in, by default divbast-scan's own in the
@@ -162,7 +162,7 @@ func main() {
 // the environment holds: every other command, trivy, grype, skopeo, cosign
 // and zstd, gets GH_TOKEN and GITHUB_TOKEN empty. They read registries
 // anonymously, and the scanners parse whatever an image holds. trivy and
-// grype also get their own variables cleared.
+// grype also run with none of their own variables, TRIVY_ and GRYPE_.
 type tokenOnlyForGH struct{}
 
 // Run implements [execx.Runner].
@@ -170,10 +170,11 @@ func (tokenOnlyForGH) Run(ctx context.Context, name string, args ...string) (exe
 	switch name {
 	case "gh":
 		return execx.OS{}.Run(ctx, name, args...)
-	case "trivy":
-		return execx.OS{Env: slices.Concat(noToken, cleared("TRIVY_", os.Environ()))}.Run(ctx, name, args...)
-	case "grype":
-		return execx.OS{Env: slices.Concat(noToken, cleared("GRYPE_", os.Environ()))}.Run(ctx, name, args...)
+	case "trivy", "grype":
+		// Each reads a variable for every setting it has, and the scan
+		// job's steps inherit a caller's mise.toml [env]. Left out, not
+		// emptied: grype reads an empty one as a value, false for a switch
+		return execx.OS{Env: noToken, Without: []string{strings.ToUpper(name) + "_"}}.Run(ctx, name, args...)
 	}
 	return execx.OS{Env: noToken}.Run(ctx, name, args...)
 }

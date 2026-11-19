@@ -10,12 +10,14 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/scan"
 )
 
 // writes answers as the real tools would, through a Fake that checks
@@ -322,13 +324,43 @@ func TestRunGrype(t *testing.T) {
 	}
 }
 
-func TestClearedEnv(t *testing.T) {
-	t.Parallel()
-	environ := []string{"PATH=/bin", "GRYPE_ONLY_FIXED=true", "TRIVY_SEVERITY=LOW", "GRYPE_DB_CACHE_DIR=/x", "MY_GRYPE_X=1"}
-	if got := cleared("GRYPE_", environ); strings.Join(got, " ") != "GRYPE_ONLY_FIXED= GRYPE_DB_CACHE_DIR=" {
-		t.Errorf(`cleared("GRYPE_") = %q`, got)
+// TestGrypeIgnoresCallerSettings asks the real grype, offline, what
+// configuration it runs with under the runner divbast-scan uses, from a
+// caller's checkout holding a .grype.yaml and with GRYPE_ variables in the
+// environment, as a caller's mise.toml [env] puts them in the scan job's:
+// ci's configuration alone must decide. grype reads an empty variable as
+// an empty value, not as unset, so the variables must be gone, not empty.
+func TestGrypeIgnoresCallerSettings(t *testing.T) {
+	// Not parallel: it sets the environment and changes the directory
+	if _, err := exec.LookPath("grype"); err != nil {
+		t.Fatalf("grype is not on PATH: %v", err)
 	}
-	if got := cleared("TRIVY_", environ); strings.Join(got, " ") != "TRIVY_SEVERITY=" {
-		t.Errorf(`cleared("TRIVY_") = %q`, got)
+	caller := t.TempDir()
+	if err := os.WriteFile(filepath.Join(caller, ".grype.yaml"), []byte("ignore:\n  - vulnerability: DHI-fwcj-m32u-e4uq-6hzy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GRYPE_DB_CACHE_DIR", "/elsewhere")
+	t.Setenv("GRYPE_MATCH_STOCK_USING_CPES", "false")
+	t.Chdir(caller)
+	dir := t.TempDir()
+	cfg, err := scan.Grype{}.WriteConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := tokenOnlyForGH{}.Run(t.Context(), "grype", "-c", cfg, "config", "--load")
+	if err != nil || res.Code != 0 {
+		t.Fatalf("grype config --load: %v, exit %d: %s", err, res.Code, res.Stderr)
+	}
+	out := string(res.Stdout)
+	if want := "\n  cache-dir: '" + filepath.Join(dir, "db") + "'\n"; !strings.Contains(out, want) {
+		t.Errorf("grype's cache directory is not ci's %q: GRYPE_DB_CACHE_DIR reached it", want)
+	}
+	if !strings.Contains(out, "\nignore: []\n") {
+		t.Error("grype runs with ignore rules: it read the caller's .grype.yaml")
+	}
+	_, stock, _ := strings.Cut(out, "\n  stock:\n")
+	_, setting, _ := strings.Cut(stock, "using-cpes:")
+	if value, _, _ := strings.Cut(setting, "\n"); strings.TrimSpace(value) != "true" {
+		t.Errorf("the stock matcher's using-cpes is %q, want its default, true: GRYPE_MATCH_STOCK_USING_CPES reached it", value)
 	}
 }
