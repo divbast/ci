@@ -26,12 +26,12 @@ func Listing(against, verdict string, s Split) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "compared with %s\n", against)
 	fmt.Fprintf(&b, "%d %s:\n", len(s.New), verdict)
-	for _, f := range s.New {
-		fmt.Fprintf(&b, "  %s\n", f)
+	for i := range s.New {
+		fmt.Fprintf(&b, "  %s\n", &s.New[i])
 	}
 	fmt.Fprintf(&b, "%d already published, so advisory:\n", len(s.Old))
-	for _, f := range s.Old {
-		fmt.Fprintf(&b, "  %s\n", f)
+	for i := range s.Old {
+		fmt.Fprintf(&b, "  %s\n", &s.Old[i])
 	}
 	return b.String()
 }
@@ -62,7 +62,8 @@ func table(b *strings.Builder, findings []Finding) {
 	}
 	b.WriteString("| Vulnerability | Severity | Package | Installed | Fixed in | Where |\n")
 	b.WriteString("|---|---|---|---|---|---|\n")
-	for _, f := range findings {
+	for i := range findings {
+		f := &findings[i]
 		id := f.ID
 		if f.URL != "" {
 			id = "[" + f.ID + "](" + f.URL + ")"

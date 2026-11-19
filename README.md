@@ -815,9 +815,18 @@ so `scan` fails unless all four are there.
 #### Scan
 
 `divbast-scan` fails only on a HIGH or CRITICAL finding that the published
-image, `PUBLISHED`, lacks for the same architecture: the same
-vulnerability in the same package, at any version. A new advisory against
-something already shipped is reported, not blocked. Whether anything is
+image, `PUBLISHED`, lacks for the same architecture. A finding is already
+shipped when `PUBLISHED` has the same vulnerability in the same package,
+at any version, matched by any of its IDs where the scanner records
+aliases (Trivy records none: its `VendorIDs` are vendor bulletins, each
+fixing many vulnerabilities), or when `PUBLISHED` ships that package at
+that very version, whatever the advisory. With one scanner and one
+vulnerability database on both sides, the second rule decides nothing the
+first does not; it matters only when the advisories' model changes
+between the two images, as at DHI's cutover, below, where every ID
+changes. A package new to the image, or at a new version, is still judged
+by its IDs. A new advisory against something already shipped is
+reported, not blocked. Whether anything is
 published is the registry's to say, never Trivy's: the tool first reads
 `PUBLISHED` as an anonymous client, as users pull it, and when ghcr.io
 refuses, asks the GitHub API why, through gh and the job's token, which
@@ -837,10 +846,34 @@ Each warning is a GitHub Actions warning and a callout on the run's
 summary. Only gh gets the token: Trivy and skopeo run without it.
 
 It also refuses a report, of the build or of `PUBLISHED`, in which Trivy
-recognised no operating system or saw no OS package. An image whose OS
-Trivy does not know still has its language packages, which would pass
-the check for a scan that saw no packages, yet the scan could then not
-see the OS packages, and nothing would show they are clean.
+recognised no operating system (its family empty, or `none`) or saw no
+OS package. An image whose OS Trivy does not know still has its language
+packages, which would pass the check for a scan that saw no packages, yet
+the scan could then not see the OS packages, and nothing would show they
+are clean.
+
+A scanner can also be wrong without being blind, so the tool reads the
+image's own os-release, `/etc/os-release` or else `/usr/lib/os-release`,
+from the build's OCI layout, layer by layer, and holds Trivy's report
+against it, before any SARIF is written. Docker is moving its Hardened
+Images to their own model: an image that says `ID=dhi`, judged by
+Docker's own advisories rather than Debian's. Trivy takes Debian from
+`/etc/debian_version`, which those images keep, so it reads a switched
+image as plain Debian and scans it against the wrong advisories, with a
+report that looks like any other. The scan refuses a build that says
+`ID=dhi` when Trivy's OS family is anything but `dhi`, naming both. Until
+ci scans that model, the first switched base's digest bump fails here,
+with that reason. An image with no os-release is left to the checks
+above.
+
+Trivy reads `.trivyignore` and `trivy.yaml` from its working directory,
+which is the caller's repository, and a `TRIVY_` variable for each of its
+flags from the environment, which the scan job's steps inherit from the
+caller's `mise.toml` `[env]`. Any of them could hide a finding from the
+verdict and from code scanning. The scan turns both files off on every
+Trivy call and runs Trivy with every `TRIVY_` variable cleared: a finding
+an app argues is not reachable goes in its `openvex.json`
+([VEX](#vex)), which the verdict and the summary both show.
 
 Outside GitHub Actions the tool never asks GitHub, since the token a
 person gives the recipes, a fine-grained one, cannot read packages: the
@@ -1223,7 +1256,7 @@ the token was found.
 | `divbast-pin [-dir DIR] [-expect SHA]` | Prints the one commit the workflows pin ci at | One commit, and it is `SHA` when given | None, more than one, not `SHA`, or unreadable |
 | `divbast-published-revision IMAGE` | Prints the commit a published image was built from | Printed, or nothing published yet | Private, or unreadable |
 | `divbast-publish-decision -event E -built SHA -published SHA [-content-change TEXT] [-content-gated]` | Decides whether a run publishes | Decided, publish or skip | Refused: an event that does not publish, a `-built` or `-published` that is not a full commit SHA, a published commit not on main, a built commit that diverged, or git failed |
-| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched, not verified, or not that image's; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
+| `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]...` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched, not verified, or not that image's; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; the layout's os-release unreadable, or saying `ID=dhi` when Trivy read another OS; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |

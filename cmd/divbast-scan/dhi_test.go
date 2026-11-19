@@ -389,6 +389,7 @@ func TestRunDHIVEX(t *testing.T) {
 			for _, p := range []string{"layout", "report.json", "baseline.json", "report.sarif", "Containerfile"} {
 				paths[p] = filepath.Join(dir, p)
 			}
+			writeLayout(t, paths["layout"], debianRelease)
 			if tt.containerfile != "" {
 				if err := os.WriteFile(paths["Containerfile"], []byte(tt.containerfile), 0o600); err != nil {
 					t.Fatal(err)
@@ -409,11 +410,11 @@ func TestRunDHIVEX(t *testing.T) {
 				for _, doc := range tt.wantVEX {
 					vex = append(vex, "--vex", doc)
 				}
-				scanArgs := slices.Concat(vex, []string{"--severity", "HIGH,CRITICAL", "--format", "json"})
+				scanArgs := slices.Concat(vex, []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"})
 				calls = append(calls,
 					execx.Call{Argv: slices.Concat([]string{"trivy", "image", "--input", paths["layout"]}, scanArgs,
 						[]string{"--output", paths["report.json"]})},
-					execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", paths["report.sarif"], paths["report.json"]}},
+					execx.Call{Argv: []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", paths["report.sarif"], paths["report.json"]}},
 					execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
 					execx.Call{Argv: slices.Concat(
 						[]string{"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update"}, scanArgs,
@@ -437,7 +438,7 @@ func TestRunDHIVEX(t *testing.T) {
 				}
 				return ""
 			}
-			code := run(t.Context(), args, runner, src, getenv, &stdout, &stderr)
+			code := run(t.Context(), args, runner, execx.OS{}, src, getenv, &stdout, &stderr)
 			errText := strings.ReplaceAll(stderr.String(), paths["Containerfile"], "CONTAINERFILE")
 
 			if code != tt.wantCode {
