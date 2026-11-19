@@ -194,6 +194,9 @@ func TestRun(t *testing.T) {
 		// is checked when empty; wantBaseline the same for the baseline.
 		wantSummary  []string
 		wantBaseline string
+		// osRelease is the layout's /etc/os-release, debianRelease when
+		// "", or withoutOSRelease or withoutLayout.
+		osRelease string
 	}{
 		{
 			name:           "nothing-new",
@@ -221,6 +224,61 @@ func TestRun(t *testing.T) {
 				"1 already published, so advisory:\n" + line("CVE-2"),
 			wantStderr:  []string{"2 finding(s) the published image does not have. Move what carries them.\n"},
 			wantSummary: []string{"### Vulnerability scan, arm64\n", "**New, so blocking: 2**"},
+		},
+		{
+			// Trivy reads an image that says ID=dhi as Debian while it keeps
+			// /etc/debian_version, and would judge it by Debian's advisories
+			name:         "refuses-dhi-read-as-debian",
+			osRelease:    dhiRelease,
+			candidate:    report(t, "amd64", "", 3, "CVE-1"),
+			layoutResult: &execx.Result{},
+			wantCode:     1,
+			wantStderr:   []string{"ID=dhi", "debian 13.2", "LAYOUT"},
+			notInStdout:  []string{"CVE-1"},
+		},
+		{
+			// A Trivy that knows DHI's model reads it as dhi
+			name:           "dhi-family-passes",
+			osRelease:      dhiRelease,
+			skopeo:         index,
+			candidate:      withOS(t, report(t, "amd64", "", 3, "CVE-1"), "dhi", "13", "dhi"),
+			baseline:       withOS(t, report(t, "amd64", digest, 3, "CVE-1"), "dhi", "13", "dhi"),
+			layoutResult:   &execx.Result{},
+			sarifResult:    &execx.Result{},
+			baselineResult: &execx.Result{},
+			wantStdout: "compared with " + digest + "\n0 new, so blocking:\n" +
+				"1 already published, so advisory:\n" + line("CVE-1") +
+				"nothing new against what is published (1 advisory)\n",
+		},
+		{
+			// What Trivy calls an OS it does not know
+			name:         "family-none-is-blind",
+			osRelease:    dhiRelease,
+			candidate:    withOS(t, report(t, "amd64", "", 3, "CVE-1"), "none", "", "debian"),
+			layoutResult: &execx.Result{},
+			wantCode:     1,
+			wantStderr:   []string{"recognised no operating system"},
+		},
+		{
+			name:           "no-os-release-defers",
+			osRelease:      withoutOSRelease,
+			skopeo:         index,
+			candidate:      report(t, "amd64", "", 3, "CVE-1"),
+			baseline:       report(t, "amd64", digest, 3, "CVE-1"),
+			layoutResult:   &execx.Result{},
+			sarifResult:    &execx.Result{},
+			baselineResult: &execx.Result{},
+			wantStdout: "compared with " + digest + "\n0 new, so blocking:\n" +
+				"1 already published, so advisory:\n" + line("CVE-1") +
+				"nothing new against what is published (1 advisory)\n",
+		},
+		{
+			name:         "unreadable-layout-fails",
+			osRelease:    withoutLayout,
+			candidate:    report(t, "amd64", "", 3, "CVE-1"),
+			layoutResult: &execx.Result{},
+			wantCode:     1,
+			wantStderr:   []string{"LAYOUT", "os-release"},
 		},
 		{
 			// The published image ships the package at the version the
@@ -408,13 +466,20 @@ func TestRun(t *testing.T) {
 			if err := os.WriteFile(paths["summary.md"], []byte(before), 0o600); err != nil {
 				t.Fatal(err)
 			}
+			switch tt.osRelease {
+			case withoutLayout:
+			case withoutOSRelease:
+				writeLayout(t, paths["layout"], "")
+			default:
+				writeLayout(t, paths["layout"], cmp.Or(tt.osRelease, debianRelease))
+			}
 
 			image := cmp.Or(tt.image, published)
 			args := []string{
 				"-layout", paths["layout"], "-report", paths["report.json"], "-published", image,
 				"-baseline", paths["baseline.json"], "-sarif", paths["report.sarif"],
 			}
-			scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+			scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
 			if tt.vex != "" {
 				args = append(args, "-vex", tt.vex)
 				scanArgs = slices.Concat([]string{"--vex", tt.vex}, scanArgs)
@@ -426,7 +491,7 @@ func TestRun(t *testing.T) {
 				calls = append(calls, execx.Call{Argv: argv, Result: *tt.layoutResult})
 			}
 			if tt.sarifResult != nil {
-				argv := []string{"trivy", "convert", "--format", "sarif", "--output", paths["report.sarif"], paths["report.json"]}
+				argv := []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", paths["report.sarif"], paths["report.json"]}
 				calls = append(calls, execx.Call{Argv: argv, Result: *tt.sarifResult})
 			}
 			if tt.skopeo != nil {
@@ -459,7 +524,7 @@ func TestRun(t *testing.T) {
 			getenv := func(key string) string { return env[key] }
 
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), args, runner, offline(t), getenv, &stdout, &stderr)
+			code := run(t.Context(), args, runner, execx.OS{}, offline(t), getenv, &stdout, &stderr)
 			// Every message names its paths by flag, so the scratch
 			// directory reads as the flag that put it there.
 			errText := strings.ReplaceAll(stderr.String(), paths["layout"], "LAYOUT")
@@ -694,10 +759,11 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 
 			dir := t.TempDir()
 			layout, rep, base, sarif := filepath.Join(dir, "layout"), filepath.Join(dir, "r.json"), filepath.Join(dir, "b.json"), filepath.Join(dir, "r.sarif")
-			scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+			writeLayout(t, layout, debianRelease)
+			scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
 			calls := []execx.Call{
 				{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
-				{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+				{Argv: []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", sarif, rep}},
 				{Argv: skopeoArgv, Result: tt.skopeo},
 			}
 			if tt.gh != nil {
@@ -723,7 +789,7 @@ func TestPublishedPresenceFromRegistry(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-			code := run(t.Context(), args, runner, offline(t), getenv, &stdout, &stderr)
+			code := run(t.Context(), args, runner, execx.OS{}, offline(t), getenv, &stdout, &stderr)
 			if code != tt.wantCode {
 				t.Errorf("run() = %d, want %d; stderr: %s", code, tt.wantCode, stderr.String())
 			}
@@ -839,12 +905,15 @@ func TestRunOutsideActions(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	layout, rep, base, sarif := filepath.Join(dir, "layout"), filepath.Join(dir, "r.json"), filepath.Join(dir, "b.json"), filepath.Join(dir, "r.sarif")
-	scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+	rep, base, sarif := filepath.Join(dir, "r.json"), filepath.Join(dir, "b.json"), filepath.Join(dir, "r.sarif")
+	// In a directory of its own, so that dir holds only what run writes
+	layout := filepath.Join(t.TempDir(), "layout")
+	writeLayout(t, layout, debianRelease)
+	scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
 	runner := trivy{
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
-			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+			execx.Call{Argv: []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", sarif, rep}},
 			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
@@ -854,7 +923,7 @@ func TestRunOutsideActions(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 	args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-	if code := run(t.Context(), args, runner, offline(t), func(string) string { return "" }, &stdout, &stderr); code != 0 {
+	if code := run(t.Context(), args, runner, execx.OS{}, offline(t), func(string) string { return "" }, &stdout, &stderr); code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
 	}
 	if want := "nothing new against what is published (0 advisory)\n"; !strings.HasSuffix(stdout.String(), want) {
@@ -880,11 +949,12 @@ func TestRunUnwritableSummary(t *testing.T) {
 
 	dir := t.TempDir()
 	layout, rep, base, sarif := filepath.Join(dir, "layout"), filepath.Join(dir, "r.json"), filepath.Join(dir, "b.json"), filepath.Join(dir, "r.sarif")
-	scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+	writeLayout(t, layout, debianRelease)
+	scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
 	runner := trivy{
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
-			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+			execx.Call{Argv: []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", sarif, rep}},
 			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
 			execx.Call{Argv: append(append([]string{
 				"trivy", "image", "--image-src", "remote", "--platform", "linux/amd64", "--skip-db-update",
@@ -901,7 +971,7 @@ func TestRunUnwritableSummary(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 	args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-	if code := run(t.Context(), args, runner, offline(t), getenv, &stdout, &stderr); code != 1 {
+	if code := run(t.Context(), args, runner, execx.OS{}, offline(t), getenv, &stdout, &stderr); code != 1 {
 		t.Errorf("run() = %d, want 1; stderr: %s", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "write the run summary") {
@@ -918,6 +988,7 @@ func TestRunBaselineStaysInItsDirectory(t *testing.T) {
 
 	dir, outside := t.TempDir(), t.TempDir()
 	layout, rep, base, sarif := filepath.Join(dir, "layout"), filepath.Join(dir, "r.json"), filepath.Join(dir, "b.json"), filepath.Join(dir, "r.sarif")
+	writeLayout(t, layout, debianRelease)
 	target := filepath.Join(outside, "elsewhere.json")
 	if err := os.WriteFile(target, []byte("untouched\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -925,18 +996,18 @@ func TestRunBaselineStaysInItsDirectory(t *testing.T) {
 	if err := os.Symlink(target, base); err != nil {
 		t.Fatal(err)
 	}
-	scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+	scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
 	runner := trivy{
 		fake: execx.NewFake(t,
 			execx.Call{Argv: append(append([]string{"trivy", "image", "--input", layout}, scanArgs...), "--output", rep)},
-			execx.Call{Argv: []string{"trivy", "convert", "--format", "sarif", "--output", sarif, rep}},
+			execx.Call{Argv: []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", sarif, rep}},
 			execx.Call{Argv: skopeoArgv, Result: execx.Result{Stderr: skopeoRecording(t, "skopeo-no-such-package.txt"), Code: 1}},
 		),
 		reports: map[string]string{rep: report(t, "amd64", "", 1)},
 	}
 	var stdout, stderr bytes.Buffer
 	args := []string{"-layout", layout, "-report", rep, "-published", published, "-baseline", base, "-sarif", sarif}
-	if code := run(t.Context(), args, runner, offline(t), func(string) string { return "" }, &stdout, &stderr); code != 1 {
+	if code := run(t.Context(), args, runner, execx.OS{}, offline(t), func(string) string { return "" }, &stdout, &stderr); code != 1 {
 		t.Errorf("run() = %d, want 1; stderr: %s", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "write the baseline") {
@@ -977,7 +1048,7 @@ func TestRunUsage(t *testing.T) {
 			t.Parallel()
 			var stdout, stderr bytes.Buffer
 			// No call is scripted: a usage error runs nothing
-			code := run(t.Context(), tt.args, execx.NewFake(t), offline(t), func(string) string { return "" }, &stdout, &stderr)
+			code := run(t.Context(), tt.args, execx.NewFake(t), execx.OS{}, offline(t), func(string) string { return "" }, &stdout, &stderr)
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d", tt.args, code, tt.wantCode)
 			}
@@ -1028,7 +1099,7 @@ func TestScanAgainstItself(t *testing.T) {
 		"-baseline", filepath.Join(dir, "baseline.json"), "-sarif", filepath.Join(dir, "report.sarif"),
 	}
 	var stdout, stderr bytes.Buffer
-	code := run(t.Context(), args, execx.OS{}, offline(t), getenv, &stdout, &stderr)
+	code := run(t.Context(), args, execx.OS{}, execx.OS{}, offline(t), getenv, &stdout, &stderr)
 	t.Logf("stdout:\n%s", stdout.String())
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr:\n%s", code, stderr.String())

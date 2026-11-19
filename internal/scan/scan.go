@@ -214,12 +214,19 @@ type Trivy struct {
 	Log io.Writer
 }
 
+// isolated turns off the two files Trivy reads from its working directory
+// unless told otherwise, .trivyignore and trivy.yaml, for every call: the
+// scan runs from the caller's repository, where either would decide what
+// Trivy reports, hiding a finding from the verdict and from code scanning
+// alike. An empty path turns each off.
+var isolated = []string{"--config", "", "--ignorefile", ""}
+
 func (t Trivy) scanArgs() []string {
 	vex := make([]string, 0, 2*len(t.VEX))
 	for _, doc := range t.VEX {
 		vex = append(vex, "--vex", doc)
 	}
-	return slices.Concat(vex, []string{"--severity", "HIGH,CRITICAL", "--format", "json"})
+	return slices.Concat(vex, isolated, []string{"--severity", "HIGH,CRITICAL", "--format", "json"})
 }
 
 // Layout scans the image in the OCI layout at layout, and writes the
@@ -255,7 +262,7 @@ func (t Trivy) Published(ctx context.Context, image, arch, report string) error 
 // SARIF converts the report at report to SARIF, for code scanning, at
 // sarif.
 func (t Trivy) SARIF(ctx context.Context, report, sarif string) error {
-	return t.logged(ctx, "convert", "--format", "sarif", "--output", sarif, report)
+	return t.logged(ctx, slices.Concat([]string{"convert"}, isolated, []string{"--format", "sarif", "--output", sarif, report})...)
 }
 
 // logged runs trivy with args, and passes on what it says.

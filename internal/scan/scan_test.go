@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -501,11 +502,51 @@ func TestListingGolden(t *testing.T) {
 	}
 }
 
+// TestTrivyIgnoresCallerConfig runs the real trivy convert, which needs
+// no database, from a directory holding a caller's .trivyignore and
+// trivy.yaml, each of which would hide the fixture's one finding: Trivy
+// reads both from its working directory unless told not to, and the scan
+// runs from the caller's repository. The SARIF must still carry it.
+// trivy image reads them the same way; TestTrivy pins that every call
+// turns them off.
+func TestTrivyIgnoresCallerConfig(t *testing.T) {
+	// Not parallel: it changes the working directory
+	if _, err := exec.LookPath("trivy"); err != nil {
+		t.Fatalf("trivy is not on PATH: %v", err)
+	}
+	report := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(report, readTestdata(t, "trivy-librespeed.json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	caller := t.TempDir()
+	for name, body := range map[string]string{
+		".trivyignore": goJose.ID + "\n",
+		"trivy.yaml":   "vulnerability:\n  ignore-unfixed: true\n",
+	} {
+		if err := os.WriteFile(filepath.Join(caller, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(caller)
+
+	sarif := filepath.Join(t.TempDir(), "report.sarif")
+	if err := (scan.Trivy{Run: execx.OS{}}).SARIF(t.Context(), report, sarif); err != nil {
+		t.Fatalf("SARIF() error = %v", err)
+	}
+	data, err := os.ReadFile(sarif) //nolint:gosec // G304: the test's own temporary file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(goJose.ID)) {
+		t.Errorf("the SARIF lacks %s: Trivy read the caller's .trivyignore or trivy.yaml", goJose.ID)
+	}
+}
+
 func TestTrivy(t *testing.T) {
 	t.Parallel()
 
 	logged := []byte("INFO\t[vuln] Vulnerability scanning is enabled\n")
-	scanArgs := []string{"--severity", "HIGH,CRITICAL", "--format", "json"}
+	scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
 	layoutArgv := func(vex ...string) []string {
 		argv := append([]string{"trivy", "image", "--input", "/w/layout"}, vex...)
 		return append(append(argv, scanArgs...), "--output", "/w/report.json")
@@ -514,7 +555,7 @@ func TestTrivy(t *testing.T) {
 		argv := append([]string{"trivy", "image", "--image-src", "remote", "--platform", "linux/" + arch, "--skip-db-update"}, vex...)
 		return append(append(argv, scanArgs...), "--output", "/w/baseline.json", latest)
 	}
-	sarifArgv := []string{"trivy", "convert", "--format", "sarif", "--output", "/w/report.sarif", "/w/report.json"}
+	sarifArgv := []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", "/w/report.sarif", "/w/report.json"}
 
 	tests := []struct {
 		name string

@@ -107,6 +107,7 @@ import (
 	"github.com/divbast/ci/internal/dhivex"
 	"github.com/divbast/ci/internal/execx"
 	"github.com/divbast/ci/internal/ghapi"
+	"github.com/divbast/ci/internal/osrelease"
 	"github.com/divbast/ci/internal/registry"
 	"github.com/divbast/ci/internal/scan"
 	"github.com/divbast/ci/internal/verify"
@@ -116,7 +117,7 @@ const name = "divbast-scan"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := run(ctx, os.Args[1:], tokenOnlyForGH{}, dhivex.Source{}, os.Getenv, os.Stdout, os.Stderr)
+	code := run(ctx, os.Args[1:], tokenOnlyForGH{}, execx.OS{Env: noToken}, dhivex.Source{}, os.Getenv, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
@@ -132,12 +133,16 @@ func (tokenOnlyForGH) Run(ctx context.Context, name string, args ...string) (exe
 	if name == "gh" {
 		return execx.OS{}.Run(ctx, name, args...)
 	}
-	return execx.OS{Env: []string{"GH_TOKEN=", "GITHUB_TOKEN="}}.Run(ctx, name, args...)
+	return execx.OS{Env: noToken}.Run(ctx, name, args...)
 }
 
-// run is the command. r runs every command it runs, and src is where
-// DHI's VEX documents are fetched from.
-func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, getenv func(string) string, stdout, stderr io.Writer) int {
+// noToken is the environment every command but gh runs with.
+var noToken = []string{"GH_TOKEN=", "GITHUB_TOKEN="}
+
+// run is the command. r runs every command it runs but zstd, which zstd
+// runs for the layout's zstd layers, and src is where DHI's VEX documents
+// are fetched from.
+func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRunner, src dhivex.Source, getenv func(string) string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	layout := flags.String("layout", "", "the OCI layout `DIR` of the image to scan")
@@ -216,6 +221,12 @@ func run(ctx context.Context, args []string, r execx.Runner, src dhivex.Source, 
 	}
 	if blindToOS(&candidate) {
 		complain(stderr, "%s: %s", *layout, noOS(&candidate))
+		return 1
+	}
+	// Before the SARIF, so findings under the wrong model never reach
+	// code scanning
+	if err = sameModel(ctx, zstd, *layout, &candidate); err != nil {
+		complain(stderr, "%v", err)
 		return 1
 	}
 	if err = trivy.SARIF(ctx, *report, *sarif); err != nil {
@@ -430,7 +441,7 @@ func readBaseline(path, image string) (shipped []scan.Finding, inventory []scan.
 // whether the scan looked at the rest.
 func noOS(rep *scan.Report) string {
 	saw := "recognised no operating system and saw"
-	if rep.OS != "" {
+	if rep.OS != "" && rep.Family != "none" {
 		saw = "recognised " + rep.OS + " but saw"
 	}
 	return fmt.Sprintf("Trivy %s %d OS packages, so the scan cannot see OS packages and nothing shows they are clean",
@@ -438,7 +449,29 @@ func noOS(rep *scan.Report) string {
 }
 
 // blindToOS reports whether rep identified no OS or saw no OS package.
-func blindToOS(rep *scan.Report) bool { return rep.OS == "" || rep.OSPackages == 0 }
+// Trivy names an OS it found no analyser for "none".
+func blindToOS(rep *scan.Report) bool {
+	return rep.OS == "" || rep.Family == "none" || rep.OSPackages == 0
+}
+
+// sameModel reads the os-release of the image in the layout at layout,
+// with zstd for zstd layers, and fails unless rep, Trivy's report on it,
+// read it under the model it says it is. A Docker Hardened Image that
+// says ID=dhi is judged by Docker's own advisories, and Trivy reads one
+// that keeps /etc/debian_version as plain Debian, judging it by Debian's
+// instead: findings, and an absence of them, about another image. An
+// image with no os-release leaves the decision to the blind guard.
+func sameModel(ctx context.Context, zstd execx.StreamRunner, layout string, rep *scan.Report) error {
+	info, ok, err := osrelease.Read(ctx, zstd, layout, rep.Arch)
+	if err != nil {
+		return fmt.Errorf("could not read the image's own os-release, so nothing shows Trivy read it as what it is: %w", err)
+	}
+	if ok && info.ID == "dhi" && rep.Family != "dhi" {
+		return fmt.Errorf("%s: the image says ID=dhi, VERSION_ID=%s, a Docker Hardened Image judged by Docker's own advisories, "+
+			"but Trivy read it as %s and judged it by that OS's: the wrong model, so nothing is scanned", layout, info.VersionID, rep.OS)
+	}
+	return nil
+}
 
 // readFile reads the file at path, through an [os.Root] on its directory.
 func readFile(path string) (data []byte, err error) {
