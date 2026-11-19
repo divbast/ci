@@ -20,9 +20,19 @@
 // -report and its SARIF, for code scanning, to -sarif. It then scans IMAGE
 // as the registry serves it, for the layout's architecture and from the
 // same vulnerability database, writing that report to -baseline. A finding
-// IMAGE has too, the same vulnerability in the same package at any
-// version, is reported as an advisory. -vex names an OpenVEX document both
-// scans apply, the app's own; it may be given more than once.
+// IMAGE has too is reported as an advisory: the same vulnerability, by any
+// of its IDs, in the same package at any version, or any finding in a
+// package IMAGE ships at that very version. -vex names an OpenVEX document
+// both scans apply, the app's own; it may be given more than once. Every
+// trivy call turns off the .trivyignore and trivy.yaml trivy would read
+// from the working directory, the caller's repository.
+//
+// Before the SARIF, it reads the image's own os-release from DIR, the
+// zstd layers with the zstd command, and refuses a report that read the
+// image under another model than the one it says it is: an image that
+// says ID=dhi, a Docker Hardened Image judged by Docker's own advisories,
+// that trivy read as another OS, as it reads one that keeps
+// /etc/debian_version as plain Debian.
 //
 // -containerfile names the Containerfile the image was built from. When
 // its final stage builds on a dhi.io image, a Docker Hardened Image (its
@@ -71,8 +81,8 @@
 // packages. A refusal is then an advisory too, with a warning that only
 // CI can tell what it means.
 //
-// Only gh gets the token: trivy, skopeo and cosign run with GH_TOKEN and
-// GITHUB_TOKEN empty.
+// Only gh gets the token: trivy, skopeo, cosign and zstd run with
+// GH_TOKEN and GITHUB_TOKEN empty.
 //
 // Exit codes:
 //
@@ -84,6 +94,8 @@
 //	   document not fetched, not verified, or not that image's; a scan
 //	   that failed or saw no packages; a report, of the layout or of
 //	   IMAGE, that recognised no operating system or saw no OS package;
+//	   the layout's os-release unreadable, or saying ID=dhi when trivy
+//	   read another OS;
 //	   IMAGE not a ghcr.io image, unreadable, or refused though public for
 //	   any reason but a missing tag; the GitHub API not answering, or
 //	   refusing the token; or the summary not written
