@@ -103,7 +103,7 @@ jobs:
           persist-credentials: false
 
       # Before the pin check, which needs the caller's pinned Go.
-      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -191,7 +191,7 @@ jobs:
           persist-credentials: false
 
       # Before the pin check, which needs the caller's pinned Go.
-      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -323,7 +323,7 @@ jobs:
           persist-credentials: false
 
       # Before the pin check, which needs the caller's pinned Go.
-      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
           version: ${{ env.MISE_VERSION }}
 
@@ -460,7 +460,7 @@ jobs:
       # for the Containerfile's final stage's base, when it is a dhi.io
       # image. An install runs code from outside the repository, and this
       # job can dismiss code scanning alerts.
-      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+      - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: core:go aqua:casey/just aqua:aquasecurity/trivy aqua:sigstore/cosign
