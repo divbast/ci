@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	divbast-stall open|stuck|renovate|slots
+//	divbast-stall open|stuck|renovate|slots|lookups
 //	divbast-stall slots -content-gated
 //
 // The checks:
@@ -21,6 +21,9 @@
 //	slots     LOST_SLOTS or more daily slots, the scheduled runs of
 //	          SLOT_WORKFLOW on main, that should have published main as
 //	          PUBLISHED and did not; or PUBLISHED private
+//	lookups   a dependency Renovate failed to look up, as its Dependency
+//	          Dashboard lists it, at once; or no open dashboard by
+//	          divbast-renovate once RENOVATE_WORKFLOW has succeeded
 //
 // slots -content-gated is for a slot workflow that publishes only when the
 // image's content moved, as divbast-publish-decision -content-gated does:
@@ -29,12 +32,14 @@
 // nothing published, every slot run publishes, so one that succeeded and
 // left nothing published is lost all the same.
 //
-// It reads the repository's pull requests, runs and commits through gh,
-// and PUBLISHED as an anonymous client through skopeo. The environment:
+// It reads the repository's pull requests, issues, runs and commits
+// through gh, and PUBLISHED as an anonymous client through skopeo. The
+// environment:
 //
 //	GH_REPO            the repository, as owner/name; always required
 //	GH_TOKEN           gh's token: in a workflow, one that can read pull
-//	                   requests, actions, checks, statuses and packages
+//	                   requests, issues, actions, checks, statuses and
+//	                   packages
 //	OPEN_DAYS          open's limit, a whole number
 //	STUCK_HOURS        stuck's limit
 //	RUN_HOURS          renovate's limit
@@ -46,7 +51,8 @@
 //	                   run that publishes PUBLISHED, as GitHub names it in
 //	                   the run, whose conclusion counts rather than the
 //	                   whole run's; unset, the run's
-//	RENOVATE_WORKFLOW  Renovate's workflow file, renovate.yml if unset
+//	RENOVATE_WORKFLOW  Renovate's workflow file, renovate.yml if unset; for
+//	                   renovate and lookups
 //
 // Each check reads only its own limit. It prints what it found on stdout:
 // one line when nothing is stalled, or a headline and then what stalled,
@@ -89,7 +95,7 @@ func main() {
 func run(ctx context.Context, args []string, getenv func(string) string, r execx.Runner, stdout, stderr io.Writer) int {
 	usage := func() {
 		// As for complain: nowhere better to report a failed write.
-		_, _ = fmt.Fprintf(stderr, "usage: %s open|stuck|renovate|slots\n       %s slots -content-gated\n", name, name)
+		_, _ = fmt.Fprintf(stderr, "usage: %s open|stuck|renovate|slots|lookups\n       %s slots -content-gated\n", name, name)
 	}
 	// The check comes first, and its own flags after it.
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
@@ -157,6 +163,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, r execx
 		}
 		lookup := registry.Lookup{Run: r, GH: ghapi.Client{Run: r}}
 		do = func() (stall.Result, error) { return stall.Slots(ctx, src, lookup, &c) }
+	case "lookups":
+		c.RenovateWorkflow = env.or("RENOVATE_WORKFLOW", "renovate.yml")
+		do = func() (stall.Result, error) { return stall.Lookups(ctx, src, &c) }
 	default:
 		complain(stderr, "no such check: %q", check)
 		usage()

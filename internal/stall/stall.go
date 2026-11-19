@@ -3,8 +3,9 @@
 
 // Package stall finds the ways a repository's updates stop flowing without
 // anything failing loudly: a Renovate pull request open too long, one red
-// or pending too long, Renovate itself silent, and daily slots that should
-// have published main and did not.
+// or pending too long, Renovate itself silent, daily slots that should
+// have published main and did not, and a dependency Renovate failed to
+// look up, which only its Dependency Dashboard shows.
 //
 // Each check reads the time from [time.Now] and the repository through a
 // [Source], and says what it found in a [Result].
@@ -172,9 +173,23 @@ type Source interface {
 	Compare(ctx context.Context, base, head string) (status string, firstCommit time.Time, err error)
 	// RepoCreated returns when the repository was created.
 	RepoCreated(ctx context.Context) (time.Time, error)
+	// Dashboards returns the open issues Renovate made titled exactly
+	// [DashboardTitle].
+	Dashboards(ctx context.Context) ([]Issue, error)
 	// WorkflowCreated returns when the workflow in file, such as
 	// build.yml, was created.
 	WorkflowCreated(ctx context.Context, file string) (time.Time, error)
+}
+
+// DashboardTitle is the title of Renovate's Dependency Dashboard, by which
+// Renovate itself finds its own, exactly.
+const DashboardTitle = "Dependency Dashboard"
+
+// Issue is an open issue of Renovate's: its number, title, body in
+// Markdown, and page.
+type Issue struct {
+	Number           int
+	Title, Body, URL string
 }
 
 // Job is a job of a slot run.
@@ -268,6 +283,103 @@ func Renovate(ctx context.Context, s Source, c *Config) (Result, error) {
 		return Result{Stalled: true, Headline: silent, Details: []string{"last successful Renovate run " + timestamp(last)}}, nil
 	}
 	return Result{Headline: fmt.Sprintf("Renovate succeeded within %d hours", c.RunHours)}, nil
+}
+
+// lookupSentence opens the line on which Renovate lists the dependencies
+// it failed to look up, each backticked, on a Dependency Dashboard. Its
+// other warnings share the section's heading but never the sentence, the
+// one stable marker Renovate writes; its own tests pin it.
+const lookupSentence = "Renovate failed to look up the following dependencies:"
+
+// backticked is one backticked item of Renovate's.
+var backticked = regexp.MustCompile("`([^`]+)`")
+
+// Lookups finds lookups Renovate failed, on any open Dependency Dashboard:
+// a datasource that answered nothing, or a digest it could not resolve,
+// leaves that dependency where it is, and only the dashboard says so.
+// Each is a detail, and so is the list of files that hold them. A line
+// with the sentence and nothing backticked is quoted whole: a format that
+// drifted fails closed.
+//
+// With no open dashboard, failed lookups cannot be seen: once Renovate has
+// succeeded, which reopens or remakes its dashboard on every run, that is
+// a stall. Before its first success, the renovate check owns the case.
+func Lookups(ctx context.Context, s Source, c *Config) (Result, error) {
+	dashboards, err := s.Dashboards(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(dashboards) == 0 {
+		last, ok, err := s.LastSuccess(ctx, c.RenovateWorkflow)
+		if err != nil {
+			return Result{}, err
+		}
+		if !ok {
+			return Result{Headline: "no Dependency Dashboard yet, and no successful Renovate run to have made one"}, nil
+		}
+		return Result{
+			Stalled:  true,
+			Headline: "No open Dependency Dashboard by divbast-renovate, so failed lookups cannot be seen:",
+			Details:  []string{fmt.Sprintf("no open issue titled %q; Renovate last succeeded %s", DashboardTitle, timestamp(last))},
+		}, nil
+	}
+	var urls, numbers, failed []string
+	for _, d := range dashboards {
+		numbers = append(numbers, "#"+strconv.Itoa(d.Number))
+		if found := failedLookups(d.Body); len(found) > 0 {
+			urls = append(urls, d.URL)
+			failed = append(failed, found...)
+		}
+	}
+	if len(failed) > 0 {
+		return Result{Stalled: true, Headline: "Renovate failed lookups, by the Dependency Dashboard " + strings.Join(urls, ", ") + ":", Details: failed}, nil
+	}
+	return Result{Headline: "no failed Renovate lookup on the Dependency Dashboard " + strings.Join(numbers, ", ")}, nil
+}
+
+// failedLookups returns the lookups a dashboard's body lists as failed,
+// and the files they are in.
+func failedLookups(body string) []string {
+	// A web edit saves the body with CRLF until Renovate's next rewrite:
+	// each line is trimmed, so a line's \r goes with its spaces
+	lines := strings.Split(body, "\n")
+	var found []string
+	for i, line := range lines {
+		rest, ok := strings.CutPrefix(unquote(line), lookupSentence)
+		if !ok {
+			continue
+		}
+		items := backticked.FindAllStringSubmatch(rest, -1)
+		if len(items) == 0 {
+			found = append(found, "unreadable: "+strings.TrimSpace(line))
+			continue
+		}
+		for _, m := range items {
+			found = append(found, m[1])
+		}
+		// The files follow in the same quote
+		for _, next := range lines[i+1:] {
+			if !strings.HasPrefix(strings.TrimSpace(next), ">") {
+				break
+			}
+			if files, ok := strings.CutPrefix(unquote(next), "Files affected:"); ok {
+				var names []string
+				for _, m := range backticked.FindAllStringSubmatch(files, -1) {
+					names = append(names, m[1])
+				}
+				if len(names) > 0 {
+					found = append(found, "files affected: "+strings.Join(names, ", "))
+				}
+				break
+			}
+		}
+	}
+	return found
+}
+
+// unquote is a Markdown quote's line without its marker.
+func unquote(line string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), ">"))
 }
 
 // Slots finds daily slots that should have published main and did not,
