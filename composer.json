@@ -4,7 +4,7 @@
   ],
   "license": "BSD-2-Clause",
   "require-dev": {
-    "phpstan/phpstan": "2.3.6"
+    "phpstan/phpstan": "2.3.7"
   },
   "config": {
     "platform": {
