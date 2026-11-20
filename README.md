@@ -1021,25 +1021,26 @@ older commit. When it publishes, it:
    for the calling repository, this workflow and `refs/heads/main`, against
    the index's bytes, fetched by digest and checked against it, trying three
    times, ten seconds apart;
-5. only then tags the index `<image>:<version>` and `<image>:latest`, once
-   a dry run of that `imagetools create` shows it would push the index
-   attested, byte for byte;
-6. checks that both tags, as an anonymous client pulls them, are that
-   index, and fails if they are not: a private package fails here. A
+5. only then tags the index `<image>:<version>` and `<image>:latest`, and
+   `<image>:<extra>` when `extra-tag-arg` names an `ARG`, once a dry run
+   of that `imagetools create` shows it would push the index attested,
+   byte for byte;
+6. checks that each of those tags, as an anonymous client pulls it, is
+   that index, and fails if one is not: a private package fails here. A
    rehearsal, below, checks with the job's login instead.
 
 The staging tag is where the index waits while it is attested and
 verified. Like each architecture's tag, it sits in the package as any tag
 does, but it is not for pulling, and the next publish overwrites it.
-Neither `<image>:<version>` nor `<image>:latest` ever names an index whose
-attestation has not verified. When a step after the decision fails before
-those two move, the job says so in an error: the public tags
-`:<version>` and `:latest` did not move. Re-running the failed job then
-publishes, since the decision still reads the last index published, but
-only within a day of the build: it downloads the images `app-check.yml`
-built, whose artifacts are kept for a day. A newer image published in the
-meantime keeps `:latest`, and once the artifacts are gone the next daily
-slot or a manual run publishes.
+Neither `<image>:<version>` nor `<image>:latest`, nor the extra tag, ever
+names an index whose attestation has not verified. When a step after the
+decision fails before they move, the job says so in an error: the public
+tags `:<version>` and `:latest` did not move. Re-running the failed job
+then publishes, since the decision still reads the last index published,
+but only within a day of the build: it downloads the images
+`app-check.yml` built, whose artifacts are kept for a day. A newer image
+published in the meantime keeps `:latest`, and once the artifacts are gone
+the next daily slot or a manual run publishes.
 
 Publishes queue one at a time in the calling repository's `publish`
 concurrency group, so the calling job needs no group of its own.
@@ -1048,6 +1049,7 @@ concurrency group, so the calling job needs no group of its own.
 |---|---|---|
 | `image` | string, required | The image, without a tag, such as `ghcr.io/divbast/librespeed` |
 | `version-arg` | string, required | The Containerfile `ARG` whose value is the app's version, which tags the image |
+| `extra-tag-arg` | string, default `''` | A Containerfile `ARG` whose value tags the image too, beside `<version>` and `latest`, such as the build's own version. Read and checked as `version-arg`'s is; the job fails, before any push, when its value is the version or `latest`. Empty tags nothing more |
 | `description` | string, required | The index's description annotation, which GHCR shows on the package page |
 | `rehearse` | boolean, default `false` | Decide against `image` as ever, then publish into a registry started inside the job instead: [Rehearsal](#rehearsal) |
 

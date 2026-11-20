@@ -79,6 +79,7 @@ printf '[[registry]]\nlocation = "localhost:5000"\ninsecure = true\n' \
 echo rehearsal | docker login --username rehearsal --password-stdin localhost:5000
 == Read the version from the Containerfile ==
 env: VERSION_ARG: ${{ inputs.version-arg }}
+env: EXTRA_TAG_ARG: ${{ inputs.extra-tag-arg }}
 run:
 if [[ ! "${VERSION_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
   echo "version-arg must name an ARG, not ${VERSION_ARG}" >&2
@@ -90,6 +91,22 @@ if [[ ! "${v}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
   exit 1
 fi
 echo "version=${v}" >> "${GITHUB_OUTPUT}"
+if [ -n "${EXTRA_TAG_ARG}" ]; then
+  if [[ ! "${EXTRA_TAG_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "extra-tag-arg must name an ARG, not ${EXTRA_TAG_ARG}" >&2
+    exit 1
+  fi
+  e=$(sed -n "s/^ARG ${EXTRA_TAG_ARG}=//p" Containerfile)
+  if [[ ! "${e}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+    echo "Containerfile has no one ARG ${EXTRA_TAG_ARG}= line whose value can tag an image" >&2
+    exit 1
+  fi
+  if [ "${e}" = "${v}" ] || [ "${e}" = latest ]; then
+    echo "extra-tag-arg names ARG ${EXTRA_TAG_ARG}, whose value ${e} the index is tagged with anyway: name an ARG with another value, or leave extra-tag-arg empty" >&2
+    exit 1
+  fi
+  echo "extra=${e}" >> "${GITHUB_OUTPUT}"
+fi
 == Choose where to publish ==
 env: IMAGE: ${{ inputs.image }}
 env: REHEARSE: ${{ inputs.rehearse }}
@@ -157,13 +174,17 @@ echo "${IMAGE}@${DIGEST} verifies, signed by ${signer}"
 == Tag the attested index with the version and latest ==
 env: IMAGE: ${{ steps.target.outputs.image }}
 env: VERSION: ${{ steps.version.outputs.version }}
+env: EXTRA: ${{ steps.version.outputs.extra }}
 env: DIGEST: ${{ steps.merge.outputs.digest }}
 run:
 args=(
   -t "${IMAGE}:${VERSION}"
   -t "${IMAGE}:latest"
-  "${IMAGE}@${DIGEST}"
 )
+if [ -n "${EXTRA}" ]; then
+  args+=(-t "${IMAGE}:${EXTRA}")
+fi
+args+=("${IMAGE}@${DIGEST}")
 docker buildx imagetools create --dry-run "${args[@]}" > /tmp/promoted.json
 size=$(wc -c < /tmp/promoted.json)
 would=$(head -c "$((size - 1))" /tmp/promoted.json | shasum -a 256)
@@ -176,6 +197,7 @@ docker buildx imagetools create "${args[@]}"
 == Check both tags are the attested index as users pull them ==
 env: IMAGE: ${{ steps.target.outputs.image }}
 env: VERSION: ${{ steps.version.outputs.version }}
+env: EXTRA: ${{ steps.version.outputs.extra }}
 env: DIGEST: ${{ steps.merge.outputs.digest }}
 env: ANONYMOUS: ${{ !inputs.rehearse }}
 run:
@@ -185,7 +207,11 @@ if [ "${ANONYMOUS}" = false ]; then
   creds=()
   who="the job's login"
 fi
-for tag in "${VERSION}" latest; do
+tags=("${VERSION}" latest)
+if [ -n "${EXTRA}" ]; then
+  tags+=("${EXTRA}")
+fi
+for tag in "${tags[@]}"; do
   if ! pulled=$(skopeo inspect --raw "${creds[@]}" "docker://${IMAGE}:${tag}" | shasum -a 256) ||
     [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
     echo "${IMAGE}:${tag} is not ${DIGEST} to ${who}" >&2
