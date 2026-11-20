@@ -1378,7 +1378,9 @@ func TestPublishAttestsBeforePromote(t *testing.T) {
 		"another digest attested":                              strings.Replace(publish, "subject-digest: ${{ steps.merge.outputs.digest }}", "subject-digest: ${{ steps.merge.outputs.amd64 }}", 1),
 		"another digest verified":                              replaceAfter(publish, verifyName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
 		"another digest promoted":                              replaceAfter(publish, promoteName, digest, "          DIGEST: ${{ steps.merge.outputs.amd64 }}\n"),
-		"another source promoted":                              strings.Replace(publish, `            "${IMAGE}@${DIGEST}"`+"\n", `            "${IMAGE}@$(cat /tmp/digest-amd64)"`+"\n", 1),
+		"another source promoted":                              strings.Replace(publish, `args+=("${IMAGE}@${DIGEST}")`, `args+=("${IMAGE}@$(cat /tmp/digest-amd64)")`, 1),
+		"the extra tag staged before attesting":                strings.Replace(publish, staging, staging+`            -t "${IMAGE}:${EXTRA}" \`+"\n", 1),
+		"the extra tag pushed before attesting":                replaceAfter(publish, pushName, "          done\n", "          done\n          "+from+` "docker://${IMAGE}:${EXTRA}"`+"\n"),
 		"latest left out of the promotion":                     strings.Replace(publish, version+latest, version, 1),
 		"the version left out of the promotion":                strings.Replace(publish, version+latest, latest, 1),
 	} {
@@ -1445,8 +1447,9 @@ func unmoved(ref string) bool {
 // decision alone; before the promotion, every tag is -staging, every
 // docker:// or ${IMAGE} reference is a digest or a -staging or -${arch}
 // tag, and no line names the version's tag or latest, but for the lines
-// notReferences allows; the promotion tags the version and latest alone;
-// and all four steps name the one digest. The verification is a user's: gh attestation verify, for the
+// notReferences allows; the promotion tags the version and latest, and
+// extra-tag-arg's ${EXTRA} at most besides; and all four steps name the
+// one digest. The verification is a user's: gh attestation verify, for the
 // caller's repository, this workflow and main.
 func attestsBeforePromote(workflow string) error {
 	job := jobsOf(linesOf(workflow))["publish"]
@@ -1529,9 +1532,15 @@ func attestsBeforePromote(workflow string) error {
 	for _, l := range st[promote] {
 		promoted = append(promoted, tags(l)...)
 	}
-	if len(promoted) != 2 || !slices.ContainsFunc(promoted, func(t string) bool { return strings.HasSuffix(t, ":${VERSION}") }) ||
-		!slices.ContainsFunc(promoted, func(t string) bool { return strings.HasSuffix(t, ":latest") }) {
-		return fmt.Errorf("line %d promotes to %q, want the version's tag and latest", st[promote][0].n, promoted)
+	tagged := func(suffix string) bool {
+		return slices.ContainsFunc(promoted, func(t string) bool { return strings.HasSuffix(t, suffix) })
+	}
+	count := 2
+	if tagged(":${EXTRA}") {
+		count++
+	}
+	if len(promoted) != count || !tagged(":${VERSION}") || !tagged(":latest") {
+		return fmt.Errorf("line %d promotes to %q, want the version's tag and latest, and the extra tag at most besides", st[promote][0].n, promoted)
 	}
 
 	id := value(st[stage], "id")
@@ -3139,6 +3148,277 @@ func checksAnonymously(t *testing.T, workflow string) error {
 		}
 		if (res.Code == 0) != tt.ok {
 			return fmt.Errorf("with ANONYMOUS=%q and the tags pulled as %q, the script exits %d: %s", tt.anonymous, tt.bytes, res.Code, res.Stderr)
+		}
+	}
+	return nil
+}
+
+// TestPublishTagsExtraArg checks that app-publish.yml's extra-tag-arg, an
+// optional string that is empty unless a caller sets it, tags the attested
+// index with one more version, the value of the Containerfile ARG it
+// names, and that a caller who leaves it empty runs the same commands as
+// before it existed. Run with bash, the version step reads that ARG with
+// the same checks of its name and its value as version-arg's, and refuses
+// a value the index is tagged with anyway; the promotion, with a stand-in
+// for docker, tags the value beside the version and latest only when
+// there is one; and the last check, with a stand-in for skopeo, reads it
+// too. Against app-publish.yml as it is, then with each broken, which the
+// check must refuse.
+func TestPublishTagsExtraArg(t *testing.T) {
+	t.Parallel()
+	publish := readWorkflows(t)["app-publish.yml"]
+	if err := tagsExtraArg(t, publish); err != nil {
+		t.Errorf("app-publish.yml: %v", err)
+	}
+	const (
+		input    = "      extra-tag-arg:\n"
+		promoted = "          if [ -n \"${EXTRA}\" ]; then\n            args+=(-t \"${IMAGE}:${EXTRA}\")\n          fi\n"
+		checked  = "          if [ -n \"${EXTRA}\" ]; then\n            tags+=(\"${EXTRA}\")\n          fi\n"
+		name     = `if [[ ! "${EXTRA_TAG_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then`
+		value    = `if [[ ! "${e}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then`
+		again    = `if [ "${e}" = "${v}" ] || [ "${e}" = latest ]; then`
+		output   = "EXTRA: ${{ steps.version.outputs.extra }}\n"
+	)
+	for name, mutant := range map[string]string{
+		"the extra tag left out of the promotion":   strings.Replace(publish, promoted, "", 1),
+		"the extra tag promoted when there is none": strings.Replace(publish, promoted, "          args+=(-t \"${IMAGE}:${EXTRA}\")\n", 1),
+		"the extra ARG's name unchecked":            strings.Replace(publish, name, "if false; then", 1),
+		"the extra ARG's value unchecked":           strings.Replace(publish, value, "if false; then", 1),
+		"the extra ARG's value checked otherwise":   strings.Replace(publish, value, `if [[ ! "${e}" =~ ^[A-Za-z0-9_./-]+$ ]]; then`, 1),
+		"a tag the index has anyway let through":    strings.Replace(publish, again, "if false; then", 1),
+		"the extra tag left out of the check":       strings.Replace(publish, checked, "", 1),
+		"another input read":                        strings.Replace(publish, "EXTRA_TAG_ARG: ${{ inputs.extra-tag-arg }}", "EXTRA_TAG_ARG: ${{ inputs.version-arg }}", 1),
+		"the promotion reading another output":      replaceAfter(publish, promoteName, output, "EXTRA: ${{ steps.version.outputs.version }}\n"),
+		"the check reading another output":          replaceAfter(publish, checkName, output, "EXTRA: ${{ steps.version.outputs.version }}\n"),
+		"the input required":                        replaceAfter(publish, input, "        required: false\n", "        required: true\n"),
+		"an ARG named by default":                   replaceAfter(publish, input, "        default: ''\n", "        default: APP_BUILD\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == publish {
+				t.Fatal("the change changed nothing")
+			}
+			if tagsExtraArg(t, mutant) == nil {
+				t.Error("passes app-publish.yml with " + name)
+			}
+		})
+	}
+}
+
+// tagsExtraArg returns an error unless app-publish.yml declares
+// extra-tag-arg as an optional string whose default is empty, and the
+// publish job's steps with id version and promote, and its step after the
+// promotion that runs skopeo inspect, take it in their env, each run with
+// bash:
+//
+//   - the version step, with extra-tag-arg empty, outputs the version
+//     alone, as it did before the input existed; given the name of an ARG,
+//     it accepts and refuses each name and value exactly as it does for
+//     version-arg, and outputs the value as extra beside the version; and
+//     it refuses a value that is the version or latest;
+//   - the promotion, its dry run and its run alike, tags the version and
+//     latest, and the extra tag after them only when there is one;
+//   - the last check reads the version, latest and then the extra tag,
+//     when there is one, and fails when the extra tag is not the digest.
+func tagsExtraArg(t *testing.T, workflow string) error {
+	t.Helper()
+	decl := map[string]string{}
+	for _, d := range declaration(linesOf(workflow), "extra-tag-arg") {
+		if k, v, ok := strings.Cut(d, ":"); ok {
+			decl[k] = v
+		}
+	}
+	if _, ok := decl["default"]; !ok || unquote(decl["type"]) != "string" || unquote(decl["required"]) != "false" || unquote(decl["default"]) != "" {
+		return fmt.Errorf("extra-tag-arg is declared as %q, not an optional string whose default is empty", decl)
+	}
+	st := publishSteps(workflow)
+	id := func(want string) func(line) bool {
+		return func(l line) bool { return strings.TrimSpace(l.text) == "id: "+want }
+	}
+	version, promote := stepsWhere(st, id("version")), stepsWhere(st, id("promote"))
+	if len(version) != 1 || len(promote) != 1 {
+		return fmt.Errorf("%d steps have id version and %d have id promote, want one of each", len(version), len(promote))
+	}
+	after := stepsWhere(st[promote[0]+1:], contains("skopeo inspect"))
+	if len(after) != 1 {
+		return fmt.Errorf("%d steps after the promotion run skopeo inspect, want one", len(after))
+	}
+	read, tag, check := st[version[0]], st[promote[0]], st[promote[0]+1+after[0]]
+	for _, e := range []struct {
+		step        []line
+		name, value string
+	}{
+		{read, "EXTRA_TAG_ARG", "${{ inputs.extra-tag-arg }}"},
+		{tag, "EXTRA", "${{ steps.version.outputs.extra }}"},
+		{check, "EXTRA", "${{ steps.version.outputs.extra }}"},
+	} {
+		if !setsEnv(e.step, e.name, e.value) {
+			return fmt.Errorf("line %d has no %s: %s in its env", e.step[0].n, e.name, e.value)
+		}
+	}
+	if err := readsExtraArg(t, read); err != nil {
+		return err
+	}
+	if err := promotesExtraTag(t, tag); err != nil {
+		return err
+	}
+	return checksExtraTag(t, check)
+}
+
+// readsExtraArg returns an error unless the version step, run with bash
+// from a directory holding a Containerfile, reads extra-tag-arg's ARG as
+// tagsExtraArg says.
+func readsExtraArg(t *testing.T, step []line) error {
+	t.Helper()
+	script, err := runScript(step)
+	if err != nil {
+		return err
+	}
+	run := func(containerfile, versionArg, extraArg string) (string, execx.Result) {
+		dir := t.TempDir()
+		writeFile(t, dir, "Containerfile", containerfile)
+		writeFile(t, dir, "output", "")
+		output := filepath.Join(dir, "output")
+		res := runStep(t, dir, script, "VERSION_ARG="+versionArg, "EXTRA_TAG_ARG="+extraArg, "GITHUB_OUTPUT="+output)
+		out, _ := os.ReadFile(output) //nolint:gosec // G304: the test's own temporary directory
+		return string(out), res
+	}
+	const app = "ARG APP_VERSION=1.2.3\n"
+	if out, res := run(app, "APP_VERSION", ""); res.Code != 0 || out != "version=1.2.3\n" {
+		return fmt.Errorf("with extra-tag-arg empty, the version step exits %d and outputs %q, want 0 and the version alone: %s", res.Code, out, res.Stderr)
+	}
+	// Each a name and the lines that give it a value, or none; value is
+	// the tag read, or empty when the name or the value is refused. Each
+	// refused one is refused by one check alone: sed would read a value
+	// for a name that is no ARG's, and each value refused is one sed reads.
+	for _, tt := range []struct{ what, arg, lines, value string }{
+		{what: "a build's version", arg: "APP_BUILD", lines: "ARG APP_BUILD=1.2.3-divbast.1\n", value: "1.2.3-divbast.1"},
+		{what: "a value of 128 characters", arg: "_B2", lines: "ARG _B2=" + strings.Repeat("a", 128) + "\n", value: strings.Repeat("a", 128)},
+		{what: "a name that is a pattern", arg: "BUILD_.*", lines: "ARG BUILD_VERSION=1.2.3-divbast.1\n"},
+		{what: "a name with a hyphen", arg: "APP-BUILD", lines: "ARG APP-BUILD=1.2.3-divbast.1\n"},
+		{what: "a name that starts with a digit", arg: "1BUILD", lines: "ARG 1BUILD=1.2.3-divbast.1\n"},
+		{what: "a value with a slash", arg: "APP_BUILD", lines: "ARG APP_BUILD=1.2.3/divbast.1\n"},
+		{what: "a value that starts with a dot", arg: "APP_BUILD", lines: "ARG APP_BUILD=.1.2.3\n"},
+		{what: "a value of 129 characters", arg: "APP_BUILD", lines: "ARG APP_BUILD=" + strings.Repeat("a", 129) + "\n"},
+		{what: "two lines", arg: "APP_BUILD", lines: "ARG APP_BUILD=1.2.3-divbast.1\nARG APP_BUILD=1.2.3-divbast.2\n"},
+		{what: "no line", arg: "APP_BUILD", lines: "ARG OTHER=1.2.3-divbast.1\n"},
+	} {
+		out, res := run(tt.lines, tt.arg, "")
+		if ok := res.Code == 0 && out == "version="+tt.value+"\n"; ok != (tt.value != "") {
+			return fmt.Errorf("with %s as version-arg, the version step exits %d and outputs %q", tt.what, res.Code, out)
+		}
+		out, res = run(app+tt.lines, "APP_VERSION", tt.arg)
+		if tt.value != "" {
+			if res.Code != 0 || out != "version=1.2.3\nextra="+tt.value+"\n" {
+				return fmt.Errorf("with %s as extra-tag-arg, the version step exits %d and outputs %q, want 0 and extra=%s: %s",
+					tt.what, res.Code, out, tt.value, res.Stderr)
+			}
+			continue
+		}
+		if res.Code == 0 || strings.Contains(out, "extra=") || !strings.Contains(string(res.Stderr), tt.arg) {
+			return fmt.Errorf("with %s as extra-tag-arg, the version step exits %d, outputs %q and says %q;"+
+				" want it to fail, naming %s, as it does for version-arg", tt.what, res.Code, out, res.Stderr, tt.arg)
+		}
+	}
+	for _, tt := range []struct{ what, arg, lines string }{
+		{what: "the version again", arg: "APP_BUILD", lines: "ARG APP_BUILD=1.2.3\n"},
+		{what: "version-arg's own ARG", arg: "APP_VERSION"},
+		{what: "latest", arg: "APP_BUILD", lines: "ARG APP_BUILD=latest\n"},
+	} {
+		out, res := run(app+tt.lines, "APP_VERSION", tt.arg)
+		if res.Code == 0 || strings.Contains(out, "extra=") || !strings.Contains(string(res.Stderr), tt.arg) {
+			return fmt.Errorf("with %s as extra-tag-arg, the version step exits %d, outputs %q and says %q;"+
+				" want it to fail, naming %s: the index is tagged with that anyway", tt.what, res.Code, out, res.Stderr, tt.arg)
+		}
+	}
+	return nil
+}
+
+// promotesExtraTag returns an error unless the promotion, run with bash
+// and a stand-in for docker whose dry run prints the attested index, runs
+// the dry run and then imagetools create with the version's tag and
+// latest, the extra tag after them only when EXTRA is set, and the index
+// by digest last.
+func promotesExtraTag(t *testing.T, step []line) error {
+	t.Helper()
+	script, err := runScript(step)
+	if err != nil {
+		return err
+	}
+	const (
+		image = "ghcr.io/divbast/app"
+		index = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`
+	)
+	sum := sha256.Sum256([]byte(index))
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	for _, tt := range []struct{ extra, tags string }{
+		{extra: "", tags: "-t " + image + ":1.2.3 -t " + image + ":latest"},
+		{extra: "1.2.3-divbast.1", tags: "-t " + image + ":1.2.3 -t " + image + ":latest -t " + image + ":1.2.3-divbast.1"},
+	} {
+		dir := withBin(t)
+		writeFile(t, dir, "would", index)
+		writeFile(t, dir, "output", "")
+		writeFile(t, dir, "bin/docker", "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"${CALLS}\"\n"+
+			"case \" $* \" in *\" --dry-run \"*) cat \"${WOULD}\"; echo ;; esac\n")
+		calls := filepath.Join(dir, "calls")
+		res := runStep(t, dir, strings.ReplaceAll(script, "/tmp/", dir+"/"),
+			"PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"),
+			"IMAGE="+image, "VERSION=1.2.3", "EXTRA="+tt.extra, "DIGEST="+digest,
+			"CALLS="+calls, "WOULD="+filepath.Join(dir, "would"), "GITHUB_OUTPUT="+filepath.Join(dir, "output"))
+		got, _ := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
+		args := tt.tags + " " + image + "@" + digest
+		want := "buildx imagetools create --dry-run " + args + "\nbuildx imagetools create " + args + "\n"
+		if res.Code != 0 || string(got) != want {
+			return fmt.Errorf("with EXTRA=%q, the promotion exits %d and runs\n%s\nwant 0 and\n%s%s", tt.extra, res.Code, got, want, res.Stderr)
+		}
+	}
+	return nil
+}
+
+// checksExtraTag returns an error unless the last check, run with bash
+// and a stand-in for skopeo, reads the version's tag, latest and then the
+// extra tag, when EXTRA is set, each with --no-creds, and fails when the
+// extra tag's bytes are not the digest.
+func checksExtraTag(t *testing.T, step []line) error {
+	t.Helper()
+	script, err := runScript(step)
+	if err != nil {
+		return err
+	}
+	const (
+		image = "ghcr.io/divbast/app"
+		index = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`
+	)
+	sum := sha256.Sum256([]byte(index))
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	reads := func(tags ...string) string {
+		var b strings.Builder
+		for _, tag := range tags {
+			b.WriteString("inspect --raw --no-creds docker://" + image + ":" + tag + "\n")
+		}
+		return b.String()
+	}
+	for _, tt := range []struct {
+		extra, other, calls string
+		ok                  bool
+	}{
+		{calls: reads("1.2.3", "latest"), ok: true},
+		{extra: "1.2.3-divbast.1", calls: reads("1.2.3", "latest", "1.2.3-divbast.1"), ok: true},
+		{extra: "1.2.3-divbast.1", other: "1.2.3-divbast.1", calls: reads("1.2.3", "latest", "1.2.3-divbast.1")},
+	} {
+		dir := withBin(t)
+		writeFile(t, dir, "pulled", index)
+		// The tag OTHER names comes back as other bytes
+		writeFile(t, dir, "bin/skopeo", "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"${CALLS}\"\ncat \"${PULLED}\"\n"+
+			"ref=\"${*: -1}\"\n[ \"${ref##*:}\" != \"${OTHER}\" ] || echo\n")
+		calls := filepath.Join(dir, "calls")
+		res := runStep(t, dir, script, "PATH="+filepath.Join(dir, "bin")+":"+os.Getenv("PATH"),
+			"IMAGE="+image, "VERSION=1.2.3", "EXTRA="+tt.extra, "DIGEST="+digest, "ANONYMOUS=true",
+			"CALLS="+calls, "PULLED="+filepath.Join(dir, "pulled"), "OTHER="+tt.other)
+		got, _ := os.ReadFile(calls) //nolint:gosec // G304: the test's own temporary directory
+		if (res.Code == 0) != tt.ok || string(got) != tt.calls {
+			return fmt.Errorf("with EXTRA=%q and %q pulled as other bytes, the check exits %d and runs\n%s\nwant\n%s%s",
+				tt.extra, tt.other, res.Code, got, tt.calls, res.Stderr)
 		}
 	}
 	return nil

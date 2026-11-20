@@ -7,10 +7,12 @@
 # never moves :latest backwards. When it publishes, it pushes the two images
 # app-check built and tested, and merges them into one index under a
 # staging tag. It attests that index and verifies the attestation as a user
-# would, and only then tags it with the app's version and latest, so that
-# neither ever names an index whose attestation has not verified. Last, it
-# checks that both tags are that index to an anonymous client, as users
-# pull it, or, in a rehearsal, to the job's login.
+# would, and only then tags it with the app's version and latest, and with
+# the value of the Containerfile ARG extra-tag-arg names when the caller
+# names one, so that none of those tags ever names an index whose
+# attestation has not verified. Last, it checks that each of them is that
+# index to an anonymous client, as users pull it, or, in a rehearsal, to
+# the job's login.
 #
 # The attestation is signed by this workflow, for the caller's repository
 # and ref, so it verifies with
@@ -45,6 +47,11 @@ on:
         description: The Containerfile ARG whose value is the app's version, which tags the image
         type: string
         required: true
+      extra-tag-arg:
+        description: A Containerfile ARG whose value tags the image too, beside the version and latest, such as the build's own version. Read and checked as version-arg's is, and refused when its value is the version or latest. Empty, the default, tags nothing more
+        type: string
+        required: false
+        default: ''
       description:
         description: The index's description annotation, which GHCR shows on the package page
         type: string
@@ -256,11 +263,16 @@ jobs:
         with:
           pattern: image-*
           path: /tmp/images
+      # The extra tag, when extra-tag-arg names an ARG, is read and checked
+      # as the version is. One that is the version or latest would tag
+      # nothing new and hide the caller's mistake, so it fails, before any
+      # push.
       - name: Read the version from the Containerfile
         if: steps.decide.outputs.publish == 'true'
         id: version
         env:
           VERSION_ARG: ${{ inputs.version-arg }}
+          EXTRA_TAG_ARG: ${{ inputs.extra-tag-arg }}
         run: |
           if [[ ! "${VERSION_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
             echo "version-arg must name an ARG, not ${VERSION_ARG}" >&2
@@ -272,6 +284,22 @@ jobs:
             exit 1
           fi
           echo "version=${v}" >> "${GITHUB_OUTPUT}"
+          if [ -n "${EXTRA_TAG_ARG}" ]; then
+            if [[ ! "${EXTRA_TAG_ARG}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "extra-tag-arg must name an ARG, not ${EXTRA_TAG_ARG}" >&2
+              exit 1
+            fi
+            e=$(sed -n "s/^ARG ${EXTRA_TAG_ARG}=//p" Containerfile)
+            if [[ ! "${e}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "Containerfile has no one ARG ${EXTRA_TAG_ARG}= line whose value can tag an image" >&2
+              exit 1
+            fi
+            if [ "${e}" = "${v}" ] || [ "${e}" = latest ]; then
+              echo "extra-tag-arg names ARG ${EXTRA_TAG_ARG}, whose value ${e} the index is tagged with anyway: name an ARG with another value, or leave extra-tag-arg empty" >&2
+              exit 1
+            fi
+            echo "extra=${e}" >> "${GITHUB_OUTPUT}"
+          fi
       # Where every step below writes: the caller's image, or in a
       # rehearsal the same path in the registry started above
       - name: Choose where to publish
@@ -370,23 +398,28 @@ jobs:
           echo "${IMAGE}@${DIGEST} verifies, signed by ${signer}"
 
       # The index is attested, and the attestation verifies: the public tags
-      # move now. Given one index and no annotations, imagetools pushes the
-      # index's own bytes, and its dry run prints the bytes it would push and
-      # a newline, so the tags move only once those are known to be the
-      # index attested. moving says the tags may have moved from then on.
+      # move now, the extra tag with them when there is one. Given one index
+      # and no annotations, imagetools pushes the index's own bytes, and its
+      # dry run prints the bytes it would push and a newline, so the tags
+      # move only once those are known to be the index attested. moving says
+      # the tags may have moved from then on.
       - name: Tag the attested index with the version and latest
         if: steps.decide.outputs.publish == 'true'
         id: promote
         env:
           IMAGE: ${{ steps.target.outputs.image }}
           VERSION: ${{ steps.version.outputs.version }}
+          EXTRA: ${{ steps.version.outputs.extra }}
           DIGEST: ${{ steps.merge.outputs.digest }}
         run: |
           args=(
             -t "${IMAGE}:${VERSION}"
             -t "${IMAGE}:latest"
-            "${IMAGE}@${DIGEST}"
           )
+          if [ -n "${EXTRA}" ]; then
+            args+=(-t "${IMAGE}:${EXTRA}")
+          fi
+          args+=("${IMAGE}@${DIGEST}")
           docker buildx imagetools create --dry-run "${args[@]}" > /tmp/promoted.json
           size=$(wc -c < /tmp/promoted.json)
           would=$(head -c "$((size - 1))" /tmp/promoted.json | shasum -a 256)
@@ -397,15 +430,18 @@ jobs:
           echo "moving=true" >> "${GITHUB_OUTPUT}"
           docker buildx imagetools create "${args[@]}"
 
-      # What users pull, as they pull it: anonymously. A private package, or
-      # a tag that is not the index attested, fails the run here rather than
-      # when someone first pulls. A rehearsal's registry is the job's own and
-      # takes no anonymous pulls, so a rehearsal reads with the job's login.
+      # What users pull, as they pull it: anonymously, each tag the
+      # promotion moved, the extra one too when there is one. A private
+      # package, or a tag that is not the index attested, fails the run here
+      # rather than when someone first pulls. A rehearsal's registry is the
+      # job's own and takes no anonymous pulls, so a rehearsal reads with the
+      # job's login.
       - name: Check both tags are the attested index as users pull them
         if: steps.decide.outputs.publish == 'true'
         env:
           IMAGE: ${{ steps.target.outputs.image }}
           VERSION: ${{ steps.version.outputs.version }}
+          EXTRA: ${{ steps.version.outputs.extra }}
           DIGEST: ${{ steps.merge.outputs.digest }}
           ANONYMOUS: ${{ !inputs.rehearse }}
         run: |
@@ -415,7 +451,11 @@ jobs:
             creds=()
             who="the job's login"
           fi
-          for tag in "${VERSION}" latest; do
+          tags=("${VERSION}" latest)
+          if [ -n "${EXTRA}" ]; then
+            tags+=("${EXTRA}")
+          fi
+          for tag in "${tags[@]}"; do
             if ! pulled=$(skopeo inspect --raw "${creds[@]}" "docker://${IMAGE}:${tag}" | shasum -a 256) ||
               [ "sha256:${pulled%% *}" != "${DIGEST}" ]; then
               echo "${IMAGE}:${tag} is not ${DIGEST} to ${who}" >&2
