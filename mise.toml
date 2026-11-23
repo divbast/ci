@@ -9,7 +9,7 @@
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:mvdan/sh" = "3.14.1"
 "aqua:rhysd/actionlint" = "1.7.12"
-"aqua:zizmorcore/zizmor" = "1.32.0"
+"aqua:zizmorcore/zizmor" = "1.33.1"
 "aqua:suzuki-shunsuke/pinact" = "5.0.2"
 
 "pipx:reuse" = "6.3.0"
