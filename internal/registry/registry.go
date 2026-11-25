@@ -12,12 +12,16 @@
 // first publish through without a commit to compare with, and so what
 // would let a registry outage move :latest backwards. Presence tells the
 // same answers apart without the revision, for a caller that needs only
-// whether anything is published.
+// whether anything is published, and Pin with the reference that names the
+// very image the registry served, by its digest, which Copy copies into an
+// OCI layout.
 package registry
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +77,10 @@ const host = "ghcr.io"
 // timeout is how long the skopeo call may take when a Lookup sets no
 // Timeout of its own.
 const timeout = time.Minute
+
+// copyTimeout is how long Copy's skopeo call may take: one architecture of
+// an image, every layer of it.
+const copyTimeout = 5 * time.Minute
 
 // notFound is GitHub's message for a package that does not exist, which
 // alone among 404s says nothing is published there.
@@ -152,6 +160,53 @@ func (l Lookup) Revision(ctx context.Context, image string) (string, State, erro
 func (l Lookup) Presence(ctx context.Context, image string) (State, error) {
 	_, state, err := l.inspect(ctx, image)
 	return state, err
+}
+
+// Pin says whether image, a ghcr.io reference, is published, as
+// [Lookup.Presence] does, and for a published one also returns the
+// reference that names what the registry served: image's repository at
+// the digest of the manifest it read, as in
+// ghcr.io/divbast/librespeed@sha256:d9ea… . Two reads of a tag may read
+// two images, when a publish moves the tag between them; two of the pinned
+// reference read one.
+func (l Lookup) Pin(ctx context.Context, image string) (string, State, error) {
+	manifest, state, err := l.inspect(ctx, image)
+	if err != nil || state != Published {
+		return "", state, err
+	}
+	// skopeo inspect --raw prints the manifest as served, so its sha256 is
+	// the digest the registry knows it by
+	sum := sha256.Sum256(manifest)
+	return repository(image) + "@sha256:" + hex.EncodeToString(sum[:]), Published, nil
+}
+
+// Copy copies the linux/arch image of pinned, a reference [Lookup.Pin]
+// returned, into a new OCI layout at dir, with skopeo, as an anonymous
+// client, as users pull it. A reference with no digest is refused, as is
+// a dir with a colon in it, where skopeo's oci: reference ends its path.
+// A copy that takes longer than five minutes is given up on.
+func (l Lookup) Copy(ctx context.Context, pinned, arch, dir string) error {
+	if _, digest, _ := strings.Cut(pinned, "@"); !strings.HasPrefix(digest, "sha256:") {
+		return fmt.Errorf("%s names no digest, so two reads of it may read two images: copy the reference Pin returns", pinned)
+	}
+	if strings.Contains(dir, ":") {
+		return fmt.Errorf("%s holds a colon, where skopeo's oci: reference would end its path", dir)
+	}
+	copyCtx, cancel := context.WithTimeout(ctx, copyTimeout)
+	defer cancel()
+	res, err := l.Run.Run(copyCtx, "skopeo", "copy", "--quiet", "--src-no-creds",
+		"--override-os", "linux", "--override-arch", arch, "docker://"+pinned, "oci:"+dir)
+	if err != nil {
+		// Only the copy's own limit is Copy's to name, as for inspect
+		if ctx.Err() == nil && errors.Is(copyCtx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("skopeo copy docker://%s gave up after %v: %w", pinned, copyTimeout, err)
+		}
+		return fmt.Errorf("could not copy %s: %w", pinned, err)
+	}
+	if res.Code != 0 {
+		return fmt.Errorf("could not copy %s: skopeo exit status %d: %s", pinned, res.Code, bytes.TrimSpace(res.Stderr))
+	}
+	return nil
 }
 
 // inspect reads image's manifest as an anonymous client, and returns it
@@ -268,4 +323,13 @@ func parse(image string) (owner, name string, err error) {
 		return "", "", fmt.Errorf("%q names no %s owner and package, as in %s/divbast/librespeed:latest", image, host, host)
 	}
 	return owner, name, nil
+}
+
+// repository is image, a reference, without its tag or digest.
+func repository(image string) string {
+	repo, _, _ := strings.Cut(image, "@")
+	if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+		repo = repo[:i]
+	}
+	return repo
 }

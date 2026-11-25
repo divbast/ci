@@ -692,3 +692,157 @@ func TestRevisionTimeout(t *testing.T) {
 		})
 	}
 }
+
+// The librespeed index the recording holds, by the sha256 of its bytes,
+// which is its digest: skopeo inspect --raw prints them as served.
+const pinnedLatest = "ghcr.io/divbast/librespeed@sha256:d9ea226a05957bd70876b6b3eb81ca454fefc4365902f061dba82515efb12909"
+
+// TestPin checks that Pin answers as Presence does, and that a published
+// image's answer names its repository at the digest of what the registry
+// served, whatever tag or digest the reference carried.
+func TestPin(t *testing.T) {
+	t.Parallel()
+
+	served := execx.Result{Stdout: readTestdata(t, "skopeo-librespeed-latest.json")}
+	tests := []struct {
+		name      string
+		image     string
+		skopeo    execx.Result
+		gh        *execx.Result
+		want      string
+		wantState registry.State
+		wantErr   string
+	}{
+		{name: "tag", image: latest, skopeo: served, want: pinnedLatest, wantState: registry.Published},
+		{name: "digest", image: pinnedLatest, skopeo: served, want: pinnedLatest, wantState: registry.Published},
+		{name: "tag-and-digest", image: "ghcr.io/divbast/librespeed:latest@sha256:00", skopeo: served, want: pinnedLatest, wantState: registry.Published},
+		{
+			name: "nested-name", image: "ghcr.io/divbast/a/b:latest", skopeo: served,
+			want: "ghcr.io/divbast/a/b@sha256:d9ea226a05957bd70876b6b3eb81ca454fefc4365902f061dba82515efb12909", wantState: registry.Published,
+		},
+		{
+			name: "absent", image: latest, skopeo: failed(t, "skopeo-no-such-package.txt", 1), gh: new(status(404, "Package not found.")),
+			wantState: registry.Absent,
+		},
+		{
+			name: "private", image: latest, skopeo: failed(t, "skopeo-no-such-package.txt", 1), gh: new(pkg("private")),
+			wantErr: "package is private",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			calls := []execx.Call{{Argv: skopeoArgv(tt.image), Result: tt.skopeo}}
+			if tt.gh != nil {
+				calls = append(calls, execx.Call{Argv: []string{"gh", "api", "-i", librespeedAPI}, Result: *tt.gh})
+			}
+			run := execx.NewFake(t, calls...)
+			l := registry.Lookup{Run: run, GH: ghapi.Client{Run: run}}
+			got, state, err := l.Pin(t.Context(), tt.image)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) || got != "" || state != 0 {
+					t.Errorf("Pin() = %q, %v, %v; want an error containing %q", got, state, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tt.want || state != tt.wantState {
+				t.Errorf("Pin() = %q, %v, %v; want %q, %v", got, state, err, tt.want, tt.wantState)
+			}
+		})
+	}
+}
+
+// copyArgv is skopeo copying ref's linux/arch image into the layout dir,
+// as an anonymous client.
+func copyArgv(ref, arch, dir string) []string {
+	return []string{"skopeo", "copy", "--quiet", "--src-no-creds", "--override-os", "linux", "--override-arch", arch, "docker://" + ref, "oci:" + dir}
+}
+
+func TestCopy(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tests := []struct {
+		name    string
+		ref     string
+		dir     string
+		skopeo  *execx.Result
+		err     error
+		wantErr []string
+	}{
+		{name: "copied", ref: pinnedLatest, dir: dir, skopeo: &execx.Result{}},
+		{
+			name: "fails", ref: pinnedLatest, dir: dir, skopeo: new(failed(t, "skopeo-manifest-503.txt", 1)),
+			wantErr: []string{"could not copy " + pinnedLatest, "503"},
+		},
+		{name: "skopeo-missing", ref: pinnedLatest, dir: dir, err: exec.ErrNotFound, wantErr: []string{"could not copy", "executable file not found"}},
+		// A tag can move between two reads: only a digest names one image
+		{name: "unpinned", ref: latest, dir: dir, wantErr: []string{latest, "no digest"}},
+		// oci:'s reference ends a path at its first colon
+		{name: "colon-in-dir", ref: pinnedLatest, dir: dir + "/a:b", wantErr: []string{"a:b", "colon"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var calls []execx.Call
+			if tt.skopeo != nil || tt.err != nil {
+				res := execx.Result{}
+				if tt.skopeo != nil {
+					res = *tt.skopeo
+				}
+				calls = append(calls, execx.Call{Argv: copyArgv(tt.ref, "arm64", tt.dir), Result: res, Err: tt.err})
+			}
+			run := execx.NewFake(t, calls...)
+			err := registry.Lookup{Run: run}.Copy(t.Context(), tt.ref, "arm64", tt.dir)
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Errorf("Copy() error = %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Copy() error = nil, want one containing %q", tt.wantErr)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Copy() error = %q, want it to contain %q", err, want)
+				}
+			}
+			if tt.err != nil && !errors.Is(err, tt.err) {
+				t.Errorf("Copy() error = %v, want it to wrap %v", err, tt.err)
+			}
+		})
+	}
+}
+
+// TestCopyTimeout checks that a skopeo copy that hangs is given up on
+// after five minutes, naming the copy and its limit, unless the caller's
+// deadline comes first.
+func TestCopyTimeout(t *testing.T) {
+	t.Parallel()
+	for _, caller := range []time.Duration{0, 3 * time.Second} {
+		t.Run(caller.String(), func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				want := 5 * time.Minute
+				if caller != 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, caller)
+					defer cancel()
+					want = caller
+				}
+				start := time.Now()
+				err := registry.Lookup{Run: hangs(t, "skopeo")}.Copy(ctx, pinnedLatest, "arm64", t.TempDir())
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Copy() error = %v, want one wrapping %v", err, context.DeadlineExceeded)
+				}
+				if waited := time.Since(start); waited != want {
+					t.Errorf("Copy() gave up after %v, want %v", waited, want)
+				}
+				if gaveUp := strings.Contains(err.Error(), "gave up after 5m0s"); gaveUp != (caller == 0) {
+					t.Errorf("Copy() error = %q; it says the copy gave up: %t, want %t", err, gaveUp, caller == 0)
+				}
+			})
+		})
+	}
+}
