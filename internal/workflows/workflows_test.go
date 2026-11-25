@@ -17,6 +17,7 @@ import (
 	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -968,6 +969,192 @@ func hostRuleForDHI(workflow string) error {
 // the username and the token as JSON strings when the caller passes a
 // username, and [] otherwise.
 const hostRulesExpr = `${{ inputs.dhi-username != '' && format('[{{"matchHost":"dhi.io","hostType":"docker","username":{0},"password":{1}}}]', toJSON(inputs.dhi-username), toJSON(secrets.DHI_TOKEN)) || '[]' }}`
+
+// allowedCommands are the regular expressions RENOVATE_ALLOWED_COMMANDS
+// must decode to: the post-upgrade commands Renovate may run, each one
+// exact command, anchored at both ends.
+var allowedCommands = []string{
+	`^go tool -modfile=tools/go\.mod templ generate$`,
+	`^go tool -modfile=tools/go\.mod sqlc generate$`,
+	`^pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile$`,
+	`^go run \./cmd/genicons$`,
+}
+
+// TestRenovateAllowedCommands checks that renovate.yml's Renovate step
+// sets RENOVATE_ALLOWED_COMMANDS to a JSON array of exactly
+// allowedCommands, that nothing else in the workflow sets the list, and
+// that nothing turns on Renovate's shell for post-upgrade tasks, where a
+// pattern could no longer bound what a command runs. Renovate parses the
+// value as JSON5, which reads an unknown escape such as \. as the
+// character alone, so the check decodes it as JSON, which refuses one.
+// Against renovate.yml as it is, then with each of those broken.
+func TestRenovateAllowedCommands(t *testing.T) {
+	t.Parallel()
+	renovate := readWorkflows(t)["renovate.yml"]
+	if err := allowsCommands(renovate); err != nil {
+		t.Errorf("renovate.yml: %v", err)
+	}
+	const (
+		key      = "          RENOVATE_ALLOWED_COMMANDS:"
+		genicons = `"^go run \\./cmd/genicons$"`
+	)
+	for name, mutant := range map[string]string{
+		"a dot escaped once":              strings.Replace(renovate, `go\\.mod templ`, `go\.mod templ`, 1),
+		"a pattern unanchored":            strings.Replace(renovate, genicons, `"go run \\./cmd/genicons"`, 1),
+		"pnpm install running scripts":    strings.Replace(renovate, ` --ignore-scripts --ignore-pnpmfile$"`, ` --ignore-pnpmfile$"`, 1),
+		"pnpm install running a pnpmfile": strings.Replace(renovate, ` --ignore-pnpmfile$"`, `$"`, 1),
+		"a pattern missing":               strings.Replace(renovate, ",\n            "+genicons+"]", "]", 1),
+		"an extra pattern":                strings.Replace(renovate, genicons+"]", genicons+`, "^just generate$"]`, 1),
+		"the list set again on the job":   strings.Replace(renovate, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    env:\n      RENOVATE_ALLOWED_COMMANDS: '[\".*\"]'\n", 1),
+		"the shell turned on":             strings.Replace(renovate, key, "          RENOVATE_ALLOW_SHELL_EXECUTOR_FOR_POST_UPGRADE_COMMANDS: 'true'\n"+key, 1),
+		"the list on one line":            strings.Replace(renovate, key+" >-\n            [", key+" [", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == renovate {
+				t.Fatal("the change changed nothing")
+			}
+			if allowsCommands(mutant) == nil {
+				t.Error("passes renovate.yml with " + name)
+			}
+		})
+	}
+}
+
+// TestAllowedCommandsMatchOnlyTheirOwn holds allowedCommands, read by RE2
+// as Renovate reads them, to the commands they are for: each of those
+// matches, whole, and nothing near one does.
+func TestAllowedCommandsMatchOnlyTheirOwn(t *testing.T) {
+	t.Parallel()
+	patterns := make([]*regexp.Regexp, 0, len(allowedCommands))
+	for _, p := range allowedCommands {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		patterns = append(patterns, re)
+	}
+	for _, tt := range []struct {
+		name, cmd string
+		allowed   bool
+	}{
+		{name: "templ", cmd: "go tool -modfile=tools/go.mod templ generate", allowed: true},
+		{name: "sqlc", cmd: "go tool -modfile=tools/go.mod sqlc generate", allowed: true},
+		{name: "pnpm", cmd: "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile", allowed: true},
+		{name: "genicons", cmd: "go run ./cmd/genicons", allowed: true},
+		{name: "any character for templ's dot", cmd: "go tool -modfile=tools/goXmod templ generate"},
+		{name: "any character for sqlc's dot", cmd: "go tool -modfile=tools/goXmod sqlc generate"},
+		{name: "any character for genicons' dot", cmd: "go run X/cmd/genicons"},
+		{name: "another flag", cmd: "go tool -modfile=tools/go.mod templ generate --watch"},
+		{name: "a second command", cmd: "go tool -modfile=tools/go.mod sqlc generate; go run ./x"},
+		{name: "a second line", cmd: "go tool -modfile=tools/go.mod sqlc generate\ngo run ./x"},
+		{name: "a leading blank", cmd: " go tool -modfile=tools/go.mod sqlc generate"},
+		{name: "a command before templ", cmd: "env GOFLAGS=-x go tool -modfile=tools/go.mod templ generate"},
+		{name: "a command before pnpm", cmd: "npx pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile"},
+		{name: "a command before genicons", cmd: "env GOFLAGS=-x go run ./cmd/genicons"},
+		{name: "pnpm with another flag", cmd: "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --force"},
+		{name: "another subcommand", cmd: "go tool -modfile=tools/go.mod sqlc diff"},
+		{name: "pnpm running scripts", cmd: "pnpm install --frozen-lockfile --ignore-pnpmfile"},
+		{name: "pnpm running a pnpmfile", cmd: "pnpm install --frozen-lockfile --ignore-scripts"},
+		{name: "pnpm flags reordered", cmd: "pnpm install --ignore-pnpmfile --frozen-lockfile --ignore-scripts"},
+		{name: "pnpm resolving", cmd: "pnpm install --ignore-scripts --ignore-pnpmfile"},
+		{name: "genicons elsewhere", cmd: "go run .Xcmd/genicons"},
+		{name: "genicons with an argument", cmd: "go run ./cmd/genicons -out x"},
+		{name: "another program", cmd: "go run ./cmd/pisati"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := slices.ContainsFunc(patterns, func(re *regexp.Regexp) bool { return re.MatchString(tt.cmd) })
+			if got != tt.allowed {
+				t.Errorf("allowedCommands allow %q: %t, want %t", tt.cmd, got, tt.allowed)
+			}
+		})
+	}
+}
+
+// allowsCommands returns an error unless the workflow's one
+// renovatebot/github-action step sets RENOVATE_ALLOWED_COMMANDS, as a >-
+// block, to a JSON array of exactly allowedCommands; no other line sets
+// the list; and no line turns on Renovate's shell for post-upgrade tasks,
+// in its env name or its config name.
+func allowsCommands(workflow string) error {
+	lines := linesOf(workflow)
+	sets := 0
+	for _, l := range lines {
+		lower := strings.ToLower(l.text)
+		if strings.Contains(lower, "allow_shell_executor") || strings.Contains(lower, "allowshellexecutor") {
+			return fmt.Errorf("line %d turns on Renovate's shell for post-upgrade tasks", l.n)
+		}
+		if strings.Contains(lower, "allowed_commands") || strings.Contains(lower, "allowedcommands") {
+			sets++
+		}
+	}
+	if sets != 1 {
+		return fmt.Errorf("%d lines set Renovate's allowed commands, want one: the Renovate step's env", sets)
+	}
+	var values []string
+	for _, job := range jobsOf(lines) {
+		st := steps(job)
+		for _, i := range stepsWhere(st, isUses("renovatebot/github-action")) {
+			env, err := stepMapping(st[i], "env")
+			if err != nil {
+				return err
+			}
+			v, err := foldedValue(env, "RENOVATE_ALLOWED_COMMANDS")
+			if err != nil {
+				return err
+			}
+			values = append(values, v)
+		}
+	}
+	if len(values) != 1 {
+		return fmt.Errorf("%d renovatebot/github-action steps, want one", len(values))
+	}
+	var got []string
+	if err := json.Unmarshal([]byte(values[0]), &got); err != nil {
+		return fmt.Errorf("RENOVATE_ALLOWED_COMMANDS is not a JSON array of strings: %w", err)
+	}
+	if !slices.Equal(got, allowedCommands) {
+		return fmt.Errorf("RENOVATE_ALLOWED_COMMANDS allows %q, want exactly %q", got, allowedCommands)
+	}
+	return nil
+}
+
+// foldedValue returns the value of key in a mapping's lines, as
+// mappingOf gives them, written as a >- block whose lines share one
+// indent: those lines joined by blanks, as YAML folds them. Any other
+// form of the key is an error, as is the key missing.
+func foldedValue(mapping []string, key string) (string, error) {
+	for i, l := range mapping {
+		v, ok := strings.CutPrefix(l, key+":")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(v) != ">-" {
+			return "", fmt.Errorf("%s: is %q, want a >- block", key, strings.TrimSpace(v))
+		}
+		var parts []string
+		at := -1
+		for _, next := range mapping[i+1:] {
+			ind := indent(next)
+			if ind == 0 {
+				break
+			}
+			if at < 0 {
+				at = ind
+			}
+			if ind != at {
+				return "", fmt.Errorf("%s: the >- block's lines are at more than one indent", key)
+			}
+			parts = append(parts, strings.TrimSpace(next))
+		}
+		if len(parts) == 0 {
+			return "", fmt.Errorf("%s: an empty >- block", key)
+		}
+		return strings.Join(parts, " "), nil
+	}
+	return "", fmt.Errorf("no %s", key)
+}
 
 // scanReadsPackages returns an error unless the workflow's scan job grants
 // packages: read, saying why, and no other job grants packages at all;
