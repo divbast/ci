@@ -43,7 +43,8 @@
 //
 // For grype, -cache names the directory its configuration and its
 // vulnerability database go in, by default divbast-scan's own in the
-// user's cache directory, so a local scan keeps the database between runs.
+// user's cache directory, so a local scan keeps the database between runs,
+// for an image that says ID=dhi and for any that declares lockfiles.
 // It updates the database once, with grype db update, then asks it about a
 // package a record in DHI's own namespace is known to match, for the
 // image's ID_LIKE and VERSION_ID, and refuses to scan unless the match
@@ -79,6 +80,36 @@
 // temporary directory, in $TMPDIR, removed once the scans are done.
 // Without -containerfile, no document of Docker's is applied.
 //
+// An image may declare, in its io.github.divbast.scan.lockfiles label, the
+// lockfiles it ships of the packages that built it: absolute paths in the
+// image, separated by commas, each a pnpm-lock.yaml, as in
+//
+//	LABEL io.github.divbast.scan.lockfiles="/usr/share/doc/pisati/pnpm-lock.yaml"
+//
+// No image scan reads a lockfile, so grype scans each one the label
+// declares, whichever scanner reads the image, as a directory scan would:
+// from the image's layers, written at its path in a temporary directory in
+// $TMPDIR, removed once the scans are done. Its report and CycloneDX go
+// beside -report, as .lockfiles.json and .lockfiles.cdx.json, and its HIGH
+// and CRITICAL findings into the SARIF, in grype's run. Its database is
+// the image's scan's for an image that says ID=dhi; for any other, grype
+// is configured in -cache, and its database updated once. A lockfile in
+// which grype finds no package is refused.
+//
+// A lockfile's findings join the image's, and are judged as every finding
+// is, but one can block only in the lockfile's runtime packages: those an
+// importer's dependencies or optionalDependencies reach, in any of the
+// file's documents. A finding in any other package the lockfile names, one
+// only devDependencies reach, or pnpm's own, from pnpm 12's boot document,
+// is listed and never blocks. So is every finding in a lockfile while
+// IMAGE carries none. To tell, with lockfiles declared, the scan reads
+// IMAGE by the digest the registry served, both for its scan and for a
+// copy of its layers, which skopeo makes for the layout's architecture, as
+// an anonymous client, into the temporary directory; the lockfiles
+// IMAGE's own label declares are scanned as the candidate's are, their
+// report beside -baseline. An image without the label is scanned as
+// before, and nothing of IMAGE is copied.
+//
 // It lists every finding on stdout and, when GitHub Actions sets it,
 // appends them as tables to $GITHUB_STEP_SUMMARY.
 //
@@ -107,14 +138,16 @@
 //
 // Exit codes:
 //
-//	0  nothing IMAGE lacks; or every finding is an advisory, because IMAGE
-//	   is not published yet or is private, or, outside GitHub Actions,
-//	   because the registry refused to show it
-//	1  a finding IMAGE lacks; a Containerfile that cannot be read, or
-//	   that names an image unpinned; the final stage's dhi.io base's VEX
-//	   document not fetched, not verified, or not that image's; a scan
-//	   that failed or saw no packages; a report, of the layout or of
-//	   IMAGE, that recognised no operating system or saw no OS package;
+//	0  nothing IMAGE lacks but findings that never block, in a lockfile's
+//	   build-only packages or in a lockfile while IMAGE carries none; or
+//	   every finding is an advisory, because IMAGE is not published yet or
+//	   is private, or, outside GitHub Actions, because the registry
+//	   refused to show it
+//	1  a finding IMAGE lacks that can block; a Containerfile that cannot
+//	   be read, or that names an image unpinned; the final stage's dhi.io
+//	   base's VEX document not fetched, not verified, or not that image's;
+//	   a scan that failed or saw no packages; a report, of the layout or
+//	   of IMAGE, that recognised no operating system or saw no OS package;
 //	   a layout that is not one linux image, or whose os-release cannot be
 //	   read; for an image that says ID=dhi, grype's database not updated,
 //	   no probe for its release or the probe unanswered from DHI's
@@ -122,7 +155,13 @@
 //	   reports from different databases or without the dhi provider;
 //	   IMAGE not a ghcr.io image, unreadable, or refused though public for
 //	   any reason but a missing tag; the GitHub API not answering, or
-//	   refusing the token; or the summary not written
+//	   refusing the token; a lockfile label, the layout's or IMAGE's, that
+//	   names other than clean absolute paths to pnpm-lock.yaml files, or
+//	   one twice, or a path the image holds no file at, or a symlink; a
+//	   declared lockfile not in pnpm's v9 format as the scan reads it, or
+//	   in which grype found no package; for an image that declares
+//	   lockfiles, grype's database not updated, or IMAGE not copied; or the
+//	   summary not written
 //	2  the command line is wrong
 package main
 
@@ -198,7 +237,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 	containerfile := flags.String("containerfile", "", "the Containerfile `FILE` the image was built from, "+
 		"whose final stage's base, when a dhi.io image, has its signed VEX document applied by both scans")
 	cache := flags.String("cache", "", "the `DIR` grype keeps its configuration and vulnerability database in, "+
-		"for an image that says ID=dhi (default: divbast-scan's own in the user's cache directory)")
+		"for an image that says ID=dhi or declares lockfiles (default: divbast-scan's own in the user's cache directory)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -254,6 +293,16 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		complain(stderr, "could not read the image's own os-release, so nothing says which model to scan it under: %v", err)
 		return 1
 	}
+	locks, err := readLockfiles(ctx, zstd, *layout, layoutArch)
+	if err != nil {
+		complain(stderr, "could not read the lockfiles the image declares, so nothing is scanned: %v", err)
+		return 1
+	}
+	read, err := locks.runtime()
+	if err != nil {
+		complain(stderr, "%v", err)
+		return 1
+	}
 	var sc scanner = &trivyScanner{
 		trivy:  scan.Trivy{Run: r, VEX: docs, Log: stderr},
 		layout: *layout, report: *report, sarif: *sarif, baseline: *baseline,
@@ -289,9 +338,59 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		return 1
 	}
 
+	// The lockfiles' own scan, by grype whatever scans the image, as its
+	// directory catalogers read lockfiles and an image's read none
+	var (
+		g       scan.Grype
+		tmp     string
+		lockRep scan.Report
+	)
+	if len(locks.paths) > 0 {
+		if _, err = fmt.Fprintf(stdout, "%s declares %s in its %s label, so grype scans them too: only findings in their runtime dependencies can block\n",
+			*layout, locks, lockfileLabel); err != nil {
+			complain(stderr, "write the lockfiles: %v", err)
+			return 1
+		}
+		if tmp, err = os.MkdirTemp(getenv("TMPDIR"), name+"-lockfiles-"); err != nil {
+			complain(stderr, "make a directory for the lockfiles: %v", err)
+			return 1
+		}
+		defer func() {
+			if rerr := os.RemoveAll(tmp); rerr != nil {
+				complain(stderr, "remove %s: %v", tmp, rerr)
+			}
+		}()
+		lockSARIF := filepath.Join(tmp, "candidate.sarif")
+		g, err = lockGrype(ctx, sc, *cache, docs, r, stderr)
+		if err == nil {
+			lockRep, err = locks.scan(ctx, g, filepath.Join(tmp, "candidate"), *report+".lockfiles.json", *report+".lockfiles.cdx.json", lockSARIF)
+		}
+		if err == nil {
+			err = g.SARIF(*report+".lockfiles.json", lockSARIF)
+		}
+		if err == nil {
+			err = scan.MergeSARIF(*sarif, lockSARIF)
+		}
+		if err != nil {
+			complain(stderr, "%v", err)
+			return 1
+		}
+	}
+
 	inActions := getenv("GITHUB_ACTIONS") == "true"
 	lookup := registry.Lookup{Run: r, GH: ghapi.Client{Run: r}, RegistryOnly: !inActions}
-	state, err := lookup.Presence(ctx, *published)
+	// With lockfiles, the published image is read twice, by its scanner and
+	// for its layers, so both read it by the digest the registry served
+	ref := *published
+	var state registry.State
+	if len(locks.paths) > 0 {
+		var pinned string
+		if pinned, state, err = lookup.Pin(ctx, *published); pinned != "" {
+			ref = pinned
+		}
+	} else {
+		state, err = lookup.Presence(ctx, *published)
+	}
 	advisory, err := unshippedFor(state, err, inActions, *published)
 	if err != nil {
 		complain(stderr, "could not tell whether %s is published, so no finding can be told apart from one already published: %v", *published, err)
@@ -302,14 +401,27 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		shipped          []scan.Finding
 		inventory        []scan.Pkg
 		against, warning string
+		uncarried        bool
 	)
 	if advisory == nil {
 		var pub scan.Report
-		if pub, err = sc.published(ctx, *published, arch); err != nil {
+		if pub, err = sc.published(ctx, ref, arch); err != nil {
 			complain(stderr, "%v", err)
 			return 1
 		}
 		shipped, inventory, against = pub.Findings, pub.Inventory, pub.Ref
+		if len(locks.paths) > 0 {
+			if uncarried, err = publishedLockfiles(ctx, lookup, zstd, g, ref, arch, tmp, *baseline, &shipped, &inventory); err != nil {
+				complain(stderr, "could not read the lockfiles %s declares, so no finding in a lockfile can be told apart from one already published: %v", ref, err)
+				return 1
+			}
+			if uncarried {
+				if _, err = fmt.Fprintf(stdout, "%s carries no lockfile, so the findings in %s are listed, not blocking, until a published image carries one\n", ref, locks); err != nil {
+					complain(stderr, "write the lockfiles: %v", err)
+					return 1
+				}
+			}
+		}
 	} else {
 		// With nothing published, nothing is already shipped, and a first
 		// image could never pass a scan that blocks on what it inherits
@@ -329,7 +441,8 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		}
 	}
 
-	split := scan.Compare(candidate.Findings, shipped, inventory)
+	held(lockRep.Findings, read, uncarried)
+	split := scan.Compare(slices.Concat(candidate.Findings, lockRep.Findings), shipped, inventory)
 	verdict, heading := "new, so blocking", "New, so blocking"
 	if advisory != nil {
 		verdict, heading = "advisory: "+advisory.heading, "Advisory: "+advisory.heading
@@ -345,7 +458,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 
 	switch {
 	case advisory != nil:
-		_, err = fmt.Fprintf(stdout, "%s %s, so all %d finding(s) are advisory\n", *published, advisory.reason, len(split.New)+len(split.Listed))
+		_, err = fmt.Fprintf(stdout, "%s %s, so all %d finding(s) are advisory\n", *published, advisory.reason, len(split.New)+len(split.Listed)+len(split.Held))
 	case len(split.New) > 0:
 		move := "Move what carries them"
 		if len(vex) > 0 {
@@ -353,10 +466,15 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		}
 		complain(stderr, "%d finding(s) the published image does not have. %s.", len(split.New), move)
 		return 1
-	case len(split.Listed) > 0:
-		_, err = fmt.Fprintf(stdout, "nothing new against what is published (%d advisory, %d listed with no severity)\n", len(split.Old), len(split.Listed))
 	default:
-		_, err = fmt.Fprintf(stdout, "nothing new against what is published (%d advisory)\n", len(split.Old))
+		counts := fmt.Sprintf("%d advisory", len(split.Old))
+		if len(split.Listed) > 0 {
+			counts += fmt.Sprintf(", %d listed with no severity", len(split.Listed))
+		}
+		if len(split.Held) > 0 {
+			counts += fmt.Sprintf(", %d in lockfiles listed, not blocking", len(split.Held))
+		}
+		_, err = fmt.Fprintf(stdout, "nothing new against what is published (%s)\n", counts)
 	}
 	if err != nil {
 		complain(stderr, "write the verdict: %v", err)
