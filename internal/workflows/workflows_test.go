@@ -976,7 +976,7 @@ const hostRulesExpr = `${{ inputs.dhi-username != '' && format('[{{"matchHost":"
 var allowedCommands = []string{
 	`^go tool -modfile=tools/go\.mod templ generate$`,
 	`^go tool -modfile=tools/go\.mod sqlc generate$`,
-	`^pnpm install --frozen-lockfile --ignore-scripts$`,
+	`^pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile$`,
 	`^go run \./cmd/genicons$`,
 }
 
@@ -999,14 +999,15 @@ func TestRenovateAllowedCommands(t *testing.T) {
 		genicons = `"^go run \\./cmd/genicons$"`
 	)
 	for name, mutant := range map[string]string{
-		"a dot escaped once":            strings.Replace(renovate, `go\\.mod templ`, `go\.mod templ`, 1),
-		"a pattern unanchored":          strings.Replace(renovate, genicons, `"go run \\./cmd/genicons"`, 1),
-		"pnpm install running scripts":  strings.Replace(renovate, ` --ignore-scripts$"`, `$"`, 1),
-		"a pattern missing":             strings.Replace(renovate, ",\n            "+genicons+"]", "]", 1),
-		"an extra pattern":              strings.Replace(renovate, genicons+"]", genicons+`, "^just generate$"]`, 1),
-		"the list set again on the job": strings.Replace(renovate, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    env:\n      RENOVATE_ALLOWED_COMMANDS: '[\".*\"]'\n", 1),
-		"the shell turned on":           strings.Replace(renovate, key, "          RENOVATE_ALLOW_SHELL_EXECUTOR_FOR_POST_UPGRADE_COMMANDS: 'true'\n"+key, 1),
-		"the list on one line":          strings.Replace(renovate, key+" >-\n            [", key+" [", 1),
+		"a dot escaped once":              strings.Replace(renovate, `go\\.mod templ`, `go\.mod templ`, 1),
+		"a pattern unanchored":            strings.Replace(renovate, genicons, `"go run \\./cmd/genicons"`, 1),
+		"pnpm install running scripts":    strings.Replace(renovate, ` --ignore-scripts --ignore-pnpmfile$"`, ` --ignore-pnpmfile$"`, 1),
+		"pnpm install running a pnpmfile": strings.Replace(renovate, ` --ignore-pnpmfile$"`, `$"`, 1),
+		"a pattern missing":               strings.Replace(renovate, ",\n            "+genicons+"]", "]", 1),
+		"an extra pattern":                strings.Replace(renovate, genicons+"]", genicons+`, "^just generate$"]`, 1),
+		"the list set again on the job":   strings.Replace(renovate, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    env:\n      RENOVATE_ALLOWED_COMMANDS: '[\".*\"]'\n", 1),
+		"the shell turned on":             strings.Replace(renovate, key, "          RENOVATE_ALLOW_SHELL_EXECUTOR_FOR_POST_UPGRADE_COMMANDS: 'true'\n"+key, 1),
+		"the list on one line":            strings.Replace(renovate, key+" >-\n            [", key+" [", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1039,7 +1040,7 @@ func TestAllowedCommandsMatchOnlyTheirOwn(t *testing.T) {
 	}{
 		{name: "templ", cmd: "go tool -modfile=tools/go.mod templ generate", allowed: true},
 		{name: "sqlc", cmd: "go tool -modfile=tools/go.mod sqlc generate", allowed: true},
-		{name: "pnpm", cmd: "pnpm install --frozen-lockfile --ignore-scripts", allowed: true},
+		{name: "pnpm", cmd: "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile", allowed: true},
 		{name: "genicons", cmd: "go run ./cmd/genicons", allowed: true},
 		{name: "any character for templ's dot", cmd: "go tool -modfile=tools/goXmod templ generate"},
 		{name: "any character for sqlc's dot", cmd: "go tool -modfile=tools/goXmod sqlc generate"},
@@ -1049,13 +1050,14 @@ func TestAllowedCommandsMatchOnlyTheirOwn(t *testing.T) {
 		{name: "a second line", cmd: "go tool -modfile=tools/go.mod sqlc generate\ngo run ./x"},
 		{name: "a leading blank", cmd: " go tool -modfile=tools/go.mod sqlc generate"},
 		{name: "a command before templ", cmd: "env GOFLAGS=-x go tool -modfile=tools/go.mod templ generate"},
-		{name: "a command before pnpm", cmd: "npx pnpm install --frozen-lockfile --ignore-scripts"},
+		{name: "a command before pnpm", cmd: "npx pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile"},
 		{name: "a command before genicons", cmd: "env GOFLAGS=-x go run ./cmd/genicons"},
-		{name: "pnpm with another flag", cmd: "pnpm install --frozen-lockfile --ignore-scripts --force"},
+		{name: "pnpm with another flag", cmd: "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --force"},
 		{name: "another subcommand", cmd: "go tool -modfile=tools/go.mod sqlc diff"},
-		{name: "pnpm running scripts", cmd: "pnpm install --frozen-lockfile"},
-		{name: "pnpm flags reordered", cmd: "pnpm install --ignore-scripts --frozen-lockfile"},
-		{name: "pnpm resolving", cmd: "pnpm install --ignore-scripts"},
+		{name: "pnpm running scripts", cmd: "pnpm install --frozen-lockfile --ignore-pnpmfile"},
+		{name: "pnpm running a pnpmfile", cmd: "pnpm install --frozen-lockfile --ignore-scripts"},
+		{name: "pnpm flags reordered", cmd: "pnpm install --ignore-pnpmfile --frozen-lockfile --ignore-scripts"},
+		{name: "pnpm resolving", cmd: "pnpm install --ignore-scripts --ignore-pnpmfile"},
 		{name: "genicons elsewhere", cmd: "go run .Xcmd/genicons"},
 		{name: "genicons with an argument", cmd: "go run ./cmd/genicons -out x"},
 		{name: "another program", cmd: "go run ./cmd/pisati"},

@@ -142,8 +142,12 @@ jobs:
           # - pnpm install puts the locked packages in node_modules, which
           #   Renovate's own lockfile update never creates, for genicons to
           #   read; --frozen-lockfile installs only what the lockfile holds,
-          #   and --ignore-scripts runs no package's install script;
+          #   --ignore-scripts runs no package's install script, and
+          #   --ignore-pnpmfile runs no pnpmfile hook of the repository's;
           # - go run ./cmd/genicons writes the icons from lucide-static.
+          # The patterns bound the command line only: a repository's .npmrc
+          # or pnpm-workspace.yaml can still change what pnpm does, as the
+          # repository's own code runs here anyway.
           # Renovate parses the value as JSON5, which reads an unknown escape
           # such as a backslash before a dot as the dot alone, matching any
           # character. So each backslash is doubled, to reach the pattern as
@@ -151,5 +155,5 @@ jobs:
           RENOVATE_ALLOWED_COMMANDS: >-
             ["^go tool -modfile=tools/go\\.mod templ generate$",
             "^go tool -modfile=tools/go\\.mod sqlc generate$",
-            "^pnpm install --frozen-lockfile --ignore-scripts$",
+            "^pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile$",
             "^go run \\./cmd/genicons$"]
