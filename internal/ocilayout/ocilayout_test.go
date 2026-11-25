@@ -229,3 +229,36 @@ func TestOpenRefuses(t *testing.T) {
 		t.Errorf("Open(empty) error = %v, want one naming linux/arm64", err)
 	}
 }
+
+// TestOpenAsNamesTheImage checks that every error of an Image OpenAs
+// opened names the image as the caller does, and never the layout's path:
+// a copy of a published image is a temporary directory, gone by the time
+// anyone reads the error.
+func TestOpenAsNamesTheImage(t *testing.T) {
+	t.Parallel()
+	const name = "ghcr.io/divbast/x@sha256:00"
+	check := func(what string, err error, dir string) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), name) || strings.Contains(err.Error(), dir) {
+			t.Errorf("%s error = %v, want one naming %s and not %s", what, err, name, dir)
+		}
+	}
+
+	empty := t.TempDir()
+	if err := os.WriteFile(filepath.Join(empty, "index.json"), []byte(`{"schemaVersion":2,"manifests":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := OpenAs(empty, "arm64", name)
+	check("OpenAs(empty)", err, empty)
+
+	dir := write(t, "{", layer(t, file{name: "a/pnpm-lock.yaml", body: "12345"}))
+	im, err := OpenAs(dir, "arm64", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = im.Close() }()
+	_, err = im.Config()
+	check("Config(not JSON)", err, dir)
+	_, err = im.Files(t.Context(), execx.OS{}, func(string) (int64, bool) { return 4, true })
+	check("Files(past the limit)", err, dir)
+}

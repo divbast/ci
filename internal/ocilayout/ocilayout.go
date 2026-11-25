@@ -31,8 +31,9 @@ const (
 
 // Image is one linux image of an OCI layout, open for reading.
 type Image struct {
-	root     *os.Root
-	layout   string
+	root *os.Root
+	// name is what errors call the image.
+	name     string
 	manifest manifest
 	platform string
 }
@@ -43,10 +44,19 @@ type Image struct {
 // none names a platform. With arch "", it opens the one linux image the
 // layout holds, of any architecture. A layout it cannot read, or one with
 // no such image or several, is an error. The caller closes the Image.
-func Open(layout, arch string) (im *Image, err error) {
+func Open(layout, arch string) (*Image, error) { return OpenAs(layout, arch, layout) }
+
+// OpenAs opens the image as [Open] does, but every error it or the Image
+// returns calls the image name, and none names the layout's path: for a
+// layout copied into a temporary directory, gone once the scan is done.
+func OpenAs(layout, arch, name string) (im *Image, err error) {
 	root, err := os.OpenRoot(layout)
 	if err != nil {
-		return nil, fmt.Errorf("open the OCI layout: %w", err)
+		var pe *os.PathError
+		if name == layout || !errors.As(err, &pe) {
+			return nil, fmt.Errorf("open the OCI layout: %w", err)
+		}
+		return nil, fmt.Errorf("open the OCI layout of %s: %w", name, pe.Err)
 	}
 	defer func() {
 		if err != nil {
@@ -55,23 +65,23 @@ func Open(layout, arch string) (im *Image, err error) {
 	}()
 	var top index
 	if err = readJSON(root, "index.json", &top); err != nil {
-		return nil, fmt.Errorf("%s: %w", layout, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	found, err := images(root, top, arch, 0)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", layout, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	switch {
 	case arch == "" && len(found) != 1:
-		return nil, fmt.Errorf("%s holds %d linux images, where the scan needs one, so which to scan is unclear", layout, len(found))
+		return nil, fmt.Errorf("%s holds %d linux images, where the scan needs one, so which to scan is unclear", name, len(found))
 	case len(found) == 0:
-		return nil, fmt.Errorf("%s holds no linux/%s image", layout, arch)
+		return nil, fmt.Errorf("%s holds no linux/%s image", name, arch)
 	case len(found) > 1:
-		return nil, fmt.Errorf("%s holds %d linux/%s images, so which one was built is unclear", layout, len(found), arch)
+		return nil, fmt.Errorf("%s holds %d linux/%s images, so which one was built is unclear", name, len(found), arch)
 	}
-	im = &Image{root: root, layout: layout, platform: found[0].arch}
+	im = &Image{root: root, name: name, platform: found[0].arch}
 	if err = readJSON(root, found[0].path, &im.manifest); err != nil {
-		return nil, fmt.Errorf("%s: %w", layout, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	return im, nil
 }
@@ -95,14 +105,14 @@ type Config struct {
 func (im *Image) Config() (Config, error) {
 	p, err := blobPath(im.manifest.Config.Digest)
 	if err != nil {
-		return Config{}, fmt.Errorf("%s: %w", im.layout, err)
+		return Config{}, fmt.Errorf("%s: %w", im.name, err)
 	}
 	var raw struct {
 		Architecture string
 		Config       struct{ Labels map[string]string }
 	}
 	if err = readJSON(im.root, p, &raw); err != nil {
-		return Config{}, fmt.Errorf("%s: %w", im.layout, err)
+		return Config{}, fmt.Errorf("%s: %w", im.name, err)
 	}
 	return Config{Architecture: raw.Architecture, Labels: raw.Config.Labels}, nil
 }
@@ -125,7 +135,7 @@ func (im *Image) Files(ctx context.Context, zstd execx.StreamRunner, keep func(n
 	fs := rootfs{}
 	for _, l := range im.manifest.Layers {
 		if err := fs.apply(ctx, zstd, im.root, l.Digest, keep); err != nil {
-			return nil, fmt.Errorf("%s: layer %s: %w", im.layout, l.Digest, err)
+			return nil, fmt.Errorf("%s: layer %s: %w", im.name, l.Digest, err)
 		}
 	}
 	return fs, nil
