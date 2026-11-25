@@ -1,0 +1,340 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "metadata": {
+    "component": {
+      "type": "file",
+      "name": "root"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "@pnpm/exe.android-arm64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.android-arm64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.android-x64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.android-x64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.darwin-arm64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.darwin-arm64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.darwin-x64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.darwin-x64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.freebsd-x64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.freebsd-x64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.linux-arm64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.linux-arm64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.linux-arm64-musl",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.linux-arm64-musl@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.linux-ppc64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.linux-ppc64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.linux-riscv64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.linux-riscv64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.linux-s390x",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.linux-s390x@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.linux-x64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.linux-x64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.linux-x64-musl",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.linux-x64-musl@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.win32-arm64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.win32-arm64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "@pnpm/exe.win32-x64",
+      "version": "12.14.0",
+      "purl": "pkg:npm/%40pnpm/exe.win32-x64@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "debug",
+      "version": "2.6.9",
+      "purl": "pkg:npm/debug@2.6.9",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "is-number",
+      "version": "7.0.0",
+      "purl": "pkg:npm/is-number@7.0.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "js-tokens",
+      "version": "4.0.0",
+      "purl": "pkg:npm/js-tokens@4.0.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lodash",
+      "version": "4.17.20",
+      "purl": "pkg:npm/lodash@4.17.20",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "loose-envify",
+      "version": "1.4.0",
+      "purl": "pkg:npm/loose-envify@1.4.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "minimist",
+      "version": "1.2.5",
+      "purl": "pkg:npm/minimist@1.2.5",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "minimist",
+      "version": "1.2.6",
+      "purl": "pkg:npm/minimist@1.2.6",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "mkdirp",
+      "version": "0.5.5",
+      "purl": "pkg:npm/mkdirp@0.5.5",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ms",
+      "version": "2.0.0",
+      "purl": "pkg:npm/ms@2.0.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "pnpm",
+      "version": "12.14.0",
+      "purl": "pkg:npm/pnpm@12.14.0",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "react",
+      "version": "18.3.1",
+      "purl": "pkg:npm/react@18.3.1",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "react-dom",
+      "version": "18.3.1",
+      "purl": "pkg:npm/react-dom@18.3.1",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "scheduler",
+      "version": "0.23.2",
+      "purl": "pkg:npm/scheduler@0.23.2",
+      "properties": [
+        {
+          "name": "syft:location:0:path",
+          "value": "/usr/share/doc/app/pnpm-lock.yaml"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "name": "/usr/share/doc/app/pnpm-lock.yaml"
+    }
+  ]
+}

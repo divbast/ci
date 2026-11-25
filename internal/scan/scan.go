@@ -36,10 +36,26 @@ import (
 // one. With Trivy on both sides of a comparison and one database, the
 // IDs themselves agree. Namespace is where the scanner's database keeps
 // the advisory, such as dhi:distro:dhi:13, where it says; Trivy does not.
+//
+// Hold, when not "", is why the finding never blocks when the published
+// image lacks it, as words that follow "new": [BuildOnly] or [Uncarried].
 type Finding struct {
 	ID, Pkg, Version, Fixed, Severity, URL, Where, Namespace string
 	Aliases                                                  []string
+	Hold                                                     string
 }
+
+// The holds a finding in a lockfile an image declares can carry.
+const (
+	// BuildOnly is a finding in a package the lockfile places outside
+	// every runtime graph: only devDependencies reach it, or it is
+	// pnpm's own. Only what the image runs blocks a release.
+	BuildOnly = "in a lockfile's build-only packages"
+	// Uncarried is a finding in a lockfile while the published image
+	// carries none: until one is published, nothing shows which of its
+	// findings are already shipped.
+	Uncarried = "in a lockfile the published image does not carry"
+)
 
 // Pkg is a package an image ships, by name and version, the version
 // written as a finding's is.
@@ -49,7 +65,8 @@ type Pkg struct{ Name, Version string }
 // image lacks, New, and those it has, Old. Listed are the findings the
 // published image lacks that carry no severity, UNKNOWN: reported, never
 // blocking, as Trivy's HIGH,CRITICAL filter leaves them out altogether.
-type Split struct{ New, Old, Listed []Finding }
+// Held are those it lacks that carry a Hold: reported, never blocking.
+type Split struct{ New, Old, Listed, Held []Finding }
 
 // Report is what a Trivy JSON report says: its findings, in Trivy's order;
 // how many packages it saw; the image's architecture; and what it
@@ -67,7 +84,9 @@ type Split struct{ New, Old, Listed []Finding }
 //
 // Inventory is every package the report lists by name, OS and language
 // alike, with its version as a finding in it would give it; OSPURLs is the
-// package URL of each OS package, where the scanner gives them.
+// package URL of each OS package, where the scanner gives them. PackagesIn
+// is how many packages each file holds, by its path with no leading
+// slash, where the scanner says which file it found each in.
 //
 // DB is the vulnerability database the scan used, as the scanner names
 // it, and Providers the sources of advisories it holds, where the
@@ -82,6 +101,7 @@ type Report struct {
 	Ref        string
 	Inventory  []Pkg
 	OSPURLs    []string
+	PackagesIn map[string]int
 	DB         string
 	Providers  []string
 }
@@ -191,7 +211,8 @@ func (f *Finding) ids() []string { return append([]string{f.ID}, f.Aliases...) }
 // between the published image and the candidate, as when a base image
 // moves to its vendor's own advisories and every ID changes. A package
 // new to the image, or at a new version, is still judged by its IDs. A
-// new finding with no severity goes to Listed.
+// new finding with a Hold goes to Held, and any other new one with no
+// severity to Listed.
 func Compare(candidate, published []Finding, shipped []Pkg) Split {
 	known := make(map[key]bool, len(published))
 	for i := range published {
@@ -210,6 +231,8 @@ func Compare(candidate, published []Finding, shipped []Pkg) Split {
 		switch {
 		case out[Pkg{f.Pkg, f.Version}] || slices.ContainsFunc(f.ids(), func(id string) bool { return known[key{id, f.Pkg}] }):
 			s.Old = append(s.Old, *f)
+		case f.Hold != "":
+			s.Held = append(s.Held, *f)
 		case f.Severity == "UNKNOWN":
 			s.Listed = append(s.Listed, *f)
 		default:

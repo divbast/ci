@@ -334,11 +334,11 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 	if advisory != nil {
 		verdict, heading = "advisory: "+advisory.heading, "Advisory: "+advisory.heading
 	}
-	if _, err = io.WriteString(stdout, scan.Listing(against, verdict, split)); err != nil {
+	if _, err = io.WriteString(stdout, scan.Listing(against, verdict, &split)); err != nil {
 		complain(stderr, "write the findings: %v", err)
 		return 1
 	}
-	if err = appendTo(getenv("GITHUB_STEP_SUMMARY"), scan.Summary(arch, against, heading, warning, split)); err != nil {
+	if err = appendTo(getenv("GITHUB_STEP_SUMMARY"), scan.Summary(arch, against, heading, warning, &split)); err != nil {
 		complain(stderr, "write the run summary: %v", err)
 		return 1
 	}

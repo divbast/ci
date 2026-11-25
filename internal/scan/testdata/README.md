@@ -163,3 +163,44 @@ keep(["bomFormat", "specVersion", "metadata", "components"])
 `grype-dhi.sarif` keeps the results and rules of those 7 matches, without
 each rule's long descriptions, and with the layout's path replaced by
 `layout`.
+
+## Grype on a lockfile
+
+Recorded with Grype 0.122.1 on 2026-11-25, offline, against its
+database of 2026-11-24 (the `from` in the report), with a
+configuration as `Grype.WriteConfig` writes one.
+
+The input is `internal/pnpmlock/testdata/pnpm-lock.yaml`, which pnpm 12
+wrote, as its README says, placed where an image would ship it, under a
+directory of its own, `root`, as divbast-scan writes a lockfile an image
+declares:
+
+```sh
+mkdir -p root/usr/share/doc/app
+cp pnpm-lock.yaml root/usr/share/doc/app/
+grype -c grype.yaml dir:root \
+    -o json=lock.json -o cyclonedx-json=lock.cdx.json -o sarif=lock.sarif
+```
+
+grype found 27 npm packages, both of pnpm 12's documents, and five
+findings: lodash 4.17.20, a devDependency, two HIGH and two MEDIUM, and
+minimist 1.2.5, a runtime dependency, one CRITICAL.
+
+`grype-lockfile.json` is the report, trimmed by the jq program above with
+`$ids` null, and with the directory's path, the source's target, replaced
+by `root`. `grype-lockfile.cdx.json` keeps each component's type, name,
+version and PURL, as above, and of its properties only
+`syft:location:0:path`, the file grype found it in, which the scan counts
+packages by:
+
+```jq
+def keep($ks): with_entries(select(.key | IN($ks[])));
+keep(["bomFormat", "specVersion", "metadata", "components"])
+| .metadata |= (keep(["component"]) | .component |= (keep(["type", "name"]) | .name = "root"))
+| .components |= map(keep(["type", "name", "version", "purl", "properties"])
+    | if has("properties") then .properties |= map(select(.name == "syft:location:0:path")) else . end)
+```
+
+`grype-lockfile.sarif` keeps every result and rule, without each rule's
+long descriptions. grype names no host path in a directory scan's SARIF:
+each result is at the lockfile's path in the image.

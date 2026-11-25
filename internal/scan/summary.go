@@ -5,6 +5,7 @@ package scan
 
 import (
 	"fmt"
+	"iter"
 	"strings"
 )
 
@@ -21,9 +22,9 @@ func (f Finding) String() string {
 
 // Listing returns what the scan prints: what it compared with, then how
 // many findings the published image lacks, under verdict, and each of
-// them, then those of them with no severity, when there are any, then how
-// many it has, and each of those.
-func Listing(against, verdict string, s Split) string {
+// them, then those of them with no severity, and those held for each
+// Hold, when there are any, then how many it has, and each of those.
+func Listing(against, verdict string, s *Split) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "compared with %s\n", against)
 	fmt.Fprintf(&b, "%d %s:\n", len(s.New), verdict)
@@ -36,6 +37,12 @@ func Listing(against, verdict string, s Split) string {
 			fmt.Fprintf(&b, "  %s\n", &s.Listed[i])
 		}
 	}
+	for hold, fs := range held(s.Held) {
+		fmt.Fprintf(&b, "%d new %s, so listed, not blocking:\n", len(fs), hold)
+		for i := range fs {
+			fmt.Fprintf(&b, "  %s\n", &fs[i])
+		}
+	}
 	fmt.Fprintf(&b, "%d already published, so advisory:\n", len(s.Old))
 	for i := range s.Old {
 		fmt.Fprintf(&b, "  %s\n", &s.Old[i])
@@ -46,8 +53,9 @@ func Listing(against, verdict string, s Split) string {
 // Summary returns the Markdown the scan appends to the run's summary page
 // for arch: what it compared with, warning as a callout unless it is
 // empty, then a table of the findings the published image lacks, under
-// heading, and one of those it has.
-func Summary(arch, against, heading, warning string, s Split) string {
+// heading, then one of those of them with no severity, and one of those
+// held for each Hold, when there are any, and one of those it has.
+func Summary(arch, against, heading, warning string, s *Split) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "### Vulnerability scan, %s\n\n", arch)
 	fmt.Fprintf(&b, "Compared with `%s`.\n\n", against)
@@ -60,10 +68,35 @@ func Summary(arch, against, heading, warning string, s Split) string {
 		fmt.Fprintf(&b, "\n**New with no severity, so listed, not blocking: %d**\n\n", len(s.Listed))
 		table(&b, s.Listed)
 	}
+	for hold, fs := range held(s.Held) {
+		fmt.Fprintf(&b, "\n**New %s, so listed, not blocking: %d**\n\n", hold, len(fs))
+		table(&b, fs)
+	}
 	fmt.Fprintf(&b, "\n**Already published, so advisory: %d**\n\n", len(s.Old))
 	table(&b, s.Old)
 	b.WriteString("\n")
 	return b.String()
+}
+
+// held yields findings by their Hold, each Hold once, in the order it
+// first appears, with its findings in theirs.
+func held(findings []Finding) iter.Seq2[string, []Finding] {
+	return func(yield func(string, []Finding) bool) {
+		var holds []string
+		by := map[string][]Finding{}
+		for i := range findings {
+			f := &findings[i]
+			if _, ok := by[f.Hold]; !ok {
+				holds = append(holds, f.Hold)
+			}
+			by[f.Hold] = append(by[f.Hold], *f)
+		}
+		for _, h := range holds {
+			if !yield(h, by[h]) {
+				return
+			}
+		}
+	}
 }
 
 func table(b *strings.Builder, findings []Finding) {
