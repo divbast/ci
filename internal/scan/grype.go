@@ -156,9 +156,26 @@ func (g Grype) Layout(ctx context.Context, layout, arch, report, cdx, sarif stri
 	return g.logged(ctx, args...)
 }
 
-// SARIF rewrites the SARIF at sarif, from the Layout run that wrote the
-// report at report, to hold the HIGH and CRITICAL findings alone, as the
-// verdict counts them, for code scanning.
+// Dir scans the files under dir, where the scan wrote files an image
+// declares, each at its path in the image, and writes the report to
+// report, its CycloneDX to cdx, and its SARIF to sarif, unless sarif is "".
+// grype reads a directory with its directory catalogers, which read
+// lockfiles, where an image's catalogers read none.
+func (g Grype) Dir(ctx context.Context, dir, report, cdx, sarif string) error {
+	rest := []string{"dir:" + dir, "-o", "json=" + report, "-o", "cyclonedx-json=" + cdx}
+	if sarif != "" {
+		rest = append(rest, "-o", "sarif="+sarif)
+	}
+	args, err := g.args(slices.Concat(rest, g.vexArgs())...)
+	if err != nil {
+		return err
+	}
+	return g.logged(ctx, args...)
+}
+
+// SARIF rewrites the SARIF at sarif, from the Layout or Dir run that wrote
+// the report at report, to hold the HIGH and CRITICAL findings alone, as
+// the verdict counts them, for code scanning.
 func (Grype) SARIF(report, sarif string) error { return filterSARIF(report, sarif) }
 
 // Published scans image as its registry serves it for linux/arch, and
@@ -242,8 +259,13 @@ type cdxJSON struct {
 	Components []struct {
 		Type, Name, Version string
 		PURL                string `json:"purl"`
+		Properties          []struct{ Name, Value string }
 	}
 }
+
+// cdxLocation is the CycloneDX property grype gives the file it found a
+// package in.
+const cdxLocation = "syft:location:0:path"
 
 // osPURLTypes are the package URL types of an OS's packages.
 var osPURLTypes = []string{"pkg:deb/", "pkg:rpm/", "pkg:apk/", "pkg:alpm/"}
@@ -270,7 +292,7 @@ func keptSeverity(sev string) (string, bool) {
 // same scan, which lists every package where the report lists only those
 // with findings: HIGH, CRITICAL and UNKNOWN findings, each with its aliases
 // and the namespace of its record, the OS grype identified, its packages,
-// and the database it read.
+// and how many of them each file holds, and the database it read.
 func ParseGrype(report, cdx io.Reader) (Report, error) {
 	var raw grypeJSON
 	if err := decodeAll(report, &raw); err != nil {
@@ -336,6 +358,14 @@ func ParseGrype(report, cdx io.Reader) (Report, error) {
 		}
 		rep.Packages++
 		rep.Inventory = append(rep.Inventory, Pkg{c.Name, c.Version})
+		for _, p := range c.Properties {
+			if p.Name == cdxLocation {
+				if rep.PackagesIn == nil {
+					rep.PackagesIn = map[string]int{}
+				}
+				rep.PackagesIn[strings.TrimPrefix(p.Value, "/")]++
+			}
+		}
 		if slices.ContainsFunc(osPURLTypes, func(p string) bool { return strings.HasPrefix(c.PURL, p) }) {
 			rep.OSPackages++
 			rep.OSPURLs = append(rep.OSPURLs, c.PURL)
@@ -413,6 +443,78 @@ func filterSARIF(report, sarif string) error {
 		return err
 	}
 	return writeFileIn(sarif, data)
+}
+
+// MergeSARIF adds the runs of the SARIF at from to the SARIF at into. A
+// run whose tool a run of into's names too goes into that run: its
+// results after that run's own, and each of its rules the run lacks.
+// Any other run goes beside into's. Code scanning refuses a file with two
+// runs of one tool in one category, and the scan uploads one file for
+// each architecture, so each tool keeps one run there.
+func MergeSARIF(into, from string) error {
+	var dst, src map[string]any
+	if err := readJSONFile(into, &dst); err != nil {
+		return fmt.Errorf("read the SARIF to merge into: %w", err)
+	}
+	if err := readJSONFile(from, &src); err != nil {
+		return fmt.Errorf("read the SARIF to merge: %w", err)
+	}
+	runs, ok := dst["runs"].([]any)
+	if !ok {
+		return fmt.Errorf("%s holds no runs to merge into", into)
+	}
+	more, _ := src["runs"].([]any)
+	for _, r := range more {
+		run, _ := r.(map[string]any)
+		i := slices.IndexFunc(runs, func(x any) bool {
+			other, _ := x.(map[string]any)
+			return toolName(other) == toolName(run)
+		})
+		if i < 0 {
+			runs = append(runs, run)
+			continue
+		}
+		target, _ := runs[i].(map[string]any)
+		results, _ := target["results"].([]any)
+		added, _ := run["results"].([]any)
+		target["results"] = append(results, added...)
+		have := map[string]bool{}
+		rules := driverOf(target)["rules"]
+		kept, _ := rules.([]any)
+		for _, rule := range kept {
+			id, _ := rule.(map[string]any)["id"].(string)
+			have[id] = true
+		}
+		newRules, _ := driverOf(run)["rules"].([]any)
+		for _, rule := range newRules {
+			if id, _ := rule.(map[string]any)["id"].(string); !have[id] {
+				kept = append(kept, rule)
+				have[id] = true
+			}
+		}
+		if d := driverOf(target); d != nil {
+			d["rules"] = kept
+		}
+	}
+	dst["runs"] = runs
+	data, err := json.MarshalIndent(dst, "", " ")
+	if err != nil {
+		return err
+	}
+	return writeFileIn(into, data)
+}
+
+// driverOf is a SARIF run's tool.driver, or nil.
+func driverOf(run map[string]any) map[string]any {
+	tool, _ := run["tool"].(map[string]any)
+	driver, _ := tool["driver"].(map[string]any)
+	return driver
+}
+
+// toolName is the name of a SARIF run's tool.
+func toolName(run map[string]any) string {
+	name, _ := driverOf(run)["name"].(string)
+	return name
 }
 
 // readJSONFile decodes the JSON file at path, read through an [os.Root] on

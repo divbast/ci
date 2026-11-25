@@ -1,0 +1,214 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "grype",
+          "version": "0.122.1",
+          "informationUri": "https://github.com/anchore/grype",
+          "rules": [
+            {
+              "id": "GHSA-35jh-r3h4-6jhm-lodash",
+              "name": "JavascriptMatcherExactDirectMatch",
+              "shortDescription": {
+                "text": "GHSA-35jh-r3h4-6jhm high vulnerability for lodash package"
+              },
+              "helpUri": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+              "properties": {
+                "purls": [
+                  "pkg:npm/lodash@4.17.20"
+                ],
+                "security-severity": "7.2"
+              }
+            },
+            {
+              "id": "GHSA-xvch-5gv4-984h-minimist",
+              "name": "JavascriptMatcherExactDirectMatch",
+              "shortDescription": {
+                "text": "GHSA-xvch-5gv4-984h critical vulnerability for minimist package"
+              },
+              "helpUri": "https://github.com/advisories/GHSA-xvch-5gv4-984h",
+              "properties": {
+                "purls": [
+                  "pkg:npm/minimist@1.2.5"
+                ],
+                "security-severity": "9.8"
+              }
+            },
+            {
+              "id": "GHSA-29mw-wpgm-hmr9-lodash",
+              "name": "JavascriptMatcherExactDirectMatch",
+              "shortDescription": {
+                "text": "GHSA-29mw-wpgm-hmr9 medium vulnerability for lodash package"
+              },
+              "helpUri": "https://github.com/advisories/GHSA-29mw-wpgm-hmr9",
+              "properties": {
+                "purls": [
+                  "pkg:npm/lodash@4.17.20"
+                ],
+                "security-severity": "5.3"
+              }
+            },
+            {
+              "id": "GHSA-r5fr-rjxr-66jc-lodash",
+              "name": "JavascriptMatcherExactDirectMatch",
+              "shortDescription": {
+                "text": "GHSA-r5fr-rjxr-66jc high vulnerability for lodash package"
+              },
+              "helpUri": "https://github.com/advisories/GHSA-r5fr-rjxr-66jc",
+              "properties": {
+                "purls": [
+                  "pkg:npm/lodash@4.17.20"
+                ],
+                "security-severity": "8.1"
+              }
+            },
+            {
+              "id": "GHSA-xxjr-mmjv-4gpg-lodash",
+              "name": "JavascriptMatcherExactDirectMatch",
+              "shortDescription": {
+                "text": "GHSA-xxjr-mmjv-4gpg medium vulnerability for lodash package"
+              },
+              "helpUri": "https://github.com/advisories/GHSA-xxjr-mmjv-4gpg",
+              "properties": {
+                "purls": [
+                  "pkg:npm/lodash@4.17.20"
+                ],
+                "security-severity": "6.9"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "GHSA-35jh-r3h4-6jhm-lodash",
+          "level": "error",
+          "message": {
+            "text": "A high vulnerability in npm package: lodash, version 4.17.20 was found at: /usr/share/doc/app/pnpm-lock.yaml"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/usr/share/doc/app/pnpm-lock.yaml"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a561a9c8a03b25268c6edb731c973fd94c0f9f1d1e88a3d3dbff647979c696aa:1"
+          }
+        },
+        {
+          "ruleId": "GHSA-xvch-5gv4-984h-minimist",
+          "level": "error",
+          "message": {
+            "text": "A critical vulnerability in npm package: minimist, version 1.2.5 was found at: /usr/share/doc/app/pnpm-lock.yaml"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/usr/share/doc/app/pnpm-lock.yaml"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e753081476e85ffef188e9a4bb1837189593e5f175beb74b07fffce4f90f1e14:1"
+          }
+        },
+        {
+          "ruleId": "GHSA-29mw-wpgm-hmr9-lodash",
+          "level": "warning",
+          "message": {
+            "text": "A medium vulnerability in npm package: lodash, version 4.17.20 was found at: /usr/share/doc/app/pnpm-lock.yaml"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/usr/share/doc/app/pnpm-lock.yaml"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a561a9c8a03b25268c6edb731c973fd94c0f9f1d1e88a3d3dbff647979c696aa:1"
+          }
+        },
+        {
+          "ruleId": "GHSA-r5fr-rjxr-66jc-lodash",
+          "level": "error",
+          "message": {
+            "text": "A high vulnerability in npm package: lodash, version 4.17.20 was found at: /usr/share/doc/app/pnpm-lock.yaml"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/usr/share/doc/app/pnpm-lock.yaml"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a561a9c8a03b25268c6edb731c973fd94c0f9f1d1e88a3d3dbff647979c696aa:1"
+          }
+        },
+        {
+          "ruleId": "GHSA-xxjr-mmjv-4gpg-lodash",
+          "level": "warning",
+          "message": {
+            "text": "A medium vulnerability in npm package: lodash, version 4.17.20 was found at: /usr/share/doc/app/pnpm-lock.yaml"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/usr/share/doc/app/pnpm-lock.yaml"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a561a9c8a03b25268c6edb731c973fd94c0f9f1d1e88a3d3dbff647979c696aa:1"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -40,17 +40,34 @@ func writeLayout(t *testing.T, dir, osRelease string) {
 // writeLayoutFor is writeLayout's, for an image whose config says arch.
 func writeLayoutFor(t *testing.T, dir, osRelease, arch string) {
 	t.Helper()
+	writeImage(t, dir, osRelease, arch, nil)
+}
+
+// imageFile is a file a test image's layer holds beside its os-release: a
+// regular file with body, or a symlink to link.
+type imageFile struct{ name, body, link string }
+
+// writeImage is writeLayoutFor's, for an image whose config also sets
+// labels, and whose layer also holds files.
+func writeImage(t *testing.T, dir, osRelease, arch string, labels map[string]string, files ...imageFile) {
+	t.Helper()
 	var layer bytes.Buffer
 	tw := tar.NewWriter(&layer)
 	name, body := "etc/os-release", osRelease
 	if osRelease == "" {
 		name, body = "etc/hostname", "image\n"
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tw.Write([]byte(body)); err != nil {
-		t.Fatal(err)
+	for _, f := range append([]imageFile{{name: name, body: body}}, files...) {
+		h := &tar.Header{Name: f.name, Mode: 0o644, Size: int64(len(f.body)), Typeflag: tar.TypeReg}
+		if f.link != "" {
+			h = &tar.Header{Name: f.name, Mode: 0o777, Linkname: f.link, Typeflag: tar.TypeSymlink}
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(f.body)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := tw.Close(); err != nil {
 		t.Fatal(err)
@@ -80,10 +97,14 @@ func writeLayoutFor(t *testing.T, dir, osRelease, arch string) {
 		}
 		return data
 	}
+	config := map[string]any{"architecture": arch, "os": "linux"}
+	if labels != nil {
+		config["config"] = map[string]any{"Labels": labels}
+	}
 	manifest := put("application/vnd.oci.image.manifest.v1+json", marshal(map[string]any{
 		"schemaVersion": 2,
 		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
-		"config":        put("application/vnd.oci.image.config.v1+json", []byte(`{"architecture":"`+arch+`","os":"linux"}`)),
+		"config":        put("application/vnd.oci.image.config.v1+json", marshal(config)),
 		"layers":        []descriptor{put("application/vnd.oci.image.layer.v1.tar", layer.Bytes())},
 	}))
 	index := marshal(map[string]any{"schemaVersion": 2, "manifests": []descriptor{manifest}})

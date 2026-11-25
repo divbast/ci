@@ -462,11 +462,11 @@ func TestCompareListsUnknown(t *testing.T) {
 		!sameFindings(got.Old, []scan.Finding{oldUnknown}) {
 		t.Errorf("Compare() = %+v; want the HIGH new, the new UNKNOWN listed, the published one old", got)
 	}
-	listing := scan.Listing("x", "new, so blocking", got)
+	listing := scan.Listing("x", "new, so blocking", &got)
 	if !strings.Contains(listing, "1 new with no severity, so listed, not blocking:\n  DHI-u UNKNOWN qemu 11") {
 		t.Errorf("Listing() = %q, want the UNKNOWN finding listed apart", listing)
 	}
-	summary := scan.Summary("amd64", "x", "New, so blocking", "", got)
+	summary := scan.Summary("amd64", "x", "New, so blocking", "", &got)
 	if !strings.Contains(summary, "**New with no severity, so listed, not blocking: 1**") || !strings.Contains(summary, "DHI-u") {
 		t.Errorf("Summary() = %q, want the UNKNOWN finding in a table of its own", summary)
 	}
@@ -523,7 +523,7 @@ func TestSummaryGolden(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			split := scan.Compare(parse(t, tt.candidate), parse(t, tt.published), nil)
-			got := scan.Summary(tt.arch, tt.against, tt.heading, tt.warning, split)
+			got := scan.Summary(tt.arch, tt.against, tt.heading, tt.warning, &split)
 			if want := string(readTestdata(t, tt.summaryGolden)); got != want {
 				t.Errorf("Summary() differs from %s\n got: %q\nwant: %q", tt.summaryGolden, got, want)
 			}
@@ -538,7 +538,7 @@ func TestListingGolden(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			split := scan.Compare(parse(t, tt.candidate), parse(t, tt.published), nil)
-			got := scan.Listing(tt.against, tt.verdict, split)
+			got := scan.Listing(tt.against, tt.verdict, &split)
 			if want := string(readTestdata(t, tt.listingGolden)); got != want {
 				t.Errorf("Listing() differs from %s\n got: %q\nwant: %q", tt.listingGolden, got, want)
 			}
