@@ -69,23 +69,36 @@ func declared(labels map[string]string, image string) ([]string, error) {
 	return paths, nil
 }
 
-// readLockfiles reads the lockfiles the linux/arch image in the OCI
-// layout at layout declares, from its layers. Each must be a file there.
-func readLockfiles(ctx context.Context, zstd execx.StreamRunner, layout, arch string) (lockfiles, error) {
-	im, err := ocilayout.Open(layout, arch)
+// declaredBy reads which lockfiles the linux/arch image in the OCI layout
+// at layout declares, in its label: none when it has none. name is what
+// the errors call the image. A config that cannot be read is an error that
+// says no more than that.
+func declaredBy(layout, arch, name string) ([]string, error) {
+	im, err := ocilayout.OpenAs(layout, arch, name)
 	if err != nil {
-		return lockfiles{}, err
+		return nil, fmt.Errorf("could not read %s's config, so nothing says which lockfiles it declares: %w", name, err)
 	}
 	defer func() { _ = im.Close() }() // read-only, so nothing to lose
 	cfg, err := im.Config()
 	if err != nil {
+		return nil, fmt.Errorf("could not read %s's config, so nothing says which lockfiles it declares: %w", name, err)
+	}
+	return declared(cfg.Labels, name)
+}
+
+// readLockfiles reads paths, the lockfiles the linux/arch image in the
+// OCI layout at layout declares, from its layers. Each must be a file
+// there. name is what the errors call the image.
+func readLockfiles(ctx context.Context, zstd execx.StreamRunner, layout, arch, name string, paths []string) (lockfiles, error) {
+	if len(paths) == 0 {
+		return lockfiles{}, nil
+	}
+	im, err := ocilayout.OpenAs(layout, arch, name)
+	if err != nil {
 		return lockfiles{}, err
 	}
-	paths, err := declared(cfg.Labels, layout)
-	if err != nil || len(paths) == 0 {
-		return lockfiles{}, err
-	}
-	tree, err := im.Files(ctx, zstd, func(name string) (int64, bool) { return maxLockfile, slices.Contains(paths, name) })
+	defer func() { _ = im.Close() }() // read-only, so nothing to lose
+	tree, err := im.Files(ctx, zstd, func(p string) (int64, bool) { return maxLockfile, slices.Contains(paths, p) })
 	if err != nil {
 		return lockfiles{}, err
 	}
@@ -94,9 +107,9 @@ func readLockfiles(ctx context.Context, zstd execx.StreamRunner, layout, arch st
 		n, ok := tree[p]
 		switch {
 		case !ok:
-			return lockfiles{}, fmt.Errorf("%s declares /%s in its %s label, but holds no file there", layout, p, lockfileLabel)
+			return lockfiles{}, fmt.Errorf("%s declares /%s in its %s label, but holds no file there", name, p, lockfileLabel)
 		case n.Link != "":
-			return lockfiles{}, fmt.Errorf("%s declares /%s in its %s label, but it is a symlink, to %s: declare the file itself", layout, p, lockfileLabel, n.Link)
+			return lockfiles{}, fmt.Errorf("%s declares /%s in its %s label, but it is a symlink, to %s: declare the file itself", name, p, lockfileLabel, n.Link)
 		}
 		l.files[p] = n.Body
 	}
@@ -210,7 +223,7 @@ func lockGrype(ctx context.Context, sc scanner, cache string, docs []string, r e
 
 // publishedLockfiles copies ref, the published image as pinned, for
 // linux/arch, into tmp, with skopeo, and reads the lockfiles its own label
-// declares. It scans them with g, writing its report beside baseline, and
+// declares, naming it ref in every error, never the copy's directory. It scans them with g, writing its report beside baseline, and
 // adds their findings to shipped and their packages to inventory. It
 // reports whether the image carries none.
 func publishedLockfiles(ctx context.Context, lookup registry.Lookup, zstd execx.StreamRunner, g scan.Grype,
@@ -220,12 +233,16 @@ func publishedLockfiles(ctx context.Context, lookup registry.Lookup, zstd execx.
 	if err := lookup.Copy(ctx, ref, arch, layout); err != nil {
 		return false, err
 	}
-	locks, err := readLockfiles(ctx, zstd, layout, arch)
+	paths, err := declaredBy(layout, arch, ref)
 	if err != nil {
 		return false, err
 	}
-	if len(locks.paths) == 0 {
+	if len(paths) == 0 {
 		return true, nil
+	}
+	locks, err := readLockfiles(ctx, zstd, layout, arch, ref, paths)
+	if err != nil {
+		return false, err
 	}
 	rep, err := locks.scan(ctx, g, filepath.Join(tmp, "published"), baseline+".lockfiles.json", baseline+".lockfiles.cdx.json", "")
 	if err != nil {

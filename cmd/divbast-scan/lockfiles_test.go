@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/pnpmlock"
+	"github.com/divbast/ci/internal/scan"
 )
 
 // The lockfile the tests' images declare, where the recordings in
@@ -133,15 +135,27 @@ func TestRunLockfiles(t *testing.T) {
 	pubLock, _ = edited(t, pubLock, "GHSA-r5fr-rjxr-66jc", pubLockCDX, "lodash", "4.17.19")
 	// The lockfile's packages with minimist at 1.2.4
 	_, olderMinimist := edited(t, lockReport, "", lockCDX, "minimist", "1.2.4")
+	// The published lockfile without minimist's finding, at the same
+	// version: already shipped by the version rule alone, which only the
+	// published lockfile's packages show
+	noMinimistFinding, _ := edited(t, lockReport, "GHSA-xvch-5gv4-984h", lockCDX, "", "")
 	// A CycloneDX of the lockfile in which grype found no package
 	noPackages := []byte(`{"components":[{"type":"file","name":"/` + lockPath + `"}]}`)
+	// A second lockfile, declared beside the first
+	const second = "srv/b/pnpm-lock.yaml"
 
 	labelled := map[string]string{lockfileLabel: lockLabel}
 	tests := []struct {
 		name string
+		// labels and files are the candidate's labels and its files
+		// beside its os-release; nil, the label and the lockfile.
+		labels map[string]string
+		files  []imageFile
 		// pubLabels are the published image's labels, and pubLock its
 		// lockfile's grype report and CycloneDX; nil, no lockfile.
+		// pubNoFile leaves the file out of the published image.
 		pubLabels            map[string]string
+		pubNoFile            bool
 		pubReport, pubCDX    []byte
 		candidateCDX         []byte
 		skopeo               *execx.Result
@@ -150,6 +164,7 @@ func TestRunLockfiles(t *testing.T) {
 		wantStdout           []string
 		notInStdout          []string
 		wantStderr           []string
+		notInStderr          []string
 		wantSummary          []string
 		wantRules, notInRule []string
 	}{
@@ -160,7 +175,7 @@ func TestRunLockfiles(t *testing.T) {
 			pubLabels: labelled, pubReport: lockReport, pubCDX: lockCDX,
 			skopeo: index, copyResult: &execx.Result{},
 			wantStdout: []string{
-				"declares " + lockLabel + " in its " + lockfileLabel + " label",
+				"declares " + lockLabel + " in its " + lockfileLabel + " label, so grype scans them too, and their findings in build-only packages never block\n",
 				"7 already published, so advisory:",
 				"  GHSA-xvch-5gv4-984h CRITICAL minimist 1.2.5, fixed in 1.2.6, " + lockPath + "\n",
 				"nothing new against what is published (7 advisory)",
@@ -177,6 +192,12 @@ func TestRunLockfiles(t *testing.T) {
 			// the published lockfile's findings show
 			name:      "bumped-within-affected",
 			pubLabels: labelled, pubReport: lockReport, pubCDX: olderMinimist,
+			skopeo: index, copyResult: &execx.Result{},
+			wantStdout: []string{"nothing new against what is published (7 advisory)"},
+		},
+		{
+			name:      "published-inventory-alone",
+			pubLabels: labelled, pubReport: noMinimistFinding, pubCDX: lockCDX,
 			skopeo: index, copyResult: &execx.Result{},
 			wantStdout: []string{"nothing new against what is published (7 advisory)"},
 		},
@@ -237,13 +258,43 @@ func TestRunLockfiles(t *testing.T) {
 			pubLabels: labelled, pubReport: lockReport, pubCDX: noPackages,
 			skopeo: index, copyResult: &execx.Result{},
 			wantCode:   1,
-			wantStderr: []string{"could not read the lockfiles " + digest + " declares", "grype found no package in " + lockLabel},
+			wantStderr: []string{"could not tell which lockfiles " + digest + " carries", "grype found no package in " + lockLabel},
 		},
 		{
 			name:   "copy-fails",
 			skopeo: index, copyResult: &execx.Result{Stderr: skopeoRecording(t, "skopeo-manifest-503.txt"), Code: 1},
 			wantCode:   1,
-			wantStderr: []string{"could not read the lockfiles " + digest + " declares", "could not copy " + digest, "503"},
+			wantStderr: []string{"could not tell which lockfiles " + digest + " carries", "could not copy " + digest, "503"},
+		},
+		{
+			// The published image's own label is held to the candidate's
+			// rules, and no error names the copy's temporary directory
+			name:      "published-label-names-no-file",
+			pubLabels: labelled, pubNoFile: true,
+			skopeo: index, copyResult: &execx.Result{},
+			wantCode: 1,
+			wantStderr: []string{
+				"could not tell which lockfiles " + digest + " carries",
+				digest + " declares " + lockLabel + " in its " + lockfileLabel + " label, but holds no file there",
+			},
+			notInStderr: []string{"divbast-scan-lockfiles-"},
+		},
+		{
+			name:      "published-label-malformed",
+			pubLabels: map[string]string{lockfileLabel: lockPath},
+			skopeo:    index, copyResult: &execx.Result{},
+			wantCode:    1,
+			wantStderr:  []string{digest + "'s " + lockfileLabel + ` label names "` + lockPath + `"`},
+			notInStderr: []string{"divbast-scan-lockfiles-"},
+		},
+		{
+			// Each lockfile must hold a package grype found, not only the
+			// report as a whole
+			name:       "two-lockfiles-one-empty",
+			labels:     map[string]string{lockfileLabel: lockLabel + ",/" + second},
+			files:      []imageFile{{name: lockPath, body: string(lock)}, {name: second, body: string(lock)}},
+			wantCode:   1,
+			wantStderr: []string{"grype found no package in /" + second + ", so a clean scan of it would prove nothing"},
 		},
 	}
 
@@ -258,7 +309,11 @@ func TestRunLockfiles(t *testing.T) {
 			}
 			cache := p("cache")
 			cfg := filepath.Join(cache, "grype.yaml")
-			writeImage(t, p("layout"), dhiRelease, "arm64", labelled, imageFile{name: lockPath, body: string(lock)})
+			labels, extra := tt.labels, tt.files
+			if labels == nil {
+				labels, extra = labelled, []imageFile{{name: lockPath, body: string(lock)}}
+			}
+			writeImage(t, p("layout"), dhiRelease, "arm64", labels, extra...)
 
 			candidateCDX := lockCDX
 			if tt.candidateCDX != nil {
@@ -305,7 +360,7 @@ func TestRunLockfiles(t *testing.T) {
 				t: t, fake: execx.NewFake(t, calls...), tmp: tmp, files: files, seen: map[string]string{},
 				published: func(layout string) {
 					var extra []imageFile
-					if tt.pubLabels != nil {
+					if tt.pubLabels != nil && !tt.pubNoFile {
 						extra = append(extra, imageFile{name: lockPath, body: string(lock)})
 					}
 					writeImage(t, layout, dhiRelease, "arm64", tt.pubLabels, extra...)
@@ -335,6 +390,11 @@ func TestRunLockfiles(t *testing.T) {
 			for _, want := range tt.wantStderr {
 				if !strings.Contains(stderr.String(), want) {
 					t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+				}
+			}
+			for _, not := range tt.notInStderr {
+				if strings.Contains(stderr.String(), not) {
+					t.Errorf("stderr = %q, want it not to contain %q", stderr.String(), not)
 				}
 			}
 			if len(tt.wantSummary) > 0 {
@@ -550,5 +610,131 @@ func TestDeclared(t *testing.T) {
 				t.Errorf("declared() = %q, %v; want %q", got, err, tt.want)
 			}
 		})
+	}
+}
+
+// unreadableConfig makes the image's config in the layout at dir no
+// JSON, and names its platform, linux/arch, in the index, so that only a
+// read of the config itself fails: the scan reads the architecture from
+// the index, and the os-release from the layers.
+func unreadableConfig(t *testing.T, dir, arch string) {
+	t.Helper()
+	read := func(name string, v any) {
+		data, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // G304: the test's own layout
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = json.Unmarshal(data, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var index struct{ Manifests []map[string]any }
+	read("index.json", &index)
+	m := index.Manifests[0]
+	m["platform"] = map[string]string{"os": "linux", "architecture": arch}
+	digest, _ := m["digest"].(string)
+	var manifest struct{ Config struct{ Digest string } }
+	read(filepath.Join("blobs", "sha256", strings.TrimPrefix(digest, "sha256:")), &manifest)
+	config := filepath.Join(dir, "blobs", "sha256", strings.TrimPrefix(manifest.Config.Digest, "sha256:"))
+	if err := os.WriteFile(config, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]any{"schemaVersion": 2, "manifests": []any{m}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, "index.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunLockfileUnreadable checks that an image whose config cannot be
+// read, or a declared lockfile past the scan's limit, fails before any
+// scanner runs, and that an unread config is not said to declare
+// lockfiles.
+func TestRunLockfileUnreadable(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		files     []imageFile
+		breakIt   bool
+		want, not []string
+	}{
+		{
+			name:    "config",
+			breakIt: true,
+			want:    []string{"could not read ", "'s config, so nothing says which lockfiles it declares"},
+			not:     []string{"the lockfiles the image declares"},
+		},
+		{
+			name:  "past-the-limit",
+			files: []imageFile{{name: lockPath, body: strings.Repeat("a", maxLockfile+1)}},
+			want: []string{
+				"could not read the lockfiles the image declares",
+				"/" + lockPath + " is 67108865 bytes, more than the 67108864 the reader takes for it",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			p := func(name string) string { return filepath.Join(dir, name) }
+			writeImage(t, p("layout"), dhiRelease, "arm64", map[string]string{lockfileLabel: lockLabel}, tt.files...)
+			if tt.breakIt {
+				unreadableConfig(t, p("layout"), "arm64")
+			}
+			args := []string{
+				"-layout", p("layout"), "-report", p("report.json"), "-published", published,
+				"-baseline", p("baseline.json"), "-sarif", p("report.sarif"), "-cache", p("cache"),
+			}
+			var stdout, stderr bytes.Buffer
+			code := run(t.Context(), args, execx.NewFake(t), execx.OS{}, offline(t), func(string) string { return "" }, &stdout, &stderr)
+			if code != 1 {
+				t.Errorf("run() = %d, want 1; stderr: %s", code, stderr.String())
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+				}
+			}
+			for _, not := range tt.not {
+				if strings.Contains(stderr.String(), not) {
+					t.Errorf("stderr = %q, want it not to contain %q", stderr.String(), not)
+				}
+			}
+		})
+	}
+}
+
+// TestHeld checks which findings held marks: a lockfile's in a package it
+// places outside every runtime graph, always, and its others only while
+// the published image carries no lockfile; never one found anywhere but
+// in a declared lockfile, even with a package of the same name.
+func TestHeld(t *testing.T) {
+	t.Parallel()
+	lock, err := pnpmlock.Read(fixtureLock(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := map[string]*pnpmlock.Lockfile{lockPath: lock}
+	for _, uncarried := range []bool{false, true} {
+		findings := []scan.Finding{
+			{ID: "GHSA-d", Pkg: "lodash", Version: "4.17.20", Where: lockPath},
+			{ID: "GHSA-r", Pkg: "minimist", Version: "1.2.5", Where: lockPath},
+			{ID: "GHSA-n", Pkg: "lodash", Version: "4.17.20", Where: "app/node_modules/lodash/package.json"},
+			{ID: "CVE-1", Pkg: "stdlib", Version: "v1.27.3", Where: "usr/local/bin/pisati"},
+		}
+		held(findings, read, uncarried)
+		runtime := ""
+		if uncarried {
+			runtime = scan.Uncarried
+		}
+		want := []string{scan.BuildOnly, runtime, "", ""}
+		for i, f := range findings {
+			if f.Hold != want[i] {
+				t.Errorf("held(uncarried %t) gave %s in %s the hold %q, want %q", uncarried, f.ID, f.Where, f.Hold, want[i])
+			}
+		}
 	}
 }

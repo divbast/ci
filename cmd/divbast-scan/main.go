@@ -82,7 +82,7 @@
 //
 // An image may declare, in its io.github.divbast.scan.lockfiles label, the
 // lockfiles it ships of the packages that built it: absolute paths in the
-// image, separated by commas, each a pnpm-lock.yaml, as in
+// image, separated by commas, each a pnpm-lock.yaml of 64 MiB at most:
 //
 //	LABEL io.github.divbast.scan.lockfiles="/usr/share/doc/pisati/pnpm-lock.yaml"
 //
@@ -155,13 +155,15 @@
 //	   reports from different databases or without the dhi provider;
 //	   IMAGE not a ghcr.io image, unreadable, or refused though public for
 //	   any reason but a missing tag; the GitHub API not answering, or
-//	   refusing the token; a lockfile label, the layout's or IMAGE's, that
-//	   names other than clean absolute paths to pnpm-lock.yaml files, or
-//	   one twice, or a path the image holds no file at, or a symlink; a
-//	   declared lockfile not in pnpm's v9 format as the scan reads it, or
-//	   in which grype found no package; for an image that declares
-//	   lockfiles, grype's database not updated, or IMAGE not copied; or the
-//	   summary not written
+//	   refusing the token; an image config, the layout's or that of IMAGE's
+//	   copy, that cannot be read; a lockfile label, either's, that names
+//	   other than clean absolute paths to pnpm-lock.yaml files, or one
+//	   twice, or a path the image holds no file at, or a symlink; a
+//	   declared lockfile larger than 64 MiB, not in pnpm's v9 format as the
+//	   scan reads it, or in which grype found no package; for an image that
+//	   declares lockfiles, grype's database not updated, the lockfiles'
+//	   SARIF not filtered or not merged into the image's, or IMAGE not
+//	   copied; or the summary not written
 //	2  the command line is wrong
 package main
 
@@ -293,7 +295,12 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		complain(stderr, "could not read the image's own os-release, so nothing says which model to scan it under: %v", err)
 		return 1
 	}
-	locks, err := readLockfiles(ctx, zstd, *layout, layoutArch)
+	paths, err := declaredBy(*layout, layoutArch, *layout)
+	if err != nil {
+		complain(stderr, "nothing is scanned: %v", err)
+		return 1
+	}
+	locks, err := readLockfiles(ctx, zstd, *layout, layoutArch, *layout, paths)
 	if err != nil {
 		complain(stderr, "could not read the lockfiles the image declares, so nothing is scanned: %v", err)
 		return 1
@@ -346,7 +353,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		lockRep scan.Report
 	)
 	if len(locks.paths) > 0 {
-		if _, err = fmt.Fprintf(stdout, "%s declares %s in its %s label, so grype scans them too: only findings in their runtime dependencies can block\n",
+		if _, err = fmt.Fprintf(stdout, "%s declares %s in its %s label, so grype scans them too, and their findings in build-only packages never block\n",
 			*layout, locks, lockfileLabel); err != nil {
 			complain(stderr, "write the lockfiles: %v", err)
 			return 1
@@ -412,7 +419,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		shipped, inventory, against = pub.Findings, pub.Inventory, pub.Ref
 		if len(locks.paths) > 0 {
 			if uncarried, err = publishedLockfiles(ctx, lookup, zstd, g, ref, arch, tmp, *baseline, &shipped, &inventory); err != nil {
-				complain(stderr, "could not read the lockfiles %s declares, so no finding in a lockfile can be told apart from one already published: %v", ref, err)
+				complain(stderr, "could not tell which lockfiles %s carries, so no finding in a lockfile can be told apart from one already published: %v", ref, err)
 				return 1
 			}
 			if uncarried {
