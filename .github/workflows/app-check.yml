@@ -255,7 +255,7 @@ jobs:
           image=$(just --evaluate IMAGE)
           args=(
             --attest 'type=provenance,mode=max'
-            --attest 'type=sbom,generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315'
+            --attest 'type=sbom,generator=docker/buildkit-syft-scanner:1.13.0@sha256:a190379321cf51fba8c284a1834555b55e7bf58d577d574db23370461defc430'
             --output 'type=oci,dest=/tmp/image.tar,rewrite-timestamp=true'
             -f Containerfile -t "${image}"
           )
