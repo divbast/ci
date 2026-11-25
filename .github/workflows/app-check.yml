@@ -61,6 +61,13 @@ on:
           template layer's
         type: string
         default: ''
+      full-history:
+        description: >-
+          Check the caller out with its whole git history in the lint job,
+          for a lint that scans every commit, such as a secret scan. Off,
+          the checkout holds the one commit, as it always has
+        type: boolean
+        default: false
     secrets:
       DHI_TOKEN:
         description: The access token for dhi-username on dhi.io
@@ -91,6 +98,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The strings, since an expression reads the number 0 as false.
+          fetch-depth: ${{ inputs.full-history && '0' || '1' }}
           persist-credentials: false
 
       # A step's `uses: ./` and a recipe's .ci/ both resolve against the

@@ -535,6 +535,86 @@ func logsInToDHI(workflow string) error {
 	return nil
 }
 
+// TestAppCheckFullHistory checks that app-check.yml's lint job can check
+// the caller out with its whole history, for a lint that scans every
+// commit, when the caller passes full-history; that without it every
+// job's checkout stays as shallow as before; and that the input is
+// optional, so no caller breaks. Against app-check.yml as it is, then
+// with each of those broken.
+func TestAppCheckFullHistory(t *testing.T) {
+	t.Parallel()
+	check := readWorkflows(t)["app-check.yml"]
+	if err := checksOutFullHistory(check); err != nil {
+		t.Errorf("app-check.yml: %v", err)
+	}
+	const (
+		depth = "          fetch-depth: ${{ inputs.full-history && '0' || '1' }}\n"
+		input = "      full-history:\n"
+	)
+	for name, mutant := range map[string]string{
+		"no input default":           replaceAfter(check, input, "        default: false\n", ""),
+		"the input defaults to true": replaceAfter(check, input, "default: false", "default: true"),
+		"the input is a string":      replaceAfter(check, input, "type: boolean", "type: string"),
+		"no fetch-depth":             strings.Replace(check, depth, "", 1),
+		"always deep":                strings.Replace(check, depth, "          fetch-depth: 0\n", 1),
+		// 0 is false in an expression, so this is always 1.
+		"a number for the deep side": strings.Replace(check, depth, "          fetch-depth: ${{ inputs.full-history && 0 || 1 }}\n", 1),
+		"inverted":                   strings.Replace(check, depth, "          fetch-depth: ${{ inputs.full-history && '1' || '0' }}\n", 1),
+		"on the build checkout": onBuildJob(check, func(tail string) string {
+			return strings.Replace(tail, "        with:\n          persist-credentials: false\n", "        with:\n"+depth+"          persist-credentials: false\n", 1)
+		}),
+		"on the ci checkout": strings.Replace(check, "          path: .ci\n", "          path: .ci\n"+depth, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if mutant == check {
+				t.Fatal("the change changed nothing")
+			}
+			if checksOutFullHistory(mutant) == nil {
+				t.Error("passes app-check.yml with " + name)
+			}
+		})
+	}
+}
+
+// onBuildJob applies f to the workflow from the build job on.
+func onBuildJob(workflow string, f func(string) string) string {
+	head, tail, _ := strings.Cut(workflow, "\n  build:\n")
+	return head + "\n  build:\n" + f(tail)
+}
+
+// checksOutFullHistory returns an error unless the full-history input is
+// a boolean that defaults to false, the lint job's first checkout, the
+// caller's, has fetch-depth ${{ inputs.full-history && '0' || '1' }} (the
+// strings, since an expression reads the number 0 as false), and no
+// other checkout in the workflow sets fetch-depth.
+func checksOutFullHistory(workflow string) error {
+	lines := linesOf(workflow)
+	decl := declaration(lines, "full-history")
+	if !slices.Contains(decl, "type: boolean") {
+		return errors.New("the full-history input is not a boolean")
+	}
+	if !slices.Contains(decl, "default: false") {
+		return errors.New("the full-history input does not default to false")
+	}
+	const want = "${{ inputs.full-history && '0' || '1' }}"
+	for name, job := range jobsOf(lines) {
+		for i, st := range steps(job) {
+			if !slices.ContainsFunc(st, isUses("actions/checkout")) {
+				continue
+			}
+			got := withInput(st, "fetch-depth")
+			switch {
+			case name == "lint" && i == 0 && got != want:
+				return fmt.Errorf("the lint job's caller checkout has fetch-depth %q, want %q", got, want)
+			case (name != "lint" || i != 0) && got != "":
+				return fmt.Errorf("step %d of the %s job's checkout sets fetch-depth %q", i+1, name, got)
+			}
+		}
+	}
+	return nil
+}
+
 // TestAppCheckVerifiesListedContainerfiles checks that app-check.yml's
 // lint job verifies the images of each Containerfile the caller lists in
 // verify-containerfiles before just setup and just lint, which may run
