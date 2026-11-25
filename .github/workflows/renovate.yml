@@ -127,3 +127,29 @@ jobs:
           # string would fail the parse. toJSON quotes the username and the
           # token, so a quote or a backslash in either stays inside its string.
           RENOVATE_HOST_RULES: ${{ inputs.dhi-username != '' && format('[{{"matchHost":"dhi.io","hostType":"docker","username":{0},"password":{1}}}]', toJSON(inputs.dhi-username), toJSON(secrets.DHI_TOKEN)) || '[]' }}
+          # The only commands a repository's postUpgradeTasks may run. They
+          # regenerate committed code in the pull request that bumps what it
+          # is generated from, so the files stay in step with the bump. Each
+          # pattern is one exact command, anchored at both ends, and nothing
+          # sets the list but this line: the tasks run in this job, beside
+          # the App token, so a repository's renovate.json can neither widen
+          # the list nor chain a second command onto one, as Renovate runs
+          # each without a shell. In order:
+          # - templ generate writes the Go for each .templ file, run as the
+          #   templ that tools/go.mod pins;
+          # - sqlc generate writes the query code, run as the sqlc that
+          #   tools/go.mod pins;
+          # - pnpm install puts the locked packages in node_modules, which
+          #   Renovate's own lockfile update never creates, for genicons to
+          #   read; --frozen-lockfile installs only what the lockfile holds,
+          #   and --ignore-scripts runs no package's install script;
+          # - go run ./cmd/genicons writes the icons from lucide-static.
+          # Renovate parses the value as JSON5, which reads an unknown escape
+          # such as a backslash before a dot as the dot alone, matching any
+          # character. So each backslash is doubled, to reach the pattern as
+          # one.
+          RENOVATE_ALLOWED_COMMANDS: >-
+            ["^go tool -modfile=tools/go\\.mod templ generate$",
+            "^go tool -modfile=tools/go\\.mod sqlc generate$",
+            "^pnpm install --frozen-lockfile --ignore-scripts$",
+            "^go run \\./cmd/genicons$"]
