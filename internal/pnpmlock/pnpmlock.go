@@ -149,6 +149,9 @@ func parse(lines []line) (*graph, error) {
 		dep      *ref
 		snap     string
 		field    = nothing
+		// pnpm writes importers in every document, one at least
+		sawImporters bool
+		nImporters   int
 	)
 	finish := func() error {
 		if dep == nil {
@@ -194,6 +197,8 @@ func parse(lines []line) (*graph, error) {
 				section = importers
 				if e.key == "snapshots" {
 					section = snapshots
+				} else {
+					sawImporters = true
 				}
 			default:
 				section = other
@@ -207,6 +212,9 @@ func parse(lines []line) (*graph, error) {
 		case version:
 			err = fmt.Errorf("line %d: something indented under lockfileVersion, which holds only a version", l.n)
 		case importers:
+			if indent == 2 {
+				nImporters++
+			}
 			err = importerLine(l, indent, rest, &importer, &group, &dep, finish)
 		case snapshots:
 			err = snapshotLine(g, l, indent, rest, &snap, &field)
@@ -218,14 +226,17 @@ func parse(lines []line) (*graph, error) {
 	if err := finish(); err != nil {
 		return nil, err
 	}
-	switch format {
-	case "9.0":
-		return g, nil
-	case "":
+	switch {
+	case format == "":
 		return nil, errors.New("a document holds no lockfileVersion, so nothing says it is in pnpm's v9 format")
-	default:
+	case format != "9.0":
 		return nil, fmt.Errorf("a document is in lockfileVersion %s, which the reader does not know: it reads pnpm's v9 format", format)
+	case !sawImporters:
+		return nil, errors.New("a document holds no importers, which pnpm writes in every one, so nothing says what its packages are reached from")
+	case nImporters == 0 && len(g.snaps) > 0:
+		return nil, errors.New("a document's importers are empty beside its snapshots, which pnpm never writes, so nothing says what reaches them")
 	}
+	return g, nil
 }
 
 // importerLine reads line l, indented by indent, in importers: an

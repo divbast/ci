@@ -194,6 +194,14 @@ func TestReadForms(t *testing.T) {
 			wantKnown:   4,
 		},
 		{
+			// A project with no dependencies: pnpm writes its importer, and
+			// no snapshots
+			name:        "empty-project",
+			lockfile:    "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n",
+			wantRuntime: nil,
+			wantKnown:   0,
+		},
+		{
 			name: "crlf",
 			lockfile: strings.ReplaceAll(doc("  .:\n    dependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0\n", "  a@1.0.0: {}\n"),
 				"\n", "\r\n"),
@@ -247,6 +255,14 @@ func TestReadRefuses(t *testing.T) {
 		{"bad-indent", doc("  .:\n     dependencies:\n", ""), "indented 5"},
 		{"unbalanced-key", doc(dep, "  a@1.0.0: {}\n\n  b@1.0.0(c@1.0.0)): {}\n"), "parenthes"},
 		{"separator-with-content", "--- !tag\n" + doc(dep, "  a@1.0.0: {}\n"), "---"},
+		// pnpm writes importers in every document, so snapshots that no
+		// importer could reach mean the reader missed what reaches them
+		{"no-importers", "lockfileVersion: '9.0'\n\nsnapshots:\n\n  a@1.0.0: {}\n", "no importers"},
+		{"no-importers-no-snapshots", "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n", "no importers"},
+		{"empty-importers", "lockfileVersion: '9.0'\n\nimporters: {}\n\nsnapshots:\n\n  a@1.0.0: {}\n", "importers are empty"},
+		{"importers-with-none", "lockfileVersion: '9.0'\n\nimporters:\n\nsnapshots:\n\n  a@1.0.0: {}\n", "importers are empty"},
+		{"anchor", doc("  .:\n    dependencies:\n      a:\n        version: &v 1.0.0\n", "  a@1.0.0: {}\n"), "form of YAML"},
+		{"alias", doc("  .:\n    dependencies:\n      a:\n        version: *v\n", "  a@1.0.0: {}\n"), "form of YAML"},
 		{"nested-under-version", strings.Replace(doc(dep, "  a@1.0.0: {}\n"), "'9.0'\n", "'9.0'\n  extra: 1\n", 1), "lockfileVersion"},
 	}
 	for _, tt := range tests {
