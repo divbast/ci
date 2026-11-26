@@ -39,7 +39,7 @@ import (
 //
 // Hold, when not "", is why the finding never blocks when the published
 // image lacks it, as words that follow "new": [BuildOnly], [Uncarried] or
-// [UncarriedSBOM].
+// [UncarriedSBOM] or [AdvisorySBOM].
 type Finding struct {
 	ID, Pkg, Version, Fixed, Severity, URL, Where, Namespace string
 	Aliases                                                  []string
@@ -62,6 +62,12 @@ const (
 // while the published image carries none: until one is published, nothing
 // shows which of its findings are already shipped.
 const UncarriedSBOM = "in an SBOM the published image does not carry"
+
+// AdvisorySBOM is the hold of a finding in an SBOM its image marks
+// advisory, in the label that names it: the SBOM describes a payload the
+// image's repository cannot patch. The hold has no end, and a finding in
+// such an SBOM is held whether or not the published image carries one.
+const AdvisorySBOM = "in an SBOM the image marks advisory"
 
 // Pkg is a package an image ships, by name and version, the version
 // written as a finding's is.

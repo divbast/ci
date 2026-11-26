@@ -62,23 +62,26 @@ func declaredPaths(labels map[string]string, label, image string, unreadable fun
 // either when it has no such label. name is what the errors call the
 // image. A config that cannot be read is an error that says no more than
 // that.
-func declaredBy(layout, arch, name string) (locks, boms []string, err error) {
+func declaredBy(layout, arch, name string) (locks, boms []string, advisory map[string]bool, err error) {
 	im, err := ocilayout.OpenAs(layout, arch, name)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not read %s's config, so nothing says which files it declares to the scan: %w", name, err)
+		return nil, nil, nil, fmt.Errorf("could not read %s's config, so nothing says which files it declares to the scan: %w", name, err)
 	}
 	defer func() { _ = im.Close() }() // read-only, so nothing to lose
 	cfg, err := im.Config()
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not read %s's config, so nothing says which files it declares to the scan: %w", name, err)
+		return nil, nil, nil, fmt.Errorf("could not read %s's config, so nothing says which files it declares to the scan: %w", name, err)
 	}
 	if locks, err = declared(cfg.Labels, name); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if boms, err = declaredSBOMs(cfg.Labels, name); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return locks, boms, nil
+	if advisory, err = declaredAdvisorySBOMs(cfg.Labels, name, boms); err != nil {
+		return nil, nil, nil, err
+	}
+	return locks, boms, advisory, nil
 }
 
 // readDeclared reads paths, files the linux/arch image in the OCI layout
@@ -156,7 +159,7 @@ func publishedDeclared(ctx context.Context, lookup registry.Lookup, zstd execx.S
 	err = lookup.Copy(ctx, ref, arch, layout)
 	var pubLocks, pubBOMs []string
 	if err == nil {
-		pubLocks, pubBOMs, err = declaredBy(layout, arch, ref)
+		pubLocks, pubBOMs, _, err = declaredBy(layout, arch, ref)
 	}
 	if err != nil {
 		return false, false, fmt.Errorf("could not tell which %s %s carries, so no finding in them can be told apart from one already published: %w",

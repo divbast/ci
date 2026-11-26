@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/divbast/ci/internal/execx"
@@ -20,6 +21,13 @@ import (
 // what no image scan sees, such as a binary it builds from source:
 // absolute paths in the image, separated by commas.
 const sbomLabel = "io.github.divbast.scan.sboms"
+
+// advisoryLabel is the image label that marks some of the SBOMs sbomLabel
+// declares as advisory: the findings in them are listed and never block.
+// It names them as sbomLabel does, and each must also be in sbomLabel.
+// An image uses it for a payload it cannot patch, such as a signed bundle
+// from upstream that carries its own copies of libraries.
+const advisoryLabel = "io.github.divbast.scan.sboms.advisory"
 
 // sbomSuffix ends the name of every SBOM the scan reads: CycloneDX JSON.
 const sbomSuffix = ".cdx.json"
@@ -48,6 +56,45 @@ func declaredSBOMs(labels map[string]string, image string) ([]string, error) {
 		}
 		return ""
 	})
+}
+
+// declaredAdvisorySBOMs reads the advisory label of the image whose labels
+// are labels: the paths in it, without their leading slash, or none when
+// it is not there. It names paths as sbomLabel does, and each must be one
+// of sboms, the paths sbomLabel declares, without their leading slash;
+// one that is not is refused, by name. image names the image in the
+// error.
+func declaredAdvisorySBOMs(labels map[string]string, image string, sboms []string) (map[string]bool, error) {
+	paths, err := declaredPaths(labels, advisoryLabel, image, func(p string) string {
+		if !slices.Contains(sboms, strings.TrimPrefix(p, "/")) {
+			return "it is not in its " + sbomLabel + " label, so there is no SBOM there to mark"
+		}
+		return ""
+	})
+	if len(paths) == 0 || err != nil {
+		return nil, err
+	}
+	advisory := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		advisory[p] = true
+	}
+	return advisory, nil
+}
+
+// holdSBOMs holds the findings in an SBOM the image declares, each at its
+// SBOM's path: those at a path in advisory with [scan.AdvisorySBOM], and,
+// when uncarried, the rest with [scan.UncarriedSBOM]. The advisory mark
+// stays for good, while an uncarried SBOM is held only until a published
+// image carries one.
+func holdSBOMs(findings []scan.Finding, advisory map[string]bool, uncarried bool) {
+	for i := range findings {
+		switch f := &findings[i]; {
+		case advisory[f.Where]:
+			f.Hold = scan.AdvisorySBOM
+		case uncarried:
+			f.Hold = scan.UncarriedSBOM
+		}
+	}
 }
 
 // readSBOMs reads paths, the SBOMs the linux/arch image in the OCI layout
