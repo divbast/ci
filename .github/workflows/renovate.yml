@@ -110,7 +110,7 @@ jobs:
           # everything else. renovate-version would not do: the manager takes
           # all of its value, digest included, as the version. With a tag in
           # the image, the action ignores that input.
-          renovate-image: ghcr.io/renovatebot/renovate:44.263.1@sha256:0efa7b743c52015c08a5bd2bb98fbc16f735a4e684a45526c622eddce00be909
+          renovate-image: ghcr.io/renovatebot/renovate:44.263.5@sha256:9806d1b444f2b0b57d7c3b882d453b99c7494db07689c2e1abed8e6ae502b271
         env:
           RENOVATE_REPOSITORIES: ${{ github.repository }}
           RENOVATE_ONBOARDING: 'false'
