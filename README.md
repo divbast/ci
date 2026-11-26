@@ -946,6 +946,34 @@ Trivy call and runs Trivy with no `TRIVY_` variable in its environment: a findin
 an app argues is not reachable goes in its `openvex.json`
 ([VEX](#vex)), which the verdict and the summary both show.
 
+Neither scanner sees a binary an image builds from source or copies in
+whole, since no package database lists it. An image names such binaries
+in a [CycloneDX](https://cyclonedx.org) SBOM it ships, and declares the
+file in a label, as it declares the lockfiles of the packages that built
+it:
+
+```dockerfile
+LABEL io.github.divbast.scan.sboms="/usr/local/share/divbast/sbom.cdx.json"
+```
+
+- The label holds absolute paths in the image, separated by commas. Each
+  names a file, not a symlink, whose name ends in `.cdx.json`, of 16 MiB
+  at most.
+- Each component the SBOM names has a name, a version, and a package URL
+  (`purl`) or a CPE (`cpe`).
+- Grype scans each SBOM, whichever scanner reads the image, as an
+  `sbom:` source: it matches a component by its CPE, which Trivy does
+  not, or by its package URL. A Docker Hardened Images package is named
+  by its own package URL, such as
+  `pkg:deb/dhi/brotli@1.1.0-1?arch=arm64&distro=dhi-13`.
+- The tool refuses an SBOM unless Grype's own record of the scan names
+  every component in it, so a file Grype read only in part cannot pass
+  for clean.
+- Its findings are judged as every finding is, against the SBOMs
+  `PUBLISHED` declares, and are listed, not blocking, while `PUBLISHED`
+  declares none. In code scanning each sits at the SBOM's path in the
+  image.
+
 Outside GitHub Actions the tool never asks GitHub, since the token a
 person gives the recipes, a fine-grained one, cannot read packages: the
 API answers it HTTP 403. A local `just scan`
