@@ -133,6 +133,14 @@
 // and the SBOMs its own label declares are scanned as the candidate's are,
 // their reports beside -baseline.
 //
+// An image that ships a payload it cannot patch, such as a signed bundle
+// from upstream, marks the SBOM of it advisory, in its
+// io.github.divbast.scan.sboms.advisory label: paths named as in the
+// sboms label, each also named there, or the scan refuses the image. A
+// new finding in such an SBOM is listed and never blocks, whether or not
+// IMAGE carries an SBOM, and the verdict line counts it as in advisory
+// SBOMs. An image without the label is scanned as before.
+//
 // It lists every finding on stdout and, when GitHub Actions sets it,
 // appends them as tables to $GITHUB_STEP_SUMMARY.
 //
@@ -323,7 +331,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		complain(stderr, "could not read the image's own os-release, so nothing says which model to scan it under: %v", err)
 		return 1
 	}
-	lockPaths, bomPaths, err := declaredBy(*layout, layoutArch, *layout)
+	lockPaths, bomPaths, advisoryBOMs, err := declaredBy(*layout, layoutArch, *layout)
 	if err != nil {
 		complain(stderr, "nothing is scanned: %v", err)
 		return 1
@@ -497,11 +505,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 	}
 
 	held(lockRep.Findings, read, uncarriedLocks)
-	if uncarriedBOMs {
-		for i := range bomRep.Findings {
-			bomRep.Findings[i].Hold = scan.UncarriedSBOM
-		}
-	}
+	holdSBOMs(bomRep.Findings, advisoryBOMs, uncarriedBOMs)
 	split := scan.Compare(slices.Concat(candidate.Findings, lockRep.Findings, bomRep.Findings), shipped, inventory)
 	verdict, heading := "new, so blocking", "New, so blocking"
 	if advisory != nil {
@@ -531,17 +535,23 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		if len(split.Listed) > 0 {
 			counts += fmt.Sprintf(", %d listed with no severity", len(split.Listed))
 		}
-		inSBOMs := 0
+		inSBOMs, inAdvisory := 0, 0
 		for i := range split.Held {
-			if split.Held[i].Hold == scan.UncarriedSBOM {
+			switch split.Held[i].Hold {
+			case scan.UncarriedSBOM:
 				inSBOMs++
+			case scan.AdvisorySBOM:
+				inAdvisory++
 			}
 		}
-		if n := len(split.Held) - inSBOMs; n > 0 {
+		if n := len(split.Held) - inSBOMs - inAdvisory; n > 0 {
 			counts += fmt.Sprintf(", %d in lockfiles listed, not blocking", n)
 		}
 		if inSBOMs > 0 {
 			counts += fmt.Sprintf(", %d in SBOMs listed, not blocking", inSBOMs)
+		}
+		if inAdvisory > 0 {
+			counts += fmt.Sprintf(", %d in advisory SBOMs listed, not blocking", inAdvisory)
 		}
 		_, err = fmt.Fprintf(stdout, "nothing new against what is published (%s)\n", counts)
 	}

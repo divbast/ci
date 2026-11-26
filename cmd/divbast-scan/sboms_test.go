@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -84,6 +85,135 @@ func TestDeclaredSBOMs(t *testing.T) {
 			for _, want := range append([]string{"image's " + sbomLabel}, tt.wantErr...) {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("declaredSBOMs() error %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDeclaredAdvisorySBOMs(t *testing.T) {
+	t.Parallel()
+	const other = "/srv/a/codecs.cdx.json"
+	both := sbomAt + "," + other
+	tests := []struct {
+		name    string
+		labels  map[string]string
+		want    map[string]bool
+		wantErr []string
+	}{
+		{name: "no-label", labels: map[string]string{sbomLabel: sbomAt}},
+		{name: "no-labels"},
+		{
+			name:   "one-in-both",
+			labels: map[string]string{sbomLabel: sbomAt, advisoryLabel: sbomAt},
+			want:   map[string]bool{sbomPath: true},
+		},
+		{
+			name:   "one-of-two",
+			labels: map[string]string{sbomLabel: both, advisoryLabel: " " + other},
+			want:   map[string]bool{"srv/a/codecs.cdx.json": true},
+		},
+		{
+			name:    "not-in-sboms",
+			labels:  map[string]string{sbomLabel: sbomAt, advisoryLabel: other},
+			wantErr: []string{other, "is not in its " + sbomLabel + " label"},
+		},
+		{
+			name:    "no-sboms-label",
+			labels:  map[string]string{advisoryLabel: sbomAt},
+			wantErr: []string{sbomAt, "is not in its " + sbomLabel + " label"},
+		},
+		{
+			name:    "empty-entry",
+			labels:  map[string]string{sbomLabel: sbomAt, advisoryLabel: sbomAt + ","},
+			wantErr: []string{"empty path"},
+		},
+		{
+			name:    "relative",
+			labels:  map[string]string{sbomLabel: sbomAt, advisoryLabel: sbomPath},
+			wantErr: []string{`"` + sbomPath + `"`, "no clean absolute path"},
+		},
+		{
+			name:    "unclean",
+			labels:  map[string]string{sbomLabel: sbomAt, advisoryLabel: "/usr/local/../local/share/divbast/sbom.cdx.json"},
+			wantErr: []string{"no clean absolute path"},
+		},
+		{
+			name:    "twice",
+			labels:  map[string]string{sbomLabel: sbomAt, advisoryLabel: sbomAt + ", " + sbomAt},
+			wantErr: []string{sbomAt, "twice"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			paths, err := declaredSBOMs(tt.labels, "image")
+			if err != nil && tt.wantErr == nil {
+				t.Fatalf("declaredSBOMs() error %v", err)
+			}
+			var got map[string]bool
+			if err == nil {
+				got, err = declaredAdvisorySBOMs(tt.labels, "image", paths)
+			}
+			if tt.wantErr == nil {
+				if err != nil || !maps.Equal(got, tt.want) {
+					t.Errorf("declaredAdvisorySBOMs() = %v, %v; want %v", got, err, tt.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("declaredAdvisorySBOMs() = %v, want an error", got)
+			}
+			for _, want := range append([]string{"image's " + advisoryLabel}, tt.wantErr...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("declaredAdvisorySBOMs() error %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestAdvisorySBOMHeld is the same new HIGH finding in two SBOMs of one
+// image, the second marked advisory: the first blocks, the second is held
+// and the verdict passes, whether or not the published image carries an
+// SBOM.
+func TestAdvisorySBOMHeld(t *testing.T) {
+	t.Parallel()
+	const bundle, tools = "opt/bundle/sbom.cdx.json", "usr/share/tools.cdx.json"
+	in := func(where string) scan.Finding {
+		return scan.Finding{ID: "CVE-2022-30333", Pkg: "unrar", Version: "6.11", Fixed: "6.12", Severity: "HIGH", Where: where}
+	}
+	advisory := map[string]bool{bundle: true}
+	tests := []struct {
+		name      string
+		where     string
+		uncarried bool
+		wantHold  string
+	}{
+		{name: "advisory", where: bundle, wantHold: scan.AdvisorySBOM},
+		{name: "not-advisory", where: tools},
+		{name: "not-advisory-uncarried", where: tools, uncarried: true, wantHold: scan.UncarriedSBOM},
+		// The mark is permanent, and an uncarried SBOM is a hold that ends
+		{name: "advisory-uncarried", where: bundle, uncarried: true, wantHold: scan.AdvisorySBOM},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			findings := []scan.Finding{in(tt.where)}
+			holdSBOMs(findings, advisory, tt.uncarried)
+			if findings[0].Hold != tt.wantHold {
+				t.Errorf("Hold = %q, want %q", findings[0].Hold, tt.wantHold)
+			}
+			split := scan.Compare(findings, nil, nil)
+			if blocks := len(split.New) > 0; blocks != (tt.wantHold == "") {
+				t.Errorf("Compare() = %+v, want it to block only without a hold", split)
+			}
+			if tt.wantHold == scan.AdvisorySBOM {
+				if len(split.Held) != 1 {
+					t.Errorf("Compare() = %+v, want the finding held", split)
+				}
+				if want := "1 new in an SBOM the image marks advisory, so listed, not blocking:\n"; !strings.Contains(scan.Listing("x", "new, so blocking", &split), want) {
+					t.Errorf("Listing() lacks %q", want)
 				}
 			}
 		})
@@ -555,6 +685,90 @@ func TestRunSBOMTrivy(t *testing.T) {
 	}
 	if want := "1 new, so blocking:\n  CVE-2022-30333 HIGH unrar 6.11, fixed in 6.12, " + sbomPath + "\n"; !strings.Contains(stdout.String(), want) {
 		t.Errorf("stdout = %q, want it to contain %q", stdout.String(), want)
+	}
+	runs, rules := sarifRuleIDs(t, p("report.sarif"))
+	if runs != 2 || !slices.Contains(rules, "CVE-1") || !slices.Contains(rules, "CVE-2022-30333-unrar") {
+		t.Errorf("SARIF holds %d runs with rules %q; want Trivy's and grype's, each with its own", runs, rules)
+	}
+}
+
+// TestRunAdvisorySBOM is TestRunSBOMTrivy with the SBOM marked advisory: the
+// finding that blocked there is listed, in the report, the summary and the
+// SARIF, and the run passes.
+func TestRunAdvisorySBOM(t *testing.T) {
+	t.Parallel()
+	sbom := fixtureSBOM(t)
+	dir := t.TempDir()
+	p := func(name string) string { return filepath.Join(dir, name) }
+	tmp := p("tmp")
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cache := p("cache")
+	cfg := filepath.Join(cache, "grype.yaml")
+	labelled := map[string]string{sbomLabel: sbomAt, advisoryLabel: sbomAt}
+	writeImage(t, p("layout"), debianRelease, "arm64", labelled, imageFile{name: sbomPath, body: string(sbom)})
+	olderSBOM := strings.ReplaceAll(string(sbom), "6.11", "6.02")
+	pubReport, pubCDX := edited(t, recorded(t, "grype-sbom.json"), "CVE-2022-30333", recorded(t, "grype-sbom.cdx.json"), "unrar", "6.02")
+
+	scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
+	trivySARIF := []byte(`{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Trivy","rules":[{"id":"CVE-1"}]}},"results":[{"ruleId":"CVE-1"}]}]}`)
+	files := map[string][]byte{
+		p("report.json"):              []byte(report(t, "arm64", "", 3, "CVE-1")),
+		p("report.sarif"):             trivySARIF,
+		p("baseline.json"):            []byte(report(t, "arm64", digest, 3, "CVE-1")),
+		p("report.json.sboms.1.json"): recorded(t, "grype-sbom.json"), p("report.json.sboms.1.cdx.json"): recorded(t, "grype-sbom.cdx.json"),
+		"{DIR}/candidate-sboms.1.sarif": recorded(t, "grype-sbom.sarif"),
+		p("baseline.json.sboms.1.json"): pubReport, p("baseline.json.sboms.1.cdx.json"): pubCDX,
+	}
+	calls := []execx.Call{
+		{Argv: append(append([]string{"trivy", "image", "--input", p("layout")}, scanArgs...), "--output", p("report.json"))},
+		{Argv: []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", p("report.sarif"), p("report.json")}},
+		{Argv: []string{"grype", "-c", cfg, "db", "update"}},
+		{Argv: []string{
+			"grype", "-c", cfg, "sbom:{DIR}/candidate-sboms/" + sbomPath,
+			"-o", "json=" + p("report.json.sboms.1.json"), "-o", "cyclonedx-json=" + p("report.json.sboms.1.cdx.json"),
+			"-o", "sarif={DIR}/candidate-sboms.1.sarif",
+		}},
+		{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
+		{Argv: append(append([]string{
+			"trivy", "image", "--image-src", "remote", "--platform", "linux/arm64", "--skip-db-update",
+		}, scanArgs...), "--output", p("baseline.json"), digest)},
+		{Argv: copyArgv},
+		{Argv: []string{
+			"grype", "-c", cfg, "sbom:{DIR}/published-sboms/" + sbomPath,
+			"-o", "json=" + p("baseline.json.sboms.1.json"), "-o", "cyclonedx-json=" + p("baseline.json.sboms.1.cdx.json"),
+		}},
+	}
+	runner := &lockRunner{
+		t: t, fake: execx.NewFake(t, calls...), tmp: tmp, files: files, seen: map[string]string{},
+		published: func(layout string) {
+			writeImage(t, layout, debianRelease, "arm64", labelled, imageFile{name: sbomPath, body: olderSBOM})
+		},
+	}
+	args := []string{
+		"-layout", p("layout"), "-report", p("report.json"), "-published", published,
+		"-baseline", p("baseline.json"), "-sarif", p("report.sarif"), "-cache", cache,
+	}
+	env := map[string]string{"TMPDIR": tmp, "GITHUB_STEP_SUMMARY": p("summary.md")}
+	var stdout, stderr bytes.Buffer
+	code := run(t.Context(), args, runner, execx.OS{}, offline(t), func(key string) string { return env[key] }, &stdout, &stderr)
+	if code != 0 {
+		t.Errorf("run() = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	unrar := "CVE-2022-30333 HIGH unrar 6.11, fixed in 6.12, " + sbomPath + "\n"
+	for _, want := range []string{
+		"0 new, so blocking:\n",
+		"1 new in an SBOM the image marks advisory, so listed, not blocking:\n  " + unrar,
+		", 1 in advisory SBOMs listed, not blocking)",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout.String(), want)
+		}
+	}
+	summary, err := os.ReadFile(p("summary.md"))
+	if err != nil || !strings.Contains(string(summary), "| `unrar` | 6.11 | 6.12 | "+sbomPath+" |") {
+		t.Errorf("summary = %q (error %v), want it to name unrar", summary, err)
 	}
 	runs, rules := sarifRuleIDs(t, p("report.sarif"))
 	if runs != 2 || !slices.Contains(rules, "CVE-1") || !slices.Contains(rules, "CVE-2022-30333-unrar") {

@@ -974,6 +974,26 @@ LABEL io.github.divbast.scan.sboms="/usr/local/share/divbast/sbom.cdx.json"
   declares none. In code scanning each sits at the SBOM's path in the
   image.
 
+An image that ships a payload it cannot patch, such as a signed bundle
+from upstream that carries its own copies of libraries, marks the SBOM of
+that payload advisory in a second label:
+
+```dockerfile
+LABEL io.github.divbast.scan.sboms.advisory="/opt/bundle/sbom.cdx.json"
+```
+
+- The label names paths as the first label does, and each path must also
+  be in the first label. The tool refuses an image whose second label
+  names any other path, and says which.
+- A new finding in an advisory SBOM is listed, on stdout, the summary and
+  the SARIF, and never blocks, whether or not `PUBLISHED` declares an
+  SBOM. The verdict line counts it as "in advisory SBOMs listed, not
+  blocking".
+- Use it only for what the repository cannot patch. An SBOM the repository
+  builds from its own sources stays unmarked, so that a new finding in it
+  blocks.
+- An image without the label is judged as before.
+
 Outside GitHub Actions the tool never asks GitHub, since the token a
 person gives the recipes, a fine-grained one, cannot read packages: the
 API answers it HTTP 403. A local `just scan`
