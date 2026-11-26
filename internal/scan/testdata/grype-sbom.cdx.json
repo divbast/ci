@@ -1,0 +1,19 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "metadata": {},
+  "components": [
+    {
+      "type": "library",
+      "name": "brotli",
+      "version": "1.1.0-1",
+      "purl": "pkg:deb/dhi/brotli@1.1.0-1?arch=arm64&distro=dhi-13&upstream=brotli"
+    },
+    {
+      "type": "library",
+      "name": "unrar",
+      "version": "6.11",
+      "cpe": "cpe:2.3:a:rarlab:unrar:6.11:*:*:*:*:*:*:*"
+    }
+  ]
+}

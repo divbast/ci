@@ -204,3 +204,43 @@ keep(["bomFormat", "specVersion", "metadata", "components"])
 `grype-lockfile.sarif` keeps every result and rule, without each rule's
 long descriptions. grype names no host path in a directory scan's SARIF:
 each result is at the lockfile's path in the image.
+
+## Grype on an SBOM
+
+Recorded with Grype 0.122.1 on 2026-11-26, offline, against its database of
+2026-11-24, with a configuration as `Grype.WriteConfig` writes one.
+
+The input is `sbom.cdx.json`, written by hand: a CycloneDX 1.6 document
+naming two components an image might build or copy in, each by the
+identifier an image declares it by. unrar 6.11 is named by its CPE alone,
+and brotli 1.1.0-1 by the package URL Docker's own builds of it carry. Each
+version is an old one with a known record. It was placed where an image
+would ship it, as divbast-scan writes an SBOM an image declares:
+
+```sh
+mkdir -p root/usr/local/share/divbast
+cp sbom.cdx.json root/usr/local/share/divbast/
+grype -c grype.yaml sbom:root/usr/local/share/divbast/sbom.cdx.json \
+    -o json=sbom.json -o cyclonedx-json=sbom.out.cdx.json -o sarif=sbom.sarif
+```
+
+grype matched unrar by its CPE, one HIGH, and brotli by its package URL,
+one CRITICAL and one HIGH, from Docker's own namespace: it reads the
+distribution from the package URL's `distro`. No finding has a location,
+and grype names none in the SARIF.
+
+`grype-sbom.json` is the report, trimmed by the first jq program above with
+`$ids` null, and with the source's target, the file's path, replaced by
+`sbom.cdx.json`. `grype-sbom.cdx.json` keeps grype's `metadata` as it wrote
+it, and each component's type, name, version, PURL and CPE: a component an
+SBOM names by its CPE alone keeps no PURL there.
+
+```jq
+def keep($ks): with_entries(select(.key | IN($ks[])));
+keep(["bomFormat", "specVersion", "metadata", "components"])
+| .metadata |= keep(["component"])
+| .components |= map(keep(["type", "name", "version", "purl", "cpe"]))
+```
+
+`grype-sbom.sarif` keeps every result and rule, without each rule's long
+descriptions.

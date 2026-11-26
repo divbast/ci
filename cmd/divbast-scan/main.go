@@ -44,7 +44,8 @@
 // For grype, -cache names the directory its configuration and its
 // vulnerability database go in, by default divbast-scan's own in the
 // user's cache directory, so a local scan keeps the database between runs,
-// for an image that says ID=dhi and for any that declares lockfiles.
+// for an image that says ID=dhi and for any that declares lockfiles or
+// SBOMs.
 // It updates the database once, with grype db update, then asks it about a
 // package a record in DHI's own namespace is known to match, for the
 // image's ID_LIKE and VERSION_ID, and refuses to scan unless the match
@@ -110,6 +111,28 @@
 // report beside -baseline. An image without the label is scanned as
 // before, and nothing of IMAGE is copied.
 //
+// An image may also declare, in its io.github.divbast.scan.sboms label,
+// CycloneDX SBOMs of what it ships that no image scan sees, such as a
+// binary it builds from source: absolute paths in the image, separated by
+// commas, each a file whose name ends in .cdx.json, of 16 MiB at most:
+//
+//	LABEL io.github.divbast.scan.sboms="/usr/local/share/divbast/sbom.cdx.json"
+//
+// Each component an SBOM names must have a name, a version, and a package
+// URL or a CPE, which grype matches it by. grype scans each SBOM the label
+// declares, whichever scanner reads the image, one run each, as an sbom:
+// source: the file from the image's layers, written at its path in the
+// temporary directory. The nth SBOM's report and CycloneDX go beside
+// -report, as .sboms.<n>.json and .sboms.<n>.cdx.json, counting from 1 in
+// the label's order, and its HIGH and CRITICAL findings into the SARIF, in
+// grype's run, each at the SBOM's path in the image. An SBOM is refused
+// when grype's CycloneDX does not name every component it does. Its
+// findings join the image's, each at the SBOM's path, and are judged as
+// every finding is, but while IMAGE carries no SBOM each is listed and
+// never blocks. IMAGE is read and copied as for lockfiles, once for both,
+// and the SBOMs its own label declares are scanned as the candidate's are,
+// their reports beside -baseline.
+//
 // It lists every finding on stdout and, when GitHub Actions sets it,
 // appends them as tables to $GITHUB_STEP_SUMMARY.
 //
@@ -160,9 +183,14 @@
 //	   other than clean absolute paths to pnpm-lock.yaml files, or one
 //	   twice, or a path the image holds no file at, or a symlink; a
 //	   declared lockfile larger than 64 MiB, not in pnpm's v9 format as the
-//	   scan reads it, or in which grype found no package; for an image that
-//	   declares lockfiles, grype's database not updated, the lockfiles'
-//	   SARIF not filtered or not merged into the image's, or IMAGE not
+//	   scan reads it, or in which grype found no package; an SBOM label
+//	   that names other than clean absolute paths to .cdx.json files, or
+//	   one twice, or a path the image holds no file at, or a symlink; a
+//	   declared SBOM larger than 16 MiB, not CycloneDX JSON, naming no
+//	   component, or one without a name, a version, or a package URL or
+//	   CPE, or one grype's CycloneDX does not name; for an image that
+//	   declares lockfiles or SBOMs, grype's database not updated, their
+//	   SARIF not filtered, placed or merged into the image's, or IMAGE not
 //	   copied; or the summary not written
 //	2  the command line is wrong
 package main
@@ -239,7 +267,7 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 	containerfile := flags.String("containerfile", "", "the Containerfile `FILE` the image was built from, "+
 		"whose final stage's base, when a dhi.io image, has its signed VEX document applied by both scans")
 	cache := flags.String("cache", "", "the `DIR` grype keeps its configuration and vulnerability database in, "+
-		"for an image that says ID=dhi or declares lockfiles (default: divbast-scan's own in the user's cache directory)")
+		"for an image that says ID=dhi or declares lockfiles or SBOMs (default: divbast-scan's own in the user's cache directory)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -295,12 +323,12 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		complain(stderr, "could not read the image's own os-release, so nothing says which model to scan it under: %v", err)
 		return 1
 	}
-	paths, err := declaredBy(*layout, layoutArch, *layout)
+	lockPaths, bomPaths, err := declaredBy(*layout, layoutArch, *layout)
 	if err != nil {
 		complain(stderr, "nothing is scanned: %v", err)
 		return 1
 	}
-	locks, err := readLockfiles(ctx, zstd, *layout, layoutArch, *layout, paths)
+	locks, err := readLockfiles(ctx, zstd, *layout, layoutArch, *layout, lockPaths)
 	if err != nil {
 		complain(stderr, "could not read the lockfiles the image declares, so nothing is scanned: %v", err)
 		return 1
@@ -308,6 +336,11 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 	read, err := locks.runtime()
 	if err != nil {
 		complain(stderr, "%v", err)
+		return 1
+	}
+	boms, err := readSBOMs(ctx, zstd, *layout, layoutArch, *layout, bomPaths)
+	if err != nil {
+		complain(stderr, "could not read the SBOMs the image declares, so nothing is scanned: %v", err)
 		return 1
 	}
 	var sc scanner = &trivyScanner{
@@ -345,21 +378,31 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		return 1
 	}
 
-	// The lockfiles' own scan, by grype whatever scans the image, as its
-	// directory catalogers read lockfiles and an image's read none
+	// The declared files' own scans, by grype whatever scans the image:
+	// its directory catalogers read lockfiles, and its sbom: source reads
+	// an SBOM, where an image's catalogers read neither
 	var (
-		g       scan.Grype
-		tmp     string
-		lockRep scan.Report
+		g               scan.Grype
+		tmp             string
+		lockRep, bomRep scan.Report
 	)
+	declares := len(locks.paths) > 0 || len(boms.paths) > 0
 	if len(locks.paths) > 0 {
 		if _, err = fmt.Fprintf(stdout, "%s declares %s in its %s label, so grype scans them too, and their findings in build-only packages never block\n",
 			*layout, locks, lockfileLabel); err != nil {
 			complain(stderr, "write the lockfiles: %v", err)
 			return 1
 		}
-		if tmp, err = os.MkdirTemp(getenv("TMPDIR"), name+"-lockfiles-"); err != nil {
-			complain(stderr, "make a directory for the lockfiles: %v", err)
+	}
+	if len(boms.paths) > 0 {
+		if _, err = fmt.Fprintf(stdout, "%s declares %s in its %s label, so grype scans them too\n", *layout, boms, sbomLabel); err != nil {
+			complain(stderr, "write the SBOMs: %v", err)
+			return 1
+		}
+	}
+	if declares {
+		if tmp, err = os.MkdirTemp(getenv("TMPDIR"), name+"-declared-"); err != nil {
+			complain(stderr, "make a directory for the files the image declares: %v", err)
 			return 1
 		}
 		defer func() {
@@ -367,11 +410,14 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 				complain(stderr, "remove %s: %v", tmp, rerr)
 			}
 		}()
-		lockSARIF := filepath.Join(tmp, "candidate.sarif")
-		g, err = lockGrype(ctx, sc, *cache, docs, r, stderr)
-		if err == nil {
-			lockRep, err = locks.scan(ctx, g, filepath.Join(tmp, "candidate"), *report+".lockfiles.json", *report+".lockfiles.cdx.json", lockSARIF)
+		if g, err = declaredGrype(ctx, sc, *cache, docs, r, stderr); err != nil {
+			complain(stderr, "%v", err)
+			return 1
 		}
+	}
+	if len(locks.paths) > 0 {
+		lockSARIF := filepath.Join(tmp, "candidate.sarif")
+		lockRep, err = locks.scan(ctx, g, filepath.Join(tmp, "candidate"), *report+".lockfiles.json", *report+".lockfiles.cdx.json", lockSARIF)
 		if err == nil {
 			err = g.SARIF(*report+".lockfiles.json", lockSARIF)
 		}
@@ -383,14 +429,21 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 			return 1
 		}
 	}
+	if len(boms.paths) > 0 {
+		if bomRep, err = boms.scan(ctx, g, filepath.Join(tmp, "candidate-sboms"), *report+".sboms", *sarif); err != nil {
+			complain(stderr, "%v", err)
+			return 1
+		}
+	}
 
 	inActions := getenv("GITHUB_ACTIONS") == "true"
 	lookup := registry.Lookup{Run: r, GH: ghapi.Client{Run: r}, RegistryOnly: !inActions}
-	// With lockfiles, the published image is read twice, by its scanner and
-	// for its layers, so both read it by the digest the registry served
+	// With declared files, the published image is read twice, by its
+	// scanner and for its layers, so both read it by the digest the
+	// registry served
 	ref := *published
 	var state registry.State
-	if len(locks.paths) > 0 {
+	if declares {
 		var pinned string
 		if pinned, state, err = lookup.Pin(ctx, *published); pinned != "" {
 			ref = pinned
@@ -405,10 +458,10 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 	}
 
 	var (
-		shipped          []scan.Finding
-		inventory        []scan.Pkg
-		against, warning string
-		uncarried        bool
+		shipped                       []scan.Finding
+		inventory                     []scan.Pkg
+		against, warning              string
+		uncarriedLocks, uncarriedBOMs bool
 	)
 	if advisory == nil {
 		var pub scan.Report
@@ -417,16 +470,11 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 			return 1
 		}
 		shipped, inventory, against = pub.Findings, pub.Inventory, pub.Ref
-		if len(locks.paths) > 0 {
-			if uncarried, err = publishedLockfiles(ctx, lookup, zstd, g, ref, arch, tmp, *baseline, &shipped, &inventory); err != nil {
-				complain(stderr, "could not tell which lockfiles %s carries, so no finding in a lockfile can be told apart from one already published: %v", ref, err)
+		if declares {
+			if uncarriedLocks, uncarriedBOMs, err = publishedDeclared(ctx, lookup, zstd, g, locks, boms,
+				ref, arch, tmp, *baseline, &shipped, &inventory, stdout); err != nil {
+				complain(stderr, "%v", err)
 				return 1
-			}
-			if uncarried {
-				if _, err = fmt.Fprintf(stdout, "%s carries no lockfile, so the findings in %s are listed, not blocking, until a published image carries one\n", ref, locks); err != nil {
-					complain(stderr, "write the lockfiles: %v", err)
-					return 1
-				}
 			}
 		}
 	} else {
@@ -448,8 +496,13 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		}
 	}
 
-	held(lockRep.Findings, read, uncarried)
-	split := scan.Compare(slices.Concat(candidate.Findings, lockRep.Findings), shipped, inventory)
+	held(lockRep.Findings, read, uncarriedLocks)
+	if uncarriedBOMs {
+		for i := range bomRep.Findings {
+			bomRep.Findings[i].Hold = scan.UncarriedSBOM
+		}
+	}
+	split := scan.Compare(slices.Concat(candidate.Findings, lockRep.Findings, bomRep.Findings), shipped, inventory)
 	verdict, heading := "new, so blocking", "New, so blocking"
 	if advisory != nil {
 		verdict, heading = "advisory: "+advisory.heading, "Advisory: "+advisory.heading
@@ -478,8 +531,17 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 		if len(split.Listed) > 0 {
 			counts += fmt.Sprintf(", %d listed with no severity", len(split.Listed))
 		}
-		if len(split.Held) > 0 {
-			counts += fmt.Sprintf(", %d in lockfiles listed, not blocking", len(split.Held))
+		inSBOMs := 0
+		for i := range split.Held {
+			if split.Held[i].Hold == scan.UncarriedSBOM {
+				inSBOMs++
+			}
+		}
+		if n := len(split.Held) - inSBOMs; n > 0 {
+			counts += fmt.Sprintf(", %d in lockfiles listed, not blocking", n)
+		}
+		if inSBOMs > 0 {
+			counts += fmt.Sprintf(", %d in SBOMs listed, not blocking", inSBOMs)
 		}
 		_, err = fmt.Fprintf(stdout, "nothing new against what is published (%s)\n", counts)
 	}

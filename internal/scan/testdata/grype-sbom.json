@@ -1,0 +1,183 @@
+{
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "DHI-vz37-nsrl-mqqp-mdjb",
+        "dataSource": "https://scout.docker.com/v/DHI-vz37-nsrl-mqqp-mdjb",
+        "namespace": "dhi:distro:dhi:13",
+        "severity": "Critical",
+        "fix": {
+          "versions": [
+            "1.1.0-2+deb13u1+dhi0"
+          ],
+          "state": "fixed"
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2026-111497"
+        }
+      ],
+      "artifact": {
+        "name": "brotli",
+        "version": "1.1.0-1",
+        "type": "deb",
+        "locations": [],
+        "purl": "pkg:deb/dhi/brotli@1.1.0-1?arch=arm64&distro=dhi-13&upstream=brotli"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "CVE-2022-30333",
+        "dataSource": "https://nvd.nist.gov/vuln/detail/CVE-2022-30333",
+        "namespace": "nvd:cpe",
+        "severity": "High",
+        "fix": {
+          "versions": [
+            "6.12"
+          ],
+          "state": "fixed"
+        }
+      },
+      "relatedVulnerabilities": [],
+      "artifact": {
+        "name": "unrar",
+        "version": "6.11",
+        "type": "UnknownPackage",
+        "locations": [],
+        "purl": ""
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "DHI-fwcj-m32u-e4uq-6hzy",
+        "dataSource": "https://scout.docker.com/v/DHI-fwcj-m32u-e4uq-6hzy",
+        "namespace": "dhi:distro:dhi:13",
+        "severity": "High",
+        "fix": {
+          "versions": [
+            "1.1.0-2+deb13u1+dhi1"
+          ],
+          "state": "fixed"
+        }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2025-6176"
+        }
+      ],
+      "artifact": {
+        "name": "brotli",
+        "version": "1.1.0-1",
+        "type": "deb",
+        "locations": [],
+        "purl": "pkg:deb/dhi/brotli@1.1.0-1?arch=arm64&distro=dhi-13&upstream=brotli"
+      }
+    }
+  ],
+  "source": {
+    "type": "sbom-file",
+    "target": "sbom.cdx.json"
+  },
+  "distro": {
+    "name": "dhi",
+    "version": "13",
+    "idLike": [
+      "dhi"
+    ]
+  },
+  "descriptor": {
+    "name": "grype",
+    "version": "0.122.1",
+    "db": {
+      "status": {
+        "schemaVersion": "v6.1.10",
+        "from": "https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.10_2026-11-24T00:23:39Z_1795587741.tar.zst?checksum=sha256%3A8a5df903f7a5362233738dbf4f4b1066e6b121e4da881e596f2fc7ec81fdd3aa",
+        "built": "2026-11-25T06:22:21Z"
+      },
+      "providers": {
+        "alma": {
+          "captured": "2026-11-25T00:22:10Z"
+        },
+        "alpine": {
+          "captured": "2026-11-25T00:22:07Z"
+        },
+        "amazon": {
+          "captured": "2026-11-25T00:22:07Z"
+        },
+        "arch": {
+          "captured": "2026-11-25T00:22:07Z"
+        },
+        "bitnami": {
+          "captured": "2026-11-25T00:22:10Z"
+        },
+        "chainguard": {
+          "captured": "2026-11-25T00:22:17Z"
+        },
+        "chainguard-libraries": {
+          "captured": "2026-11-25T00:22:41Z"
+        },
+        "debian": {
+          "captured": "2026-11-25T00:22:21Z"
+        },
+        "dhi": {
+          "captured": "2026-11-25T00:22:22Z"
+        },
+        "echo": {
+          "captured": "2026-11-25T00:22:17Z"
+        },
+        "eol": {
+          "captured": "2026-11-25T00:22:23Z"
+        },
+        "epss": {
+          "captured": "2026-11-25T00:22:00Z"
+        },
+        "fedora": {
+          "captured": "2026-11-25T00:22:10Z"
+        },
+        "github": {
+          "captured": "2026-11-25T00:22:26Z"
+        },
+        "govulndb": {
+          "captured": "2026-11-25T00:22:18Z"
+        },
+        "hummingbird": {
+          "captured": "2026-11-24T00:23:39Z"
+        },
+        "kev": {
+          "captured": "2026-11-25T00:22:13Z"
+        },
+        "mariner": {
+          "captured": "2026-11-25T00:22:07Z"
+        },
+        "minimos": {
+          "captured": "2026-11-25T00:22:12Z"
+        },
+        "nvd": {
+          "captured": "2026-11-25T00:22:48Z"
+        },
+        "oracle": {
+          "captured": "2026-11-25T00:22:17Z"
+        },
+        "photon": {
+          "captured": "2026-11-25T00:22:10Z"
+        },
+        "rhel": {
+          "captured": "2026-11-25T00:23:31Z"
+        },
+        "secureos": {
+          "captured": "2026-11-25T00:22:09Z"
+        },
+        "sles": {
+          "captured": "2026-11-25T00:23:57Z"
+        },
+        "ubuntu": {
+          "captured": "2026-11-25T00:22:40Z"
+        },
+        "wolfi": {
+          "captured": "2026-11-25T00:22:07Z"
+        }
+      }
+    }
+  }
+}

@@ -173,6 +173,22 @@ func (g Grype) Dir(ctx context.Context, dir, report, cdx, sarif string) error {
 	return g.logged(ctx, args...)
 }
 
+// SBOM scans the components the CycloneDX SBOM at file names, as grype
+// reads an sbom: source, and writes the report to report, its CycloneDX to
+// cdx, and its SARIF to sarif, unless sarif is "". No image or directory
+// scan reads an SBOM: grype's catalogers pass over one in a tree.
+func (g Grype) SBOM(ctx context.Context, file, report, cdx, sarif string) error {
+	rest := []string{"sbom:" + file, "-o", "json=" + report, "-o", "cyclonedx-json=" + cdx}
+	if sarif != "" {
+		rest = append(rest, "-o", "sarif="+sarif)
+	}
+	args, err := g.args(slices.Concat(rest, g.vexArgs())...)
+	if err != nil {
+		return err
+	}
+	return g.logged(ctx, args...)
+}
+
 // SARIF rewrites the SARIF at sarif, from the Layout or Dir run that wrote
 // the report at report, to hold the HIGH and CRITICAL findings alone, as
 // the verdict counts them, for code scanning.
@@ -438,6 +454,38 @@ func filterSARIF(report, sarif string) error {
 	if got != want {
 		return fmt.Errorf("grype's SARIF %s holds %d results for the report's %d HIGH or CRITICAL findings: "+
 			"its rules no longer read as <ID>-<package>, so code scanning would not see what the verdict counts", sarif, got, want)
+	}
+	data, err := json.MarshalIndent(doc, "", " ")
+	if err != nil {
+		return err
+	}
+	return writeFileIn(sarif, data)
+}
+
+// LocateSARIF rewrites the SARIF at sarif to place each location of a
+// result that names no file at uri. grype places no finding of an SBOM's
+// at a file, as an SBOM names no file its components are in, so uri is
+// the SBOM's own path in the image: code scanning then shows where the
+// component is declared. A location that names a file keeps it.
+func LocateSARIF(sarif, uri string) error {
+	var doc map[string]any
+	if err := readJSONFile(sarif, &doc); err != nil {
+		return fmt.Errorf("read grype's SARIF: %w", err)
+	}
+	runs, _ := doc["runs"].([]any)
+	for _, r := range runs {
+		run, _ := r.(map[string]any)
+		results, _ := run["results"].([]any)
+		for _, res := range results {
+			locations, _ := res.(map[string]any)["locations"].([]any)
+			for _, l := range locations {
+				physical, _ := l.(map[string]any)["physicalLocation"].(map[string]any)
+				artifact, _ := physical["artifactLocation"].(map[string]any)
+				if at, _ := artifact["uri"].(string); artifact != nil && at == "" {
+					artifact["uri"] = uri
+				}
+			}
+		}
 	}
 	data, err := json.MarshalIndent(doc, "", " ")
 	if err != nil {

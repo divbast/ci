@@ -45,11 +45,11 @@ func fixtureLock(t *testing.T) []byte {
 
 // lockRunner answers as the real tools would, through a Fake that checks
 // every argv, where {DIR} stands for the directory run makes in tmp for
-// the lockfiles. A call that succeeds writes, for each -o FORMAT=PATH or
+// the files an image declares, its lockfiles and its SBOMs. A call that succeeds writes, for each -o FORMAT=PATH or
 // --output PATH it names, the content scripted for PATH, {DIR} standing
 // in; a skopeo copy that succeeds writes the published image into the
 // layout it names. It keeps the lockfile each dir: scan found, by its
-// root.
+// root, and the file each sbom: scan read, by its path.
 type lockRunner struct {
 	t         *testing.T
 	fake      *execx.Fake
@@ -62,7 +62,7 @@ type lockRunner struct {
 }
 
 func (l *lockRunner) Run(ctx context.Context, name string, args ...string) (execx.Result, error) {
-	prefix := filepath.Join(l.tmp, "divbast-scan-lockfiles-")
+	prefix := filepath.Join(l.tmp, "divbast-scan-declared-")
 	argv := slices.Clone(args)
 	for i, a := range argv {
 		if j := strings.Index(a, prefix); l.dir == "" && j >= 0 {
@@ -79,6 +79,13 @@ func (l *lockRunner) Run(ctx context.Context, name string, args ...string) (exec
 			data, err := os.ReadFile(filepath.Join(root, lockPath)) //nolint:gosec // G304: a path run made, read back
 			if err != nil {
 				l.t.Errorf("grype scanned %s, which holds no %s: %v", root, lockPath, err)
+			}
+			l.seen[argv[i]] = string(data)
+		}
+		if file, ok := strings.CutPrefix(a, "sbom:"); ok {
+			data, err := os.ReadFile(file) //nolint:gosec // G304: a path run made, read back
+			if err != nil {
+				l.t.Errorf("grype scanned %s, which run did not write: %v", file, err)
 			}
 			l.seen[argv[i]] = string(data)
 		}
@@ -277,7 +284,7 @@ func TestRunLockfiles(t *testing.T) {
 				"could not tell which lockfiles " + digest + " carries",
 				digest + " declares " + lockLabel + " in its " + lockfileLabel + " label, but holds no file there",
 			},
-			notInStderr: []string{"divbast-scan-lockfiles-"},
+			notInStderr: []string{"divbast-scan-declared-"},
 		},
 		{
 			name:      "published-label-malformed",
@@ -285,7 +292,7 @@ func TestRunLockfiles(t *testing.T) {
 			skopeo:    index, copyResult: &execx.Result{},
 			wantCode:    1,
 			wantStderr:  []string{digest + "'s " + lockfileLabel + ` label names "` + lockPath + `"`},
-			notInStderr: []string{"divbast-scan-lockfiles-"},
+			notInStderr: []string{"divbast-scan-declared-"},
 		},
 		{
 			// Each lockfile must hold a package grype found, not only the
@@ -761,7 +768,7 @@ func TestRunLockfileUnreadable(t *testing.T) {
 		{
 			name:    "config",
 			breakIt: true,
-			want:    []string{"could not read ", "'s config, so nothing says which lockfiles it declares"},
+			want:    []string{"could not read ", "'s config, so nothing says which files it declares to the scan"},
 			not:     []string{"the lockfiles the image declares"},
 		},
 		{
