@@ -144,7 +144,11 @@ jobs:
           #   read; --frozen-lockfile installs only what the lockfile holds,
           #   --ignore-scripts runs no package's install script, and
           #   --ignore-pnpmfile runs no pnpmfile hook of the repository's;
-          # - go run ./cmd/genicons writes the icons from lucide-static.
+          # - go run ./cmd/genicons writes the icons from lucide-static;
+          # - go run ./cmd/divbast-pins regenerates a repository's Python
+          #   locks and its unrar checksum from the pins the pull request
+          #   moved. It is run as the module's own command, so the code it
+          #   runs is the code under review.
           # The patterns bound the command line only: a repository's .npmrc
           # or pnpm-workspace.yaml can still change what pnpm does, as the
           # repository's own code runs here anyway.
@@ -156,4 +160,5 @@ jobs:
             ["^go tool -modfile=tools/go\\.mod templ generate$",
             "^go tool -modfile=tools/go\\.mod sqlc generate$",
             "^pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile$",
-            "^go run \\./cmd/genicons$"]
+            "^go run \\./cmd/genicons$",
+            "^go run \\./cmd/divbast-pins$"]
