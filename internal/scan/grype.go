@@ -465,6 +465,16 @@ func MergeSARIF(into, from string) error {
 		return fmt.Errorf("%s holds no runs to merge into", into)
 	}
 	more, _ := src["runs"].([]any)
+	for i, r := range runs {
+		if _, ok := r.(map[string]any); !ok {
+			return fmt.Errorf("run %d of %s is not a JSON object, so it is no SARIF run", i, into)
+		}
+	}
+	for i, r := range more {
+		if _, ok := r.(map[string]any); !ok {
+			return fmt.Errorf("run %d of %s is not a JSON object, so it is no SARIF run", i, from)
+		}
+	}
 	for _, r := range more {
 		run, _ := r.(map[string]any)
 		i := slices.IndexFunc(runs, func(x any) bool {
