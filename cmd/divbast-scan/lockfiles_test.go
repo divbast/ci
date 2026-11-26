@@ -534,6 +534,104 @@ func TestRunLockfilesTrivy(t *testing.T) {
 	}
 }
 
+// TestRunLockfilesNoFindingsSARIF checks that the SARIF written for an
+// image with lockfiles and no findings holds an array wherever SARIF
+// needs one: grype writes no rules for such a lockfile, and code scanning
+// refuses a null in their place.
+func TestRunLockfilesNoFindingsSARIF(t *testing.T) {
+	t.Parallel()
+	lock := fixtureLock(t)
+	dir := t.TempDir()
+	p := func(name string) string { return filepath.Join(dir, name) }
+	tmp := p("tmp")
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cache := p("cache")
+	cfg := filepath.Join(cache, "grype.yaml")
+	labelled := map[string]string{lockfileLabel: lockLabel}
+	writeImage(t, p("layout"), debianRelease, "arm64", labelled, imageFile{name: lockPath, body: string(lock)})
+
+	// The lockfile's packages, and none of the findings
+	var clean map[string]any
+	if err := json.Unmarshal(recorded(t, "grype-lockfile.json"), &clean); err != nil {
+		t.Fatal(err)
+	}
+	clean["matches"] = []any{}
+	lockReport, err := json.Marshal(clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockCDX := recorded(t, "grype-lockfile.cdx.json")
+	scanArgs := []string{"--config", "", "--ignorefile", "", "--severity", "HIGH,CRITICAL", "--format", "json"}
+	files := map[string][]byte{
+		p("report.json"):                []byte(report(t, "arm64", "", 3)),
+		p("report.sarif"):               []byte(`{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Trivy","rules":[]}},"results":[]}]}`),
+		p("baseline.json"):              []byte(report(t, "arm64", digest, 3)),
+		p("report.json.lockfiles.json"): lockReport, p("report.json.lockfiles.cdx.json"): lockCDX,
+		"{DIR}/candidate.sarif":           []byte(`{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"grype"}},"results":[]}]}`),
+		p("baseline.json.lockfiles.json"): lockReport, p("baseline.json.lockfiles.cdx.json"): lockCDX,
+	}
+	calls := []execx.Call{
+		{Argv: append(append([]string{"trivy", "image", "--input", p("layout")}, scanArgs...), "--output", p("report.json"))},
+		{Argv: []string{"trivy", "convert", "--config", "", "--ignorefile", "", "--format", "sarif", "--output", p("report.sarif"), p("report.json")}},
+		{Argv: []string{"grype", "-c", cfg, "db", "update"}},
+		{Argv: []string{
+			"grype", "-c", cfg, "dir:{DIR}/candidate",
+			"-o", "json=" + p("report.json.lockfiles.json"), "-o", "cyclonedx-json=" + p("report.json.lockfiles.cdx.json"),
+			"-o", "sarif={DIR}/candidate.sarif",
+		}},
+		{Argv: skopeoArgv, Result: execx.Result{Stdout: skopeoRecording(t, "skopeo-librespeed-latest.json")}},
+		{Argv: append(append([]string{
+			"trivy", "image", "--image-src", "remote", "--platform", "linux/arm64", "--skip-db-update",
+		}, scanArgs...), "--output", p("baseline.json"), digest)},
+		{Argv: copyArgv},
+		{Argv: []string{
+			"grype", "-c", cfg, "dir:{DIR}/published",
+			"-o", "json=" + p("baseline.json.lockfiles.json"), "-o", "cyclonedx-json=" + p("baseline.json.lockfiles.cdx.json"),
+		}},
+	}
+	runner := &lockRunner{
+		t: t, fake: execx.NewFake(t, calls...), tmp: tmp, files: files, seen: map[string]string{},
+		published: func(layout string) {
+			writeImage(t, layout, debianRelease, "arm64", labelled, imageFile{name: lockPath, body: string(lock)})
+		},
+	}
+	args := []string{
+		"-layout", p("layout"), "-report", p("report.json"), "-published", published,
+		"-baseline", p("baseline.json"), "-sarif", p("report.sarif"), "-cache", cache,
+	}
+	env := map[string]string{"TMPDIR": tmp}
+	var stdout, stderr bytes.Buffer
+	if code := run(t.Context(), args, runner, execx.OS{}, offline(t), func(key string) string { return env[key] }, &stdout, &stderr); code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	data, err := os.ReadFile(p("report.sarif"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Runs []struct {
+			Results any
+			Tool    struct{ Driver struct{ Rules any } }
+		}
+	}
+	if err = json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Runs) != 2 {
+		t.Fatalf("SARIF holds %d runs, want Trivy's and grype's", len(doc.Runs))
+	}
+	for i, r := range doc.Runs {
+		if _, ok := r.Results.([]any); !ok {
+			t.Errorf("runs[%d].results = %v, want an array", i, r.Results)
+		}
+		if _, ok := r.Tool.Driver.Rules.([]any); !ok {
+			t.Errorf("runs[%d].tool.driver.rules = %v, want an array", i, r.Tool.Driver.Rules)
+		}
+	}
+}
+
 // TestRunLockfileRefusals checks that a label the scan cannot follow, a
 // lockfile it does not hold or cannot read, fails before any scanner runs.
 func TestRunLockfileRefusals(t *testing.T) {

@@ -206,3 +206,61 @@ func TestMergeSARIF(t *testing.T) {
 		t.Error("MergeSARIF() into a SARIF that is no JSON = nil, want an error")
 	}
 }
+
+// TestMergeSARIFWritesArrays checks that runs with no rules or results,
+// as grype writes them when it finds nothing, merge into runs that are
+// still arrays all through.
+func TestMergeSARIFWritesArrays(t *testing.T) {
+	t.Parallel()
+	const empty = `{"runs":[{"tool":{"driver":{"name":"grype","rules":null}},"results":null}]}`
+	tests := []struct{ name, into, from string }{
+		{"same tool, both null", empty, empty},
+		{"same tool, no keys", `{"runs":[{"tool":{"driver":{"name":"grype"}}}]}`, `{"runs":[{"tool":{"driver":{"name":"grype"}}}]}`},
+		{"other tool, null kept", `{"runs":[{"tool":{"driver":{"name":"Trivy","rules":null}},"results":null}]}`, empty},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			into, from := filepath.Join(dir, "into.sarif"), filepath.Join(dir, "from.sarif")
+			for path, body := range map[string]string{into: tt.into, from: tt.from} {
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := scan.MergeSARIF(into, from); err != nil {
+				t.Fatalf("MergeSARIF() = %v", err)
+			}
+			requireSARIFArrays(t, into)
+		})
+	}
+}
+
+// TestMergeSARIFRejectsRunsThatAreNoObjects checks that a SARIF whose run
+// is null or a string fails with an error naming it, and does not panic.
+func TestMergeSARIFRejectsRunsThatAreNoObjects(t *testing.T) {
+	t.Parallel()
+	const good = `{"runs":[{"tool":{"driver":{"name":"grype"}},"results":[]}]}`
+	tests := []struct{ name, into, from, want string }{
+		{"null run to merge", good, `{"runs":[null]}`, "from.sarif"},
+		{"string run to merge", good, `{"runs":["x"]}`, "from.sarif"},
+		{"null run to merge into", `{"runs":[null]}`, good, "into.sarif"},
+		{"string run to merge into", `{"runs":["x"]}`, good, "into.sarif"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			into, from := filepath.Join(dir, "into.sarif"), filepath.Join(dir, "from.sarif")
+			for path, body := range map[string]string{into: tt.into, from: tt.from} {
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := scan.MergeSARIF(into, from)
+			if err == nil || !strings.Contains(err.Error(), tt.want) || !strings.Contains(err.Error(), "not a JSON object") {
+				t.Errorf("MergeSARIF() = %v, want an error naming %s and saying a run is not a JSON object", err, tt.want)
+			}
+		})
+	}
+}
