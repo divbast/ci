@@ -38,7 +38,8 @@ import (
 // the advisory, such as dhi:distro:dhi:13, where it says; Trivy does not.
 //
 // Hold, when not "", is why the finding never blocks when the published
-// image lacks it, as words that follow "new": [BuildOnly] or [Uncarried].
+// image lacks it, as words that follow "new": [BuildOnly], [Uncarried] or
+// [UncarriedSBOM].
 type Finding struct {
 	ID, Pkg, Version, Fixed, Severity, URL, Where, Namespace string
 	Aliases                                                  []string
@@ -56,6 +57,11 @@ const (
 	// findings are already shipped.
 	Uncarried = "in a lockfile the published image does not carry"
 )
+
+// UncarriedSBOM is the hold of a finding in an SBOM an image declares,
+// while the published image carries none: until one is published, nothing
+// shows which of its findings are already shipped.
+const UncarriedSBOM = "in an SBOM the published image does not carry"
 
 // Pkg is a package an image ships, by name and version, the version
 // written as a finding's is.

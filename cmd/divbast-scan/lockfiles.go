@@ -5,19 +5,14 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/divbast/ci/internal/execx"
-	"github.com/divbast/ci/internal/ocilayout"
 	"github.com/divbast/ci/internal/pnpmlock"
-	"github.com/divbast/ci/internal/registry"
 	"github.com/divbast/ci/internal/scan"
 )
 
@@ -45,45 +40,12 @@ type lockfiles struct {
 // pnpm-lock.yaml, and come once; a label that names none, or one any
 // other way, is an error. image names the image in the error.
 func declared(labels map[string]string, image string) ([]string, error) {
-	value, ok := labels[lockfileLabel]
-	if !ok {
-		return nil, nil
-	}
-	var paths []string
-	for p := range strings.SplitSeq(value, ",") {
-		p = strings.TrimSpace(p)
-		switch {
-		case p == "":
-			return nil, fmt.Errorf("%s's %s label is %q, with an empty path in it: name each lockfile once, separated by commas", image, lockfileLabel, value)
-		case !path.IsAbs(p) || path.Clean(p) != p || p == "/":
-			return nil, fmt.Errorf("%s's %s label names %q, which is no clean absolute path in the image", image, lockfileLabel, p)
-		case path.Base(p) != lockfileName:
-			return nil, fmt.Errorf("%s's %s label names %s, but the scan reads only pnpm's lockfiles, named %s", image, lockfileLabel, p, lockfileName)
+	return declaredPaths(labels, lockfileLabel, image, func(p string) string {
+		if path.Base(p) != lockfileName {
+			return "the scan reads only pnpm's lockfiles, named " + lockfileName
 		}
-		p = strings.TrimPrefix(p, "/")
-		if slices.Contains(paths, p) {
-			return nil, fmt.Errorf("%s's %s label names /%s twice", image, lockfileLabel, p)
-		}
-		paths = append(paths, p)
-	}
-	return paths, nil
-}
-
-// declaredBy reads which lockfiles the linux/arch image in the OCI layout
-// at layout declares, in its label: none when it has none. name is what
-// the errors call the image. A config that cannot be read is an error that
-// says no more than that.
-func declaredBy(layout, arch, name string) ([]string, error) {
-	im, err := ocilayout.OpenAs(layout, arch, name)
-	if err != nil {
-		return nil, fmt.Errorf("could not read %s's config, so nothing says which lockfiles it declares: %w", name, err)
-	}
-	defer func() { _ = im.Close() }() // read-only, so nothing to lose
-	cfg, err := im.Config()
-	if err != nil {
-		return nil, fmt.Errorf("could not read %s's config, so nothing says which lockfiles it declares: %w", name, err)
-	}
-	return declared(cfg.Labels, name)
+		return ""
+	})
 }
 
 // readLockfiles reads paths, the lockfiles the linux/arch image in the
@@ -93,27 +55,11 @@ func readLockfiles(ctx context.Context, zstd execx.StreamRunner, layout, arch, n
 	if len(paths) == 0 {
 		return lockfiles{}, nil
 	}
-	im, err := ocilayout.OpenAs(layout, arch, name)
+	files, err := readDeclared(ctx, zstd, layout, arch, name, lockfileLabel, paths, maxLockfile)
 	if err != nil {
 		return lockfiles{}, err
 	}
-	defer func() { _ = im.Close() }() // read-only, so nothing to lose
-	tree, err := im.Files(ctx, zstd, func(p string) (int64, bool) { return maxLockfile, slices.Contains(paths, p) })
-	if err != nil {
-		return lockfiles{}, err
-	}
-	l := lockfiles{paths: paths, files: map[string][]byte{}}
-	for _, p := range paths {
-		n, ok := tree[p]
-		switch {
-		case !ok:
-			return lockfiles{}, fmt.Errorf("%s declares /%s in its %s label, but holds no file there", name, p, lockfileLabel)
-		case n.Link != "":
-			return lockfiles{}, fmt.Errorf("%s declares /%s in its %s label, but it is a symlink, to %s: declare the file itself", name, p, lockfileLabel, n.Link)
-		}
-		l.files[p] = n.Body
-	}
-	return l, nil
+	return lockfiles{paths: paths, files: files}, nil
 }
 
 // runtime reads each lockfile of l, to tell its runtime packages from its
@@ -135,7 +81,7 @@ func (l lockfiles) runtime() (map[string]*pnpmlock.Lockfile, error) {
 // cdx, and its SARIF to sarif, unless sarif is "". A lockfile in which
 // grype finds no package is refused: a scan of it would prove nothing.
 func (l lockfiles) scan(ctx context.Context, g scan.Grype, root, report, cdx, sarif string) (scan.Report, error) {
-	if err := l.write(root); err != nil {
+	if err := writeUnder(root, l.paths, l.files); err != nil {
 		return scan.Report{}, fmt.Errorf("write the lockfiles %s for grype: %w", l, err)
 	}
 	if err := g.Dir(ctx, root, report, cdx, sarif); err != nil {
@@ -151,30 +97,6 @@ func (l lockfiles) scan(ctx context.Context, g scan.Grype, root, report, cdx, sa
 		}
 	}
 	return rep, nil
-}
-
-// write makes the directory root, and writes l's lockfiles under it, each
-// at its path in the image, through an [os.Root] on it.
-func (l lockfiles) write(root string) (err error) {
-	err = os.Mkdir(root, 0o700)
-	if err != nil {
-		return err
-	}
-	dir, err := os.OpenRoot(root)
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, dir.Close()) }()
-	for _, p := range l.paths {
-		err = dir.MkdirAll(path.Dir(p), 0o700)
-		if err == nil {
-			err = dir.WriteFile(p, l.files[p], 0o600)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // String lists l's paths, as the image names them.
@@ -199,11 +121,11 @@ func held(findings []scan.Finding, read map[string]*pnpmlock.Lockfile, uncarried
 	}
 }
 
-// lockGrype is the grype that scans the lockfiles: the image's scanner,
-// for an image that says ID=dhi, whose database its own scan updated, or
-// else one of its own, configured in cache, with its database updated
-// once for both sides.
-func lockGrype(ctx context.Context, sc scanner, cache string, docs []string, r execx.Runner, stderr io.Writer) (scan.Grype, error) {
+// declaredGrype is the grype that scans the files an image declares, its
+// lockfiles and its SBOMs: the image's scanner, for an image that says
+// ID=dhi, whose database its own scan updated, or else one of its own,
+// configured in cache, with its database updated once for both sides.
+func declaredGrype(ctx context.Context, sc scanner, cache string, docs []string, r execx.Runner, stderr io.Writer) (scan.Grype, error) {
 	if gs, ok := sc.(*grypeScanner); ok {
 		return gs.grype, nil
 	}
@@ -221,22 +143,15 @@ func lockGrype(ctx context.Context, sc scanner, cache string, docs []string, r e
 	return g, nil
 }
 
-// publishedLockfiles copies ref, the published image as pinned, for
-// linux/arch, into tmp, with skopeo, and reads the lockfiles its own label
-// declares, naming it ref in every error, never the copy's directory. It scans them with g, writing its report beside baseline, and
-// adds their findings to shipped and their packages to inventory. It
-// reports whether the image carries none.
-func publishedLockfiles(ctx context.Context, lookup registry.Lookup, zstd execx.StreamRunner, g scan.Grype,
-	ref, arch, tmp, baseline string, shipped *[]scan.Finding, inventory *[]scan.Pkg,
+// publishedLockfiles reads paths, the lockfiles the published image ref
+// declares in its own label, from its copy for linux/arch in the OCI
+// layout at layout, naming it ref in every error, never the copy's
+// directory. It scans them with g under tmp, writing its report beside
+// baseline, and adds their findings to shipped and their packages to
+// inventory. It reports whether the image carries none.
+func publishedLockfiles(ctx context.Context, zstd execx.StreamRunner, g scan.Grype,
+	layout, ref, arch, tmp, baseline string, paths []string, shipped *[]scan.Finding, inventory *[]scan.Pkg,
 ) (uncarried bool, _ error) {
-	layout := filepath.Join(tmp, "published-layout")
-	if err := lookup.Copy(ctx, ref, arch, layout); err != nil {
-		return false, err
-	}
-	paths, err := declaredBy(layout, arch, ref)
-	if err != nil {
-		return false, err
-	}
 	if len(paths) == 0 {
 		return true, nil
 	}
