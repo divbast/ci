@@ -392,3 +392,66 @@ func TestGrypeSARIFKeepsHighAndCritical(t *testing.T) {
 		t.Errorf("SARIF() over a SARIF it cannot match = %v, want an error naming the SARIF", err)
 	}
 }
+
+// requireSARIFArrays fails the test unless the SARIF at path holds an
+// array in each place SARIF 2.1.0 needs one that the scan writes: runs,
+// and each run's results and tool.driver.rules. JSON null is no array,
+// and code scanning refuses it.
+func requireSARIFArrays(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the test's own temporary file
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err = json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	runs, ok := doc["runs"].([]any)
+	if !ok {
+		t.Fatalf("runs = %v, want an array", doc["runs"])
+	}
+	for i, r := range runs {
+		run, _ := r.(map[string]any)
+		if _, ok := run["results"].([]any); !ok {
+			t.Errorf("runs[%d].results = %v, want an array", i, run["results"])
+		}
+		tool, _ := run["tool"].(map[string]any)
+		driver, _ := tool["driver"].(map[string]any)
+		if _, ok := driver["rules"].([]any); !ok {
+			t.Errorf("runs[%d].tool.driver.rules = %v, want an array", i, driver["rules"])
+		}
+	}
+}
+
+func TestGrypeSARIFWritesArrays(t *testing.T) {
+	t.Parallel()
+	const none = `{"matches":[]}`
+	tests := []struct {
+		name, report, sarif string
+	}{
+		{"no rules key", none, `{"runs":[{"tool":{"driver":{"name":"grype"}},"results":[]}]}`},
+		{"rules null", none, `{"runs":[{"tool":{"driver":{"name":"grype","rules":null}},"results":null}]}`},
+		{"no results key", none, `{"runs":[{"tool":{"driver":{"name":"grype","rules":[]}}}]}`},
+		{
+			"every rule filtered out", none,
+			`{"runs":[{"tool":{"driver":{"name":"grype","rules":[{"id":"CVE-1-pkg"}]}},"results":[{"ruleId":"CVE-1-pkg"}]}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			report, sarif := filepath.Join(dir, "r.json"), filepath.Join(dir, "r.sarif")
+			for path, body := range map[string]string{report: tt.report, sarif: tt.sarif} {
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := (scan.Grype{}).SARIF(report, sarif); err != nil {
+				t.Fatalf("SARIF() = %v", err)
+			}
+			requireSARIFArrays(t, sarif)
+		})
+	}
+}

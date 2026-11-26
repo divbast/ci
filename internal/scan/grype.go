@@ -427,7 +427,8 @@ func filterSARIF(report, sarif string) error {
 		if tool, ok := run["tool"].(map[string]any); ok {
 			if driver, ok := tool["driver"].(map[string]any); ok {
 				rules, _ := driver["rules"].([]any)
-				driver["rules"] = slices.DeleteFunc(slices.Clone(rules), func(rule any) bool {
+				// Not slices.Clone, which gives nil for nil, and nil is JSON null
+				driver["rules"] = slices.DeleteFunc(append([]any{}, rules...), func(rule any) bool {
 					id, _ := rule.(map[string]any)["id"].(string)
 					return !used[id]
 				})
@@ -496,12 +497,31 @@ func MergeSARIF(into, from string) error {
 			d["rules"] = kept
 		}
 	}
+	for _, r := range runs {
+		run, _ := r.(map[string]any)
+		requireArrays(run)
+	}
 	dst["runs"] = runs
 	data, err := json.MarshalIndent(dst, "", " ")
 	if err != nil {
 		return err
 	}
 	return writeFileIn(into, data)
+}
+
+// requireArrays gives a SARIF run an array for its results and for its
+// tool.driver.rules where it has none, or has null. Code scanning refuses
+// a run with null in either. A nil slice marshals to null, so it counts as
+// none.
+func requireArrays(run map[string]any) {
+	if v, ok := run["results"].([]any); !ok || v == nil {
+		run["results"] = []any{}
+	}
+	if d := driverOf(run); d != nil {
+		if v, ok := d["rules"].([]any); !ok || v == nil {
+			d["rules"] = []any{}
+		}
+	}
 }
 
 // driverOf is a SARIF run's tool.driver, or nil.
