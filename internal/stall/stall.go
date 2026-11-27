@@ -176,6 +176,17 @@ type Source interface {
 	// Dashboards returns the open issues Renovate made titled exactly
 	// [DashboardTitle].
 	Dashboards(ctx context.Context) ([]Issue, error)
+	// DashboardHistory returns the bodies the issue numbered number has
+	// had, newest first, each as it stood after its edit. It reaches back
+	// past since: its last edit is the newest made at or before since,
+	// when there is one. A history that ends before since ends with the
+	// oldest edit there is, so it says how far back it reaches, and an
+	// issue never edited has one edit, its creation. GitHub keeps no more
+	// than 100 edits of an issue, the original body and the latest 99, so
+	// once an issue has 100, the original body is left out: the edits after
+	// it may be gone, and the history ends with the oldest edit GitHub kept
+	// after it. A line is never read as older than the edits kept show.
+	DashboardHistory(ctx context.Context, number int, since time.Time) ([]DashboardEdit, error)
 	// WorkflowCreated returns when the workflow in file, such as
 	// build.yml, was created.
 	WorkflowCreated(ctx context.Context, file string) (time.Time, error)
@@ -190,6 +201,16 @@ const DashboardTitle = "Dependency Dashboard"
 type Issue struct {
 	Number           int
 	Title, Body, URL string
+}
+
+// DashboardEdit is a Dependency Dashboard's whole body as it stood after
+// the edit made at EditedAt.
+type DashboardEdit struct {
+	// EditedAt is when the edit was made. A history's oldest edit can be
+	// the issue's creation.
+	EditedAt time.Time
+	// Body is the issue's whole body in Markdown after the edit.
+	Body string
 }
 
 // Job is a job of a slot run.
