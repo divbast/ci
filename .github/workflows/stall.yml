@@ -73,6 +73,10 @@ env:
   # The mise release jdx/mise-action installs. Renovate moves it.
   # renovate: datasource=github-releases depName=jdx/mise
   MISE_VERSION: 2026.11.14
+  # mise gives a failed tool download 3 retries, over about 5 seconds. 5
+  # retries wait up to about 35 seconds (200ms, 1s, 4s, then 15s each, with
+  # jitter), enough to outlast a short outage of the download host.
+  MISE_HTTP_RETRIES: "5"
 
 jobs:
   # One job per check, so a run names every stall and not only the first.

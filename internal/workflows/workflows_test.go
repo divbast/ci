@@ -4598,3 +4598,82 @@ func buildToolsPinned(workflows map[string]string) []string {
 	}
 	return out
 }
+
+// TestMiseRetries checks that every workflow with a jdx/mise-action step
+// sets MISE_HTTP_RETRIES to "5" in its workflow-level env, against ci's
+// workflows as they are, then with the setting dropped, unquoted, left at
+// mise's own default or moved out of the workflow's env, which the check
+// must refuse.
+func TestMiseRetries(t *testing.T) {
+	t.Parallel()
+	workflows := readWorkflows(t)
+	if found := retriesMise(workflows); len(found) > 0 {
+		t.Errorf("workflows: %s", strings.Join(found, "\n"))
+	}
+	const setting = "  MISE_HTTP_RETRIES: \"5\"\n"
+	mutate := func(file, replacement string) map[string]string {
+		w := maps.Clone(workflows)
+		w[file] = strings.Replace(w[file], setting, replacement, 1)
+		if w[file] == workflows[file] {
+			t.Fatalf("the change to %s changed nothing", file)
+		}
+		return w
+	}
+	for name, mutant := range map[string]map[string]string{
+		"setting dropped from lint":        mutate("lint.yml", ""),
+		"setting dropped from app-check":   mutate("app-check.yml", ""),
+		"setting dropped from app-publish": mutate("app-publish.yml", ""),
+		"setting dropped from stall":       mutate("stall.yml", ""),
+		"setting dropped from self-ci":     mutate("self-ci.yml", ""),
+		"setting unquoted":                 mutate("lint.yml", "  MISE_HTTP_RETRIES: 5\n"),
+		"setting at mise's own default":    mutate("stall.yml", "  MISE_HTTP_RETRIES: \"3\"\n"),
+		"setting indented out of the env":  mutate("self-ci.yml", "      MISE_HTTP_RETRIES: \"5\"\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if len(retriesMise(mutant)) == 0 {
+				t.Error("passes the workflows with " + name)
+			}
+		})
+	}
+}
+
+// retriesMise returns each workflow that runs jdx/mise-action and does not
+// set MISE_HTTP_RETRIES to "5" at the top-level env's own indent. It finds
+// at least one such workflow, or says so, so that a parser that reads no
+// step cannot pass.
+func retriesMise(workflows map[string]string) []string {
+	var out []string
+	mises := 0
+	for _, file := range slices.Sorted(maps.Keys(workflows)) {
+		lines := linesOf(workflows[file])
+		runs := false
+		for _, job := range jobsOf(lines) {
+			for _, step := range steps(job) {
+				runs = runs || slices.ContainsFunc(step, isUses("jdx/mise-action"))
+			}
+		}
+		if !runs {
+			continue
+		}
+		mises++
+		env, err := mappingOf(lines, 0, "env")
+		if err != nil {
+			out = append(out, file+": "+err.Error())
+			continue
+		}
+		set := false
+		for _, l := range env {
+			if after, ok := strings.CutPrefix(l, "MISE_HTTP_RETRIES:"); ok {
+				set = strings.TrimSpace(after) == `"5"`
+			}
+		}
+		if !set {
+			out = append(out, file+`: runs mise-action but its workflow env does not set MISE_HTTP_RETRIES: "5"`)
+		}
+	}
+	if mises == 0 {
+		out = append(out, "read no workflow with a mise-action step; want at least one")
+	}
+	return out
+}
