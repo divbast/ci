@@ -24,6 +24,7 @@ import (
 
 	"github.com/divbast/ci/internal/decompress"
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/fetch"
 )
 
 // ImageConfig returns the architecture, the user, the HEALTHCHECK and the
@@ -37,7 +38,7 @@ import (
 // the image ID, which is that blob's digest.
 func (e Engine) ImageConfig(ctx context.Context, tb testing.TB, image string) (Config, error) {
 	tb.Helper()
-	id, err := e.imageID(ctx, image)
+	id, err := e.imageID(ctx, tb, image)
 	if err != nil {
 		return Config{}, err
 	}
@@ -71,12 +72,20 @@ func parseConfigDoc(b []byte) (Config, error) {
 	return doc.Config, nil
 }
 
-// imageID returns image's ID, pulling it first if it is not here.
-func (e Engine) imageID(ctx context.Context, image string) (string, error) {
+// imageID returns image's ID, pulling it first if it is not here. The
+// pull is a transient external fetch: a registry's server error, which
+// neither engine retries itself when it is a 500, has it pulled again, as
+// [fetch.Run] says, each time said in tb's log.
+func (e Engine) imageID(ctx context.Context, tb testing.TB, image string) (string, error) {
+	tb.Helper()
 	inspect := []string{"image", "inspect", "--format", "{{.Id}}", image}
 	out, err := e.output(ctx, inspect...)
 	if err != nil {
-		if _, perr := e.output(ctx, "pull", "-q", image); perr != nil {
+		pull := []string{"pull", "-q", image}
+		_, perr := fetch.Run(ctx, tbLog{tb}, e.name+" "+strings.Join(pull, " "), func(ctx context.Context, _ int) (execx.Result, error) {
+			return e.run.RunStdin(ctx, nil, e.name, pull...)
+		})
+		if perr != nil {
 			return "", fmt.Errorf("image %s is not here (%w), and pulling it failed: %w", image, err, perr)
 		}
 		if out, err = e.output(ctx, inspect...); err != nil {
@@ -84,6 +93,15 @@ func (e Engine) imageID(ctx context.Context, image string) (string, error) {
 		}
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// tbLog is an io.Writer that writes each line it is given to tb's log.
+type tbLog struct{ tb testing.TB }
+
+func (l tbLog) Write(p []byte) (int, error) {
+	l.tb.Helper()
+	l.tb.Logf("%s", strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
 }
 
 // FileCapabilities returns the path of every file in image's layers that
@@ -102,7 +120,7 @@ func (e Engine) imageID(ctx context.Context, image string) (string, error) {
 // host with no zstd command, say, which the error names.
 func (e Engine) FileCapabilities(ctx context.Context, tb testing.TB, image string) ([]string, error) {
 	tb.Helper()
-	id, err := e.imageID(ctx, image)
+	id, err := e.imageID(ctx, tb, image)
 	if err != nil {
 		return nil, err
 	}
