@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
-// Package release works out and publishes the release of a commit on a
-// repository's main branch, for a repository that releases every green
-// merge.
+// Package release works out and publishes the release of a commit on ci's
+// main branch, for a repository that releases every green merge that
+// changes something its callers use.
+//
+// A commit is to be released only when the commits since the last release
+// change something a caller uses. Which files they change is read from git
+// diff between that release's tag and the commit, over the whole range, so
+// a merge of ci's own files on top of an unreleased one callers use is
+// released with it, and a rename counts both its paths. A range that
+// changes only ci's own files, such as its own workflows, docs, tests and
+// test data, is not released, and the next release holds its commits. A
+// range with no release before it, one that changes no file, and one in
+// which any commit marks a breaking change are always released.
 //
 // The version is the latest vX.Y.Z tag the commit descends from with its
 // minor number raised, or its major number raised when any commit since
@@ -30,6 +40,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -106,12 +117,75 @@ func Next(previous Version, released bool, commits []Commit) Version {
 	if !released {
 		return First
 	}
-	for _, c := range commits {
-		if len(c.Breaking) > 0 {
-			return Version{Major: previous.Major + 1}
-		}
+	if breaks(commits) {
+		return Version{Major: previous.Major + 1}
 	}
 	return Version{Major: previous.Major, Minor: previous.Minor + 1}
+}
+
+// breaks reports whether any of commits, a merge or not, marks a breaking
+// change.
+func breaks(commits []Commit) bool {
+	return slices.ContainsFunc(commits, func(c Commit) bool { return len(c.Breaking) > 0 })
+}
+
+// selfOnly are the paths of ci's own files, which no caller uses, as
+// [match] patterns: ci's own workflows, code owners and docs, its
+// justfile, the configuration of its own Renovate, ShellCheck, Composer
+// and PHPStan, the licence texts, and its tests, test data and test
+// fixtures. A path that none of them matches is one a caller may use, so
+// add a pattern only for files no caller can reach: a wrong one holds a
+// change back from callers.
+var selfOnly = []string{
+	".github/workflows/self-ci.yml", ".github/workflows/self-renovate.yml", ".github/workflows/self-stall.yml",
+	".github/CODEOWNERS", "README.md", "CLAUDE.md", "justfile", ".shellcheckrc",
+	"renovate.json", "renovate.json.license", "LICENSES/**",
+	"composer.json", "composer.json.license", "composer.lock", "composer.lock.license", "phpstan.neon", "phpstan.neon.license",
+	"**/*_test.go", "**/testdata/**", "internal/testfixture/**", "contract/internal/minimalgoprobe/**",
+}
+
+// callerVisible reports whether a caller can see a change to the paths
+// changed: when any of them matches none of selfOnly, or when there are
+// none, as when every commit is empty, since nothing then shows the change
+// to be ci's own alone.
+func callerVisible(changed []string) bool {
+	if len(changed) == 0 {
+		return true
+	}
+	return slices.ContainsFunc(changed, func(name string) bool {
+		return !slices.ContainsFunc(selfOnly, func(pattern string) bool { return match(pattern, name) })
+	})
+}
+
+// match reports whether name, a slash-separated path, matches pattern:
+// [path.Match]'s syntax, segment by segment, where a segment that is just
+// ** matches any number of segments, none included. A malformed pattern
+// matches nothing.
+func match(pattern, name string) bool {
+	return matchSegments(strings.Split(pattern, "/"), strings.Split(name, "/"))
+}
+
+// matchSegments is match on paths split into their segments.
+func matchSegments(pattern, name []string) bool {
+	for len(pattern) > 0 {
+		if pattern[0] == "**" {
+			for i := range len(name) + 1 {
+				if matchSegments(pattern[1:], name[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(name) == 0 {
+			return false
+		}
+		// path.Match's only error is a malformed pattern.
+		if ok, err := path.Match(pattern[0], name[0]); err != nil || !ok {
+			return false
+		}
+		pattern, name = pattern[1:], name[1:]
+	}
+	return len(name) == 0
 }
 
 // Notes returns a release's notes, in Markdown: what each breaking change
@@ -151,7 +225,8 @@ type Plan struct {
 	// main.
 	Tip string
 	// Superseded is whether SHA is on origin's main but no longer its tip:
-	// a later merge landed first, and the run for Tip releases SHA with it.
+	// a later merge landed first, and the run for Tip decides whether to
+	// release SHA with it.
 	Superseded bool
 	// Released is the release tag already at SHA on origin, when there is
 	// one. The fields below are then empty.
@@ -168,6 +243,19 @@ type Plan struct {
 	// Commits are those since Previous, or all of SHA's history when there
 	// is none, merges included, oldest first.
 	Commits []Commit
+	// Changed are the paths that differ between Previous and SHA, as git
+	// names them, a rename's two paths both among them; empty when there
+	// is no Previous.
+	Changed []string
+	// CallerVisible is whether the commits change anything a caller uses,
+	// so that SHA is to be released: always when there is no Previous, or
+	// when any commit marks a breaking change, and otherwise when Changed
+	// is empty or names a path that is not one of ci's own files. When it
+	// is false, nothing is to be released, and the next release holds the
+	// commits. Its zero value is that false, so every return of [Prepare]
+	// with a plan that may be released must set it: one that left it unset
+	// would skip that release and say only that nothing changed.
+	CallerVisible bool
 }
 
 var (
@@ -197,10 +285,11 @@ var (
 // from origin itself, and when main has moved past sha, whether main holds
 // it, fetching main if the clone lacks it, and whether a later release
 // holds it already. Only origin's release tags count: one the clone alone
-// has releases nothing, takes no version and holds nothing. It refuses
-// nothing but a version tag already taken elsewhere, or a clone missing
-// origin's tags: [Create], and its caller, decide whether the plan may be
-// carried out.
+// has releases nothing, takes no version and holds nothing. It reads the
+// files changed since the last release, and says whether a caller can see
+// them, in [Plan.CallerVisible]. It refuses nothing but a version tag
+// already taken elsewhere, or a clone missing origin's tags: [Create], and
+// its caller, decide whether the plan may be carried out.
 //
 // The error wraps [ErrNoCommit] when sha is not a commit there,
 // [ErrStaleTags] when origin has a release tag the clone has not fetched,
@@ -290,6 +379,14 @@ func Prepare(ctx context.Context, git execx.Runner, sha string) (Plan, error) {
 		return Plan{}, err
 	}
 	plan.Version = Next(previous, plan.Previous != "", plan.Commits)
+	// The one place the plan decides whether there is anything to release,
+	// so that a dry run says what a real run does.
+	if plan.Previous != "" {
+		if plan.Changed, err = g.changed(ctx, plan.Previous, sha); err != nil {
+			return Plan{}, err
+		}
+	}
+	plan.CallerVisible = plan.Previous == "" || breaks(plan.Commits) || callerVisible(plan.Changed)
 
 	// Every tag sha descends from is older than the next version, so a
 	// tag that already has its name is on some other history.
@@ -507,6 +604,25 @@ func breakingIn(subject, trailers, message string) []string {
 func folds(line string) bool {
 	blank := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
 	return blank && strings.TrimSpace(line) != "" && !breakingLine.MatchString(line)
+}
+
+// changed returns the paths that differ between the commits from and to,
+// as git diff names them with renames off, so that a rename names both
+// the path it left and the one it took; from the top of the repository,
+// whatever diff.relative says, so that no path outside the directory git
+// runs in is left out; and NUL-separated, so that git quotes none of them.
+func (r runner) changed(ctx context.Context, from, to string) ([]string, error) {
+	out, err := r.out(ctx, "diff", "--name-only", "--no-renames", "--no-relative", "-z", from, to, "--")
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for name := range strings.SplitSeq(string(out), "\x00") {
+		if name != "" {
+			paths = append(paths, name)
+		}
+	}
+	return paths, nil
 }
 
 // versions returns the release tags git tag lists, every one or those the

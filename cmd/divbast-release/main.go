@@ -3,7 +3,8 @@
 
 // Command divbast-release publishes a commit on main as the repository's
 // next release: the next vX.Y.Z tag at that commit, and a GitHub release
-// of it whose notes come from the commits since the last one.
+// of it whose notes come from the commits since the last one. It releases
+// nothing when nothing a caller uses changed since the last release.
 //
 // Usage:
 //
@@ -24,6 +25,20 @@
 // yet starts at v1.0.0. The notes list what each breaking change says,
 // once, then the subject of every commit since that tag but merges.
 //
+// Whether a caller uses anything that changed is read from git diff
+// between the last release's tag and SHA, renames counted as both their
+// paths, so it is judged over every commit since that release together.
+// When every path it names is one of ci's own files, which no caller uses
+// (its own workflows and docs, its justfile, its tooling configuration,
+// the licence texts, and its tests, test data and test fixtures), and no
+// commit since marks a breaking change, it prints
+//
+//	nothing a caller uses changed since VERSION: no release
+//
+// and releases nothing, on a dry run too: the next release holds those
+// commits. A first release, and commits that change no file, are always
+// released.
+//
 // With -dry-run it prints the version, a blank line and the notes, and
 // changes nothing but fetching. A dry run of a commit that is not origin's
 // main says on stderr what a real run would do, and still shows what its
@@ -38,21 +53,23 @@
 // as the clone's origin. It then reads the new tag back from origin, and
 // fails unless it points at SHA. It does nothing when a release tag
 // already points at SHA. When a later merge has already landed on main,
-// it releases nothing and says the run for main's tip releases SHA with
-// it, or, once that release is out, which release holds SHA. It refuses a
-// SHA main does not hold at all. Only origin's release tags count, never
-// one the clone alone has. It never moves or deletes a tag.
+// it releases nothing and says the run for main's tip decides whether to
+// release SHA with it, or, once a later release is out, which release
+// holds SHA. It refuses a SHA main does not hold at all, when it has
+// something to release. Only origin's release tags count, never one the
+// clone alone has. It never moves or deletes a tag.
 //
 // Exit codes:
 //
-//	0  released; or a release tag already points at SHA; or SHA is on main
-//	   but a later merge landed first, whose run releases it or whose
+//	0  released; or a release tag already points at SHA; or nothing a
+//	   caller uses changed since the last release; or SHA is on main but a
+//	   later merge landed first, whose run decides its release or whose
 //	   release holds it; or the dry run printed the release
-//	1  refused or failed: SHA is not a commit here, or not on origin's main;
-//	   origin has a release tag the clone has not fetched; the next
-//	   version's tag is taken by another commit; the release was made but
-//	   its tag does not point at SHA; or git or gh failed; stderr says
-//	   which
+//	1  refused or failed: SHA is not a commit here, or not on origin's main
+//	   though it has something to release; origin has a release tag the
+//	   clone has not fetched; the next version's tag is taken by another
+//	   commit; the release was made but its tag does not point at SHA; or
+//	   git or gh failed; stderr says which
 //	2  the command line is wrong
 package main
 
@@ -120,12 +137,16 @@ func run(ctx context.Context, args []string, git execx.Runner, gh execx.StdinRun
 	case plan.ReleasedIn != "":
 		return say(stdout, stderr, "%s is no longer main's tip (%s), and %s, a later release, holds it: nothing to do\n",
 			plan.SHA, plan.Tip, plan.ReleasedIn)
+	// Before the dry run's branch, so that a dry run says what a real one
+	// does.
+	case !plan.CallerVisible:
+		return say(stdout, stderr, "nothing a caller uses changed since %s: no release\n", plan.Previous)
 	}
 
 	if *dryRun {
 		switch {
 		case plan.Superseded:
-			complain(stderr, "%s is no longer main's tip (%s), so a real run would skip it: the run for %s releases it",
+			complain(stderr, "%s is no longer main's tip (%s), so a real run would skip it: the run for %s decides its release",
 				plan.SHA, plan.Tip, plan.Tip)
 		case plan.Tip != plan.SHA:
 			complain(stderr, "%s is not on origin's main (%q), so a real run would refuse it", plan.SHA, plan.Tip)
@@ -134,11 +155,11 @@ func run(ctx context.Context, args []string, git execx.Runner, gh execx.StdinRun
 	}
 
 	// Ruling R29: a later merge landing first is the ordinary race of two
-	// merges, not a failure. Its run releases everything since the last
-	// tag, this commit included.
+	// merges, not a failure. Its run decides the release of everything
+	// since the last tag, this commit included.
 	switch {
 	case plan.Superseded:
-		return say(stdout, stderr, "%s is no longer main's tip (%s); the run for %s releases it\n", plan.SHA, plan.Tip, plan.Tip)
+		return say(stdout, stderr, "%s is no longer main's tip (%s); the run for %s decides its release\n", plan.SHA, plan.Tip, plan.Tip)
 	case plan.Tip != plan.SHA:
 		complain(stderr, "%s is not on origin's main, whose tip is %q", plan.SHA, plan.Tip)
 		return 1
