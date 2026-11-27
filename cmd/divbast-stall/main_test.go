@@ -102,6 +102,42 @@ func workflowAPI(workflow string) []string {
 	return []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/actions/workflows/" + workflow}
 }
 
+// workflowID is the read of the ID of the workflow in file, which is id.
+func workflowID(file, id string) execx.Call {
+	return execx.Call{Argv: workflowAPI(file), Result: apiOK(`{"id":` + id + `,"path":".github/workflows/` + file + `"}`)}
+}
+
+func previousRuns(workflow string) []string {
+	return []string{"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--limit", "3", "--json", "databaseId,createdAt"}
+}
+
+func runsSince(since string) []string {
+	return []string{
+		"gh", "run", "list", "--repo", repo, "--created", ">=" + since, "--status", "completed",
+		"--limit", "1000", "--json", "databaseId,headSha,workflowName,event,createdAt,url,workflowDatabaseId,attempt,conclusion,updatedAt",
+	}
+}
+
+func attemptJobs(id, attempt string) []string {
+	return []string{"gh", "run", "view", id, "--repo", repo, "--attempt", attempt, "--json", "jobs"}
+}
+
+// stallRuns are the stall workflow's newest runs: this one, run 900, made
+// at the bubble's clock, and the one before it, 18 hours earlier.
+const stallRuns = `[{"createdAt":"2000-01-01T00:00:00Z","databaseId":900},{"createdAt":"1999-12-31T06:00:00Z","databaseId":899}]`
+
+// runOf is a finished run in gh's form: its ID, attempt, conclusion,
+// creation, when it last changed, event, commit and workflow, whose ID is
+// workflowID.
+func runOf(id, attempt, conclusion, created, updated, event, sha, workflow, workflowID string) string {
+	return `{"attempt":` + attempt + `,"conclusion":"` + conclusion + `","createdAt":"` + created + `","databaseId":` + id +
+		`,"event":"` + event + `","headSha":"` + sha + `","updatedAt":"` + updated + `","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/` + id +
+		`","workflowDatabaseId":` + workflowID + `,"workflowName":"` + workflow + `"}`
+}
+
+// greenRun is a build run that passed at its first attempt.
+var greenRun = runOf("4", "1", "success", "1999-12-31T08:00:00Z", "1999-12-31T08:20:00Z", "push", revision, "build", "13")
+
 // slotsSucceeded is two daily slot runs that built head and succeeded, the
 // newest twenty hours before the bubble's clock.
 const slotsSucceeded = `[` +
@@ -127,6 +163,8 @@ func env(changes map[string]string) func(string) string {
 		"LOST_SLOTS":   "2",
 		"STARVED_DAYS": "7",
 		"PUBLISHED":    image,
+		// Every run of a workflow has one
+		"GITHUB_RUN_ID": "900",
 	}
 	maps.Copy(vars, changes)
 	return func(k string) string { return vars[k] }
@@ -478,6 +516,72 @@ func TestRun(t *testing.T) {
 			wantStderr: []string{"STARVED_DAYS is not set"},
 		},
 		{
+			// Every run passed at its first attempt, so no jobs are read
+			name: "flaky",
+			args: []string{"flaky"},
+			calls: []execx.Call{
+				workflowID("stall.yml", "11"),
+				workflowID("renovate.yml", "12"),
+				{Argv: previousRuns("stall.yml"), Result: ok(stallRuns)},
+				{Argv: runsSince("1999-12-30T06:00:00Z"), Result: ok("[" + greenRun + "]")},
+			},
+			wantStdout: "no job passed and failed on the same commit since 1999-12-31T06:00:00Z\n",
+		},
+		{
+			// Run 5 failed its lint at its first attempt and passed when
+			// re-run; stall's and Renovate's runs, red on main, are passed
+			// over
+			name: "flaky-stalled",
+			args: []string{"flaky"},
+			calls: []execx.Call{
+				workflowID("stall.yml", "11"),
+				workflowID("renovate.yml", "12"),
+				{Argv: previousRuns("stall.yml"), Result: ok(stallRuns)},
+				{Argv: runsSince("1999-12-30T06:00:00Z"), Result: ok("[" +
+					runOf("7", "1", "failure", "1999-12-31T12:00:00Z", "1999-12-31T12:05:00Z", "schedule", head, "stall", "11") + "," +
+					runOf("6", "1", "failure", "1999-12-31T11:00:00Z", "1999-12-31T11:10:00Z", "push", head, "renovate", "12") + "," +
+					runOf("5", "2", "success", "1999-12-31T09:00:00Z", "1999-12-31T11:00:00Z", "pull_request", head, "build", "13") + "," +
+					greenRun + "]")},
+				{Argv: attemptJobs("5", "1"), Result: ok(`{"jobs":[{"name":"lint / lint","conclusion":"failure","completedAt":"1999-12-31T10:00:00Z"}]}`)},
+				{Argv: runJobs("5"), Result: ok(`{"jobs":[{"name":"lint / lint","conclusion":"success","completedAt":"1999-12-31T11:00:00Z"}]}`)},
+			},
+			wantCode: 1,
+			wantStdout: "Passed and failed on the same commit since 1999-12-31T06:00:00Z:\n" +
+				"  build / lint / lint on 12db812: failed in run 5 attempt 1, passed in run 5 attempt 2\n",
+		},
+		{
+			// ci's own: with no stall run before this one, the window is
+			// the last 24 hours
+			name: "flaky-self",
+			args: []string{"flaky"},
+			env:  map[string]string{"STALL_WORKFLOW": "self-stall.yml", "RENOVATE_WORKFLOW": "self-renovate.yml"},
+			calls: []execx.Call{
+				workflowID("self-stall.yml", "11"),
+				workflowID("self-renovate.yml", "12"),
+				{Argv: previousRuns("self-stall.yml"), Result: ok(`[{"createdAt":"2000-01-01T00:00:00Z","databaseId":900}]`)},
+				{Argv: runsSince("1999-12-30T00:00:00Z"), Result: ok("[]")},
+			},
+			wantStdout: "no job passed and failed on the same commit since 1999-12-31T00:00:00Z\n",
+		},
+		{
+			name: "flaky-no-workflow",
+			args: []string{"flaky"},
+			calls: []execx.Call{{Argv: workflowAPI("stall.yml"), Result: execx.Result{
+				Stdout: []byte("HTTP/2.0 404 Not Found\n\r\n" + `{"message":"Not Found","status":"404"}`),
+				Stderr: []byte("gh: Not Found (HTTP 404)"),
+				Code:   1,
+			}}},
+			wantCode:   2,
+			wantStderr: []string{"divbast/librespeed-oci-image has no workflow in the file stall.yml"},
+		},
+		{
+			name:       "flaky-run-id",
+			args:       []string{"flaky"},
+			env:        map[string]string{"GITHUB_RUN_ID": "x"},
+			wantCode:   2,
+			wantStderr: []string{`GITHUB_RUN_ID is "x", not a run's ID`},
+		},
+		{
 			name:       "lookups-gh-fails",
 			args:       []string{"lookups"},
 			calls:      []execx.Call{{Argv: issuesAPI, Result: execx.Result{Stderr: []byte("HTTP 401: Bad credentials"), Code: 1}}},
@@ -547,7 +651,7 @@ func TestRun(t *testing.T) {
 		{
 			name:       "help",
 			args:       []string{"-h"},
-			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots|lookups|starved\n"},
+			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots|lookups|starved|flaky\n"},
 		},
 	}
 

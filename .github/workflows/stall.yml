@@ -7,8 +7,9 @@
 # never finishes, Renovate itself silent, daily slots that should have
 # published and did not, a dependency Renovate failed to look up, or an
 # update left waiting too long, both of which only its Dependency
-# Dashboard shows. A scheduled run's failure goes to whoever last edited
-# the caller's cron line. The checks are cmd/divbast-stall's.
+# Dashboard shows, or a job that both failed and passed on one commit. A
+# scheduled run's failure goes to whoever last edited the caller's cron
+# line. The checks are cmd/divbast-stall's.
 #
 # The caller's job grants contents, pull-requests, actions, checks,
 # statuses, packages and issues, all read.
@@ -18,9 +19,9 @@ on:
   workflow_call:
     inputs:
       checks:
-        description: The checks to run, a JSON array of open, stuck, renovate, slots, lookups and starved
+        description: The checks to run, a JSON array of open, stuck, renovate, slots, lookups, starved and flaky
         type: string
-        default: '["open","stuck","renovate","slots","lookups","starved"]'
+        default: '["open","stuck","renovate","slots","lookups","starved","flaky"]'
       published:
         description: The image the daily slot publishes, such as ghcr.io/divbast/librespeed:latest; slots needs it
         type: string
@@ -33,6 +34,10 @@ on:
         description: The workflow file that runs Renovate
         type: string
         default: renovate.yml
+      stall-workflow:
+        description: The caller's workflow file that calls this one on a schedule, whose previous run starts flaky's window
+        type: string
+        default: stall.yml
       open-days:
         description: Days a Renovate pull request may stay open
         type: number
@@ -122,6 +127,7 @@ jobs:
           PUBLISHED: ${{ inputs.published }}
           SLOT_WORKFLOW: ${{ inputs.slot-workflow }}
           RENOVATE_WORKFLOW: ${{ inputs.renovate-workflow }}
+          STALL_WORKFLOW: ${{ inputs.stall-workflow }}
           CONTENT_GATED: ${{ inputs.content-gated }}
           SLOT_JOB: ${{ inputs.slot-job }}
         # -content-gated is a flag of slots alone, and given only when the

@@ -42,6 +42,10 @@ const prLimit = 40
 // than enough to see the lost slots that matter.
 const slotLimit = 10
 
+// runLimit is how many runs one read of the runs since a time returns: the
+// most GitHub lists for a search by creation or status.
+const runLimit = 1000
+
 // timeout is how long one gh call may take when GH sets no Timeout of its
 // own.
 const timeout = time.Minute
@@ -85,6 +89,9 @@ type GH struct {
 	// check rather than holding the job until the job's own timeout. Zero
 	// means a minute.
 	Timeout time.Duration
+	// RunID is the run the check runs in, as GITHUB_RUN_ID gives it, which
+	// PreviousRunStart passes over; zero outside a run.
+	RunID int64
 }
 
 // RenovatePRs implements [Source]. It fails, rather than read part of the
@@ -224,20 +231,108 @@ func (g GH) SlotRuns(ctx context.Context, workflow string) ([]Run, error) {
 // Jobs implements [Source], from the latest attempt of run, as gh run view
 // lists its jobs.
 func (g GH) Jobs(ctx context.Context, run *Run) ([]Job, error) {
+	return g.jobs(ctx, "run", "view", strconv.FormatInt(run.ID, 10), "--repo", g.Repo, "--json", "jobs")
+}
+
+// AttemptJobs implements [Source], as gh run view lists the attempt's jobs.
+func (g GH) AttemptJobs(ctx context.Context, run *Run, attempt int) ([]Job, error) {
+	return g.jobs(ctx, "run", "view", strconv.FormatInt(run.ID, 10), "--repo", g.Repo, "--attempt", strconv.Itoa(attempt), "--json", "jobs")
+}
+
+// jobs runs gh run view with args, which ask for a run's jobs, and reads
+// them. gh gives a job that has not finished the zero time.
+func (g GH) jobs(ctx context.Context, args ...string) ([]Job, error) {
 	var raw struct {
 		Jobs []struct {
-			Name       string `json:"name"`
-			Conclusion string `json:"conclusion"`
+			Name        string    `json:"name"`
+			Conclusion  string    `json:"conclusion"`
+			CompletedAt time.Time `json:"completedAt"`
 		} `json:"jobs"`
 	}
-	if err := g.list(ctx, &raw, "run", "view", strconv.FormatInt(run.ID, 10), "--repo", g.Repo, "--json", "jobs"); err != nil {
+	if err := g.list(ctx, &raw, args...); err != nil {
 		return nil, err
 	}
 	jobs := make([]Job, 0, len(raw.Jobs))
 	for _, j := range raw.Jobs {
-		jobs = append(jobs, Job{Name: j.Name, Conclusion: j.Conclusion})
+		jobs = append(jobs, Job{Name: j.Name, Conclusion: j.Conclusion, Completed: j.CompletedAt})
 	}
 	return jobs, nil
+}
+
+// RunsSince implements [Source], every run gh lists as completed, however
+// it ended. It fails, rather than read part of the list, when as many come
+// back as one read returns.
+func (g GH) RunsSince(ctx context.Context, since time.Time) ([]Run, error) {
+	var raw []struct {
+		ID         int64     `json:"databaseId"`
+		HeadSHA    string    `json:"headSha"`
+		Workflow   string    `json:"workflowName"`
+		Event      string    `json:"event"`
+		CreatedAt  time.Time `json:"createdAt"`
+		URL        string    `json:"url"`
+		WorkflowID int64     `json:"workflowDatabaseId"`
+		Attempt    int       `json:"attempt"`
+		Conclusion string    `json:"conclusion"`
+		UpdatedAt  time.Time `json:"updatedAt"`
+	}
+	err := g.list(ctx, &raw, "run", "list", "--repo", g.Repo, "--created", ">="+timestamp(since), "--status", "completed",
+		"--limit", strconv.Itoa(runLimit), "--json", "databaseId,headSha,workflowName,event,createdAt,url,workflowDatabaseId,attempt,conclusion,updatedAt")
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) >= runLimit {
+		return nil, fmt.Errorf("%d finished runs in %s created since %s, as many as one read returns, so any beyond them would go unchecked",
+			len(raw), g.Repo, timestamp(since))
+	}
+	runs := make([]Run, 0, len(raw))
+	for i := range raw {
+		r := &raw[i]
+		runs = append(runs, Run{
+			ID:         r.ID,
+			HeadSHA:    r.HeadSHA,
+			Workflow:   r.Workflow,
+			WorkflowID: r.WorkflowID,
+			Event:      r.Event,
+			Attempt:    r.Attempt,
+			Updated:    r.UpdatedAt,
+			Created:    r.CreatedAt,
+			Completed:  true,
+			Conclusion: r.Conclusion,
+			URL:        r.URL,
+		})
+	}
+	return runs, nil
+}
+
+// PreviousRunStart implements [Source], from workflow's newest three runs,
+// newest first, so that a newer run already queued leaves this one and the
+// one before it in the list. When g.RunID is one of them, the current run
+// is that one, and the previous run the one listed after it, if any: with
+// two newer runs started since, the one before this is not among the
+// three, and is none. When g.RunID is none of them, outside a run or with
+// three newer runs started since, the previous run is the newest, and the
+// current one is not known.
+func (g GH) PreviousRunStart(ctx context.Context, workflow string) (previous, current time.Time, err error) {
+	type listed struct {
+		ID        int64     `json:"databaseId"`
+		CreatedAt time.Time `json:"createdAt"`
+	}
+	var runs []listed
+	err = g.list(ctx, &runs, "run", "list", "--repo", g.Repo, "--workflow", workflow, "--limit", "3", "--json", "databaseId,createdAt")
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	i := slices.IndexFunc(runs, func(r listed) bool { return r.ID == g.RunID })
+	switch {
+	case i < 0 && len(runs) > 0:
+		return runs[0].CreatedAt, time.Time{}, nil
+	case i < 0:
+		return time.Time{}, time.Time{}, nil
+	case i+1 < len(runs):
+		return runs[i+1].CreatedAt, runs[i].CreatedAt, nil
+	default:
+		return time.Time{}, runs[i].CreatedAt, nil
+	}
 }
 
 // MainSHA implements [Source].
@@ -463,6 +558,26 @@ func (g GH) WorkflowCreated(ctx context.Context, file string) (time.Time, error)
 	return w.CreatedAt, nil
 }
 
+// WorkflowID implements [Source].
+func (g GH) WorkflowID(ctx context.Context, file string) (int64, error) {
+	var w struct {
+		ID int64 `json:"id"`
+	}
+	path := "repos/{owner}/{repo}/actions/workflows/" + url.PathEscape(file)
+	status, err := ghapi.Client{Run: g.Run, Repo: g.Repo, Timeout: g.Timeout}.API(ctx, path, &w)
+	switch {
+	case err != nil:
+		return 0, err
+	case status == http.StatusNotFound:
+		return 0, fmt.Errorf("%s has no workflow in the file %s", g.Repo, file)
+	case status != http.StatusOK:
+		return 0, g.answered(path, status)
+	case w.ID == 0:
+		return 0, fmt.Errorf("GitHub gives no ID for %s's workflow %s", g.Repo, file)
+	}
+	return w.ID, nil
+}
+
 // list runs gh with args, which ask for JSON, and decodes what it prints
 // into v.
 func (g GH) list(ctx context.Context, v any, args ...string) error {
@@ -498,7 +613,12 @@ func (g GH) api(ctx context.Context, path string, v any) error {
 		return err
 	}
 	if status != http.StatusOK {
-		return fmt.Errorf("gh api %s: GitHub answered HTTP %d", strings.ReplaceAll(path, "{owner}/{repo}", g.Repo), status)
+		return g.answered(path, status)
 	}
 	return nil
+}
+
+// answered is the error for GitHub answering path with status.
+func (g GH) answered(path string, status int) error {
+	return fmt.Errorf("gh api %s: GitHub answered HTTP %d", strings.ReplaceAll(path, "{owner}/{repo}", g.Repo), status)
 }
