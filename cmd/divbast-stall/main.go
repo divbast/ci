@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	divbast-stall open|stuck|renovate|slots|lookups
+//	divbast-stall open|stuck|renovate|slots|lookups|starved
 //	divbast-stall slots -content-gated
 //
 // The checks:
@@ -25,6 +25,10 @@
 //	          Dashboard has listed the same failed lookup for 24 hours; or
 //	          no open dashboard by divbast-renovate once RENOVATE_WORKFLOW
 //	          has succeeded
+//	starved   an update the Dependency Dashboard has listed as waiting,
+//	          under Pending Status Checks or Awaiting Schedule, for more
+//	          than STARVED_DAYS days, known by its branch; or no open
+//	          dashboard, as for lookups
 //
 // slots -content-gated is for a slot workflow that publishes only when the
 // image's content moved, as divbast-publish-decision -content-gated does:
@@ -45,6 +49,7 @@
 //	STUCK_HOURS        stuck's limit
 //	RUN_HOURS          renovate's limit
 //	LOST_SLOTS         slots' limit
+//	STARVED_DAYS       starved's limit
 //	PUBLISHED          the image the slot publishes, such as
 //	                   ghcr.io/divbast/librespeed:latest
 //	SLOT_WORKFLOW      the slot's workflow file, build.yml if unset
@@ -53,7 +58,7 @@
 //	                   the run, whose conclusion counts rather than the
 //	                   whole run's; unset, the run's
 //	RENOVATE_WORKFLOW  Renovate's workflow file, renovate.yml if unset; for
-//	                   renovate and lookups
+//	                   renovate, lookups and starved
 //
 // Each check reads only its own limit. It prints what it found on stdout:
 // one line when nothing is stalled, or a headline and then what stalled,
@@ -96,7 +101,7 @@ func main() {
 func run(ctx context.Context, args []string, getenv func(string) string, r execx.Runner, stdout, stderr io.Writer) int {
 	usage := func() {
 		// As for complain: nowhere better to report a failed write.
-		_, _ = fmt.Fprintf(stderr, "usage: %s open|stuck|renovate|slots|lookups\n       %s slots -content-gated\n", name, name)
+		_, _ = fmt.Fprintf(stderr, "usage: %s open|stuck|renovate|slots|lookups|starved\n       %s slots -content-gated\n", name, name)
 	}
 	// The check comes first, and its own flags after it.
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
@@ -167,6 +172,10 @@ func run(ctx context.Context, args []string, getenv func(string) string, r execx
 	case "lookups":
 		c.RenovateWorkflow = env.or("RENOVATE_WORKFLOW", "renovate.yml")
 		do = func() (stall.Result, error) { return stall.Lookups(ctx, src, &c) }
+	case "starved":
+		c.StarvedDays = env.count("STARVED_DAYS")
+		c.RenovateWorkflow = env.or("RENOVATE_WORKFLOW", "renovate.yml")
+		do = func() (stall.Result, error) { return stall.Starved(ctx, src, &c) }
 	default:
 		complain(stderr, "no such check: %q", check)
 		usage()

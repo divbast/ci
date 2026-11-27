@@ -70,6 +70,10 @@ const (
 //	gh-api-graphql-edits-template-20.json  the same, its twentieth and last page
 //	gh-api-graphql-edits-never-sabnzbd.json  sabnzbd-oci-image #2, first 100, its edits emptied
 //
+// and the same day,
+//
+//	dashboard-pending.md               gh api repos/divbast/pisati/issues/7 --jq .body
+//
 // Sabnzbd's dashboard had been edited 12 times, so its two pages hold the
 // whole of its history, ending with its creation. Oci-image-template's had
 // reached 100, as many as GitHub keeps: its original body and the latest
@@ -85,7 +89,9 @@ const (
 // The issue lists hold each repository's Dependency Dashboard, #94 and
 // #4, both clean, among Renovate's open pull requests, which the issues
 // API lists too: two in Baikal's, four in Sonarr's. dashboard-clean.md is
-// Baikal's dashboard's body.
+// Baikal's dashboard's body. dashboard-pending.md is pisati's, as gh
+// printed it: one update under Pending Approval, and seven under Pending
+// Status Checks, two of them with a pull request.
 //
 // The two slot lists hold the same runs as their recordings of the day
 // before, which lacked databaseId. The frankenphp run is a daily slot in

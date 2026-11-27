@@ -4,8 +4,9 @@
 // Package stall finds the ways a repository's updates stop flowing without
 // anything failing loudly: a Renovate pull request open too long, one red
 // or pending too long, Renovate itself silent, daily slots that should
-// have published main and did not, and a dependency Renovate failed to
-// look up, which only its Dependency Dashboard shows.
+// have published main and did not, a dependency Renovate failed to look
+// up, and an update left waiting, which only its Dependency Dashboard
+// shows.
 //
 // Each check reads the time from [time.Now] and the repository through a
 // [Source], and says what it found in a [Result].
@@ -45,6 +46,9 @@ type Config struct {
 	RunHours int
 	// LostSlots is how many lost daily slots make a stall.
 	LostSlots int
+	// StarvedDays is how many days an update may wait on the Dependency
+	// Dashboard.
+	StarvedDays int
 	// Published is the image the daily slot publishes, such as
 	// ghcr.io/divbast/librespeed:latest.
 	Published string
@@ -341,18 +345,7 @@ func Lookups(ctx context.Context, s Source, c *Config) (Result, error) {
 		return Result{}, err
 	}
 	if len(dashboards) == 0 {
-		last, ok, err := s.LastSuccess(ctx, c.RenovateWorkflow)
-		if err != nil {
-			return Result{}, err
-		}
-		if !ok {
-			return Result{Headline: "no Dependency Dashboard yet, and no successful Renovate run to have made one"}, nil
-		}
-		return Result{
-			Stalled:  true,
-			Headline: "No open Dependency Dashboard by divbast-renovate, so failed lookups cannot be seen:",
-			Details:  []string{fmt.Sprintf("no open issue titled %q; Renovate last succeeded %s", DashboardTitle, timestamp(last))},
-		}, nil
+		return noDashboard(ctx, s, c, "failed lookups")
 	}
 	now := time.Now()
 	lines := make([][]lookupLine, len(dashboards))
@@ -390,6 +383,26 @@ func Lookups(ctx context.Context, s Source, c *Config) (Result, error) {
 			int(lookupPersistence.Hours()), where, strings.Join(newer, ", "))}, nil
 	}
 	return Result{Headline: "no failed Renovate lookup " + where}, nil
+}
+
+// noDashboard is what a check that reads the Dependency Dashboard finds
+// when none is open: what it reads there, unseen, cannot be seen. Once
+// c.RenovateWorkflow has succeeded, which reopens or remakes the dashboard
+// on every run, that is a stall. Before its first success, the renovate
+// check owns the case.
+func noDashboard(ctx context.Context, s Source, c *Config, unseen string) (Result, error) {
+	last, ok, err := s.LastSuccess(ctx, c.RenovateWorkflow)
+	if err != nil {
+		return Result{}, err
+	}
+	if !ok {
+		return Result{Headline: "no Dependency Dashboard yet, and no successful Renovate run to have made one"}, nil
+	}
+	return Result{
+		Stalled:  true,
+		Headline: "No open Dependency Dashboard by divbast-renovate, so " + unseen + " cannot be seen:",
+		Details:  []string{fmt.Sprintf("no open issue titled %q; Renovate last succeeded %s", DashboardTitle, timestamp(last))},
+	}, nil
 }
 
 // lastingLookups returns, from the lines on dashboard d that list failed
@@ -442,27 +455,36 @@ func lastingLookups(ctx context.Context, s Source, d *Issue, lines []lookupLine,
 // lookup, for window up to now. It has if item is listed in current, the
 // dashboard's body now, in each of its edits made after now-window, and
 // in the newest edit made at or before then, the body that stood at
-// now-window. The files item is in may have changed. A history with no
+// now-window: if listedSince puts the start of its listing at now-window
+// or earlier. The files item is in may have changed. A history with no
 // edit that old cannot show what stood then, whether the dashboard is
 // younger than window or GitHub kept too few of its edits, so then item
 // is not persistent.
 func persistent(item, current string, edits []DashboardEdit, now time.Time, window time.Duration) bool {
-	if !listsLookup(current, item) {
-		return false
+	since, ok := listedSince(current, edits, func(body string) bool { return listsLookup(body, item) })
+	return ok && !since.After(now.Add(-window))
+}
+
+// listedSince returns when a dashboard began to list something without a
+// break, by its edits: the time of the oldest edit in the unbroken run of
+// edits, counted back from the newest, each of whose bodies lists it, as
+// listed says. It is false when current, the dashboard's body now, does
+// not list it, or the newest edit does not. The edits may come in any
+// order. A history GitHub cut short ends the run at the oldest edit it
+// kept, so what it returns is never earlier than those edits show.
+func listedSince(current string, edits []DashboardEdit, listed func(body string) bool) (time.Time, bool) {
+	if !listed(current) {
+		return time.Time{}, false
 	}
-	since := now.Add(-window)
-	var stood *DashboardEdit
-	for i := range edits {
-		e := &edits[i]
-		if e.EditedAt.After(since) {
-			if !listsLookup(e.Body, item) {
-				return false
-			}
-		} else if stood == nil || e.EditedAt.After(stood.EditedAt) {
-			stood = e
+	var since time.Time
+	found := false
+	for _, e := range slices.SortedStableFunc(slices.Values(edits), func(a, b DashboardEdit) int { return b.EditedAt.Compare(a.EditedAt) }) {
+		if !listed(e.Body) {
+			break
 		}
+		since, found = e.EditedAt, true
 	}
-	return stood != nil && listsLookup(stood.Body, item)
+	return since, found
 }
 
 // listsLookup reports whether body lists item as a failed lookup.
@@ -520,6 +542,159 @@ func failedLookups(body string) []lookupLine {
 // unquote is a Markdown quote's line without its marker.
 func unquote(line string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), ">"))
+}
+
+// waitingSections are the headings of the Dependency Dashboard's sections
+// that list updates left waiting, as Renovate 45 writes them
+// (dependency-dashboard.ts): updates whose status checks are pending,
+// their release age among them, and updates their schedule holds back.
+var waitingSections = []string{"## Pending Status Checks", "## Awaiting Schedule"}
+
+// waitingItem is the line on which a Dependency Dashboard lists an update
+// in one of waitingSections, trimmed: its checkbox, ticked or not, the
+// comment that names the update's branch, and its title, a link to its
+// pull request when it has one.
+var waitingItem = regexp.MustCompile(`^- \[[ x]\] <!-- [a-zA-Z]+-branch=(\S+) -->(.*)$`)
+
+// bulkItem is the line, below two updates or more, that creates them all
+// at once: no update itself.
+var bulkItem = regexp.MustCompile(`^- \[[ x]\] <!-- create-all-[a-z-]+ -->`)
+
+// htmlComment and markdownLink are what an update's title is shown
+// without, and with the link's text in its place. The text runs to the
+// last "](" on the line, so a bracket in the title, as in a security
+// update's "[SECURITY]", stays in it: Renovate writes at most one link on
+// an update's line.
+var (
+	htmlComment  = regexp.MustCompile(`<!--.*?-->`)
+	markdownLink = regexp.MustCompile(`\[(.*)\]\([^)\s]*\)`)
+)
+
+// pendingUpdate is an update a Dependency Dashboard lists as waiting. Its
+// branch is what it is known by: the same from one version or digest to
+// the next. Its text is its line as shown, without its checkbox, comment
+// and link.
+type pendingUpdate struct {
+	branch, text string
+}
+
+// pendingUpdates returns the updates a Dependency Dashboard's body lists
+// in waitingSections, each once, and what it cannot read there: each line
+// of the list that is not one of Renovate's updates, trimmed, and each
+// heading with no update under it, which Renovate never writes. A section
+// runs to the next heading of its level or above, or to a rule, which
+// opens Renovate's warnings and a footer.
+func pendingUpdates(body string) (items []pendingUpdate, unreadable []string) {
+	// A web edit saves the body with CRLF until Renovate's next rewrite:
+	// each line is trimmed, so a line's \r goes with its spaces
+	var heading string
+	read := false
+	end := func() {
+		if heading != "" && !read {
+			unreadable = append(unreadable, heading+": no update under it in Renovate's form")
+		}
+		heading = ""
+	}
+	for line := range strings.Lines(body) {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") || strings.HasPrefix(line, "## ") || line == "---" {
+			end()
+			if slices.Contains(waitingSections, line) {
+				heading, read = line, false
+			}
+			continue
+		}
+		if heading == "" || !strings.HasPrefix(line, "- ") || bulkItem.MatchString(line) {
+			continue
+		}
+		m := waitingItem.FindStringSubmatch(line)
+		if m == nil {
+			unreadable = append(unreadable, line)
+			continue
+		}
+		read = true
+		if slices.ContainsFunc(items, func(u pendingUpdate) bool { return u.branch == m[1] }) {
+			continue
+		}
+		text := strings.TrimSpace(markdownLink.ReplaceAllString(htmlComment.ReplaceAllString(m[2], ""), "$1"))
+		if text == "" {
+			text = m[1]
+		}
+		items = append(items, pendingUpdate{branch: m[1], text: text})
+	}
+	end()
+	return items, unreadable
+}
+
+// pendingIn reports whether body lists the update on branch as waiting.
+func pendingIn(body, branch string) bool {
+	items, _ := pendingUpdates(body)
+	return slices.ContainsFunc(items, func(u pendingUpdate) bool { return u.branch == branch })
+}
+
+// Starved finds updates that each open Dependency Dashboard has listed as
+// waiting, under Pending Status Checks or Awaiting Schedule, for more than
+// c.StarvedDays days: an update whose release age is never reached, its
+// tag re-pushed more often than the age, or one a schedule holds, leaves
+// that dependency where it is, and nothing fails. Each is named by its line
+// now, with when it was first listed: the oldest edit, by the dashboard's
+// history back c.StarvedDays days and one more, in the unbroken run of
+// edits up to now that list it. An update is known by its branch, so a
+// newer version or digest, a pull request opened, or a move from one
+// section to the other keeps its clock; an update that leaves both
+// sections and comes back starts it again. A history GitHub cut short
+// counts from its oldest edit, never earlier.
+//
+// What it cannot read in those sections, it quotes, at once, whatever the
+// history: a format that drifted fails closed. Beside that, a history that
+// cannot be read is a detail, not an error that would hide it. With no
+// open dashboard it behaves as [Lookups] does.
+func Starved(ctx context.Context, s Source, c *Config) (Result, error) {
+	dashboards, err := s.Dashboards(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(dashboards) == 0 {
+		return noDashboard(ctx, s, c, "updates waiting on it")
+	}
+	now := time.Now()
+	items := make([][]pendingUpdate, len(dashboards))
+	unreadable := make([][]string, len(dashboards))
+	anyUnreadable := false
+	for i := range dashboards {
+		items[i], unreadable[i] = pendingUpdates(dashboards[i].Body)
+		anyUnreadable = anyUnreadable || len(unreadable[i]) > 0
+	}
+	limit := days(c.StarvedDays)
+	var numbers, starved []string
+	for i := range dashboards {
+		d := &dashboards[i]
+		numbers = append(numbers, "#"+strconv.Itoa(d.Number))
+		for _, u := range unreadable[i] {
+			starved = append(starved, "unreadable: "+u)
+		}
+		if len(items[i]) == 0 {
+			continue
+		}
+		edits, err := s.DashboardHistory(ctx, d.Number, now.Add(-days(c.StarvedDays+1)))
+		if err != nil {
+			if !anyUnreadable {
+				return Result{}, err
+			}
+			starved = append(starved, fmt.Sprintf("could not read the history of #%d: %v", d.Number, err))
+			continue
+		}
+		for _, u := range items[i] {
+			since, ok := listedSince(d.Body, edits, func(body string) bool { return pendingIn(body, u.branch) })
+			if ok && time.Since(since) > limit {
+				starved = append(starved, fmt.Sprintf("%s (since %s)", u.text, timestamp(since)))
+			}
+		}
+	}
+	if len(starved) > 0 {
+		return Result{Stalled: true, Headline: fmt.Sprintf("Waiting on the Dependency Dashboard for more than %d days:", c.StarvedDays), Details: starved}, nil
+	}
+	return Result{Headline: fmt.Sprintf("no update waiting more than %d days on the Dependency Dashboard %s", c.StarvedDays, strings.Join(numbers, ", "))}, nil
 }
 
 // Slots finds daily slots that should have published main and did not,

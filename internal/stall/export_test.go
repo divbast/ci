@@ -17,3 +17,14 @@ func SetPageSize(t *testing.T, n int) {
 
 // Persistent is persistent, for its tests.
 var Persistent = persistent
+
+// PendingUpdates is pendingUpdates, for its tests, with each update's
+// branch and text apart.
+func PendingUpdates(body string) (branches, text, unreadable []string) {
+	updates, unreadable := pendingUpdates(body)
+	for _, u := range updates {
+		branches = append(branches, u.branch)
+		text = append(text, u.text)
+	}
+	return branches, text, unreadable
+}

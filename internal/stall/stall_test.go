@@ -45,6 +45,7 @@ var config = stall.Config{
 	StuckHours:       24,
 	RunHours:         24,
 	LostSlots:        2,
+	StarvedDays:      7,
 	Published:        image,
 	SlotWorkflow:     "build.yml",
 	RenovateWorkflow: "renovate.yml",
@@ -1158,6 +1159,7 @@ func TestErrors(t *testing.T) {
 		{"renovate", func(ctx context.Context) (stall.Result, error) { return stall.Renovate(ctx, broken, &config) }},
 		{"slots-absent", func(ctx context.Context) (stall.Result, error) { return stall.Slots(ctx, broken, absent, &config) }},
 		{"slots-published", func(ctx context.Context) (stall.Result, error) { return stall.Slots(ctx, broken, pub, &config) }},
+		{"starved", func(ctx context.Context) (stall.Result, error) { return stall.Starved(ctx, broken, &config) }},
 	}
 
 	for _, tt := range tests {
@@ -1598,6 +1600,552 @@ func TestPersistent(t *testing.T) {
 			t.Parallel()
 			if got := stall.Persistent(trivyFailed, tt.current, tt.edits, epoch, day); got != tt.want {
 				t.Errorf("persistent() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+// pendingSection and scheduleSection are the sections Renovate 45 writes
+// on a Dependency Dashboard for updates whose status checks are pending,
+// its release age among them, and for updates their schedule holds back,
+// as dependency-dashboard.ts writes them, with each of items a line.
+func pendingSection(items ...string) string {
+	return "## Pending Status Checks\n\nThe following updates await pending status checks. To force their creation now, click on a checkbox below.\n\n" +
+		strings.Join(items, "\n") + "\n\n"
+}
+
+func scheduleSection(items ...string) string {
+	return "## Awaiting Schedule\n\nThe following updates are awaiting their schedule. To get an update now, click on a checkbox below.\n\n" +
+		strings.Join(items, "\n") + "\n\n"
+}
+
+// stylelint is the line on which a dashboard lists stylelint's update to
+// version v as waiting on its status checks, and stylelintWaiting is the
+// same update as starved names it, waiting since since.
+func stylelint(v string) string {
+	return " - [ ] <!-- unpend-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to " + v
+}
+
+func stylelintWaiting(v, since string) string {
+	return "tools: update dependency stylelint to " + v + " (since " + since + ")"
+}
+
+// pnpm is another update waiting on its status checks.
+const pnpm = " - [ ] <!-- unpend-branch=renovate/pnpm -->tools: update pnpm to v12.23.0"
+
+// pisatiWaiting are the updates pisati's dashboard, dashboard-pending.md,
+// lists under Pending Status Checks: each one's branch, and its line with
+// the comment and the link taken out.
+var pisatiWaiting = []struct{ branch, text string }{
+	{"renovate/axe-core-playwright-4.x", "tools: update dependency @axe-core/playwright to v4.14.1"},
+	{"renovate/github.com-ncruces-go-sqlite3-0.x", "tools: update module github.com/ncruces/go-sqlite3 to v0.38.1"},
+	{"renovate/github.com-pressly-goose-v3-3.x", "tools: update module github.com/pressly/goose/v3 to v3.30.2"},
+	{"renovate/lucide-monorepo", "tools: update dependency lucide-static to v1.81.0"},
+	{"renovate/stylelint-18.x", "tools: update dependency stylelint to v18.1.0"},
+	{"renovate/vite-plus-monorepo", "tools: update dependency vite-plus to v1.8.0"},
+	{"renovate/pnpm", "tools: update pnpm to v12.23.0"},
+}
+
+// starvedHeadline is the headline of a starved stall at 7 days, and
+// notStarved the passing one on dashboard #94.
+const (
+	starvedHeadline = "Waiting on the Dependency Dashboard for more than 7 days:"
+	notStarved      = "no update waiting more than 7 days on the Dependency Dashboard #94"
+)
+
+func starvedWith(t *testing.T, s *source) stall.Result {
+	t.Helper()
+	res, err := stall.Starved(t.Context(), s, &config)
+	if err != nil {
+		t.Fatalf("Starved() error = %v", err)
+	}
+	return res
+}
+
+// TestStarvedNone reads dashboards with no update waiting under Pending
+// Status Checks or Awaiting Schedule, which never ask for their history:
+// the source has none to give.
+func TestStarvedNone(t *testing.T) {
+	t.Parallel()
+
+	approval := "## Pending Approval\n\nThe following branches are pending approval. To create them, click on a checkbox below.\n\n" +
+		" - [ ] <!-- approve-branch=renovate/go-1.x -->tools: update go module directive to v1.27.4\n\n"
+
+	tests := []struct {
+		name, section string
+	}{
+		{"clean", ""},
+		// Pending Approval waits on a person, whom the dashboard asks
+		{"pending-approval", approval},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				res := starvedWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, tt.section), URL: dashboardURL}}})
+				checkResult(t, res, stall.Result{Headline: notStarved})
+			})
+		})
+	}
+}
+
+// TestStarvedYoung reads an update waiting no more than 7 days: since 6
+// days ago, with the edit before that clean, and since exactly 7 days
+// ago, which is not more than 7.
+func TestStarvedYoung(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		waiting time.Duration
+	}{
+		{"six-days", 6 * day},
+		{"exactly-seven-days", 7 * day},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+				res := starvedWith(t, onDashboard(body, edit(0, body), edit(tt.waiting, body), edit(9*day, dashboard(t, ""))))
+				checkResult(t, res, stall.Result{Headline: notStarved})
+			})
+		})
+	}
+}
+
+// TestStarvedOld reads updates waiting more than 7 days, each named with
+// the edit it has been listed since, whichever of the two sections lists
+// it.
+func TestStarvedOld(t *testing.T) {
+	t.Parallel()
+
+	clean := dashboard(t, "")
+	waiting := dashboard(t, pendingSection(stylelint("v18.1.0")))
+	pisati := string(testdata(t, "dashboard-pending.md"))
+	pisatiDetails := make([]string, 0, len(pisatiWaiting))
+	for _, w := range pisatiWaiting {
+		pisatiDetails = append(pisatiDetails, w.text+" (since 1999-12-24T00:00:00Z)")
+	}
+
+	tests := []struct {
+		name  string
+		body  string
+		edits []stall.DashboardEdit
+		want  []string
+	}{
+		{
+			name:  "pending-status-checks",
+			body:  waiting,
+			edits: []stall.DashboardEdit{edit(0, waiting), edit(3*day, waiting), edit(8*day, waiting), edit(10*day, clean)},
+			want:  []string{stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z")},
+		},
+		{
+			name: "awaiting-schedule",
+			body: dashboard(t, scheduleSection(" - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3")),
+			edits: []stall.DashboardEdit{
+				edit(time.Hour, dashboard(t, scheduleSection(" - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3"))),
+				edit(9*day, dashboard(t, scheduleSection(" - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3"))),
+			},
+			want: []string{"build: update debian Docker tag to v13.3 (since 1999-12-23T00:00:00Z)"},
+		},
+		{
+			// A second past 7 days is more than 7
+			name:  "just-past",
+			body:  waiting,
+			edits: []stall.DashboardEdit{edit(0, waiting), edit(7*day+time.Second, waiting), edit(9*day, clean)},
+			want:  []string{stylelintWaiting("v18.1.0", "1999-12-24T23:59:59Z")},
+		},
+		{
+			// Renovate edits the dashboard only when its body changes, so the
+			// newest edit older than the window stood throughout
+			name:  "unedited",
+			body:  waiting,
+			edits: []stall.DashboardEdit{edit(10*day, waiting)},
+			want:  []string{stylelintWaiting("v18.1.0", "1999-12-22T00:00:00Z")},
+		},
+		{
+			// pnpm waits since 3 days ago, so only stylelint is named
+			name: "one-of-two",
+			body: dashboard(t, pendingSection(stylelint("v18.1.0"), pnpm)),
+			edits: []stall.DashboardEdit{
+				edit(0, dashboard(t, pendingSection(stylelint("v18.1.0"), pnpm))),
+				edit(3*day, dashboard(t, pendingSection(stylelint("v18.1.0"), pnpm))),
+				edit(8*day, waiting),
+			},
+			want: []string{stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z")},
+		},
+		{
+			name:  "recorded",
+			body:  pisati,
+			edits: []stall.DashboardEdit{edit(0, pisati), edit(8*day, pisati)},
+			want:  pisatiDetails,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				res := starvedWith(t, onDashboard(tt.body, tt.edits...))
+				checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: tt.want})
+			})
+		})
+	}
+}
+
+// TestStarvedTwoDashboards reads two open dashboards, each with an update
+// waiting more than 7 days: both are named, in the dashboards' order.
+func TestStarvedTwoDashboards(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		first := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		second := dashboard(t, pendingSection(pnpm))
+		res := starvedWith(t, &source{
+			dashboards: []stall.Issue{
+				{Number: 94, Title: "Dependency Dashboard", Body: first, URL: dashboardURL},
+				{Number: 95, Title: "Dependency Dashboard", Body: second, URL: "https://github.com/divbast/baikal-oci-image/issues/95"},
+			},
+			edits: map[int][]stall.DashboardEdit{94: {edit(9*day, first)}, 95: {edit(0, second), edit(8*day, second)}},
+		})
+		checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: []string{
+			stylelintWaiting("v18.1.0", "1999-12-23T00:00:00Z"), "tools: update pnpm to v12.23.0 (since 1999-12-24T00:00:00Z)",
+		}})
+	})
+}
+
+// TestStarvedFlickerResets reads an update listed 8 days ago, gone 5 days
+// ago, and listed again since: its clock starts again from its return.
+func TestStarvedFlickerResets(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		res := starvedWith(t, onDashboard(body, edit(0, body), edit(4*day, body), edit(5*day, dashboard(t, "")), edit(8*day, body), edit(10*day, body)))
+		checkResult(t, res, stall.Result{Headline: notStarved})
+	})
+}
+
+// TestStarvedNewVersionKeepsClock reads an update whose line changed while
+// it waited: a newer version, a pull request opened, or a move from one
+// section to the other. Its branch is the same, so it is the same update,
+// still waiting, and the clock runs from when the branch was first listed.
+// It is named by its line now.
+func TestStarvedNewVersionKeepsClock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		now    string
+		before []string // what the edits 4 and 8 days ago list
+		want   string
+	}{
+		{
+			name:   "new-version",
+			now:    pendingSection(stylelint("v18.1.2")),
+			before: []string{pendingSection(stylelint("v18.1.1")), pendingSection(stylelint("v18.1.0"))},
+			want:   stylelintWaiting("v18.1.2", "1999-12-24T00:00:00Z"),
+		},
+		{
+			name:   "pull-request-opened",
+			now:    pendingSection(" - [ ] <!-- unpend-branch=renovate/stylelint-18.x -->[tools: update dependency stylelint to v18.1.0](../pull/14)"),
+			before: []string{pendingSection(stylelint("v18.1.0")), pendingSection(stylelint("v18.1.0"))},
+			want:   stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z"),
+		},
+		{
+			// Its schedule opened, and now its release age holds it
+			name: "schedule-then-status-checks",
+			now:  pendingSection(stylelint("v18.1.0")),
+			before: []string{
+				pendingSection(stylelint("v18.1.0")),
+				scheduleSection(" - [ ] <!-- unschedule-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to v18.1.0"),
+			},
+			want: stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				body := dashboard(t, tt.now)
+				res := starvedWith(t, onDashboard(body,
+					edit(0, body), edit(4*day, dashboard(t, tt.before[0])), edit(8*day, dashboard(t, tt.before[1])), edit(10*day, dashboard(t, ""))))
+				checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: []string{tt.want}})
+			})
+		})
+	}
+}
+
+// TestStarvedUnreadable reads sections it cannot read whole: a line under
+// either heading that names no branch, and a heading with no update under
+// it in Renovate's form. Each stalls at once, quoted, and needs no
+// history; a section it can read beside one still has its history read.
+func TestStarvedUnreadable(t *testing.T) {
+	t.Parallel()
+
+	const (
+		noBranch      = " - [ ] tools: update dependency stylelint to v18.1.0"
+		pendingEmpty  = "unreadable: ## Pending Status Checks: no update under it in Renovate's form"
+		scheduleEmpty = "unreadable: ## Awaiting Schedule: no update under it in Renovate's form"
+	)
+
+	tests := []struct {
+		name    string
+		section string
+		edits   []stall.DashboardEdit
+		want    []string
+	}{
+		{
+			name:    "no-branch",
+			section: pendingSection(noBranch),
+			want:    []string{"unreadable: " + strings.TrimSpace(noBranch), pendingEmpty},
+		},
+		{
+			name:    "nothing-under-it",
+			section: "## Awaiting Schedule\n\nThe following updates are awaiting their schedule. To get an update now, click on a checkbox below.\n\n",
+			want:    []string{scheduleEmpty},
+		},
+		{
+			// Renovate writes its bulk line only below two updates or more
+			name:    "only-the-bulk-line",
+			section: scheduleSection(" - [ ] <!-- create-all-awaiting-schedule-prs -->🔐 **Create all awaiting schedule PRs at once** 🔐"),
+			want:    []string{scheduleEmpty},
+		},
+		{
+			// Another list form: no line in it is an update
+			name:    "another-form",
+			section: pendingSection("* [ ] <!-- unpend-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to v18.1.0"),
+			want:    []string{pendingEmpty},
+		},
+		{
+			name:    "beside-one-it-reads",
+			section: pendingSection(stylelint("v18.1.0"), noBranch),
+			edits:   []stall.DashboardEdit{edit(day, dashboard(t, pendingSection(stylelint("v18.1.0"), noBranch)))},
+			want:    []string{"unreadable: " + strings.TrimSpace(noBranch)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				// Without edits scripted, a read of the history fails the test
+				src := &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, tt.section), URL: dashboardURL}}}
+				if tt.edits != nil {
+					src.edits = map[int][]stall.DashboardEdit{94: tt.edits}
+				}
+				res := starvedWith(t, src)
+				checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: tt.want})
+			})
+		})
+	}
+}
+
+// TestStarvedHistoryShort reads a history that reaches back only 2 days,
+// as GitHub's does for a dashboard edited 99 times since, with the update
+// in its oldest edit: it counts from that edit, never earlier, so it does
+// not stall.
+func TestStarvedHistoryShort(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		res := starvedWith(t, onDashboard(body, edit(0, body), edit(day, body), edit(2*day, body)))
+		checkResult(t, res, stall.Result{Headline: notStarved})
+	})
+}
+
+// TestStarvedHistoryWindow checks that starved asks for the history back
+// to one day more than StarvedDays: the source answers from there, so an
+// update listed since only within the window, or for longer, reads the
+// edits that show it.
+func TestStarvedHistoryWindow(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		src := &windowSource{source: onDashboard(body, edit(0, body), edit(9*day, body))}
+		if _, err := stall.Starved(t.Context(), src, &config); err != nil {
+			t.Fatalf("Starved() error = %v", err)
+		}
+		if want := ago(8 * day); !src.since.Equal(want) {
+			t.Errorf("DashboardHistory asked since %v, want %v", src.since, want)
+		}
+	})
+}
+
+// windowSource is a source that keeps the since of its last history read.
+type windowSource struct {
+	*source
+	since time.Time
+}
+
+func (w *windowSource) DashboardHistory(ctx context.Context, number int, since time.Time) ([]stall.DashboardEdit, error) {
+	w.since = since
+	return w.source.DashboardHistory(ctx, number, since)
+}
+
+func TestStarvedNoDashboard(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		last := time.Date(1999, 12, 31, 3, 0, 0, 0, time.UTC)
+		res := starvedWith(t, &source{success: last})
+		checkResult(t, res, stall.Result{
+			Stalled:  true,
+			Headline: "No open Dependency Dashboard by divbast-renovate, so updates waiting on it cannot be seen:",
+			Details:  []string{`no open issue titled "Dependency Dashboard"; Renovate last succeeded 1999-12-31T03:00:00Z`},
+		})
+		res = starvedWith(t, &source{})
+		checkResult(t, res, stall.Result{Headline: "no Dependency Dashboard yet, and no successful Renovate run to have made one"})
+	})
+}
+
+// TestStarvedHistoryFails checks that a dashboard listing an update whose
+// history cannot be read fails the check, rather than being taken for an
+// update waiting any length of time; beside a section it cannot read,
+// which stalls whatever the history says, the error is a detail.
+func TestStarvedHistoryFails(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		errHistory := errors.New("gh api graphql: HTTP 502")
+		src := onDashboard(dashboard(t, pendingSection(stylelint("v18.1.0"))))
+		src.historyErr = errHistory
+		got, err := stall.Starved(t.Context(), src, &config)
+		if !errors.Is(err, errHistory) {
+			t.Fatalf("Starved() = %+v, %v; want an error wrapping %v", got, err, errHistory)
+		}
+
+		noBranch := " - [ ] tools: update pnpm to v12.23.0"
+		src = onDashboard(dashboard(t, scheduleSection(noBranch)+pendingSection(stylelint("v18.1.0"))))
+		src.historyErr = errHistory
+		res := starvedWith(t, src)
+		checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: []string{
+			"unreadable: " + strings.TrimSpace(noBranch),
+			"unreadable: ## Awaiting Schedule: no update under it in Renovate's form",
+			"could not read the history of #94: " + errHistory.Error(),
+		}})
+	})
+}
+
+// TestPendingUpdates checks what starved reads as an update waiting: each
+// line under Pending Status Checks or Awaiting Schedule that names a
+// branch, known by its branch and named by the line without its comment
+// and link, and nothing else on the dashboard.
+func TestPendingUpdates(t *testing.T) {
+	t.Parallel()
+
+	pisati := string(testdata(t, "dashboard-pending.md"))
+	pisatiBranches := make([]string, 0, len(pisatiWaiting))
+	pisatiTexts := make([]string, 0, len(pisatiWaiting))
+	for _, w := range pisatiWaiting {
+		pisatiBranches = append(pisatiBranches, w.branch)
+		pisatiTexts = append(pisatiTexts, w.text)
+	}
+	debian := " - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3"
+
+	tests := []struct {
+		name           string
+		body           string
+		branches, text []string
+		unreadable     []string
+	}{
+		{name: "recorded", body: pisati, branches: pisatiBranches, text: pisatiTexts},
+		{
+			// A web edit saves the body with CRLF until Renovate's next rewrite
+			name: "crlf", body: strings.ReplaceAll(pisati, "\n", "\r\n"), branches: pisatiBranches, text: pisatiTexts,
+		},
+		{name: "clean", body: dashboard(t, "")},
+		{
+			// The bulk line is no update
+			name:     "bulk-line",
+			body:     dashboard(t, scheduleSection(debian, pnpm, " - [ ] <!-- create-all-awaiting-schedule-prs -->🔐 **Create all awaiting schedule PRs at once** 🔐")),
+			branches: []string{"renovate/debian", "renovate/pnpm"},
+			text:     []string{"build: update debian Docker tag to v13.3", "tools: update pnpm to v12.23.0"},
+		},
+		{
+			// dependencyDashboardCategory groups updates under ### headings
+			name: "categories",
+			body: dashboard(t, "## Pending Status Checks\n\nThe following updates await pending status checks. To force their creation now, click on a checkbox below.\n\n"+
+				"### build\n\n"+debian+"\n\n### tools\n\n"+pnpm+"\n\n"),
+			branches: []string{"renovate/debian", "renovate/pnpm"},
+			text:     []string{"build: update debian Docker tag to v13.3", "tools: update pnpm to v12.23.0"},
+		},
+		{
+			// Ticked, it waits still, until Renovate's next run acts on it
+			name:     "ticked",
+			body:     dashboard(t, pendingSection(" - [x] <!-- unpend-branch=renovate/pnpm -->tools: update pnpm to v12.23.0")),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"tools: update pnpm to v12.23.0"},
+		},
+		{
+			// An update of more than one package names them after its title
+			name:     "packages",
+			body:     dashboard(t, pendingSection(" - [ ] <!-- unpend-branch=renovate/lucide-monorepo -->[tools: update lucide monorepo to v1.81.0](../pull/9) (`lucide`, `lucide-static`)")),
+			branches: []string{"renovate/lucide-monorepo"},
+			text:     []string{"tools: update lucide monorepo to v1.81.0 (`lucide`, `lucide-static`)"},
+		},
+		{
+			// Renovate ends a security update's title with [SECURITY], a
+			// bracket inside the link's text, which is shown whole
+			name: "bracket-in-title",
+			body: dashboard(t, pendingSection(" - [ ] <!-- unpend-branch=renovate/npm-axios-1.x -->"+
+				"[fix(deps): update dependency axios to v1.13.5 [SECURITY]](../pull/31) (`axios`, `axios-retry`)")),
+			branches: []string{"renovate/npm-axios-1.x"},
+			text:     []string{"fix(deps): update dependency axios to v1.13.5 [SECURITY] (`axios`, `axios-retry`)"},
+		},
+		{
+			// A line with nothing after its comment is named by its branch
+			name:     "no-title",
+			body:     dashboard(t, pendingSection(" - [ ] <!-- unpend-branch=renovate/pnpm -->")),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"renovate/pnpm"},
+		},
+		{
+			name:     "listed-twice",
+			body:     dashboard(t, pendingSection(pnpm)+scheduleSection(" - [ ] <!-- unschedule-branch=renovate/pnpm -->tools: update pnpm to v12.23.0")),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"tools: update pnpm to v12.23.0"},
+		},
+		{
+			// The section ends at the next heading or rule: what follows is
+			// Renovate's warnings, a footer, or another section's list
+			name:     "ends-at-a-rule",
+			body:     dashboard(t, pendingSection(pnpm)+"---\n\nThe footer\n\n - a footer's list\n\n"),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"tools: update pnpm to v12.23.0"},
+		},
+		{
+			name:       "unreadable",
+			body:       dashboard(t, pendingSection(pnpm, " - [ ] tools: update stylelint")),
+			branches:   []string{"renovate/pnpm"},
+			text:       []string{"tools: update pnpm to v12.23.0"},
+			unreadable: []string{"- [ ] tools: update stylelint"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			branches, text, unreadable := stall.PendingUpdates(tt.body)
+			if !slices.Equal(branches, tt.branches) {
+				t.Errorf("branches = %q\nwant       %q", branches, tt.branches)
+			}
+			if !slices.Equal(text, tt.text) {
+				t.Errorf("text = %q\nwant   %q", text, tt.text)
+			}
+			if !slices.Equal(unreadable, tt.unreadable) {
+				t.Errorf("unreadable = %q\nwant         %q", unreadable, tt.unreadable)
 			}
 		})
 	}

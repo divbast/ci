@@ -73,6 +73,10 @@ const (
 		`> [!WARNING]\n> Renovate failed to look up the following dependencies: ` +
 		"`Failed to look up github-tags package anchore/grype: no-result`" + `.\n> \n> Files affected: ` + "`mise.toml`" + `\n"`
 	cleanBody = `"## Open\n\nNothing.\n"`
+	// pendingBody lists stylelint's update as waiting on its status
+	// checks.
+	pendingBody = `"## Pending Status Checks\n\nThe following updates await pending status checks. To force their creation now, click on a checkbox below.\n\n` +
+		` - [ ] <!-- unpend-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to v18.1.0\n\n## Detected Dependencies\n"`
 )
 
 // dashboardOut is the open Dependency Dashboard, #5, with body.
@@ -84,9 +88,14 @@ func dashboardOut(body string) execx.Result {
 // before the bubble's clock with first as its body, and edited at edited
 // to body: its edits newest first, the oldest its creation.
 func historyOut(edited, body, first string) execx.Result {
-	return ok(`{"data":{"repository":{"issue":{"createdAt":"1999-12-30T23:00:00Z","body":` + body + `,"userContentEdits":{"totalCount":2,` +
+	return editsOut("1999-12-30T23:00:00Z", edited, body, first)
+}
+
+// editsOut is historyOut for a Dependency Dashboard made at created.
+func editsOut(created, edited, body, first string) execx.Result {
+	return ok(`{"data":{"repository":{"issue":{"createdAt":"` + created + `","body":` + body + `,"userContentEdits":{"totalCount":2,` +
 		`"pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29yOjI="},` +
-		`"nodes":[{"editedAt":"` + edited + `","diff":` + body + `},{"editedAt":"1999-12-30T23:00:00Z","diff":` + first + `}]}}}}}`)
+		`"nodes":[{"editedAt":"` + edited + `","diff":` + body + `},{"editedAt":"` + created + `","diff":` + first + `}]}}}}}`)
 }
 
 func workflowAPI(workflow string) []string {
@@ -111,12 +120,13 @@ func apiOK(body string) execx.Result {
 // changes: a value of "" unsets the variable.
 func env(changes map[string]string) func(string) string {
 	vars := map[string]string{
-		"GH_REPO":     repo,
-		"OPEN_DAYS":   "14",
-		"STUCK_HOURS": "24",
-		"RUN_HOURS":   "24",
-		"LOST_SLOTS":  "2",
-		"PUBLISHED":   image,
+		"GH_REPO":      repo,
+		"OPEN_DAYS":    "14",
+		"STUCK_HOURS":  "24",
+		"RUN_HOURS":    "24",
+		"LOST_SLOTS":   "2",
+		"STARVED_DAYS": "7",
+		"PUBLISHED":    image,
 	}
 	maps.Copy(vars, changes)
 	return func(k string) string { return vars[k] }
@@ -395,6 +405,79 @@ func TestRun(t *testing.T) {
 				"  no open issue titled \"Dependency Dashboard\"; Renovate last succeeded 1999-12-31T23:00:00Z\n",
 		},
 		{
+			// Nothing waiting, so no history to read
+			name:       "starved",
+			args:       []string{"starved"},
+			calls:      []execx.Call{{Argv: issuesAPI, Result: dashboardOut(cleanBody)}},
+			wantStdout: "no update waiting more than 7 days on the Dependency Dashboard #5\n",
+		},
+		{
+			// Waiting since the dashboard was made, 9 days ago, and still
+			// after its edit 2 hours ago
+			name: "starved-stalled",
+			args: []string{"starved"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: editsOut("1999-12-23T00:00:00Z", "1999-12-31T22:00:00Z", pendingBody, pendingBody)},
+			},
+			wantCode: 1,
+			wantStdout: "Waiting on the Dependency Dashboard for more than 7 days:\n" +
+				"  tools: update dependency stylelint to v18.1.0 (since 1999-12-23T00:00:00Z)\n",
+		},
+		{
+			// Waiting only since an edit 3 days ago
+			name: "starved-young",
+			args: []string{"starved"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: editsOut("1999-12-23T00:00:00Z", "1999-12-29T00:00:00Z", pendingBody, cleanBody)},
+			},
+			wantStdout: "no update waiting more than 7 days on the Dependency Dashboard #5\n",
+		},
+		{
+			// The same 3 days, more than STARVED_DAYS allows
+			name: "starved-days",
+			args: []string{"starved"},
+			env:  map[string]string{"STARVED_DAYS": "2"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: editsOut("1999-12-23T00:00:00Z", "1999-12-29T00:00:00Z", pendingBody, cleanBody)},
+			},
+			wantCode: 1,
+			wantStdout: "Waiting on the Dependency Dashboard for more than 2 days:\n" +
+				"  tools: update dependency stylelint to v18.1.0 (since 1999-12-29T00:00:00Z)\n",
+		},
+		{
+			name: "starved-history-fails",
+			args: []string{"starved"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: execx.Result{Stderr: []byte("HTTP 502: Bad Gateway"), Code: 1}},
+			},
+			wantCode:   2,
+			wantStderr: []string{"gh api graphql", "502"},
+		},
+		{
+			// With no dashboard, whether Renovate ever succeeded decides
+			name: "starved-no-dashboard",
+			args: []string{"starved"},
+			env:  map[string]string{"RENOVATE_WORKFLOW": "self-renovate.yml"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: apiOK("[]")},
+				{Argv: successRuns("self-renovate.yml"), Result: ok(`[{"createdAt":"1999-12-31T23:00:00Z"}]`)},
+			},
+			wantCode: 1,
+			wantStdout: "No open Dependency Dashboard by divbast-renovate, so updates waiting on it cannot be seen:\n" +
+				"  no open issue titled \"Dependency Dashboard\"; Renovate last succeeded 1999-12-31T23:00:00Z\n",
+		},
+		{
+			name:       "starved-no-limit",
+			args:       []string{"starved"},
+			env:        map[string]string{"STARVED_DAYS": ""},
+			wantCode:   2,
+			wantStderr: []string{"STARVED_DAYS is not set"},
+		},
+		{
 			name:       "lookups-gh-fails",
 			args:       []string{"lookups"},
 			calls:      []execx.Call{{Argv: issuesAPI, Result: execx.Result{Stderr: []byte("HTTP 401: Bad credentials"), Code: 1}}},
@@ -440,7 +523,7 @@ func TestRun(t *testing.T) {
 			// Only the check's own limit is read.
 			name:       "other-limits-unset",
 			args:       []string{"open"},
-			env:        map[string]string{"STUCK_HOURS": "", "RUN_HOURS": "x", "LOST_SLOTS": "", "PUBLISHED": ""},
+			env:        map[string]string{"STUCK_HOURS": "", "RUN_HOURS": "x", "LOST_SLOTS": "", "STARVED_DAYS": "", "PUBLISHED": ""},
 			calls:      []execx.Call{{Argv: prList, Result: ok("[]")}},
 			wantStdout: "no Renovate pull request open more than 14 days\n",
 		},
@@ -464,7 +547,7 @@ func TestRun(t *testing.T) {
 		{
 			name:       "help",
 			args:       []string{"-h"},
-			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots|lookups"},
+			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots|lookups|starved\n"},
 		},
 	}
 

@@ -5,10 +5,10 @@
 # fails, so GitHub emails someone, when updates have stopped flowing without
 # anything failing loudly: a Renovate pull request that never goes green or
 # never finishes, Renovate itself silent, daily slots that should have
-# published and did not, or a dependency Renovate failed to look up, which
-# only its Dependency Dashboard shows. A scheduled run's failure goes to
-# whoever last edited the caller's cron line. The checks are
-# cmd/divbast-stall's.
+# published and did not, a dependency Renovate failed to look up, or an
+# update left waiting too long, both of which only its Dependency
+# Dashboard shows. A scheduled run's failure goes to whoever last edited
+# the caller's cron line. The checks are cmd/divbast-stall's.
 #
 # The caller's job grants contents, pull-requests, actions, checks,
 # statuses, packages and issues, all read.
@@ -18,9 +18,9 @@ on:
   workflow_call:
     inputs:
       checks:
-        description: The checks to run, a JSON array of open, stuck, renovate, slots and lookups
+        description: The checks to run, a JSON array of open, stuck, renovate, slots, lookups and starved
         type: string
-        default: '["open","stuck","renovate","slots","lookups"]'
+        default: '["open","stuck","renovate","slots","lookups","starved"]'
       published:
         description: The image the daily slot publishes, such as ghcr.io/divbast/librespeed:latest; slots needs it
         type: string
@@ -49,6 +49,10 @@ on:
         description: Lost daily slots that make a stall
         type: number
         default: 2
+      starved-days:
+        description: Days an update may wait on the Dependency Dashboard, under Pending Status Checks or Awaiting Schedule
+        type: number
+        default: 7
       content-gated:
         description: The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost
         type: boolean
@@ -114,6 +118,7 @@ jobs:
           STUCK_HOURS: ${{ inputs.stuck-hours }}
           RUN_HOURS: ${{ inputs.run-hours }}
           LOST_SLOTS: ${{ inputs.lost-slots }}
+          STARVED_DAYS: ${{ inputs.starved-days }}
           PUBLISHED: ${{ inputs.published }}
           SLOT_WORKFLOW: ${{ inputs.slot-workflow }}
           RENOVATE_WORKFLOW: ${{ inputs.renovate-workflow }}
