@@ -1,1 +1,16 @@
-{"extends": ["github>divbast/renovate-config"]}
+{
+  "extends": [
+    "github>divbast/renovate-config"
+  ],
+  "packageRules": [
+    {
+      "description": "Renovate's own image moves only on Mondays (UTC). Each move of this pin releases ci and opens a pull request in every repository, and Renovate ships several times a day.",
+      "matchDepNames": [
+        "ghcr.io/renovatebot/renovate"
+      ],
+      "schedule": [
+        "* * * * 1"
+      ]
+    }
+  ]
+}
