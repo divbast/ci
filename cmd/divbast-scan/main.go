@@ -27,19 +27,25 @@
 //
 // It scans the OCI layout in DIR, writing the JSON report to -report and
 // its SARIF, for code scanning, to -sarif, once the report passes the
-// checks below. It then scans IMAGE as the registry serves it, for the
-// layout's architecture and from the same vulnerability database, writing
-// that report to -baseline. A finding IMAGE has too is reported as an
-// advisory: the same vulnerability, by any of its IDs, in the same package
-// at any version, or any finding in a package IMAGE ships at that very
-// version. A new finding with no severity, which DHI's advisories have, is
-// listed and never blocks. -vex names an OpenVEX document both scans
-// apply, the app's own; it may be given more than once. Every trivy call
-// turns off the .trivyignore and trivy.yaml trivy would read from the
-// working directory, the caller's repository, and every grype call names
-// a configuration of the command's own instead of a .grype.yaml there;
-// each runs with none of its TRIVY_ or GRYPE_ variables in its
-// environment.
+// checks below. Whichever scanner wrote the SARIF, and whatever was merged
+// into it, the command checks it before any verdict: it is rewritten with
+// an array for each run's results and tool.driver.rules where either is
+// null or missing, which code scanning refuses, and it fails the scan when
+// the file is not JSON, has no version or runs array, has a run that is no
+// JSON object, names no tool.driver.name or holds a wrong-typed results or
+// rules, or has two runs of one tool. It then scans IMAGE as the registry
+// serves it, for the layout's architecture and from the same vulnerability
+// database, writing that report to -baseline. A finding IMAGE has too is
+// reported as an advisory: the same vulnerability, by any of its IDs, in
+// the same package at any version, or any finding in a package IMAGE ships
+// at that very version. A new finding with no severity, which DHI's
+// advisories have, is listed and never blocks. -vex names an OpenVEX
+// document both scans apply, the app's own; it may be given more than
+// once. Every trivy call turns off the .trivyignore and trivy.yaml trivy
+// would read from the working directory, the caller's repository, and
+// every grype call names a configuration of the command's own instead of a
+// .grype.yaml there; each runs with none of its TRIVY_ or GRYPE_ variables
+// in its environment.
 //
 // For grype, -cache names the directory its configuration and its
 // vulnerability database go in, by default divbast-scan's own in the
@@ -199,7 +205,10 @@
 //	   CPE, or one grype's CycloneDX does not name; for an image that
 //	   declares lockfiles or SBOMs, grype's database not updated, their
 //	   SARIF not filtered, placed or merged into the image's, or IMAGE not
-//	   copied; or the summary not written
+//	   copied; the final SARIF unreadable, not JSON, without a runs array,
+//	   or without a version; or with a run that is not a JSON object, has no
+//	   tool.driver.name, holds a results or rules that is no array, or
+//	   names a tool another run does; or the summary not written
 //	2  the command line is wrong
 package main
 
@@ -442,6 +451,15 @@ func run(ctx context.Context, args []string, r execx.Runner, zstd execx.StreamRu
 			complain(stderr, "%v", err)
 			return 1
 		}
+	}
+
+	// The SARIF is final here, whichever scanner wrote it and whether or not
+	// anything was merged into it, and every path to exit 0 follows. The
+	// upload to code scanning runs only on main, so a file it would refuse
+	// has to fail here, on every pull request.
+	if err = scan.ValidateSARIF(*sarif); err != nil {
+		complain(stderr, "the SARIF code scanning would receive is not valid: %v", err)
+		return 1
 	}
 
 	inActions := getenv("GITHUB_ACTIONS") == "true"
