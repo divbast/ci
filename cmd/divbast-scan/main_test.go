@@ -49,6 +49,10 @@ func (tr trivy) Run(ctx context.Context, name string, args ...string) (execx.Res
 		if report, ok := tr.reports[args[i+1]]; ok {
 			return res, os.WriteFile(args[i+1], []byte(report), 0o600)
 		}
+		// A SARIF nothing scripted is an empty, valid one
+		if strings.HasSuffix(args[i+1], ".sarif") {
+			return res, os.WriteFile(args[i+1], []byte(`{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Trivy","rules":[]}},"results":[]}]}`), 0o600)
+		}
 	}
 	return res, nil
 }
@@ -914,7 +918,7 @@ func TestRunOutsideActions(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	// Only what the stub trivy wrote: no summary appeared anywhere
-	if want := []string{"b.json", "r.json"}; !slices.Equal(names, want) {
+	if want := []string{"b.json", "r.json", "r.sarif"}; !slices.Equal(names, want) {
 		t.Errorf("files = %q, want %q", names, want)
 	}
 }

@@ -79,6 +79,10 @@ env:
   # The mise release jdx/mise-action installs. Renovate moves it.
   # renovate: datasource=github-releases depName=jdx/mise
   MISE_VERSION: 2026.11.14
+  # mise gives a failed tool download 3 retries, over about 5 seconds. 5
+  # retries wait up to about 35 seconds (200ms, 1s, 4s, then 15s each, with
+  # jitter), enough to outlast a short outage of the download host.
+  MISE_HTTP_RETRIES: "5"
 
 jobs:
   # lint.yml's steps, and what an app's lint needs besides. The pin
@@ -526,7 +530,9 @@ jobs:
       # a later scan stops finding them. Even when the scan failed, so a finding
       # that reached main is on record. Never from a pull request: GitHub would
       # then add its own check comparing the PR with main, a second gate
-      # measured against something other than what is published.
+      # measured against something other than what is published. The scan job
+      # does validate the SARIF on every pull request, and fails on a file code
+      # scanning would refuse, so main's upload does not fail where a PR passed.
       - name: Upload the findings to code scanning
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
         uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5

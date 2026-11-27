@@ -1,5 +1,6 @@
 == workflow env names ==
 MISE_VERSION
+MISE_HTTP_RETRIES
 == workflow defaults ==
 run:
   shell: bash
