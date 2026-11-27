@@ -176,6 +176,17 @@ type Source interface {
 	// Dashboards returns the open issues Renovate made titled exactly
 	// [DashboardTitle].
 	Dashboards(ctx context.Context) ([]Issue, error)
+	// DashboardHistory returns the bodies the issue numbered number has
+	// had, newest first, each as it stood after its edit. It reaches back
+	// past since: its last edit is the newest made at or before since,
+	// when there is one. A history that ends before since ends with the
+	// oldest edit there is, so it says how far back it reaches, and an
+	// issue never edited has one edit, its creation. GitHub keeps no more
+	// than 100 edits of an issue, the original body and the latest 99, so
+	// once an issue has 100, the original body is left out: the edits after
+	// it may be gone, and the history ends with the oldest edit GitHub kept
+	// after it. A line is never read as older than the edits kept show.
+	DashboardHistory(ctx context.Context, number int, since time.Time) ([]DashboardEdit, error)
 	// WorkflowCreated returns when the workflow in file, such as
 	// build.yml, was created.
 	WorkflowCreated(ctx context.Context, file string) (time.Time, error)
@@ -190,6 +201,16 @@ const DashboardTitle = "Dependency Dashboard"
 type Issue struct {
 	Number           int
 	Title, Body, URL string
+}
+
+// DashboardEdit is a Dependency Dashboard's whole body as it stood after
+// the edit made at EditedAt.
+type DashboardEdit struct {
+	// EditedAt is when the edit was made. A history's oldest edit can be
+	// the issue's creation.
+	EditedAt time.Time
+	// Body is the issue's whole body in Markdown after the edit.
+	Body string
 }
 
 // Job is a job of a slot run.
@@ -294,12 +315,22 @@ const lookupSentence = "Renovate failed to look up the following dependencies:"
 // backticked is one backticked item of Renovate's.
 var backticked = regexp.MustCompile("`([^`]+)`")
 
-// Lookups finds lookups Renovate failed, on any open Dependency Dashboard:
-// a datasource that answered nothing, or a digest it could not resolve,
+// lookupPersistence is how long a Dependency Dashboard must have listed
+// the same failed lookup before it is a stall. A lookup can fail once, a
+// registry briefly unreachable say, and clear on Renovate's next run.
+const lookupPersistence = 24 * time.Hour
+
+// Lookups finds lookups Renovate failed, on any open Dependency Dashboard,
+// that the dashboard has listed for lookupPersistence, by its edits: a
+// datasource that answered nothing, or a digest it could not resolve,
 // leaves that dependency where it is, and only the dashboard says so.
-// Each is a detail, and so is the list of files that hold them. A line
-// with the sentence and nothing backticked is quoted whole: a format that
-// drifted fails closed.
+// Each is a detail, and so is the list of files its line names. A lookup
+// not yet seen listed that long is named, and is no stall: it may be
+// younger, or listed on a dashboard GitHub kept too few edits of to show.
+// A line with the sentence and nothing backticked is quoted whole, at
+// once, whatever the history: a format that drifted fails closed. Beside
+// such a line, a history that cannot be read is a detail, not an error
+// that would hide the line.
 //
 // With no open dashboard, failed lookups cannot be seen: once Renovate has
 // succeeded, which reopens or remakes its dashboard on every run, that is
@@ -323,27 +354,138 @@ func Lookups(ctx context.Context, s Source, c *Config) (Result, error) {
 			Details:  []string{fmt.Sprintf("no open issue titled %q; Renovate last succeeded %s", DashboardTitle, timestamp(last))},
 		}, nil
 	}
-	var urls, numbers, failed []string
-	for _, d := range dashboards {
+	now := time.Now()
+	lines := make([][]lookupLine, len(dashboards))
+	unreadable := false
+	for i := range dashboards {
+		lines[i] = failedLookups(dashboards[i].Body)
+		unreadable = unreadable || slices.ContainsFunc(lines[i], func(l lookupLine) bool { return l.unreadable != "" })
+	}
+	var urls, numbers, failed, newer []string
+	for i := range dashboards {
+		d := &dashboards[i]
 		numbers = append(numbers, "#"+strconv.Itoa(d.Number))
-		if found := failedLookups(d.Body); len(found) > 0 {
-			urls = append(urls, d.URL)
-			failed = append(failed, found...)
+		if len(lines[i]) == 0 {
+			continue
 		}
+		lasting, young, err := lastingLookups(ctx, s, d, lines[i], now, unreadable)
+		if err != nil {
+			return Result{}, err
+		}
+		if len(lasting) > 0 {
+			urls = append(urls, d.URL)
+			failed = append(failed, lasting...)
+		}
+		newer = append(newer, young...)
 	}
 	if len(failed) > 0 {
 		return Result{Stalled: true, Headline: "Renovate failed lookups, by the Dependency Dashboard " + strings.Join(urls, ", ") + ":", Details: failed}, nil
 	}
-	return Result{Headline: "no failed Renovate lookup on the Dependency Dashboard " + strings.Join(numbers, ", ")}, nil
+	where := "on the Dependency Dashboard " + strings.Join(numbers, ", ")
+	if len(newer) > 0 {
+		for i, item := range newer {
+			newer[i] = strconv.Quote(item)
+		}
+		return Result{Headline: fmt.Sprintf("no failed Renovate lookup listed for %d hours %s; not yet seen listed that long: %s",
+			int(lookupPersistence.Hours()), where, strings.Join(newer, ", "))}, nil
+	}
+	return Result{Headline: "no failed Renovate lookup " + where}, nil
 }
 
-// failedLookups returns the lookups a dashboard's body lists as failed,
-// and the files they are in.
-func failedLookups(body string) []string {
+// lastingLookups returns, from the lines on dashboard d that list failed
+// lookups, the details of a stall: each lookup d has listed for
+// lookupPersistence, then the files of its line, and each line it cannot
+// read. It returns the lookups not yet seen listed that long apart. It
+// reads d's history only for a line it can read, and fails if it cannot,
+// unless unreadable says some dashboard has a line it cannot read, which
+// stalls whatever the history says: then the error is a detail in place
+// of the lookups that history was read for.
+func lastingLookups(ctx context.Context, s Source, d *Issue, lines []lookupLine, now time.Time, unreadable bool) (lasting, newer []string, err error) {
+	var edits []DashboardEdit
+	var historyErr error
+	read := false
+	for _, l := range lines {
+		if l.unreadable != "" {
+			lasting = append(lasting, "unreadable: "+l.unreadable)
+			continue
+		}
+		if !read {
+			edits, historyErr = s.DashboardHistory(ctx, d.Number, now.Add(-lookupPersistence))
+			read = true
+			if historyErr != nil {
+				if !unreadable {
+					return nil, nil, historyErr
+				}
+				lasting = append(lasting, fmt.Sprintf("could not read the history of #%d: %v", d.Number, historyErr))
+			}
+		}
+		if historyErr != nil {
+			continue
+		}
+		kept := false
+		for _, item := range l.lookups {
+			if persistent(item, d.Body, edits, now, lookupPersistence) {
+				lasting = append(lasting, item)
+				kept = true
+			} else {
+				newer = append(newer, item)
+			}
+		}
+		if kept && len(l.files) > 0 {
+			lasting = append(lasting, "files affected: "+strings.Join(l.files, ", "))
+		}
+	}
+	return lasting, newer, nil
+}
+
+// persistent reports whether a dashboard has listed item, a failed
+// lookup, for window up to now. It has if item is listed in current, the
+// dashboard's body now, in each of its edits made after now-window, and
+// in the newest edit made at or before then, the body that stood at
+// now-window. The files item is in may have changed. A history with no
+// edit that old cannot show what stood then, whether the dashboard is
+// younger than window or GitHub kept too few of its edits, so then item
+// is not persistent.
+func persistent(item, current string, edits []DashboardEdit, now time.Time, window time.Duration) bool {
+	if !listsLookup(current, item) {
+		return false
+	}
+	since := now.Add(-window)
+	var stood *DashboardEdit
+	for i := range edits {
+		e := &edits[i]
+		if e.EditedAt.After(since) {
+			if !listsLookup(e.Body, item) {
+				return false
+			}
+		} else if stood == nil || e.EditedAt.After(stood.EditedAt) {
+			stood = e
+		}
+	}
+	return stood != nil && listsLookup(stood.Body, item)
+}
+
+// listsLookup reports whether body lists item as a failed lookup.
+func listsLookup(body, item string) bool {
+	return slices.ContainsFunc(failedLookups(body), func(l lookupLine) bool { return slices.Contains(l.lookups, item) })
+}
+
+// lookupLine is a line on which a dashboard lists failed lookups: the
+// lookups it names, and the files that the same quote names below it. A
+// line with nothing backticked is unreadable: it is kept whole, trimmed,
+// with neither.
+type lookupLine struct {
+	lookups, files []string
+	unreadable     string
+}
+
+// failedLookups returns the lines on which a dashboard's body lists
+// lookups as failed.
+func failedLookups(body string) []lookupLine {
 	// A web edit saves the body with CRLF until Renovate's next rewrite:
 	// each line is trimmed, so a line's \r goes with its spaces
 	lines := strings.Split(body, "\n")
-	var found []string
+	var found []lookupLine
 	for i, line := range lines {
 		rest, ok := strings.CutPrefix(unquote(line), lookupSentence)
 		if !ok {
@@ -351,11 +493,12 @@ func failedLookups(body string) []string {
 		}
 		items := backticked.FindAllStringSubmatch(rest, -1)
 		if len(items) == 0 {
-			found = append(found, "unreadable: "+strings.TrimSpace(line))
+			found = append(found, lookupLine{unreadable: strings.TrimSpace(line)})
 			continue
 		}
+		var l lookupLine
 		for _, m := range items {
-			found = append(found, m[1])
+			l.lookups = append(l.lookups, m[1])
 		}
 		// The files follow in the same quote
 		for _, next := range lines[i+1:] {
@@ -363,16 +506,13 @@ func failedLookups(body string) []string {
 				break
 			}
 			if files, ok := strings.CutPrefix(unquote(next), "Files affected:"); ok {
-				var names []string
 				for _, m := range backticked.FindAllStringSubmatch(files, -1) {
-					names = append(names, m[1])
-				}
-				if len(names) > 0 {
-					found = append(found, "files affected: "+strings.Join(names, ", "))
+					l.files = append(l.files, m[1])
 				}
 				break
 			}
 		}
+		found = append(found, l)
 	}
 	return found
 }

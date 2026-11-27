@@ -530,17 +530,33 @@ the registry. `renovate.yml` builds none.
 
 ## Releases
 
-Every green merge to ci's main is a release. Once `required` has passed
-on a push to main, `self-ci.yml`'s `release` job runs `divbast-release`,
-which tags the merged commit with the next version and publishes it as a
-GitHub Release, immutable once published, then reads the tag back from
-origin and fails unless it is at that commit. Its notes list the subject
-of every commit since the last release, leaving out merge commits. When
-two merges land close together, the run for the earlier one finds main
-has moved on and leaves the release to the run for the later one, which
-releases both; a re-run of the earlier one once that release is out says
-which release holds it. Only origin's release tags count: a tag in a
-clone alone releases nothing and moves no version.
+Every green merge to ci's main that changes something a caller uses is a
+release. Once `required` has passed on a push to main, `self-ci.yml`'s
+`release` job runs `divbast-release`, which tags the merged commit with
+the next version and publishes it as a GitHub Release, immutable once
+published, then reads the tag back from origin and fails unless it is at
+that commit. Its notes list the subject of every commit since the last
+release, leaving out merge commits. When two merges land close together,
+the run for the earlier one finds main has moved on and leaves the
+release to the run for the later one, which decides for both; a re-run
+of the earlier one once a later release is out says which release holds
+it. Only origin's release tags count: a tag in a clone alone releases
+nothing and moves no version.
+
+A merge that changes only ci's own files is not released: its own
+workflows, README.md, CLAUDE.md and CODEOWNERS, its justfile, the
+configuration of its own Renovate, ShellCheck, Composer and PHPStan, the
+licence texts, and its tests, test data and test fixtures. The release
+job then prints `nothing a caller uses changed since vX.Y.Z: no release`
+and succeeds, and the next release lists those commits with its own.
+`divbast-release` reads what changed with `git diff` from the last
+release's tag to the merged commit, so it judges every commit since that
+release together, and a rename counts as both its paths. A merge is
+released whatever it changed when any commit since the last release
+marks a breaking change, and when together they change no file at all.
+`selfOnly` in `internal/release` lists ci's own files: add one there only
+when no caller can use it, since a wrong entry holds a change back from
+every caller.
 
 - The version is the last release's with its minor number raised:
   v1.4.0 follows v1.3.0. The first release is v1.0.0.
@@ -562,10 +578,11 @@ Every pull request previews the release its merge would make:
 `self-ci.yml`'s `release-preview` job, which `required` needs, dry-runs
 `divbast-release` on GitHub's test merge of the pull request into main
 and writes the version, minor or major, and its notes to the run's
-summary. Re-running an old preview fails once a later release is out: it
-runs on the test merge GitHub made at the time, whose next version is
-taken now. A push to the pull request, or a rebase, makes a new test
-merge.
+summary, or, for a pull request that changes only ci's own files, that
+merging it releases nothing. Re-running an old preview fails once a
+later release is out: it runs on the test merge GitHub made at the time,
+whose next version is taken now. A push to the pull request, or a
+rebase, makes a new test merge.
 
 A repository pins ci at a release, the release's commit with its tag as
 the comment, and zizmor and pinact check that pair as they do any other
@@ -1249,22 +1266,27 @@ by `divbast-stall`.
 | `renovate-workflow` | string | `renovate.yml` | The workflow that runs Renovate |
 | `open-days` | number | `14` | Days a Renovate pull request may stay open |
 | `stuck-hours` | number | `24` | Hours one may stay red since it opened, or pending since its last push |
-| `run-hours` | number | `24` | Hours Renovate may go without a successful run |
+| `run-hours` | number | `48` | Hours Renovate may go without a successful run |
 | `lost-slots` | number | `2` | Lost daily slots that make a stall |
 | `content-gated` | boolean | `false` | The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost |
 | `slot-job` | string | `''` | With `content-gated`, the job in each slot run that publishes the image, as GitHub names it in the run, whose conclusion counts rather than the whole run's |
 
 `lookups` reads the open issues `divbast-renovate` made, keeps the one
-titled exactly `Dependency Dashboard`, and fails at once while it lists a
-dependency Renovate failed to look up: a datasource that answered
-nothing, or a digest Renovate could not resolve, leaves that dependency
-where it is, and only the dashboard says so. It names each lookup and the
-files it is in. It anchors on the sentence Renovate lists them under,
-which its other warnings never use, and a sentence it cannot read fails
-the check. With no open dashboard it fails once Renovate has succeeded,
-since Renovate remakes the dashboard on every run; before that, the
-`renovate` check owns the case. If Renovate ever rewords the sentence,
-the check goes quietly green.
+titled exactly `Dependency Dashboard`, and fails once the Dependency
+Dashboard has listed the same failed lookup for 24 hours: a datasource
+that answered nothing, or a digest Renovate could not resolve, leaves
+that dependency where it is, and only the dashboard says so. It reads the
+dashboard's edit history to see how long, and names each lookup and the
+files it is in now; a lookup not yet seen listed that long is named when
+the check passes. GitHub keeps only the newest 99 edits of an issue, so
+on a dashboard edited more often than that within a day, the check
+cannot see back 24 hours and stays quiet until it can. It anchors on the
+sentence Renovate lists them under, which its other warnings never use,
+and a sentence it cannot read fails the check at once, even when the
+history cannot be read. With no open dashboard it fails once Renovate
+has succeeded, since Renovate remakes the dashboard on every run; before
+that, the `renovate` check owns the case. If Renovate ever rewords the
+sentence, the check goes quietly green.
 
 `content-gated` is for a repository whose daily slot runs
 `divbast-publish-decision -content-gated`, and so can succeed while it
@@ -1399,7 +1421,7 @@ the token was found.
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots\|lookups`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table (FrankenPHP, distroless, `dhi.io`) its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old; a `dhi.io` image with no `DHI_USERNAME` and `DHI_TOKEN`; or a verification failed |
-| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
+| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z, unless nothing a caller uses changed since the last release | Released, already released, nothing a caller uses changed, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main with something to release, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
 ## Shared configuration
 
@@ -1446,7 +1468,8 @@ recipes above, PHPStan, and the tests. It needs `GITHUB_TOKEN` set (see
 containers run only when `ENGINE` is `docker` or `podman`, so
 `ENGINE=docker just ci` runs them all. `self-ci.yml` runs them on amd64 and
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
-test. A merge to main that passes them is released.
+test. A merge to main that passes them is released, unless it changes
+only ci's own files ([Releases](#releases)).
 
 The contract suite runs against four images. Two are the published
 LibreSpeed and Baikal images `internal/testfixture` pins, Baikal's with

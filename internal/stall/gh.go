@@ -46,6 +46,27 @@ const slotLimit = 10
 // own.
 const timeout = time.Minute
 
+// editLimit is how many edits of an issue GitHub keeps: the original body
+// and the latest 99.
+const editLimit = 100
+
+// historyPages is how many pages one read of an issue's history may take.
+// GitHub keeps no more edits than one page holds, so a history that needs
+// more is an answer GitHub did not give when this was written.
+const historyPages = 20
+
+// pageSize is how many edits each page of an issue's history asks for: as
+// many as GitHub gives in one, and as it keeps. A test lowers it to replay
+// pages recorded smaller.
+var pageSize = 100
+
+// historyQuery asks GitHub's GraphQL API for a page of an issue's edits,
+// newest first, after $cursor when it is set, with when the issue was
+// created and its body now.
+const historyQuery = `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$cursor:String){` +
+	`repository(owner:$owner,name:$name){issue(number:$number){createdAt body ` +
+	`userContentEdits(first:$first,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{editedAt diff}}}}}`
+
 // statuses are the ways GitHub's compare API says head stands against
 // base.
 var statuses = []string{"ahead", "behind", "identical", "diverged"}
@@ -320,6 +341,98 @@ func (g GH) Dashboards(ctx context.Context) ([]Issue, error) {
 		}
 	}
 	return out, nil
+}
+
+// DashboardHistory implements [Source], from the issue's edits as GitHub's
+// GraphQL API lists them, newest first, a page at a time. Each edit's diff
+// is, whatever its name, the whole body after the edit, and the oldest is
+// the issue's creation, with its original body.
+//
+// GitHub's documentation, in "Tracking changes in a comment" under "Editing
+// history limits", says it keeps at most 100 edits of an issue. Past that,
+// it removes the oldest edits after the original body, and keeps the
+// original and the latest 99. So when GitHub counts 100 edits or more, the
+// original body is left out: it stood only until edits that may be gone,
+// not until the next one kept. An issue never edited lists no edits, and
+// its creation is made one from when it was created and the body it has
+// now.
+//
+// It fails rather than read part of the history: on an edit it reaches
+// whose body was deleted from the history, which leaves what it held
+// unknown, and on a history that goes on past historyPages pages.
+func (g GH) DashboardHistory(ctx context.Context, number int, since time.Time) ([]DashboardEdit, error) {
+	owner, name, ok := strings.Cut(g.Repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return nil, fmt.Errorf("the repository %q is not owner/name", g.Repo)
+	}
+	args := []string{
+		"api", "graphql", "-f", "query=" + historyQuery, "-F", "owner=" + owner, "-F", "name=" + name,
+		"-F", "number=" + strconv.Itoa(number), "-F", "first=" + strconv.Itoa(pageSize),
+	}
+	var edits []DashboardEdit
+	cursor := ""
+	for page := range historyPages {
+		call := args
+		if page > 0 {
+			call = append(slices.Clip(args), "-f", "cursor="+cursor)
+		}
+		var raw struct {
+			Data struct {
+				Repository struct {
+					Issue *struct {
+						CreatedAt        time.Time
+						Body             string
+						UserContentEdits struct {
+							TotalCount int
+							PageInfo   struct {
+								HasNextPage bool
+								EndCursor   string
+							}
+							Nodes []struct {
+								EditedAt time.Time
+								// Diff is null for an edit whose body was
+								// deleted from the history.
+								Diff *string
+							}
+						}
+					}
+				}
+			}
+		}
+		if err := g.list(ctx, &raw, call...); err != nil {
+			return nil, err
+		}
+		issue := raw.Data.Repository.Issue
+		if issue == nil {
+			return nil, fmt.Errorf("GitHub gives no issue #%d in %s", number, g.Repo)
+		}
+		listed := &issue.UserContentEdits
+		last := !listed.PageInfo.HasNextPage
+		if page == 0 && last && len(listed.Nodes) == 0 {
+			return []DashboardEdit{{EditedAt: issue.CreatedAt, Body: issue.Body}}, nil
+		}
+		for i, n := range listed.Nodes {
+			if last && i == len(listed.Nodes)-1 && listed.TotalCount >= editLimit {
+				// The original body, which stood only until edits
+				// GitHub may have removed.
+				break
+			}
+			if n.Diff == nil {
+				return nil, fmt.Errorf("issue #%d in %s: the body of its edit of %s was deleted from its history, so what it held is unknown",
+					number, g.Repo, n.EditedAt.UTC().Format(time.RFC3339))
+			}
+			edits = append(edits, DashboardEdit{EditedAt: n.EditedAt, Body: *n.Diff})
+			if !n.EditedAt.After(since) {
+				return edits, nil
+			}
+		}
+		if last {
+			return edits, nil
+		}
+		cursor = listed.PageInfo.EndCursor
+	}
+	return nil, fmt.Errorf("the history of issue #%d in %s goes on past %d pages of %d edits, more than GitHub keeps, so it is not read in part",
+		number, g.Repo, historyPages, pageSize)
 }
 
 // RepoCreated implements [Source].
