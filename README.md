@@ -281,7 +281,7 @@ jobs:
     name: stall
     uses: divbast/ci/.github/workflows/stall.yml@<commit> # vX.Y.Z
     with:
-      checks: '["open","stuck","renovate","lookups"]'
+      checks: '["open","stuck","renovate","lookups","starved","flaky"]'
     permissions:
       contents: read
       pull-requests: read
@@ -655,8 +655,9 @@ waits for approval on each caller's Dependency Dashboard.
 
 v2.0.0 is such a release: it added a permission a calling job must grant,
 and made a run that passed fail. [Moving to v2](#moving-to-v2) says what
-a caller changes. v3.0.0 is another: [Moving to v3](#moving-to-v3). And
-v4.0.0: [Moving to v4](#moving-to-v4).
+a caller changes. v3.0.0 is another: [Moving to v3](#moving-to-v3). So
+are v4.0.0, [Moving to v4](#moving-to-v4), and v5.0.0,
+[Moving to v5](#moving-to-v5).
 
 ### Moving to v2
 
@@ -780,6 +781,33 @@ and can make the first two before it moves, since v3 asks for less:
 `divbast-scan` gains one optional flag, `-cache`, and `divbast-stall` one
 check; every v3 command line runs as it did. The other workflows take
 the same inputs and permissions.
+
+### Moving to v5
+
+v5.0.0 adds two checks to `stall.yml`'s default `checks`, `starved` and
+`flaky` ([`stall.yml`](#stallyml)). Neither asks for a new permission.
+
+- **What goes red on the first run.** A caller that takes the default
+  runs both from its first stall run after the move, and either can fail
+  at once, for what happened before the move. `starved` reads the
+  Dependency Dashboard's edits back 8 days, so an update that has
+  already waited more than 7 days fails it. `flaky`'s first window runs
+  from the stall run before the move to this one, so a job that first
+  both failed and passed on one commit in that time, or failed again
+  after it had passed, fails it.
+- **A caller with its own `checks` list** adds `"starved"` and
+  `"flaky"` to it to run them. One that takes the default gets both
+  with the move.
+- **A caller whose stall workflow is not `stall.yml`** sets
+  `stall-workflow` to its file, as ci's own `self-stall.yml` does.
+  Otherwise `flaky` fails, naming the file it found no workflow in.
+- **To turn either off,** set `checks` to the list without it, such as
+  `'["open","stuck","renovate","slots","lookups","starved"]'` for no
+  `flaky`.
+
+`stall.yml` gains two inputs, `starved-days` and `stall-workflow`, and
+`divbast-stall` two checks; every v4 command line runs as it did. The
+other workflows take the same inputs and permissions.
 
 ## Workflows
 
@@ -1260,14 +1288,16 @@ by `divbast-stall`.
 
 | Input | Type | Default | What |
 |---|---|---|---|
-| `checks` | string | `'["open","stuck","renovate","slots","lookups"]'` | The checks to run, as a JSON array |
+| `checks` | string | `'["open","stuck","renovate","slots","lookups","starved","flaky"]'` | The checks to run, as a JSON array |
 | `published` | string | `''` | The image the daily slot publishes, such as `ghcr.io/divbast/librespeed:latest`; `slots` needs it |
 | `slot-workflow` | string | `build.yml` | The workflow whose scheduled runs on main are the daily slots |
 | `renovate-workflow` | string | `renovate.yml` | The workflow that runs Renovate |
+| `stall-workflow` | string | `stall.yml` | The caller's workflow that calls `stall.yml` on a schedule, whose previous run starts `flaky`'s window |
 | `open-days` | number | `14` | Days a Renovate pull request may stay open |
 | `stuck-hours` | number | `24` | Hours one may stay red since it opened, or pending since its last push |
 | `run-hours` | number | `48` | Hours Renovate may go without a successful run |
 | `lost-slots` | number | `2` | Lost daily slots that make a stall |
+| `starved-days` | number | `7` | Days an update may wait on the Dependency Dashboard, under Pending Status Checks or Awaiting Schedule |
 | `content-gated` | boolean | `false` | The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost |
 | `slot-job` | string | `''` | With `content-gated`, the job in each slot run that publishes the image, as GitHub names it in the run, whose conclusion counts rather than the whole run's |
 
@@ -1287,6 +1317,104 @@ history cannot be read. With no open dashboard it fails once Renovate
 has succeeded, since Renovate remakes the dashboard on every run; before
 that, the `renovate` check owns the case. If Renovate ever rewords the
 sentence, the check goes quietly green.
+
+`starved` fails once the Dependency Dashboard has listed the same update
+as waiting, under Pending Status Checks or Awaiting Schedule, for more
+than `starved-days` days, and names each one with when it was first
+listed. Renovate lists an update under Pending Status Checks while its
+release is younger than its `minimumReleaseAge`: divbast's Renovate
+preset holds every outside release that Renovate can date for 3 days.
+That age counts from the release's date, and a tag pushed again is dated
+anew, so its age starts again: a tag re-pushed more often than every 3
+days never reaches it, and its update waits for ever.
+Renovate lists an update under Awaiting Schedule while a schedule holds
+it back. Neither fails anything, so without this check such an update
+could wait unseen. A Docker Hub repository with more than about 1,000
+tags gives Renovate no dates, so its updates are never held and never
+starve; a re-pushed tag on a registry Renovate can date does. The check
+knows an update by its branch, so its own clock keeps running through a
+newer version or digest, a pull request opened, or a move from one
+section to the other; an update that leaves both sections and comes
+back starts again. It reads the dashboard's edit history, back
+`starved-days` days and one more, to see how long. GitHub keeps only
+the newest 99 edits of an issue, so on a dashboard edited more than 99
+times within `starved-days` days and one more, the check counts from
+the oldest edit GitHub kept, and stays quiet until those edits show the
+update waiting long enough. A line in either section that is not one of
+Renovate's updates, and a heading with no update under it, fail the
+check at once, even when the history cannot be read. With no open
+dashboard, it fails as `lookups` does. If Renovate ever renames either
+heading, the check goes quietly green.
+
+A caller whose own schedule holds updates back for about a week or
+longer raises `starved-days`: Renovate checks the schedule before the
+release age, so a dated update on a weekly schedule can wait 7 days plus
+the time to its next window.
+
+`flaky` fails when a job both failed and passed on one commit, in runs
+of the same workflow that the same kind of event started. A test that
+fails at random fails a pull request, someone re-runs it, and nothing
+else records that it happened. Jobs are the same job when they ran on
+the same commit, in the same workflow, for the same event, such as
+`push` or `schedule`, under the same name up to its matrix cell, such
+as `check / test` for `check / test (amd64, docker)`. Runs for different
+events are never compared: a push run that passed and the daily slot
+that failed on the same commit are not a flake, since the slot's own red
+run already reports what changed upstream. Two daily slots of an unmoved
+main are the same event, though, and are compared: a slot that fails
+one day and passes the next on the same commit reads as a flake. Only a
+job that failed or passed counts: a cancelled or skipped job does not,
+and neither does `required`, which fails whenever a job it needs does.
+A job that a re-run of the failed jobs lists again, unchanged, counts
+once, in the attempt that ran it.
+
+A failure and a pass make a flake in two ways:
+
+- **In one attempt of a run,** a cell that failed and a cell that passed
+  make a flake, unless the failing cells all share one matrix value that
+  no passing cell has. The values are the comma-separated parts inside the
+  parentheses, such as `amd64` and `docker`. Both podman cells failing
+  while both docker cells pass, or arm64 failing while amd64 passes, is
+  a fault of that engine or that architecture, not a flake. One odd cell
+  still counts: `(arm64, podman)` failing while `(arm64, docker)` and
+  `(amd64, podman)` pass is a flake, since each of its values passed
+  somewhere.
+- **Between two runs, or two attempts of one run,** the same job, or the
+  same cell, failing in one and passing in the other makes a flake. A
+  podman failure that passes when re-run is a flake.
+
+Each flake is reported once, on the day it happens. The check's window
+runs from when the previous run of `stall-workflow` was created, or 24
+hours earlier when there is none, to when this run was created. A flake
+is reported when one of its failures finished inside the window, or
+when its first pass did: the moment the job first both failed and
+passed. A new failure on the same commit on a later day is a new flake,
+and is reported again. Each job is timed by when it finished, or by
+when its attempt finished, if that is later: for the latest attempt of
+its run, when the whole run finished, and for an earlier one, when the
+last job of that attempt finished, whatever its conclusion. A run still
+going when a stall run lists the runs is then reported by the next one,
+even when it was re-run in between. A job that finished after this run
+was created, in the moments before it listed the runs, is left to the
+next run, so a flake whose last job finished then is reported once, by
+the next one. The check reads the runs created from a day before the
+window, so that a failure then still pairs with a pass inside it. A run
+created earlier than that, and re-run inside the window, is not read.
+The window starts at the previous stall run whether or not that run's
+`flaky` job ran or succeeded, so a window it missed is not read again.
+
+Runs of `stall-workflow` and `renovate-workflow` do not count, since
+both run on an unmoved main every day, and a file that holds no
+workflow fails the check. A repository with another workflow that can
+fail one day and pass the next on an unchanged main, such as infra's
+daily drift check, leaves `flaky` out of its own `checks`, or it sees
+false reds. Jobs are read only for a run that failed, a run re-run, and
+the other runs of the same commit, workflow and event. A job can fail
+in a run that is then cancelled, which leaves the run cancelled rather
+than failed: that failure is read only when another run of the same
+commit, workflow and event is. GitHub lists at most 1,000 runs for one
+search, so when 1,000 come back, the check fails rather than read part
+of them.
 
 `content-gated` is for a repository whose daily slot runs
 `divbast-publish-decision -content-gated`, and so can succeed while it
@@ -1419,7 +1547,7 @@ the token was found.
 | `divbast-scan -layout DIR -report F -published IMAGE -baseline F -sarif F [-containerfile F] [-vex F]... [-cache DIR]` | Fails on a HIGH or CRITICAL finding the published `IMAGE`, on ghcr.io, lacks, scanning with Grype an image that says `ID=dhi` and with Trivy any other, applying Docker's verified VEX document for the Containerfile's final stage's base when it is a `dhi.io` image | Nothing new; or advisory because `IMAGE` is not published yet, with no such package or no such tag in a public one, or is private, or, outside GitHub Actions, the registry refused it | A new finding; a Containerfile unreadable or naming an image unpinned; the final stage's `dhi.io` base's VEX document not fetched, not verified, or not that image's; a report, of the build or of `IMAGE`, that recognised no operating system or saw no OS package; a layout that is not one linux image, or whose os-release cannot be read; for an `ID=dhi` image, Grype's database not updated, no probe for its release or the probe unanswered from DHI's namespace, a report under another model, or the two reports from different databases; `IMAGE` unreadable, or refused though public for any reason but a missing tag; GitHub not answering or refusing the token; or the scan failed |
 | `divbast-token-leak ARCHIVE` | Fails when an image archive holds `GITHUB_TOKEN` | Clean | Found (2: unreadable or empty archive, no token, or the verdict not written) |
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
-| `divbast-stall open\|stuck\|renovate\|slots\|lookups`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
+| `divbast-stall open\|stuck\|renovate\|slots\|lookups\|starved\|flaky`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table (FrankenPHP, distroless, `dhi.io`) its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old; a `dhi.io` image with no `DHI_USERNAME` and `DHI_TOKEN`; or a verification failed |
 | `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z, unless nothing a caller uses changed since the last release | Released, already released, nothing a caller uses changed, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main with something to release, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 

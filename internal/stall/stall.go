@@ -4,17 +4,20 @@
 // Package stall finds the ways a repository's updates stop flowing without
 // anything failing loudly: a Renovate pull request open too long, one red
 // or pending too long, Renovate itself silent, daily slots that should
-// have published main and did not, and a dependency Renovate failed to
-// look up, which only its Dependency Dashboard shows.
+// have published main and did not, a dependency Renovate failed to look
+// up, an update left waiting, which only its Dependency Dashboard shows,
+// and a job that both failed and passed on one commit.
 //
 // Each check reads the time from [time.Now] and the repository through a
 // [Source], and says what it found in a [Result].
 package stall
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strconv"
@@ -45,6 +48,9 @@ type Config struct {
 	RunHours int
 	// LostSlots is how many lost daily slots make a stall.
 	LostSlots int
+	// StarvedDays is how many days an update may wait on the Dependency
+	// Dashboard.
+	StarvedDays int
 	// Published is the image the daily slot publishes, such as
 	// ghcr.io/divbast/librespeed:latest.
 	Published string
@@ -54,6 +60,9 @@ type Config struct {
 	// RenovateWorkflow is the workflow file that runs Renovate, such as
 	// renovate.yml.
 	RenovateWorkflow string
+	// StallWorkflow is the workflow file whose scheduled runs run these
+	// checks, such as stall.yml.
+	StallWorkflow string
 	// ContentGated says the slot workflow publishes only when the image's
 	// content moved, as divbast-publish-decision's -content-gated does, so
 	// that once the image is published, a slot run can succeed and leave
@@ -134,12 +143,26 @@ func (o Outcome) String() string {
 	}
 }
 
-// Run is a run of the slot workflow.
+// Run is a run of a workflow: of the slot workflow, or any of the
+// repository's.
 type Run struct {
 	// ID is the run's ID, as GitHub numbers its runs.
 	ID int64
 	// HeadSHA is the commit it built.
 	HeadSHA string
+	// Workflow is its workflow's name, as GitHub shows it, and WorkflowID
+	// its workflow's ID. Only [Source.RunsSince] gives them.
+	Workflow   string
+	WorkflowID int64
+	// Event is what started it, as GitHub puts it, such as "push" or
+	// "schedule". Only [Source.RunsSince] gives it.
+	Event string
+	// Attempt is its latest attempt, counted from 1: a re-run keeps the
+	// run and adds an attempt. Only [Source.RunsSince] gives it.
+	Attempt int
+	// Updated is when it last changed: once it has finished, when its
+	// latest attempt finished. Only [Source.RunsSince] gives it.
+	Updated time.Time
 	// Created is when GitHub started it.
 	Created time.Time
 	// Completed says it has finished, however it ended.
@@ -161,8 +184,8 @@ type Source interface {
 	// newest first.
 	SlotRuns(ctx context.Context, workflow string) ([]Run, error)
 	// Jobs returns the jobs of run's latest attempt, each by its name as
-	// GitHub shows it in the run, with its conclusion. A run that never
-	// started has none.
+	// GitHub shows it in the run, with its conclusion and when it
+	// finished. A run that never started has none.
 	Jobs(ctx context.Context, run *Run) ([]Job, error)
 	// MainSHA returns the commit main is at.
 	MainSHA(ctx context.Context) (string, error)
@@ -190,6 +213,20 @@ type Source interface {
 	// WorkflowCreated returns when the workflow in file, such as
 	// build.yml, was created.
 	WorkflowCreated(ctx context.Context, file string) (time.Time, error)
+	// WorkflowID returns the ID of the workflow in file, such as
+	// stall.yml, and fails, naming file, when there is none.
+	WorkflowID(ctx context.Context, file string) (int64, error)
+	// RunsSince returns every finished run created at or after since, of
+	// every workflow, each with its workflow, event, latest attempt and
+	// when it last changed.
+	RunsSince(ctx context.Context, since time.Time) ([]Run, error)
+	// PreviousRunStart returns when the run of workflow before the one
+	// this check runs in was created, and when this one was. Either is the
+	// zero time when there is none, or it is not known.
+	PreviousRunStart(ctx context.Context, workflow string) (previous, current time.Time, err error)
+	// AttemptJobs returns the jobs of run's attempt numbered attempt, as
+	// Jobs does the latest's.
+	AttemptJobs(ctx context.Context, run *Run, attempt int) ([]Job, error)
 }
 
 // DashboardTitle is the title of Renovate's Dependency Dashboard, by which
@@ -213,7 +250,7 @@ type DashboardEdit struct {
 	Body string
 }
 
-// Job is a job of a slot run.
+// Job is a job of a run.
 type Job struct {
 	// Name is the job's name as GitHub shows it in the run: a matrix
 	// job's expanded, such as "publish (baikal)", or, when GitHub skipped
@@ -223,6 +260,8 @@ type Job struct {
 	// Conclusion is how it ended, as GitHub puts it, such as "success" or
 	// "skipped".
 	Conclusion string
+	// Completed is when it finished, and the zero time until it has.
+	Completed time.Time
 }
 
 // Revisions reads the commit a published image was built from, as
@@ -341,18 +380,7 @@ func Lookups(ctx context.Context, s Source, c *Config) (Result, error) {
 		return Result{}, err
 	}
 	if len(dashboards) == 0 {
-		last, ok, err := s.LastSuccess(ctx, c.RenovateWorkflow)
-		if err != nil {
-			return Result{}, err
-		}
-		if !ok {
-			return Result{Headline: "no Dependency Dashboard yet, and no successful Renovate run to have made one"}, nil
-		}
-		return Result{
-			Stalled:  true,
-			Headline: "No open Dependency Dashboard by divbast-renovate, so failed lookups cannot be seen:",
-			Details:  []string{fmt.Sprintf("no open issue titled %q; Renovate last succeeded %s", DashboardTitle, timestamp(last))},
-		}, nil
+		return noDashboard(ctx, s, c, "failed lookups")
 	}
 	now := time.Now()
 	lines := make([][]lookupLine, len(dashboards))
@@ -390,6 +418,26 @@ func Lookups(ctx context.Context, s Source, c *Config) (Result, error) {
 			int(lookupPersistence.Hours()), where, strings.Join(newer, ", "))}, nil
 	}
 	return Result{Headline: "no failed Renovate lookup " + where}, nil
+}
+
+// noDashboard is what a check that reads the Dependency Dashboard finds
+// when none is open: what it reads there, unseen, cannot be seen. Once
+// c.RenovateWorkflow has succeeded, which reopens or remakes the dashboard
+// on every run, that is a stall. Before its first success, the renovate
+// check owns the case.
+func noDashboard(ctx context.Context, s Source, c *Config, unseen string) (Result, error) {
+	last, ok, err := s.LastSuccess(ctx, c.RenovateWorkflow)
+	if err != nil {
+		return Result{}, err
+	}
+	if !ok {
+		return Result{Headline: "no Dependency Dashboard yet, and no successful Renovate run to have made one"}, nil
+	}
+	return Result{
+		Stalled:  true,
+		Headline: "No open Dependency Dashboard by divbast-renovate, so " + unseen + " cannot be seen:",
+		Details:  []string{fmt.Sprintf("no open issue titled %q; Renovate last succeeded %s", DashboardTitle, timestamp(last))},
+	}, nil
 }
 
 // lastingLookups returns, from the lines on dashboard d that list failed
@@ -442,27 +490,36 @@ func lastingLookups(ctx context.Context, s Source, d *Issue, lines []lookupLine,
 // lookup, for window up to now. It has if item is listed in current, the
 // dashboard's body now, in each of its edits made after now-window, and
 // in the newest edit made at or before then, the body that stood at
-// now-window. The files item is in may have changed. A history with no
+// now-window: if listedSince puts the start of its listing at now-window
+// or earlier. The files item is in may have changed. A history with no
 // edit that old cannot show what stood then, whether the dashboard is
 // younger than window or GitHub kept too few of its edits, so then item
 // is not persistent.
 func persistent(item, current string, edits []DashboardEdit, now time.Time, window time.Duration) bool {
-	if !listsLookup(current, item) {
-		return false
+	since, ok := listedSince(current, edits, func(body string) bool { return listsLookup(body, item) })
+	return ok && !since.After(now.Add(-window))
+}
+
+// listedSince returns when a dashboard began to list something without a
+// break, by its edits: the time of the oldest edit in the unbroken run of
+// edits, counted back from the newest, each of whose bodies lists it, as
+// listed says. It is false when current, the dashboard's body now, does
+// not list it, or the newest edit does not. The edits may come in any
+// order. A history GitHub cut short ends the run at the oldest edit it
+// kept, so what it returns is never earlier than those edits show.
+func listedSince(current string, edits []DashboardEdit, listed func(body string) bool) (time.Time, bool) {
+	if !listed(current) {
+		return time.Time{}, false
 	}
-	since := now.Add(-window)
-	var stood *DashboardEdit
-	for i := range edits {
-		e := &edits[i]
-		if e.EditedAt.After(since) {
-			if !listsLookup(e.Body, item) {
-				return false
-			}
-		} else if stood == nil || e.EditedAt.After(stood.EditedAt) {
-			stood = e
+	var since time.Time
+	found := false
+	for _, e := range slices.SortedStableFunc(slices.Values(edits), func(a, b DashboardEdit) int { return b.EditedAt.Compare(a.EditedAt) }) {
+		if !listed(e.Body) {
+			break
 		}
+		since, found = e.EditedAt, true
 	}
-	return stood != nil && listsLookup(stood.Body, item)
+	return since, found
 }
 
 // listsLookup reports whether body lists item as a failed lookup.
@@ -520,6 +577,546 @@ func failedLookups(body string) []lookupLine {
 // unquote is a Markdown quote's line without its marker.
 func unquote(line string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), ">"))
+}
+
+// waitingSections are the headings of the Dependency Dashboard's sections
+// that list updates left waiting, as Renovate 45 writes them
+// (dependency-dashboard.ts): updates whose status checks are pending,
+// their release age among them, and updates their schedule holds back.
+var waitingSections = []string{"## Pending Status Checks", "## Awaiting Schedule"}
+
+// waitingItem is the line on which a Dependency Dashboard lists an update
+// in one of waitingSections, trimmed: its checkbox, ticked or not, the
+// comment that names the update's branch, and its title, a link to its
+// pull request when it has one.
+var waitingItem = regexp.MustCompile(`^- \[[ x]\] <!-- [a-zA-Z]+-branch=(\S+) -->(.*)$`)
+
+// bulkItem is the line, below two updates or more, that creates them all
+// at once: no update itself.
+var bulkItem = regexp.MustCompile(`^- \[[ x]\] <!-- create-all-[a-z-]+ -->`)
+
+// htmlComment and markdownLink are what an update's title is shown
+// without, and with the link's text in its place. The text runs to the
+// last "](" on the line, so a bracket in the title, as in a security
+// update's "[SECURITY]", stays in it: Renovate writes at most one link on
+// an update's line.
+var (
+	htmlComment  = regexp.MustCompile(`<!--.*?-->`)
+	markdownLink = regexp.MustCompile(`\[(.*)\]\([^)\s]*\)`)
+)
+
+// pendingUpdate is an update a Dependency Dashboard lists as waiting. Its
+// branch is what it is known by: the same from one version or digest to
+// the next. Its text is its line as shown, without its checkbox, comment
+// and link.
+type pendingUpdate struct {
+	branch, text string
+}
+
+// pendingUpdates returns the updates a Dependency Dashboard's body lists
+// in waitingSections, each once, and what it cannot read there: each line
+// of the list that is not one of Renovate's updates, trimmed, and each
+// heading with no update under it, which Renovate never writes. A section
+// runs to the next heading of its level or above, or to a rule, which
+// opens Renovate's warnings and a footer.
+func pendingUpdates(body string) (items []pendingUpdate, unreadable []string) {
+	// A web edit saves the body with CRLF until Renovate's next rewrite:
+	// each line is trimmed, so a line's \r goes with its spaces
+	var heading string
+	read := false
+	end := func() {
+		if heading != "" && !read {
+			unreadable = append(unreadable, heading+": no update under it in Renovate's form")
+		}
+		heading = ""
+	}
+	for line := range strings.Lines(body) {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") || strings.HasPrefix(line, "## ") || line == "---" {
+			end()
+			if slices.Contains(waitingSections, line) {
+				heading, read = line, false
+			}
+			continue
+		}
+		if heading == "" || !strings.HasPrefix(line, "- ") || bulkItem.MatchString(line) {
+			continue
+		}
+		m := waitingItem.FindStringSubmatch(line)
+		if m == nil {
+			unreadable = append(unreadable, line)
+			continue
+		}
+		read = true
+		if slices.ContainsFunc(items, func(u pendingUpdate) bool { return u.branch == m[1] }) {
+			continue
+		}
+		text := strings.TrimSpace(markdownLink.ReplaceAllString(htmlComment.ReplaceAllString(m[2], ""), "$1"))
+		if text == "" {
+			text = m[1]
+		}
+		items = append(items, pendingUpdate{branch: m[1], text: text})
+	}
+	end()
+	return items, unreadable
+}
+
+// pendingIn reports whether body lists the update on branch as waiting.
+func pendingIn(body, branch string) bool {
+	items, _ := pendingUpdates(body)
+	return slices.ContainsFunc(items, func(u pendingUpdate) bool { return u.branch == branch })
+}
+
+// Starved finds updates that each open Dependency Dashboard has listed as
+// waiting, under Pending Status Checks or Awaiting Schedule, for more than
+// c.StarvedDays days: an update whose release age is never reached, its
+// tag re-pushed more often than the age, or one a schedule holds, leaves
+// that dependency where it is, and nothing fails. Each is named by its line
+// now, with when it was first listed: the oldest edit, by the dashboard's
+// history back c.StarvedDays days and one more, in the unbroken run of
+// edits up to now that list it. An update is known by its branch, so a
+// newer version or digest, a pull request opened, or a move from one
+// section to the other keeps its clock; an update that leaves both
+// sections and comes back starts it again. A history GitHub cut short
+// counts from its oldest edit, never earlier.
+//
+// What it cannot read in those sections, it quotes, at once, whatever the
+// history: a format that drifted fails closed. Beside that, a history that
+// cannot be read is a detail, not an error that would hide it. With no
+// open dashboard it behaves as [Lookups] does.
+func Starved(ctx context.Context, s Source, c *Config) (Result, error) {
+	dashboards, err := s.Dashboards(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(dashboards) == 0 {
+		return noDashboard(ctx, s, c, "updates waiting on it")
+	}
+	now := time.Now()
+	items := make([][]pendingUpdate, len(dashboards))
+	unreadable := make([][]string, len(dashboards))
+	anyUnreadable := false
+	for i := range dashboards {
+		items[i], unreadable[i] = pendingUpdates(dashboards[i].Body)
+		anyUnreadable = anyUnreadable || len(unreadable[i]) > 0
+	}
+	limit := days(c.StarvedDays)
+	var numbers, starved []string
+	for i := range dashboards {
+		d := &dashboards[i]
+		numbers = append(numbers, "#"+strconv.Itoa(d.Number))
+		for _, u := range unreadable[i] {
+			starved = append(starved, "unreadable: "+u)
+		}
+		if len(items[i]) == 0 {
+			continue
+		}
+		edits, err := s.DashboardHistory(ctx, d.Number, now.Add(-days(c.StarvedDays+1)))
+		if err != nil {
+			if !anyUnreadable {
+				return Result{}, err
+			}
+			starved = append(starved, fmt.Sprintf("could not read the history of #%d: %v", d.Number, err))
+			continue
+		}
+		for _, u := range items[i] {
+			since, ok := listedSince(d.Body, edits, func(body string) bool { return pendingIn(body, u.branch) })
+			if ok && time.Since(since) > limit {
+				starved = append(starved, fmt.Sprintf("%s (since %s)", u.text, timestamp(since)))
+			}
+		}
+	}
+	if len(starved) > 0 {
+		return Result{Stalled: true, Headline: fmt.Sprintf("Waiting on the Dependency Dashboard for more than %d days:", c.StarvedDays), Details: starved}, nil
+	}
+	return Result{Headline: fmt.Sprintf("no update waiting more than %d days on the Dependency Dashboard %s", c.StarvedDays, strings.Join(numbers, ", "))}, nil
+}
+
+// flakyLookback is how long before its window a flaky check lists runs
+// from: a job that failed then pairs with one on the same commit that
+// passed inside the window, as when a run is re-run hours later.
+const flakyLookback = 24 * time.Hour
+
+// firstWindow is the window of a flaky check with no stall run before it.
+const firstWindow = 24 * time.Hour
+
+// Flaky finds a job that both failed and passed on one commit, in runs of
+// one workflow that one kind of event started. A test that fails at random
+// fails a pull request, someone re-runs it, and nothing else records that
+// it happened.
+//
+// Jobs are the same job when they ran on the same commit, in the same
+// workflow, for the same event, such as "push" or "schedule", under the
+// same name before its matrix cell, the part from " (". Runs of different
+// events are never compared: a push run that passed and the daily slot
+// that failed on one commit are no flake, since the slot's own red run
+// reports what changed upstream. Each job that failed or passed counts, in
+// every attempt of each run; cancelled and skipped jobs, and the [Required]
+// job, which fails whenever a job it needs does, do not. A job that a
+// re-run of the failed jobs lists again, with the time and conclusion it
+// had, counts once, in the attempt that ran it.
+//
+// A failure and a pass pair as a flake in two ways. In one attempt of a
+// run, a failing cell and a passing one pair unless every failing cell
+// shares a matrix value, one of the comma-separated parts of its cell,
+// that no passing cell has: every podman cell failing while every docker
+// one passes is a fault of that engine, not a flake. Across runs or
+// attempts, only the same cell pairs: the same job or cell failed, and
+// then passed, or the other way round.
+//
+// The window runs from when the stall workflow's previous run was created,
+// or 24 hours before this run with none, to when this run was created, or
+// now when gh does not list it. A flake is reported when one of its paired
+// failures, or its earliest paired pass, finished inside the window: the
+// moment it first both failed and passed, or a new failure of it on a
+// later day, which is a new flake. So each is reported once, by the stall
+// run whose window holds that moment. A job finished when gh says it did,
+// or when its attempt finished, if later: the run, for its latest attempt,
+// and the attempt's last job, for an earlier one. A run still going when
+// one stall run lists the runs is listed only by the next, even when it
+// was re-run in between. A job that finished after the window's end, in
+// the moments before this run listed the runs, is left out, so that the
+// next run pairs it. Runs are listed from a day before the window, so
+// that a job that failed then still pairs with one that passed inside it.
+// The window starts at the previous stall run whether or not that run's
+// flaky check ran or succeeded: a window it missed is not read again.
+//
+// The stall and Renovate workflows' runs are passed over: both run on an
+// unmoved main every day. Jobs are read only for runs that could hold a
+// flake, as flakyCandidates says.
+func Flaky(ctx context.Context, s Source, c *Config) (Result, error) {
+	passOver := make(map[int64]bool, 2)
+	for _, file := range []string{c.StallWorkflow, c.RenovateWorkflow} {
+		id, err := s.WorkflowID(ctx, file)
+		if err != nil {
+			return Result{}, err
+		}
+		passOver[id] = true
+	}
+	start, end, err := s.PreviousRunStart(ctx, c.StallWorkflow)
+	if err != nil {
+		return Result{}, err
+	}
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if start.IsZero() {
+		start = end.Add(-firstWindow)
+	}
+	runs, err := s.RunsSince(ctx, start.Add(-flakyLookback))
+	if err != nil {
+		return Result{}, err
+	}
+	groups, err := flakyGroups(ctx, s, flakyCandidates(runs, passOver))
+	if err != nil {
+		return Result{}, err
+	}
+	var flaky []string
+	for _, g := range groups {
+		// A job that finished after this run was created, before it listed
+		// the runs, is the next run's to pair
+		g.jobs = slices.DeleteFunc(g.jobs, func(j flakyJob) bool { return j.at.After(end) })
+		failed, passed := g.paired()
+		if reportedIn(failed, passed, start, end) {
+			flaky = append(flaky, g.line(failed, passed))
+		}
+	}
+	if len(flaky) > 0 {
+		return Result{Stalled: true, Headline: "Passed and failed on the same commit since " + timestamp(start) + ":", Details: flaky}, nil
+	}
+	return Result{Headline: "no job passed and failed on the same commit since " + timestamp(start)}, nil
+}
+
+// commitRuns is what the runs of one commit, in one workflow, for one
+// event, share.
+type commitRuns struct {
+	sha      string
+	workflow int64
+	event    string
+}
+
+// flakyCandidates returns, in order, the runs whose jobs could hold a
+// flake, none of a workflow passOver holds: each run that failed, each run
+// re-run, whose earlier attempt may have failed, and each run of the same
+// commit, workflow and event as one of those. A flake needs a job that
+// failed, and such a job almost always fails its run. A run cancelled after
+// one of its jobs failed ends cancelled, not failed, so its failure is read
+// only when another run of its commit, workflow and event is.
+func flakyCandidates(runs []Run, passOver map[int64]bool) []*Run {
+	suspect := make(map[commitRuns]bool)
+	for i := range runs {
+		r := &runs[i]
+		if !passOver[r.WorkflowID] && (r.Conclusion == "failure" || r.Attempt > 1) {
+			suspect[commitRuns{r.HeadSHA, r.WorkflowID, r.Event}] = true
+		}
+	}
+	var out []*Run
+	for i := range runs {
+		if r := &runs[i]; suspect[commitRuns{r.HeadSHA, r.WorkflowID, r.Event}] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// flakyKey is what makes jobs the same job: the commit, the workflow and
+// the event, and the name before its matrix cell.
+type flakyKey struct {
+	commitRuns
+	job string
+}
+
+// flakyJob is a job that failed or passed: the run and attempt it ran in,
+// its matrix cell, the values in it, and when it finished.
+type flakyJob struct {
+	run     int64
+	attempt int
+	cell    string
+	values  []string
+	failed  bool
+	at      time.Time
+}
+
+// flakyGroup is the jobs, each failed or passed, that are one job, and the
+// name of their workflow.
+type flakyGroup struct {
+	key      flakyKey
+	workflow string
+	jobs     []flakyJob
+}
+
+// flakyGroups reads the jobs of every attempt of each run, and returns
+// them grouped into the same job, ordered by workflow, job, commit and
+// event. A job that failed or passed with no time it finished is an error,
+// since the time decides its window.
+func flakyGroups(ctx context.Context, s Source, runs []*Run) ([]*flakyGroup, error) {
+	byKey := make(map[flakyKey]*flakyGroup)
+	for _, run := range runs {
+		jobs, err := runJobs(ctx, s, run)
+		if err != nil {
+			return nil, err
+		}
+		for i := range jobs {
+			j := &jobs[i]
+			if j.Name == Required || (j.Conclusion != "failure" && j.Conclusion != "success") {
+				continue
+			}
+			if j.Completed.IsZero() {
+				return nil, fmt.Errorf("the run %s: its job %q ended as %s at no time GitHub gives", run.URL, j.Name, j.Conclusion)
+			}
+			at := j.Completed
+			if j.finished.After(at) {
+				at = j.finished
+			}
+			name, cell, values := matrixCell(j.Name)
+			key := flakyKey{commitRuns{run.HeadSHA, run.WorkflowID, run.Event}, name}
+			g, ok := byKey[key]
+			if !ok {
+				g = &flakyGroup{key: key, workflow: run.Workflow}
+				byKey[key] = g
+			}
+			g.jobs = append(g.jobs, flakyJob{run: run.ID, attempt: j.attempt, cell: cell, values: values, failed: j.Conclusion == "failure", at: at})
+		}
+	}
+	return slices.SortedFunc(maps.Values(byKey), func(a, b *flakyGroup) int {
+		return cmp.Or(strings.Compare(a.workflow, b.workflow), strings.Compare(a.key.job, b.key.job),
+			strings.Compare(a.key.sha, b.key.sha), strings.Compare(a.key.event, b.key.event))
+	}), nil
+}
+
+// matrixCell splits a job's name into the name before its matrix cell, the
+// cell, such as "(amd64, docker)", and the values in it, such as amd64 and
+// docker. A name with no cell has neither.
+func matrixCell(job string) (name, cell string, values []string) {
+	name, rest, ok := strings.Cut(job, " (")
+	if !ok {
+		return job, "", nil
+	}
+	cell = "(" + rest
+	for v := range strings.SplitSeq(strings.TrimSuffix(rest, ")"), ",") {
+		values = append(values, strings.TrimSpace(v))
+	}
+	return name, cell, values
+}
+
+// attemptJob is a job of the attempt it ran in, with when that attempt
+// finished.
+type attemptJob struct {
+	Job
+	attempt  int
+	finished time.Time
+}
+
+// runJobs returns the jobs of every attempt of run, oldest first. A re-run
+// of the failed jobs lists the others again in its attempt, as new jobs
+// with the times and conclusions they had: each is kept once, in the
+// earliest attempt that lists it, the one that ran it.
+//
+// Each job carries when its attempt finished: for the latest attempt, when
+// the run last changed, and for an earlier one, when the last job its
+// listing holds finished, whatever its conclusion, which is when the run
+// finished that attempt.
+func runJobs(ctx context.Context, s Source, run *Run) ([]attemptJob, error) {
+	type ran struct {
+		name, conclusion string
+		completed        int64
+	}
+	seen := make(map[ran]bool)
+	var out []attemptJob
+	latest := max(run.Attempt, 1)
+	for n := 1; n <= latest; n++ {
+		var jobs []Job
+		var err error
+		if n == latest {
+			jobs, err = s.Jobs(ctx, run)
+		} else {
+			jobs, err = s.AttemptJobs(ctx, run, n)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("the run %s: %w", run.URL, err)
+		}
+		finished := run.Updated
+		if n < latest {
+			finished = time.Time{}
+			for _, j := range jobs {
+				if j.Completed.After(finished) {
+					finished = j.Completed
+				}
+			}
+		}
+		for _, j := range jobs {
+			k := ran{j.Name, j.Conclusion, j.Completed.UnixMicro()}
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, attemptJob{Job: j, attempt: n, finished: finished})
+			}
+		}
+	}
+	return out, nil
+}
+
+// paired returns the failures and the passes of g that pair as a flake,
+// each in g's order. In one attempt of a run, every failure pairs with
+// every pass unless the attempt's failures share a value no pass in it
+// has; across runs or attempts, a failure pairs with a pass of the same
+// cell.
+func (g *flakyGroup) paired() (failed, passed []flakyJob) {
+	oneValue := make(map[[2]int64]bool)
+	for _, j := range g.jobs {
+		k := [2]int64{j.run, int64(j.attempt)}
+		if _, done := oneValue[k]; !done {
+			oneValue[k] = g.oneValue(j.run, j.attempt)
+		}
+	}
+	inFailed := make([]bool, len(g.jobs))
+	inPassed := make([]bool, len(g.jobs))
+	for i, f := range g.jobs {
+		for k, p := range g.jobs {
+			if !f.failed || p.failed {
+				continue
+			}
+			sameAttempt := f.run == p.run && f.attempt == p.attempt
+			if (sameAttempt && !oneValue[[2]int64{f.run, int64(f.attempt)}]) || (!sameAttempt && f.cell == p.cell) {
+				inFailed[i], inPassed[k] = true, true
+			}
+		}
+	}
+	for i, j := range g.jobs {
+		switch {
+		case inFailed[i]:
+			failed = append(failed, j)
+		case inPassed[i]:
+			passed = append(passed, j)
+		}
+	}
+	return failed, passed
+}
+
+// oneValue reports whether, in the attempt of run numbered attempt, g's
+// failures all share a matrix value that none of its passes has: one
+// engine or architecture failing, as every one of its cells does.
+func (g *flakyGroup) oneValue(run int64, attempt int) bool {
+	var failed, passed [][]string
+	for _, j := range g.jobs {
+		switch {
+		case j.run != run || j.attempt != attempt:
+		case j.failed:
+			failed = append(failed, j.values)
+		default:
+			passed = append(passed, j.values)
+		}
+	}
+	if len(failed) == 0 || len(passed) == 0 {
+		return false
+	}
+	for _, v := range failed[0] {
+		has := func(values []string) bool { return slices.Contains(values, v) }
+		if !slices.ContainsFunc(failed, func(f []string) bool { return !has(f) }) && !slices.ContainsFunc(passed, has) {
+			return true
+		}
+	}
+	return false
+}
+
+// reportedIn reports whether a flake, its paired failures and passes, is
+// reported by the stall run whose window runs from start to end: when one
+// of its failures, or the earliest of its passes, finished inside it.
+func reportedIn(failed, passed []flakyJob, start, end time.Time) bool {
+	if len(failed) == 0 || len(passed) == 0 {
+		return false
+	}
+	inside := func(t time.Time) bool { return t.After(start) && !t.After(end) }
+	first := slices.MinFunc(passed, func(a, b flakyJob) int { return a.at.Compare(b.at) })
+	return inside(first.at) || slices.ContainsFunc(failed, func(j flakyJob) bool { return inside(j.at) })
+}
+
+// line is how a flaky job is listed: its workflow, its name, its commit,
+// and where its paired failures and passes ran, oldest first, each by its
+// matrix cell. The run names a job with no cell, and any job of a flake
+// that spans runs, and the attempt one of a flake that spans attempts of
+// its run.
+func (g *flakyGroup) line(failed, passed []flakyJob) string {
+	attempts := make(map[int64]map[int]bool)
+	for _, j := range slices.Concat(failed, passed) {
+		if attempts[j.run] == nil {
+			attempts[j.run] = make(map[int]bool)
+		}
+		attempts[j.run][j.attempt] = true
+	}
+	where := func(jobs []flakyJob) string {
+		var out []string
+		for _, j := range slices.SortedFunc(slices.Values(jobs), func(a, b flakyJob) int {
+			return cmp.Or(cmp.Compare(a.run, b.run), cmp.Compare(a.attempt, b.attempt), strings.Compare(a.cell, b.cell))
+		}) {
+			if w := j.where(len(attempts) > 1, len(attempts[j.run]) > 1); !slices.Contains(out, w) {
+				out = append(out, w)
+			}
+		}
+		return strings.Join(out, ", ")
+	}
+	return fmt.Sprintf("%s / %s on %s: failed in %s, passed in %s",
+		g.workflow, g.key.job, g.key.sha[:min(7, len(g.key.sha))], where(failed), where(passed))
+}
+
+// where names where j ran: its matrix cell, then its run when it has no
+// cell or runs says its flake spans runs, and its attempt when attempts
+// says its flake spans attempts of its run.
+func (j *flakyJob) where(runs, attempts bool) string {
+	var in []string
+	if runs || j.cell == "" {
+		in = append(in, "run "+strconv.FormatInt(j.run, 10))
+	}
+	if attempts {
+		in = append(in, "attempt "+strconv.Itoa(j.attempt))
+	}
+	switch {
+	case j.cell == "":
+		return strings.Join(in, " ")
+	case len(in) == 0:
+		return j.cell
+	default:
+		return j.cell + " of " + strings.Join(in, " ")
+	}
 }
 
 // Slots finds daily slots that should have published main and did not,

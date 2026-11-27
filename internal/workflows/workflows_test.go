@@ -1541,21 +1541,36 @@ func passesSlotJob(workflow string) error {
 
 // TestStallDefaults pins the defaults of stall.yml's inputs that callers
 // get without setting them: Renovate may go 48 hours without a successful
-// run, since GitHub starts daily crons hours late, and every check runs.
+// run, since GitHub starts daily crons hours late, an update may wait 7
+// days on the Dependency Dashboard, the caller's stall workflow is
+// stall.yml, which its step passes to flaky, and every check runs.
 func TestStallDefaults(t *testing.T) {
 	t.Parallel()
 	lines := linesOf(readWorkflows(t)["stall.yml"])
 	if got := defaultOf(lines, "run-hours"); got != "48" {
 		t.Errorf("run-hours defaults to %q, want 48", got)
 	}
+	if got := defaultOf(lines, "starved-days"); got != "7" {
+		t.Errorf("starved-days defaults to %q, want 7", got)
+	}
+	if got := defaultOf(lines, "stall-workflow"); got != "stall.yml" {
+		t.Errorf("stall-workflow defaults to %q, want stall.yml", got)
+	}
 	var checks []string
 	raw := defaultOf(lines, "checks")
 	if err := json.Unmarshal([]byte(strings.Trim(raw, "'")), &checks); err != nil {
 		t.Fatalf("checks defaults to %q, not a JSON array: %v", raw, err)
 	}
-	want := []string{"open", "stuck", "renovate", "slots", "lookups"}
+	want := []string{"open", "stuck", "renovate", "slots", "lookups", "starved", "flaky"}
 	if !slices.Equal(checks, want) {
 		t.Errorf("checks defaults to %q, want %q", checks, want)
+	}
+	step, err := stallStep(lines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !setsEnv(step, "STALL_WORKFLOW", "${{ inputs.stall-workflow }}") {
+		t.Errorf("line %d runs divbast-stall with no STALL_WORKFLOW: ${{ inputs.stall-workflow }} in its env", step[0].n)
 	}
 }
 

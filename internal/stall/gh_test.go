@@ -70,6 +70,22 @@ const (
 //	gh-api-graphql-edits-template-20.json  the same, its twentieth and last page
 //	gh-api-graphql-edits-never-sabnzbd.json  sabnzbd-oci-image #2, first 100, its edits emptied
 //
+// and the same day,
+//
+//	dashboard-pending.md               gh api repos/divbast/pisati/issues/7 --jq .body
+//	gh-run-list-since-baikal.json      gh run list --repo divbast/baikal-oci-image --created '>=2026-11-26T00:00:00Z' --status completed --limit 1000 --json databaseId,headSha,workflowName,event,createdAt,url,workflowDatabaseId,attempt,conclusion,updatedAt
+//	gh-run-list-previous-baikal.json   gh run list --repo divbast/baikal-oci-image --workflow stall.yml --limit 3 --json databaseId,createdAt
+//	gh-run-view-jobs-ci-attempt-1.json  gh run view 43785315672 --repo divbast/ci --attempt 1 --json jobs
+//	gh-api-workflow-missing-baikal.txt  gh api -i repos/divbast/baikal-oci-image/actions/workflows/no-such.yml
+//
+// The run list holds Baikal's finished runs from 26 November to early on
+// the 27th: Renovate's, some of them cancelled or skipped, the build's, and
+// one of stall's. The ci
+// run is one whose test (amd64, docker) failed in its first attempt and
+// passed in its second, which re-ran only the jobs that had failed: the
+// second lists the others too, as new jobs with the first's times and
+// conclusions.
+//
 // Sabnzbd's dashboard had been edited 12 times, so its two pages hold the
 // whole of its history, ending with its creation. Oci-image-template's had
 // reached 100, as many as GitHub keeps: its original body and the latest
@@ -85,7 +101,9 @@ const (
 // The issue lists hold each repository's Dependency Dashboard, #94 and
 // #4, both clean, among Renovate's open pull requests, which the issues
 // API lists too: two in Baikal's, four in Sonarr's. dashboard-clean.md is
-// Baikal's dashboard's body.
+// Baikal's dashboard's body. dashboard-pending.md is pisati's, as gh
+// printed it: one update under Pending Approval, and seven under Pending
+// Status Checks, two of them with a pull request.
 //
 // The two slot lists hold the same runs as their recordings of the day
 // before, which lacked databaseId. The frankenphp run is a daily slot in
@@ -492,7 +510,7 @@ func TestGHSlotRuns(t *testing.T) {
 }
 
 // TestGHJobs reads the jobs of a slot run, each by its name as GitHub
-// shows it in the run, and its conclusion (backlog CI-7).
+// shows it in the run, its conclusion, and when it finished (backlog CI-7).
 func TestGHJobs(t *testing.T) {
 	t.Parallel()
 
@@ -510,20 +528,20 @@ func TestGHJobs(t *testing.T) {
 		{
 			name: "frankenphp", repo: frankenphp, id: 43493850688,
 			result: stdout(testdata(t, "gh-run-view-jobs-frankenphp.json")),
-			count:  8, has: stall.Job{Name: "publish (baikal)", Conclusion: "success"},
+			count:  8, has: stall.Job{Name: "publish (baikal)", Conclusion: "success", Completed: rfc3339(t, "2026-11-13T19:54:28Z")},
 		},
 		{
 			// The run failed in its arm64 build, and so never published.
 			name: "baikal-publish-skipped", repo: baikal, id: 42310287997,
 			result: stdout(testdata(t, "gh-run-view-jobs-baikal-failed.json")),
-			count:  6, has: stall.Job{Name: "publish", Conclusion: "skipped"},
+			count:  6, has: stall.Job{Name: "publish", Conclusion: "skipped", Completed: rfc3339(t, "2026-11-06T23:26:15Z")},
 		},
 		{
 			// GitHub skipped the publish matrix before expanding it, and
 			// names the job as written
 			name: "frankenphp-matrix-skipped", repo: frankenphp, id: 43481642005,
 			result: stdout(testdata(t, "gh-run-view-jobs-frankenphp-skipped.json")),
-			count:  7, has: stall.Job{Name: "publish (${{ matrix.app }})", Conclusion: "skipped"},
+			count:  7, has: stall.Job{Name: "publish (${{ matrix.app }})", Conclusion: "skipped", Completed: rfc3339(t, "2026-11-13T18:23:36Z")},
 		},
 		{
 			// A run that never started has no jobs.
@@ -557,6 +575,352 @@ func TestGHJobs(t *testing.T) {
 			}
 			if len(jobs) != tt.count || (tt.count > 0 && !slices.Contains(jobs, tt.has)) {
 				t.Errorf("Jobs() = %q, want %d jobs, %+v among them", jobs, tt.count, tt.has)
+			}
+		})
+	}
+}
+
+func runsSince(repo, since string) []string {
+	return []string{
+		"gh", "run", "list", "--repo", repo, "--created", ">=" + since, "--status", "completed",
+		"--limit", "1000", "--json", "databaseId,headSha,workflowName,event,createdAt,url,workflowDatabaseId,attempt,conclusion,updatedAt",
+	}
+}
+
+func previousRuns(repo, workflow string) []string {
+	return []string{"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--limit", "3", "--json", "databaseId,createdAt"}
+}
+
+func attemptJobs(repo string, id int64, attempt int) []string {
+	return []string{"gh", "run", "view", strconv.FormatInt(id, 10), "--repo", repo, "--attempt", strconv.Itoa(attempt), "--json", "jobs"}
+}
+
+// sameRun fails t unless got is want, field by field.
+func sameRun(t *testing.T, got, want *stall.Run) {
+	t.Helper()
+	if got.ID != want.ID || got.HeadSHA != want.HeadSHA || got.Workflow != want.Workflow || got.WorkflowID != want.WorkflowID ||
+		got.Event != want.Event || got.Attempt != want.Attempt || !got.Updated.Equal(want.Updated) || !got.Created.Equal(want.Created) ||
+		got.Completed != want.Completed || got.Conclusion != want.Conclusion || got.URL != want.URL {
+		t.Errorf("run = %+v\nwant  %+v", *got, *want)
+	}
+}
+
+// TestGHRunsSince reads every finished run created since a time, of every
+// workflow, with its workflow's name and ID, its event, its latest attempt
+// and when it last changed.
+func TestGHRunsSince(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		repo string
+		// since is the time asked, and argSince how gh is given it.
+		since, argSince string
+		result          execx.Result
+		wantLen         int
+		want            []stall.Run
+		wantErr         string
+	}{
+		{
+			// Renovate's runs, the build's and stall's, from 26 November to
+			// early on the 27th; the first is the newest.
+			name: "baikal", repo: baikal,
+			since: "2026-11-26T00:00:00Z", argSince: "2026-11-26T00:00:00Z",
+			result:  stdout(testdata(t, "gh-run-list-since-baikal.json")),
+			wantLen: 42,
+			want: []stall.Run{{
+				ID:         45926771468,
+				HeadSHA:    "851947707e7e6d2b34c22779c1820669fc67b9fb",
+				Workflow:   "renovate",
+				WorkflowID: 389993186,
+				Event:      "issues",
+				Attempt:    1,
+				Updated:    rfc3339(t, "2026-11-27T02:10:33Z"),
+				Created:    rfc3339(t, "2026-11-27T02:10:32Z"),
+				Completed:  true,
+				Conclusion: "skipped",
+				URL:        "https://github.com/divbast/baikal-oci-image/actions/runs/45926771468",
+			}},
+		},
+		{
+			// A run of ci's re-run once, as gh lists it: its creation, and
+			// its second attempt. The time asked is written in UTC.
+			name: "re-run", repo: "divbast/ci",
+			since: "2026-11-16T12:00:00+11:00", argSince: "2026-11-16T01:00:00Z",
+			result: stdout([]byte(`[{"attempt":2,"conclusion":"success","createdAt":"2026-11-16T01:16:44Z","databaseId":43785315672,"event":"push",` +
+				`"headSha":"1335cbc6827ce97e058d10711188752e0b2b349f","updatedAt":"2026-11-16T01:32:19Z","url":"https://github.com/divbast/ci/actions/runs/43785315672",` +
+				`"workflowDatabaseId":414049623,"workflowName":"self-ci"}]` + "\n")),
+			wantLen: 1,
+			want: []stall.Run{{
+				ID:         43785315672,
+				HeadSHA:    "1335cbc6827ce97e058d10711188752e0b2b349f",
+				Workflow:   "self-ci",
+				WorkflowID: 414049623,
+				Event:      "push",
+				Attempt:    2,
+				Updated:    rfc3339(t, "2026-11-16T01:32:19Z"),
+				Created:    rfc3339(t, "2026-11-16T01:16:44Z"),
+				Completed:  true,
+				Conclusion: "success",
+				URL:        "https://github.com/divbast/ci/actions/runs/43785315672",
+			}},
+		},
+		{
+			name: "none", repo: baikal,
+			since: "2026-11-26T00:00:00Z", argSince: "2026-11-26T00:00:00Z",
+			result: stdout([]byte("[]\n")),
+		},
+		{
+			name: "gh-fails", repo: baikal,
+			since: "2026-11-26T00:00:00Z", argSince: "2026-11-26T00:00:00Z",
+			result:  ghFailed("HTTP 403: Resource not accessible by integration\n"),
+			wantErr: "Resource not accessible by integration",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: runsSince(tt.repo, tt.argSince), Result: tt.result}), Repo: tt.repo}
+			runs, err := gh.RunsSince(t.Context(), rfc3339(t, tt.since))
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("RunsSince() = %v, %v; want an error containing %q", runs, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(runs) != tt.wantLen {
+				t.Fatalf("RunsSince() returned %d runs, want %d", len(runs), tt.wantLen)
+			}
+			for i := range tt.want {
+				sameRun(t, &runs[i], &tt.want[i])
+			}
+			for i := range runs {
+				if r := &runs[i]; r.ID == 0 || r.WorkflowID == 0 || r.Workflow == "" || r.Event == "" || r.Attempt < 1 || r.Updated.Before(r.Created) || !r.Completed {
+					t.Errorf("run %d = %+v, want every field GitHub gives set", i, *r)
+				}
+			}
+		})
+	}
+}
+
+// TestGHRunsSinceCap checks that RunsSince fails, rather than read part of
+// the list, when as many runs come back as one read returns: 1000, the most
+// GitHub lists for a search by creation or status.
+func TestGHRunsSinceCap(t *testing.T) {
+	t.Parallel()
+
+	page := func(n int) []byte {
+		runs := make([]string, n)
+		for i := range runs {
+			runs[i] = fmt.Sprintf(`{"attempt":1,"conclusion":"success","createdAt":"2026-11-26T01:00:00Z","databaseId":%d,"event":"push",`+
+				`"headSha":"%s","updatedAt":"2026-11-26T01:20:00Z","url":"https://github.com/divbast/baikal-oci-image/actions/runs/%d","workflowDatabaseId":354063381,"workflowName":"build"}`,
+				i+1, baikalMain, i+1)
+		}
+		return []byte("[" + strings.Join(runs, ",") + "]")
+	}
+	for _, tt := range []struct {
+		n       int
+		wantErr bool
+	}{{999, false}, {1000, true}} {
+		t.Run(strconv.Itoa(tt.n), func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: runsSince(baikal, "2026-11-26T00:00:00Z"), Result: stdout(page(tt.n))}), Repo: baikal}
+			runs, err := gh.RunsSince(t.Context(), rfc3339(t, "2026-11-26T00:00:00Z"))
+			if !tt.wantErr {
+				if err != nil || len(runs) != tt.n {
+					t.Fatalf("RunsSince() = %d runs, %v; want %d, nil", len(runs), err, tt.n)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "1000") {
+				t.Fatalf("RunsSince() = %d runs, %v; want an error naming 1000", len(runs), err)
+			}
+		})
+	}
+}
+
+// TestGHPreviousRunStart reads when the stall workflow's run before this
+// one was created, and when this one was, from its newest three runs:
+// Baikal's of 26 November, 45900219294, and of the two days before,
+// 45708076923 and 45502688399.
+func TestGHPreviousRunStart(t *testing.T) {
+	t.Parallel()
+
+	const (
+		newest  = "2026-11-26T21:44:46Z"
+		before  = "2026-11-25T21:51:05Z"
+		earlier = "2026-11-24T22:37:37Z"
+	)
+	recordedRuns := stdout(testdata(t, "gh-run-list-previous-baikal.json"))
+	tests := []struct {
+		name   string
+		runID  int64
+		result execx.Result
+		// wantPrevious and wantCurrent are empty for none.
+		wantPrevious, wantCurrent string
+		wantErr                   string
+	}{
+		{
+			// Inside the newest run, the one before it.
+			name: "inside-the-newest", runID: 45900219294, result: recordedRuns,
+			wantPrevious: before, wantCurrent: newest,
+		},
+		{
+			// A newer run is already queued: the one before this is the
+			// third.
+			name: "newer-run-queued", runID: 45708076923, result: recordedRuns,
+			wantPrevious: earlier, wantCurrent: before,
+		},
+		{
+			// Two newer runs have started since this one, so the one
+			// before this is not among the three.
+			name: "two-newer-runs", runID: 45502688399, result: recordedRuns,
+			wantCurrent: earlier,
+		},
+		{
+			// Outside a run, the newest is the one before, and this one is
+			// not known.
+			name: "outside-a-run", result: recordedRuns,
+			wantPrevious: newest,
+		},
+		{
+			// Three newer runs have started since this one.
+			name: "not-listed", runID: 5, result: recordedRuns,
+			wantPrevious: newest,
+		},
+		{
+			// The first run of stall.yml has none before it.
+			name: "first", runID: 45900219294, result: stdout([]byte(`[{"createdAt":"2026-11-26T21:44:46Z","databaseId":45900219294}]` + "\n")),
+			wantCurrent: newest,
+		},
+		{
+			name: "never", result: stdout([]byte("[]\n")),
+		},
+		{
+			name: "no-such-workflow", result: ghFailed("could not find any workflows named stall.yml\n"),
+			wantErr: "could not find any workflows named stall.yml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: previousRuns(baikal, "stall.yml"), Result: tt.result}), Repo: baikal, RunID: tt.runID}
+			previous, current, err := gh.PreviousRunStart(t.Context(), "stall.yml")
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("PreviousRunStart() = %v, %v, %v; want an error containing %q", previous, current, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range []struct {
+				what string
+				got  time.Time
+				want string
+			}{{"previous", previous, tt.wantPrevious}, {"current", current, tt.wantCurrent}} {
+				if c.want == "" && !c.got.IsZero() {
+					t.Errorf("PreviousRunStart() %s = %v, want none", c.what, c.got)
+				}
+				if c.want != "" && !c.got.Equal(rfc3339(t, c.want)) {
+					t.Errorf("PreviousRunStart() %s = %v, want %s", c.what, c.got, c.want)
+				}
+			}
+		})
+	}
+}
+
+// TestGHAttemptJobs reads the jobs of an earlier attempt of a run: ci's run
+// whose test (amd64, docker) failed in its first attempt and passed when
+// re-run, which its latest attempt's jobs no longer show.
+func TestGHAttemptJobs(t *testing.T) {
+	t.Parallel()
+
+	const ci = "divbast/ci"
+	t.Run("recorded", func(t *testing.T) {
+		t.Parallel()
+		gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: attemptJobs(ci, 43785315672, 1), Result: stdout(testdata(t, "gh-run-view-jobs-ci-attempt-1.json"))}), Repo: ci}
+		jobs, err := gh.AttemptJobs(t.Context(), &stall.Run{ID: 43785315672, Attempt: 2}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []stall.Job{
+			{Name: "test (amd64, docker)", Conclusion: "failure", Completed: rfc3339(t, "2026-11-16T01:21:55Z")},
+			{Name: "test (amd64, podman)", Conclusion: "success", Completed: rfc3339(t, "2026-11-16T01:20:57Z")},
+			{Name: "required", Conclusion: "failure", Completed: rfc3339(t, "2026-11-16T01:22:02Z")},
+		}
+		if len(jobs) != 8 {
+			t.Errorf("AttemptJobs() = %d jobs, want 8", len(jobs))
+		}
+		for _, w := range want {
+			if !slices.Contains(jobs, w) {
+				t.Errorf("AttemptJobs() = %+v, want %+v among them", jobs, w)
+			}
+		}
+	})
+	t.Run("gh-fails", func(t *testing.T) {
+		t.Parallel()
+		gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: attemptJobs(ci, 7, 1), Result: ghFailed("HTTP 404: Not Found\n")}), Repo: ci}
+		jobs, err := gh.AttemptJobs(t.Context(), &stall.Run{ID: 7, Attempt: 2}, 1)
+		if err == nil || !strings.Contains(err.Error(), "gh run view") || !strings.Contains(err.Error(), "Not Found") {
+			t.Fatalf("AttemptJobs() = %v, %v; want gh run view's error", jobs, err)
+		}
+	})
+}
+
+// TestGHWorkflowID reads the ID of the workflow in a file, and fails,
+// naming the file, when the repository has no such workflow.
+func TestGHWorkflowID(t *testing.T) {
+	t.Parallel()
+
+	workflow := func(file string) []string { return api("repos/divbast/baikal-oci-image/actions/workflows/" + file) }
+	tests := []struct {
+		name    string
+		file    string
+		result  execx.Result
+		want    int64
+		wantErr []string
+	}{
+		{name: "build", file: "build.yml", result: stdout(testdata(t, "gh-api-workflow-build-baikal.txt")), want: 354063381},
+		{
+			name: "no-such-workflow", file: "no-such.yml",
+			result: execx.Result{
+				Stdout: testdata(t, "gh-api-workflow-missing-baikal.txt"),
+				Stderr: []byte("gh: Not Found (HTTP 404)\n"),
+				Code:   1,
+			},
+			wantErr: []string{"no-such.yml", baikal},
+		},
+		{
+			name: "no-id", file: "build.yml", result: stdout([]byte("HTTP/2.0 200 OK\r\n\r\n{}")),
+			wantErr: []string{"build.yml", "no ID"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: workflow(tt.file), Result: tt.result}), Repo: baikal}
+			got, err := gh.WorkflowID(t.Context(), tt.file)
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("WorkflowID() = %d, want an error", got)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("WorkflowID() error = %q, want it to contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("WorkflowID() = %d, %v; want %d", got, err, tt.want)
 			}
 		})
 	}

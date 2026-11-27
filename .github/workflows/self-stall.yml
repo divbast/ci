@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
 # ci's own stall check, through stall.yml from this same commit: a Renovate
-# pull request that never goes green or never finishes, or Renovate itself
-# silent. ci publishes nothing, so it has no daily slots to lose. A
-# scheduled run's failure goes to whoever last edited the cron line below.
+# pull request that never goes green or never finishes, Renovate itself
+# silent, a failed lookup or an update left waiting on its Dependency
+# Dashboard, or a job that both failed and passed on one commit. ci
+# publishes nothing, so it has no daily slots to lose. A scheduled run's
+# failure goes to whoever last edited the cron line below.
 
 name: self-stall
 
@@ -30,8 +32,9 @@ jobs:
     # for is one actionlint 1.7.12 cannot parse yet.
     uses: ./.github/workflows/stall.yml # zizmor: ignore[self-repository] see above
     with:
-      checks: '["open","stuck","renovate","lookups"]'
+      checks: '["open","stuck","renovate","lookups","starved","flaky"]'
       renovate-workflow: self-renovate.yml
+      stall-workflow: self-stall.yml
     # Everything stall.yml's job asks for, since a called job gets no more
     # than its caller grants, even what a check ci skips would need.
     permissions:

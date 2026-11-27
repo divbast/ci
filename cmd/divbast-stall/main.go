@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	divbast-stall open|stuck|renovate|slots|lookups
+//	divbast-stall open|stuck|renovate|slots|lookups|starved|flaky
 //	divbast-stall slots -content-gated
 //
 // The checks:
@@ -25,6 +25,19 @@
 //	          Dashboard has listed the same failed lookup for 24 hours; or
 //	          no open dashboard by divbast-renovate once RENOVATE_WORKFLOW
 //	          has succeeded
+//	starved   an update the Dependency Dashboard has listed as waiting,
+//	          under Pending Status Checks or Awaiting Schedule, for more
+//	          than STARVED_DAYS days, known by its branch; or no open
+//	          dashboard, as for lookups
+//	flaky     a job that both failed and passed on one commit, in runs of
+//	          one workflow for one event: a matrix cell beside another that
+//	          passed, unless the failing cells all share a matrix value no
+//	          passing cell has, or the same job or cell in another run or
+//	          attempt; reported once, by the run whose window, from
+//	          STALL_WORKFLOW's previous run to this one, holds the moment
+//	          it first failed and passed, or a new failure of it. Runs of
+//	          STALL_WORKFLOW and RENOVATE_WORKFLOW, and the job named
+//	          "required", do not count
 //
 // slots -content-gated is for a slot workflow that publishes only when the
 // image's content moved, as divbast-publish-decision -content-gated does:
@@ -45,6 +58,7 @@
 //	STUCK_HOURS        stuck's limit
 //	RUN_HOURS          renovate's limit
 //	LOST_SLOTS         slots' limit
+//	STARVED_DAYS       starved's limit
 //	PUBLISHED          the image the slot publishes, such as
 //	                   ghcr.io/divbast/librespeed:latest
 //	SLOT_WORKFLOW      the slot's workflow file, build.yml if unset
@@ -53,7 +67,13 @@
 //	                   the run, whose conclusion counts rather than the
 //	                   whole run's; unset, the run's
 //	RENOVATE_WORKFLOW  Renovate's workflow file, renovate.yml if unset; for
-//	                   renovate and lookups
+//	                   renovate, lookups, starved and flaky
+//	STALL_WORKFLOW     for flaky: the workflow file whose scheduled runs run
+//	                   these checks, stall.yml if unset
+//	GITHUB_RUN_ID      for flaky: the ID of the run the check runs in,
+//	                   which GitHub Actions sets; flaky's window ends when
+//	                   this run was created, and starts when the run of
+//	                   STALL_WORKFLOW before it was
 //
 // Each check reads only its own limit. It prints what it found on stdout:
 // one line when nothing is stalled, or a headline and then what stalled,
@@ -96,7 +116,7 @@ func main() {
 func run(ctx context.Context, args []string, getenv func(string) string, r execx.Runner, stdout, stderr io.Writer) int {
 	usage := func() {
 		// As for complain: nowhere better to report a failed write.
-		_, _ = fmt.Fprintf(stderr, "usage: %s open|stuck|renovate|slots|lookups\n       %s slots -content-gated\n", name, name)
+		_, _ = fmt.Fprintf(stderr, "usage: %s open|stuck|renovate|slots|lookups|starved|flaky\n       %s slots -content-gated\n", name, name)
 	}
 	// The check comes first, and its own flags after it.
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
@@ -167,6 +187,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, r execx
 	case "lookups":
 		c.RenovateWorkflow = env.or("RENOVATE_WORKFLOW", "renovate.yml")
 		do = func() (stall.Result, error) { return stall.Lookups(ctx, src, &c) }
+	case "starved":
+		c.StarvedDays = env.count("STARVED_DAYS")
+		c.RenovateWorkflow = env.or("RENOVATE_WORKFLOW", "renovate.yml")
+		do = func() (stall.Result, error) { return stall.Starved(ctx, src, &c) }
+	case "flaky":
+		c.StallWorkflow = env.or("STALL_WORKFLOW", "stall.yml")
+		c.RenovateWorkflow = env.or("RENOVATE_WORKFLOW", "renovate.yml")
+		src.RunID = env.runID("GITHUB_RUN_ID")
+		do = func() (stall.Result, error) { return stall.Flaky(ctx, src, &c) }
 	default:
 		complain(stderr, "no such check: %q", check)
 		usage()
@@ -229,6 +258,20 @@ func (e *environment) count(key string) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
 		e.err = errors.Join(e.err, fmt.Errorf("%s is %q, not a whole number", key, v))
+	}
+	return n
+}
+
+// runID returns the variable key, a run's ID, or 0 if it is not set.
+func (e *environment) runID(key string) int64 {
+	v := e.getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		e.err = errors.Join(e.err, fmt.Errorf("%s is %q, not a run's ID", key, v))
+		return 0
 	}
 	return n
 }

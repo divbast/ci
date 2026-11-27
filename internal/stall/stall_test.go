@@ -45,9 +45,11 @@ var config = stall.Config{
 	StuckHours:       24,
 	RunHours:         24,
 	LostSlots:        2,
+	StarvedDays:      7,
 	Published:        image,
 	SlotWorkflow:     "build.yml",
 	RenovateWorkflow: "renovate.yml",
+	StallWorkflow:    "stall.yml",
 }
 
 // comparison is what Compare answers for one base...head.
@@ -76,7 +78,20 @@ type source struct {
 	// first. DashboardHistory cuts it short as GitHub's does.
 	edits      map[int][]stall.DashboardEdit
 	historyErr error // returned by DashboardHistory when set
-	err        error // returned by every call when set
+	// finished are the runs RunsSince lists, newest first, and attempts
+	// each one's jobs, by run ID and attempt; previous is when the stall
+	// workflow's run before this one was created, and current when this
+	// one was, each zero for none, and workflowIDs are workflows' IDs by
+	// file.
+	finished          []stall.Run
+	attempts          map[int64]map[int][]stall.Job
+	previous, current time.Time
+	workflowIDs       map[string]int64
+	// listedSince is the time RunsSince was asked from, and read is each
+	// run and attempt whose jobs were read, as "run/attempt".
+	listedSince time.Time
+	read        []string
+	err         error // returned by every call when set
 }
 
 func (s *source) Dashboards(context.Context) ([]stall.Issue, error) {
@@ -133,6 +148,9 @@ func (s *source) Jobs(_ context.Context, run *stall.Run) ([]stall.Job, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
+	if s.attempts != nil {
+		return s.attemptJobs(run.ID, run.Attempt)
+	}
 	jobs, ok := s.jobs[run.ID]
 	if !ok {
 		return nil, fmt.Errorf("asked for the jobs of run %d, which the test did not script", run.ID)
@@ -142,6 +160,66 @@ func (s *source) Jobs(_ context.Context, run *stall.Run) ([]stall.Job, error) {
 		out = append(out, stall.Job{Name: name, Conclusion: jobs[name]})
 	}
 	return out, nil
+}
+
+// AttemptJobs returns an earlier attempt's jobs, and fails for the
+// latest, which Jobs reads.
+func (s *source) AttemptJobs(_ context.Context, run *stall.Run, attempt int) ([]stall.Job, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if attempt < 1 || attempt >= run.Attempt {
+		return nil, fmt.Errorf("asked for attempt %d of run %d, whose latest is %d", attempt, run.ID, run.Attempt)
+	}
+	return s.attemptJobs(run.ID, attempt)
+}
+
+func (s *source) attemptJobs(id int64, attempt int) ([]stall.Job, error) {
+	jobs, ok := s.attempts[id][attempt]
+	if !ok {
+		return nil, fmt.Errorf("asked for the jobs of run %d, attempt %d, which the test did not script", id, attempt)
+	}
+	s.read = append(s.read, fmt.Sprintf("%d/%d", id, attempt))
+	return jobs, nil
+}
+
+// RunsSince returns the runs created at or after since, as [stall.GH]
+// does, so that a check asking from the wrong time lists the wrong runs,
+// and of those only the runs finished by now, by when they last changed,
+// as gh lists only finished runs.
+func (s *source) RunsSince(_ context.Context, since time.Time) ([]stall.Run, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	s.listedSince = since
+	var out []stall.Run
+	for i := range s.finished {
+		if r := &s.finished[i]; !r.Created.Before(since) && !r.Updated.After(time.Now()) {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
+func (s *source) PreviousRunStart(_ context.Context, workflow string) (previous, current time.Time, err error) {
+	if s.err != nil {
+		return time.Time{}, time.Time{}, s.err
+	}
+	if workflow != config.StallWorkflow {
+		return time.Time{}, time.Time{}, fmt.Errorf("asked about workflow %q", workflow)
+	}
+	return s.previous, s.current, nil
+}
+
+func (s *source) WorkflowID(_ context.Context, file string) (int64, error) {
+	if s.err != nil {
+		return 0, s.err
+	}
+	id, ok := s.workflowIDs[file]
+	if !ok {
+		return 0, fmt.Errorf("no workflow file %s", file)
+	}
+	return id, nil
 }
 
 func (s *source) MainSHA(context.Context) (string, error) {
@@ -1158,6 +1236,8 @@ func TestErrors(t *testing.T) {
 		{"renovate", func(ctx context.Context) (stall.Result, error) { return stall.Renovate(ctx, broken, &config) }},
 		{"slots-absent", func(ctx context.Context) (stall.Result, error) { return stall.Slots(ctx, broken, absent, &config) }},
 		{"slots-published", func(ctx context.Context) (stall.Result, error) { return stall.Slots(ctx, broken, pub, &config) }},
+		{"starved", func(ctx context.Context) (stall.Result, error) { return stall.Starved(ctx, broken, &config) }},
+		{"flaky", func(ctx context.Context) (stall.Result, error) { return stall.Flaky(ctx, broken, &config) }},
 	}
 
 	for _, tt := range tests {
@@ -1601,4 +1681,1376 @@ func TestPersistent(t *testing.T) {
 			}
 		})
 	}
+}
+
+// pendingSection and scheduleSection are the sections Renovate 45 writes
+// on a Dependency Dashboard for updates whose status checks are pending,
+// its release age among them, and for updates their schedule holds back,
+// as dependency-dashboard.ts writes them, with each of items a line.
+func pendingSection(items ...string) string {
+	return "## Pending Status Checks\n\nThe following updates await pending status checks. To force their creation now, click on a checkbox below.\n\n" +
+		strings.Join(items, "\n") + "\n\n"
+}
+
+func scheduleSection(items ...string) string {
+	return "## Awaiting Schedule\n\nThe following updates are awaiting their schedule. To get an update now, click on a checkbox below.\n\n" +
+		strings.Join(items, "\n") + "\n\n"
+}
+
+// stylelint is the line on which a dashboard lists stylelint's update to
+// version v as waiting on its status checks, and stylelintWaiting is the
+// same update as starved names it, waiting since since.
+func stylelint(v string) string {
+	return " - [ ] <!-- unpend-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to " + v
+}
+
+func stylelintWaiting(v, since string) string {
+	return "tools: update dependency stylelint to " + v + " (since " + since + ")"
+}
+
+// pnpm is another update waiting on its status checks.
+const pnpm = " - [ ] <!-- unpend-branch=renovate/pnpm -->tools: update pnpm to v12.23.0"
+
+// pisatiWaiting are the updates pisati's dashboard, dashboard-pending.md,
+// lists under Pending Status Checks: each one's branch, and its line with
+// the comment and the link taken out.
+var pisatiWaiting = []struct{ branch, text string }{
+	{"renovate/axe-core-playwright-4.x", "tools: update dependency @axe-core/playwright to v4.14.1"},
+	{"renovate/github.com-ncruces-go-sqlite3-0.x", "tools: update module github.com/ncruces/go-sqlite3 to v0.38.1"},
+	{"renovate/github.com-pressly-goose-v3-3.x", "tools: update module github.com/pressly/goose/v3 to v3.30.2"},
+	{"renovate/lucide-monorepo", "tools: update dependency lucide-static to v1.81.0"},
+	{"renovate/stylelint-18.x", "tools: update dependency stylelint to v18.1.0"},
+	{"renovate/vite-plus-monorepo", "tools: update dependency vite-plus to v1.8.0"},
+	{"renovate/pnpm", "tools: update pnpm to v12.23.0"},
+}
+
+// starvedHeadline is the headline of a starved stall at 7 days, and
+// notStarved the passing one on dashboard #94.
+const (
+	starvedHeadline = "Waiting on the Dependency Dashboard for more than 7 days:"
+	notStarved      = "no update waiting more than 7 days on the Dependency Dashboard #94"
+)
+
+func starvedWith(t *testing.T, s *source) stall.Result {
+	t.Helper()
+	res, err := stall.Starved(t.Context(), s, &config)
+	if err != nil {
+		t.Fatalf("Starved() error = %v", err)
+	}
+	return res
+}
+
+// TestStarvedNone reads dashboards with no update waiting under Pending
+// Status Checks or Awaiting Schedule, which never ask for their history:
+// the source has none to give.
+func TestStarvedNone(t *testing.T) {
+	t.Parallel()
+
+	approval := "## Pending Approval\n\nThe following branches are pending approval. To create them, click on a checkbox below.\n\n" +
+		" - [ ] <!-- approve-branch=renovate/go-1.x -->tools: update go module directive to v1.27.4\n\n"
+
+	tests := []struct {
+		name, section string
+	}{
+		{"clean", ""},
+		// Pending Approval waits on a person, whom the dashboard asks
+		{"pending-approval", approval},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				res := starvedWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, tt.section), URL: dashboardURL}}})
+				checkResult(t, res, stall.Result{Headline: notStarved})
+			})
+		})
+	}
+}
+
+// TestStarvedYoung reads an update waiting no more than 7 days: since 6
+// days ago, with the edit before that clean, and since exactly 7 days
+// ago, which is not more than 7.
+func TestStarvedYoung(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		waiting time.Duration
+	}{
+		{"six-days", 6 * day},
+		{"exactly-seven-days", 7 * day},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+				res := starvedWith(t, onDashboard(body, edit(0, body), edit(tt.waiting, body), edit(9*day, dashboard(t, ""))))
+				checkResult(t, res, stall.Result{Headline: notStarved})
+			})
+		})
+	}
+}
+
+// TestStarvedOld reads updates waiting more than 7 days, each named with
+// the edit it has been listed since, whichever of the two sections lists
+// it.
+func TestStarvedOld(t *testing.T) {
+	t.Parallel()
+
+	clean := dashboard(t, "")
+	waiting := dashboard(t, pendingSection(stylelint("v18.1.0")))
+	pisati := string(testdata(t, "dashboard-pending.md"))
+	pisatiDetails := make([]string, 0, len(pisatiWaiting))
+	for _, w := range pisatiWaiting {
+		pisatiDetails = append(pisatiDetails, w.text+" (since 1999-12-24T00:00:00Z)")
+	}
+
+	tests := []struct {
+		name  string
+		body  string
+		edits []stall.DashboardEdit
+		want  []string
+	}{
+		{
+			name:  "pending-status-checks",
+			body:  waiting,
+			edits: []stall.DashboardEdit{edit(0, waiting), edit(3*day, waiting), edit(8*day, waiting), edit(10*day, clean)},
+			want:  []string{stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z")},
+		},
+		{
+			name: "awaiting-schedule",
+			body: dashboard(t, scheduleSection(" - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3")),
+			edits: []stall.DashboardEdit{
+				edit(time.Hour, dashboard(t, scheduleSection(" - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3"))),
+				edit(9*day, dashboard(t, scheduleSection(" - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3"))),
+			},
+			want: []string{"build: update debian Docker tag to v13.3 (since 1999-12-23T00:00:00Z)"},
+		},
+		{
+			// A second past 7 days is more than 7
+			name:  "just-past",
+			body:  waiting,
+			edits: []stall.DashboardEdit{edit(0, waiting), edit(7*day+time.Second, waiting), edit(9*day, clean)},
+			want:  []string{stylelintWaiting("v18.1.0", "1999-12-24T23:59:59Z")},
+		},
+		{
+			// Renovate edits the dashboard only when its body changes, so the
+			// newest edit older than the window stood throughout
+			name:  "unedited",
+			body:  waiting,
+			edits: []stall.DashboardEdit{edit(10*day, waiting)},
+			want:  []string{stylelintWaiting("v18.1.0", "1999-12-22T00:00:00Z")},
+		},
+		{
+			// pnpm waits since 3 days ago, so only stylelint is named
+			name: "one-of-two",
+			body: dashboard(t, pendingSection(stylelint("v18.1.0"), pnpm)),
+			edits: []stall.DashboardEdit{
+				edit(0, dashboard(t, pendingSection(stylelint("v18.1.0"), pnpm))),
+				edit(3*day, dashboard(t, pendingSection(stylelint("v18.1.0"), pnpm))),
+				edit(8*day, waiting),
+			},
+			want: []string{stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z")},
+		},
+		{
+			name:  "recorded",
+			body:  pisati,
+			edits: []stall.DashboardEdit{edit(0, pisati), edit(8*day, pisati)},
+			want:  pisatiDetails,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				res := starvedWith(t, onDashboard(tt.body, tt.edits...))
+				checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: tt.want})
+			})
+		})
+	}
+}
+
+// TestStarvedTwoDashboards reads two open dashboards, each with an update
+// waiting more than 7 days: both are named, in the dashboards' order.
+func TestStarvedTwoDashboards(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		first := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		second := dashboard(t, pendingSection(pnpm))
+		res := starvedWith(t, &source{
+			dashboards: []stall.Issue{
+				{Number: 94, Title: "Dependency Dashboard", Body: first, URL: dashboardURL},
+				{Number: 95, Title: "Dependency Dashboard", Body: second, URL: "https://github.com/divbast/baikal-oci-image/issues/95"},
+			},
+			edits: map[int][]stall.DashboardEdit{94: {edit(9*day, first)}, 95: {edit(0, second), edit(8*day, second)}},
+		})
+		checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: []string{
+			stylelintWaiting("v18.1.0", "1999-12-23T00:00:00Z"), "tools: update pnpm to v12.23.0 (since 1999-12-24T00:00:00Z)",
+		}})
+	})
+}
+
+// TestStarvedFlickerResets reads an update listed 8 days ago, gone 5 days
+// ago, and listed again since: its clock starts again from its return.
+func TestStarvedFlickerResets(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		res := starvedWith(t, onDashboard(body, edit(0, body), edit(4*day, body), edit(5*day, dashboard(t, "")), edit(8*day, body), edit(10*day, body)))
+		checkResult(t, res, stall.Result{Headline: notStarved})
+	})
+}
+
+// TestStarvedNewVersionKeepsClock reads an update whose line changed while
+// it waited: a newer version, a pull request opened, or a move from one
+// section to the other. Its branch is the same, so it is the same update,
+// still waiting, and the clock runs from when the branch was first listed.
+// It is named by its line now.
+func TestStarvedNewVersionKeepsClock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		now    string
+		before []string // what the edits 4 and 8 days ago list
+		want   string
+	}{
+		{
+			name:   "new-version",
+			now:    pendingSection(stylelint("v18.1.2")),
+			before: []string{pendingSection(stylelint("v18.1.1")), pendingSection(stylelint("v18.1.0"))},
+			want:   stylelintWaiting("v18.1.2", "1999-12-24T00:00:00Z"),
+		},
+		{
+			name:   "pull-request-opened",
+			now:    pendingSection(" - [ ] <!-- unpend-branch=renovate/stylelint-18.x -->[tools: update dependency stylelint to v18.1.0](../pull/14)"),
+			before: []string{pendingSection(stylelint("v18.1.0")), pendingSection(stylelint("v18.1.0"))},
+			want:   stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z"),
+		},
+		{
+			// Its schedule opened, and now its release age holds it
+			name: "schedule-then-status-checks",
+			now:  pendingSection(stylelint("v18.1.0")),
+			before: []string{
+				pendingSection(stylelint("v18.1.0")),
+				scheduleSection(" - [ ] <!-- unschedule-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to v18.1.0"),
+			},
+			want: stylelintWaiting("v18.1.0", "1999-12-24T00:00:00Z"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				body := dashboard(t, tt.now)
+				res := starvedWith(t, onDashboard(body,
+					edit(0, body), edit(4*day, dashboard(t, tt.before[0])), edit(8*day, dashboard(t, tt.before[1])), edit(10*day, dashboard(t, ""))))
+				checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: []string{tt.want}})
+			})
+		})
+	}
+}
+
+// TestStarvedUnreadable reads sections it cannot read whole: a line under
+// either heading that names no branch, and a heading with no update under
+// it in Renovate's form. Each stalls at once, quoted, and needs no
+// history; a section it can read beside one still has its history read.
+func TestStarvedUnreadable(t *testing.T) {
+	t.Parallel()
+
+	const (
+		noBranch      = " - [ ] tools: update dependency stylelint to v18.1.0"
+		pendingEmpty  = "unreadable: ## Pending Status Checks: no update under it in Renovate's form"
+		scheduleEmpty = "unreadable: ## Awaiting Schedule: no update under it in Renovate's form"
+	)
+
+	tests := []struct {
+		name    string
+		section string
+		edits   []stall.DashboardEdit
+		want    []string
+	}{
+		{
+			name:    "no-branch",
+			section: pendingSection(noBranch),
+			want:    []string{"unreadable: " + strings.TrimSpace(noBranch), pendingEmpty},
+		},
+		{
+			name:    "nothing-under-it",
+			section: "## Awaiting Schedule\n\nThe following updates are awaiting their schedule. To get an update now, click on a checkbox below.\n\n",
+			want:    []string{scheduleEmpty},
+		},
+		{
+			// Renovate writes its bulk line only below two updates or more
+			name:    "only-the-bulk-line",
+			section: scheduleSection(" - [ ] <!-- create-all-awaiting-schedule-prs -->🔐 **Create all awaiting schedule PRs at once** 🔐"),
+			want:    []string{scheduleEmpty},
+		},
+		{
+			// Another list form: no line in it is an update
+			name:    "another-form",
+			section: pendingSection("* [ ] <!-- unpend-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to v18.1.0"),
+			want:    []string{pendingEmpty},
+		},
+		{
+			name:    "beside-one-it-reads",
+			section: pendingSection(stylelint("v18.1.0"), noBranch),
+			edits:   []stall.DashboardEdit{edit(day, dashboard(t, pendingSection(stylelint("v18.1.0"), noBranch)))},
+			want:    []string{"unreadable: " + strings.TrimSpace(noBranch)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				// Without edits scripted, a read of the history fails the test
+				src := &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, tt.section), URL: dashboardURL}}}
+				if tt.edits != nil {
+					src.edits = map[int][]stall.DashboardEdit{94: tt.edits}
+				}
+				res := starvedWith(t, src)
+				checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: tt.want})
+			})
+		})
+	}
+}
+
+// TestStarvedHistoryShort reads a history that reaches back only 2 days,
+// as GitHub's does for a dashboard edited 99 times since, with the update
+// in its oldest edit: it counts from that edit, never earlier, so it does
+// not stall.
+func TestStarvedHistoryShort(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		res := starvedWith(t, onDashboard(body, edit(0, body), edit(day, body), edit(2*day, body)))
+		checkResult(t, res, stall.Result{Headline: notStarved})
+	})
+}
+
+// TestStarvedHistoryWindow checks that starved asks for the history back
+// to one day more than StarvedDays: the source answers from there, so an
+// update listed since only within the window, or for longer, reads the
+// edits that show it.
+func TestStarvedHistoryWindow(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, pendingSection(stylelint("v18.1.0")))
+		src := &windowSource{source: onDashboard(body, edit(0, body), edit(9*day, body))}
+		if _, err := stall.Starved(t.Context(), src, &config); err != nil {
+			t.Fatalf("Starved() error = %v", err)
+		}
+		if want := ago(8 * day); !src.since.Equal(want) {
+			t.Errorf("DashboardHistory asked since %v, want %v", src.since, want)
+		}
+	})
+}
+
+// windowSource is a source that keeps the since of its last history read.
+type windowSource struct {
+	*source
+	since time.Time
+}
+
+func (w *windowSource) DashboardHistory(ctx context.Context, number int, since time.Time) ([]stall.DashboardEdit, error) {
+	w.since = since
+	return w.source.DashboardHistory(ctx, number, since)
+}
+
+func TestStarvedNoDashboard(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		last := time.Date(1999, 12, 31, 3, 0, 0, 0, time.UTC)
+		res := starvedWith(t, &source{success: last})
+		checkResult(t, res, stall.Result{
+			Stalled:  true,
+			Headline: "No open Dependency Dashboard by divbast-renovate, so updates waiting on it cannot be seen:",
+			Details:  []string{`no open issue titled "Dependency Dashboard"; Renovate last succeeded 1999-12-31T03:00:00Z`},
+		})
+		res = starvedWith(t, &source{})
+		checkResult(t, res, stall.Result{Headline: "no Dependency Dashboard yet, and no successful Renovate run to have made one"})
+	})
+}
+
+// TestStarvedHistoryFails checks that a dashboard listing an update whose
+// history cannot be read fails the check, rather than being taken for an
+// update waiting any length of time; beside a section it cannot read,
+// which stalls whatever the history says, the error is a detail.
+func TestStarvedHistoryFails(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		errHistory := errors.New("gh api graphql: HTTP 502")
+		src := onDashboard(dashboard(t, pendingSection(stylelint("v18.1.0"))))
+		src.historyErr = errHistory
+		got, err := stall.Starved(t.Context(), src, &config)
+		if !errors.Is(err, errHistory) {
+			t.Fatalf("Starved() = %+v, %v; want an error wrapping %v", got, err, errHistory)
+		}
+
+		noBranch := " - [ ] tools: update pnpm to v12.23.0"
+		src = onDashboard(dashboard(t, scheduleSection(noBranch)+pendingSection(stylelint("v18.1.0"))))
+		src.historyErr = errHistory
+		res := starvedWith(t, src)
+		checkResult(t, res, stall.Result{Stalled: true, Headline: starvedHeadline, Details: []string{
+			"unreadable: " + strings.TrimSpace(noBranch),
+			"unreadable: ## Awaiting Schedule: no update under it in Renovate's form",
+			"could not read the history of #94: " + errHistory.Error(),
+		}})
+	})
+}
+
+// TestPendingUpdates checks what starved reads as an update waiting: each
+// line under Pending Status Checks or Awaiting Schedule that names a
+// branch, known by its branch and named by the line without its comment
+// and link, and nothing else on the dashboard.
+func TestPendingUpdates(t *testing.T) {
+	t.Parallel()
+
+	pisati := string(testdata(t, "dashboard-pending.md"))
+	pisatiBranches := make([]string, 0, len(pisatiWaiting))
+	pisatiTexts := make([]string, 0, len(pisatiWaiting))
+	for _, w := range pisatiWaiting {
+		pisatiBranches = append(pisatiBranches, w.branch)
+		pisatiTexts = append(pisatiTexts, w.text)
+	}
+	debian := " - [ ] <!-- unschedule-branch=renovate/debian -->build: update debian Docker tag to v13.3"
+
+	tests := []struct {
+		name           string
+		body           string
+		branches, text []string
+		unreadable     []string
+	}{
+		{name: "recorded", body: pisati, branches: pisatiBranches, text: pisatiTexts},
+		{
+			// A web edit saves the body with CRLF until Renovate's next rewrite
+			name: "crlf", body: strings.ReplaceAll(pisati, "\n", "\r\n"), branches: pisatiBranches, text: pisatiTexts,
+		},
+		{name: "clean", body: dashboard(t, "")},
+		{
+			// The bulk line is no update
+			name:     "bulk-line",
+			body:     dashboard(t, scheduleSection(debian, pnpm, " - [ ] <!-- create-all-awaiting-schedule-prs -->🔐 **Create all awaiting schedule PRs at once** 🔐")),
+			branches: []string{"renovate/debian", "renovate/pnpm"},
+			text:     []string{"build: update debian Docker tag to v13.3", "tools: update pnpm to v12.23.0"},
+		},
+		{
+			// dependencyDashboardCategory groups updates under ### headings
+			name: "categories",
+			body: dashboard(t, "## Pending Status Checks\n\nThe following updates await pending status checks. To force their creation now, click on a checkbox below.\n\n"+
+				"### build\n\n"+debian+"\n\n### tools\n\n"+pnpm+"\n\n"),
+			branches: []string{"renovate/debian", "renovate/pnpm"},
+			text:     []string{"build: update debian Docker tag to v13.3", "tools: update pnpm to v12.23.0"},
+		},
+		{
+			// Ticked, it waits still, until Renovate's next run acts on it
+			name:     "ticked",
+			body:     dashboard(t, pendingSection(" - [x] <!-- unpend-branch=renovate/pnpm -->tools: update pnpm to v12.23.0")),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"tools: update pnpm to v12.23.0"},
+		},
+		{
+			// An update of more than one package names them after its title
+			name:     "packages",
+			body:     dashboard(t, pendingSection(" - [ ] <!-- unpend-branch=renovate/lucide-monorepo -->[tools: update lucide monorepo to v1.81.0](../pull/9) (`lucide`, `lucide-static`)")),
+			branches: []string{"renovate/lucide-monorepo"},
+			text:     []string{"tools: update lucide monorepo to v1.81.0 (`lucide`, `lucide-static`)"},
+		},
+		{
+			// Renovate ends a security update's title with [SECURITY], a
+			// bracket inside the link's text, which is shown whole
+			name: "bracket-in-title",
+			body: dashboard(t, pendingSection(" - [ ] <!-- unpend-branch=renovate/npm-axios-1.x -->"+
+				"[fix(deps): update dependency axios to v1.13.5 [SECURITY]](../pull/31) (`axios`, `axios-retry`)")),
+			branches: []string{"renovate/npm-axios-1.x"},
+			text:     []string{"fix(deps): update dependency axios to v1.13.5 [SECURITY] (`axios`, `axios-retry`)"},
+		},
+		{
+			// A line with nothing after its comment is named by its branch
+			name:     "no-title",
+			body:     dashboard(t, pendingSection(" - [ ] <!-- unpend-branch=renovate/pnpm -->")),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"renovate/pnpm"},
+		},
+		{
+			name:     "listed-twice",
+			body:     dashboard(t, pendingSection(pnpm)+scheduleSection(" - [ ] <!-- unschedule-branch=renovate/pnpm -->tools: update pnpm to v12.23.0")),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"tools: update pnpm to v12.23.0"},
+		},
+		{
+			// The section ends at the next heading or rule: what follows is
+			// Renovate's warnings, a footer, or another section's list
+			name:     "ends-at-a-rule",
+			body:     dashboard(t, pendingSection(pnpm)+"---\n\nThe footer\n\n - a footer's list\n\n"),
+			branches: []string{"renovate/pnpm"},
+			text:     []string{"tools: update pnpm to v12.23.0"},
+		},
+		{
+			name:       "unreadable",
+			body:       dashboard(t, pendingSection(pnpm, " - [ ] tools: update stylelint")),
+			branches:   []string{"renovate/pnpm"},
+			text:       []string{"tools: update pnpm to v12.23.0"},
+			unreadable: []string{"- [ ] tools: update stylelint"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			branches, text, unreadable := stall.PendingUpdates(tt.body)
+			if !slices.Equal(branches, tt.branches) {
+				t.Errorf("branches = %q\nwant       %q", branches, tt.branches)
+			}
+			if !slices.Equal(text, tt.text) {
+				t.Errorf("text = %q\nwant   %q", text, tt.text)
+			}
+			if !slices.Equal(unreadable, tt.unreadable) {
+				t.Errorf("unreadable = %q\nwant         %q", unreadable, tt.unreadable)
+			}
+		})
+	}
+}
+
+// Workflow IDs: the build's, a docs workflow's, and stall's and Renovate's,
+// whose runs flaky passes over.
+const (
+	buildID int64 = iota + 1
+	docsID
+	stallID
+	renovateID
+)
+
+// workflowIDs are the IDs of config's stall and Renovate workflows, by
+// file.
+var workflowIDs = map[string]int64{"stall.yml": stallID, "renovate.yml": renovateID}
+
+// flakyRun is a finished run of the build workflow, numbered id, of commit
+// sha, created at created, with its latest attempt and its conclusion.
+func flakyRun(id int64, sha string, created time.Time, attempt int, conclusion string) stall.Run {
+	return stall.Run{
+		ID: id, HeadSHA: sha, Workflow: "build", WorkflowID: buildID, Event: "pull_request", Attempt: attempt,
+		Created: created, Completed: true, Conclusion: conclusion,
+		URL: fmt.Sprintf("https://github.com/divbast/librespeed-oci-image/actions/runs/%d", id),
+	}
+}
+
+// job is a job named name that ended as conclusion at completed.
+func job(name, conclusion string, completed time.Time) stall.Job {
+	return stall.Job{Name: name, Conclusion: conclusion, Completed: completed}
+}
+
+// byAttempt is a run's jobs, by attempt, from the first.
+func byAttempt(jobs ...[]stall.Job) map[int][]stall.Job {
+	m := make(map[int][]stall.Job, len(jobs))
+	for i, j := range jobs {
+		m[i+1] = j
+	}
+	return m
+}
+
+// lastStall is when the stall workflow last ran before epoch, so the window
+// starts there, and runs are listed from a day before it.
+var lastStall = ago(20 * time.Hour)
+
+// onRuns is a source that lists runs, each one's jobs by attempt in jobs,
+// with the stall workflow last run at lastStall.
+func onRuns(jobs map[int64]map[int][]stall.Job, runs ...stall.Run) *source {
+	if jobs == nil {
+		jobs = map[int64]map[int][]stall.Job{}
+	}
+	return &source{finished: runs, attempts: jobs, previous: lastStall, workflowIDs: workflowIDs}
+}
+
+// flakyHeadline is the headline of a flaky stall, and notFlaky the passing
+// one, both with the window from lastStall.
+const (
+	flakyHeadline = "Passed and failed on the same commit since 1999-12-31T04:00:00Z:"
+	notFlaky      = "no job passed and failed on the same commit since 1999-12-31T04:00:00Z"
+)
+
+func flakyWith(t *testing.T, s *source) stall.Result {
+	t.Helper()
+	res, err := stall.Flaky(t.Context(), s, &config)
+	if err != nil {
+		t.Fatalf("Flaky() error = %v", err)
+	}
+	return res
+}
+
+// TestFlakyNone reads runs that all passed, or all failed, or failed on one
+// commit and passed on another: nothing passed and failed on one commit.
+func TestFlakyNone(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		jobs map[int64]map[int][]stall.Job
+		runs []stall.Run
+	}{
+		{
+			name: "all-passed",
+			runs: []stall.Run{flakyRun(2, built, ago(2*time.Hour), 1, "success"), flakyRun(1, built, ago(3*time.Hour), 1, "success")},
+		},
+		{
+			name: "all-failed",
+			jobs: map[int64]map[int][]stall.Job{
+				2: byAttempt([]stall.Job{job("test (amd64)", "failure", ago(time.Hour)), job("test (arm64)", "failure", ago(time.Hour)), job("required", "failure", ago(time.Hour))}),
+				1: byAttempt([]stall.Job{job("test (amd64)", "failure", ago(2*time.Hour)), job("test (arm64)", "failure", ago(2*time.Hour)), job("required", "failure", ago(2*time.Hour))}),
+			},
+			runs: []stall.Run{flakyRun(2, built, ago(2*time.Hour), 1, "failure"), flakyRun(1, built, ago(3*time.Hour), 1, "failure")},
+		},
+		{
+			// Failed on one commit and passed on the next
+			name: "other-commits",
+			jobs: map[int64]map[int][]stall.Job{1: byAttempt([]stall.Job{job("build", "failure", ago(2*time.Hour))})},
+			runs: []stall.Run{flakyRun(2, head, ago(2*time.Hour), 1, "success"), flakyRun(1, built, ago(3*time.Hour), 1, "failure")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				checkResult(t, flakyWith(t, onRuns(tt.jobs, tt.runs...)), stall.Result{Headline: notFlaky})
+			})
+		})
+	}
+}
+
+// TestFlakyMatrixCell reads one run in which one cell of a matrix job
+// failed and the other three passed: flaky, naming the cell.
+func TestFlakyMatrixCell(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		at := ago(time.Hour)
+		src := onRuns(map[int64]map[int][]stall.Job{1: byAttempt([]stall.Job{
+			job("check / test (amd64, docker)", "failure", at),
+			job("check / test (amd64, podman)", "success", at),
+			job("check / test (arm64, docker)", "success", at),
+			job("check / test (arm64, podman)", "success", at),
+			job("check / lint", "success", at),
+			job("required", "failure", at),
+		})}, flakyRun(1, built, ago(2*time.Hour), 1, "failure"))
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: flakyHeadline, Details: []string{
+			"build / check / test on 3333333: failed in (amd64, docker), passed in (amd64, podman), (arm64, docker), (arm64, podman)",
+		}})
+	})
+}
+
+// TestFlakyRerun reads one commit in two runs, the first failing and the
+// second passing: flaky, naming each run.
+func TestFlakyRerun(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		first  []stall.Job
+		second []stall.Job
+		want   string
+	}{
+		{
+			name:   "one-job",
+			first:  []stall.Job{job("build", "failure", ago(3*time.Hour))},
+			second: []stall.Job{job("build", "success", ago(time.Hour))},
+			want:   "build / build on 3333333: failed in run 1, passed in run 2",
+		},
+		{
+			name:   "matrix",
+			first:  []stall.Job{job("test (amd64)", "failure", ago(3*time.Hour)), job("test (arm64)", "failure", ago(3*time.Hour))},
+			second: []stall.Job{job("test (amd64)", "success", ago(time.Hour)), job("test (arm64)", "failure", ago(time.Hour))},
+			// arm64 failing in both is no flake of its own: only the same
+			// cell pairs across runs
+			want: "build / test on 3333333: failed in (amd64) of run 1, passed in (amd64) of run 2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				src := onRuns(map[int64]map[int][]stall.Job{1: byAttempt(tt.first), 2: byAttempt(tt.second)},
+					flakyRun(2, built, ago(2*time.Hour), 1, "success"), flakyRun(1, built, ago(4*time.Hour), 1, "failure"))
+				checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: flakyHeadline, Details: []string{tt.want}})
+			})
+		})
+	}
+}
+
+// TestFlakyRerunAttempt reads one run re-run: an earlier attempt failed and
+// the latest passed, which the latest's jobs alone do not show. A re-run of
+// the failed jobs lists the others again in the next attempt, with the
+// times and conclusions they had, and those are not named twice.
+func TestFlakyRerunAttempt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		attempts [][]stall.Job
+		want     string
+	}{
+		{
+			name: "one-job",
+			attempts: [][]stall.Job{
+				{job("lint / lint", "failure", ago(3*time.Hour)), job("build", "success", ago(3*time.Hour))},
+				{job("lint / lint", "success", ago(time.Hour)), job("build", "success", ago(3*time.Hour))},
+			},
+			want: "build / lint / lint on 3333333: failed in run 7 attempt 1, passed in run 7 attempt 2",
+		},
+		{
+			// ci's own run 43785315672: its second attempt re-ran the one
+			// failed cell, and lists the other three again
+			name: "matrix-rerun-failed-jobs",
+			attempts: [][]stall.Job{
+				{
+					job("test (amd64, docker)", "failure", ago(170*time.Minute)),
+					job("test (amd64, podman)", "success", ago(171*time.Minute)),
+					job("test (arm64, docker)", "success", ago(171*time.Minute)),
+					job("test (arm64, podman)", "success", ago(172*time.Minute)),
+					job("required", "failure", ago(169*time.Minute)),
+				},
+				{
+					job("test (amd64, docker)", "success", ago(time.Hour)),
+					job("test (amd64, podman)", "success", ago(171*time.Minute)),
+					job("test (arm64, docker)", "success", ago(171*time.Minute)),
+					job("test (arm64, podman)", "success", ago(172*time.Minute)),
+					job("required", "success", ago(59*time.Minute)),
+				},
+			},
+			want: "build / test on 3333333: failed in (amd64, docker) of attempt 1, passed in (amd64, podman) of attempt 1, " +
+				"(arm64, docker) of attempt 1, (arm64, podman) of attempt 1, (amd64, docker) of attempt 2",
+		},
+		{
+			name: "three-attempts",
+			attempts: [][]stall.Job{
+				{job("build", "failure", ago(3*time.Hour))},
+				{job("build", "failure", ago(2*time.Hour))},
+				{job("build", "success", ago(time.Hour))},
+			},
+			want: "build / build on 3333333: failed in run 7 attempt 1, run 7 attempt 2, passed in run 7 attempt 3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				src := onRuns(map[int64]map[int][]stall.Job{7: byAttempt(tt.attempts...)},
+					flakyRun(7, built, ago(4*time.Hour), len(tt.attempts), "success"))
+				checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: flakyHeadline, Details: []string{tt.want}})
+			})
+		})
+	}
+}
+
+// TestFlakyIgnoresCancelled reads a failed job beside its cancelled and
+// skipped siblings, and beside the same job cancelled in another run:
+// neither passed, so nothing is flaky.
+func TestFlakyIgnoresCancelled(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		src := onRuns(map[int64]map[int][]stall.Job{
+			1: byAttempt([]stall.Job{
+				job("test (amd64)", "failure", ago(3*time.Hour)),
+				job("test (arm64)", "cancelled", ago(3*time.Hour)),
+				job("publish", "skipped", ago(3*time.Hour)),
+			}),
+			2: byAttempt([]stall.Job{
+				job("test (amd64)", "cancelled", ago(time.Hour)),
+				job("test (arm64)", "cancelled", ago(time.Hour)),
+				job("publish", "skipped", ago(time.Hour)),
+			}),
+		}, flakyRun(2, built, ago(2*time.Hour), 1, "cancelled"), flakyRun(1, built, ago(4*time.Hour), 1, "failure"))
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: notFlaky})
+	})
+}
+
+// TestFlakyIgnoresRequired reads the required job failing in one run and
+// passing in the next, with every other job passing in both: required
+// fails whenever a job it needs does, so it is no flake of its own.
+func TestFlakyIgnoresRequired(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		src := onRuns(map[int64]map[int][]stall.Job{
+			1: byAttempt([]stall.Job{job("lint / lint", "success", ago(3*time.Hour)), job("required", "failure", ago(3*time.Hour))}),
+			2: byAttempt([]stall.Job{job("lint / lint", "success", ago(time.Hour)), job("required", "success", ago(time.Hour))}),
+		}, flakyRun(2, built, ago(2*time.Hour), 1, "success"), flakyRun(1, built, ago(4*time.Hour), 1, "failure"))
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: notFlaky})
+	})
+}
+
+// TestFlakySkipsStallAndRenovate reads runs of the stall and Renovate
+// workflows, each failing once and passing once on main: both run on an
+// unmoved main every day, and a red stall goes green once fixed, so their
+// runs are passed over, and their jobs never read.
+func TestFlakySkipsStallAndRenovate(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		of := func(r stall.Run, workflow string, id int64) stall.Run {
+			r.Workflow, r.WorkflowID, r.Event = workflow, id, "schedule"
+			return r
+		}
+		src := onRuns(nil,
+			of(flakyRun(4, head, ago(time.Hour), 1, "success"), "renovate", renovateID),
+			of(flakyRun(3, head, ago(2*time.Hour), 2, "failure"), "renovate", renovateID),
+			of(flakyRun(2, head, ago(3*time.Hour), 1, "success"), "stall", stallID),
+			of(flakyRun(1, head, ago(30*time.Hour), 1, "failure"), "stall", stallID),
+		)
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: notFlaky})
+		if len(src.read) > 0 {
+			t.Errorf("read the jobs of %q, want none", src.read)
+		}
+	})
+}
+
+// TestFlakyFirstRun reads with no stall run before this one, so the window
+// is the last 24 hours, and runs are listed from a day before that: a pair
+// that finished within the 24 hours is flaky, and one before is not.
+func TestFlakyFirstRun(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		src := onRuns(map[int64]map[int][]stall.Job{
+			4: byAttempt([]stall.Job{job("build", "success", ago(21*time.Hour))}),
+			3: byAttempt([]stall.Job{job("build", "failure", ago(22*time.Hour))}),
+			2: byAttempt([]stall.Job{job("build", "success", ago(26*time.Hour))}),
+			1: byAttempt([]stall.Job{job("build", "failure", ago(29*time.Hour))}),
+		},
+			flakyRun(4, built, ago(22*time.Hour), 1, "success"),
+			flakyRun(3, built, ago(23*time.Hour), 1, "failure"),
+			flakyRun(2, older, ago(27*time.Hour), 1, "success"),
+			flakyRun(1, older, ago(30*time.Hour), 1, "failure"),
+		)
+		src.previous = time.Time{}
+		checkResult(t, flakyWith(t, src), stall.Result{
+			Stalled:  true,
+			Headline: "Passed and failed on the same commit since 1999-12-31T00:00:00Z:",
+			Details:  []string{"build / build on 3333333: failed in run 3, passed in run 4"},
+		})
+		if want := ago(48 * time.Hour); !src.listedSince.Equal(want) {
+			t.Errorf("RunsSince asked since %v, want %v", src.listedSince, want)
+		}
+	})
+}
+
+// TestFlakyStraddlesWindow reads a failure that finished before the window
+// and a pass on the same commit inside it, in two runs or in two attempts
+// of one created before the window: flaky, reported on the day it ended.
+func TestFlakyStraddlesWindow(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		jobs map[int64]map[int][]stall.Job
+		runs []stall.Run
+		want string
+	}{
+		{
+			name: "two-runs",
+			jobs: map[int64]map[int][]stall.Job{
+				2: byAttempt([]stall.Job{job("build", "success", ago(time.Hour))}),
+				1: byAttempt([]stall.Job{job("build", "failure", ago(29*time.Hour))}),
+			},
+			runs: []stall.Run{flakyRun(2, built, ago(2*time.Hour), 1, "success"), flakyRun(1, built, ago(30*time.Hour), 1, "failure")},
+			want: "build / build on 3333333: failed in run 1, passed in run 2",
+		},
+		{
+			name: "re-run",
+			jobs: map[int64]map[int][]stall.Job{7: byAttempt(
+				[]stall.Job{job("build", "failure", ago(29*time.Hour))},
+				[]stall.Job{job("build", "success", ago(time.Hour))},
+			)},
+			runs: []stall.Run{flakyRun(7, built, ago(30*time.Hour), 2, "success")},
+			want: "build / build on 3333333: failed in run 7 attempt 1, passed in run 7 attempt 2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				src := onRuns(tt.jobs, tt.runs...)
+				checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: flakyHeadline, Details: []string{tt.want}})
+				if want := lastStall.Add(-day); !src.listedSince.Equal(want) {
+					t.Errorf("RunsSince asked since %v, want %v", src.listedSince, want)
+				}
+			})
+		})
+	}
+}
+
+// TestFlakyBeforeWindow reads a failure and a pass on one commit that both
+// finished before the window: the stall run before this one reported it,
+// so this one does not.
+func TestFlakyBeforeWindow(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		jobs map[int64]map[int][]stall.Job
+		runs []stall.Run
+	}{
+		{
+			name: "two-runs",
+			jobs: map[int64]map[int][]stall.Job{
+				2: byAttempt([]stall.Job{job("build", "success", ago(25*time.Hour))}),
+				1: byAttempt([]stall.Job{job("build", "failure", ago(29*time.Hour))}),
+			},
+			runs: []stall.Run{flakyRun(2, built, ago(26*time.Hour), 1, "success"), flakyRun(1, built, ago(30*time.Hour), 1, "failure")},
+		},
+		{
+			name: "re-run",
+			jobs: map[int64]map[int][]stall.Job{7: byAttempt(
+				[]stall.Job{job("build", "failure", ago(29*time.Hour))},
+				[]stall.Job{job("build", "success", ago(21*time.Hour))},
+			)},
+			runs: []stall.Run{flakyRun(7, built, ago(30*time.Hour), 2, "success")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				checkResult(t, flakyWith(t, onRuns(tt.jobs, tt.runs...)), stall.Result{Headline: notFlaky})
+			})
+		})
+	}
+}
+
+// TestFlakyReadsOnlyCandidates checks that jobs are read only for runs that
+// could hold a flake: each run that failed, each run re-run, and each run
+// of the same commit, workflow and event as one of those. A commit whose
+// runs all passed at their first attempt has no failure, so its jobs are
+// never read, and neither are a run of another workflow, or one another
+// event started, on a commit with a failure.
+func TestFlakyReadsOnlyCandidates(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		docs := flakyRun(4, built, ago(2*time.Hour), 1, "success")
+		docs.Workflow, docs.WorkflowID = "docs", docsID
+		push := flakyRun(7, built, ago(90*time.Minute), 1, "success")
+		push.Event = "push"
+		src := onRuns(map[int64]map[int][]stall.Job{
+			2: byAttempt([]stall.Job{job("build", "failure", ago(3*time.Hour))}),
+			3: byAttempt([]stall.Job{job("build", "success", ago(2*time.Hour))}),
+			5: byAttempt([]stall.Job{job("build", "success", ago(4*time.Hour))}, []stall.Job{job("build", "success", ago(3*time.Hour))}),
+		},
+			flakyRun(6, head, ago(time.Hour), 1, "success"),
+			push,
+			flakyRun(5, older, ago(5*time.Hour), 2, "success"),
+			docs,
+			flakyRun(3, built, ago(3*time.Hour), 1, "success"),
+			flakyRun(2, built, ago(4*time.Hour), 1, "failure"),
+			flakyRun(1, head, ago(6*time.Hour), 1, "success"),
+		)
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: flakyHeadline, Details: []string{
+			"build / build on 3333333: failed in run 2, passed in run 3",
+		}})
+		if got, want := slices.Sorted(slices.Values(src.read)), []string{"2/1", "3/1", "5/1", "5/2"}; !slices.Equal(got, want) {
+			t.Errorf("read the jobs of %q, want %q", got, want)
+		}
+	})
+}
+
+// TestFlakyNoSuchWorkflow checks that a stall or Renovate workflow file
+// with no workflow fails the check, naming the file, rather than pass none
+// of its runs over.
+func TestFlakyNoSuchWorkflow(t *testing.T) {
+	t.Parallel()
+
+	for _, file := range []string{"stall.yml", "renovate.yml"} {
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				src := onRuns(nil, flakyRun(1, built, ago(time.Hour), 1, "success"))
+				src.workflowIDs = maps.Clone(workflowIDs)
+				delete(src.workflowIDs, file)
+				got, err := stall.Flaky(t.Context(), src, &config)
+				if err == nil || !strings.Contains(err.Error(), file) {
+					t.Fatalf("Flaky() = %+v, %v; want an error naming %s", got, err, file)
+				}
+			})
+		})
+	}
+}
+
+// TestFlakyNoCompletion checks that a job that failed or passed with no
+// time it finished fails the check, rather than be placed in or out of the
+// window by a guess.
+func TestFlakyNoCompletion(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		src := onRuns(map[int64]map[int][]stall.Job{1: byAttempt([]stall.Job{job("build", "failure", time.Time{})})},
+			flakyRun(1, built, ago(time.Hour), 1, "failure"))
+		got, err := stall.Flaky(t.Context(), src, &config)
+		if err == nil || !strings.Contains(err.Error(), "build") || !strings.Contains(err.Error(), src.finished[0].URL) {
+			t.Fatalf("Flaky() = %+v, %v; want an error naming the job and its run", got, err)
+		}
+	})
+}
+
+// TestFlakyOneValuePattern reads attempts in which every failing cell
+// shares a matrix value that no passing cell has: one engine or one
+// architecture failing, which is no flake, nor is the same failing again
+// when re-run.
+func TestFlakyOneValuePattern(t *testing.T) {
+	t.Parallel()
+
+	at := ago(time.Hour)
+	tests := []struct {
+		name     string
+		attempts [][]stall.Job
+	}{
+		{
+			name: "engine",
+			attempts: [][]stall.Job{{
+				job("test (amd64, podman)", "failure", at), job("test (arm64, podman)", "failure", at),
+				job("test (amd64, docker)", "success", at), job("test (arm64, docker)", "success", at),
+			}},
+		},
+		{
+			name:     "arch",
+			attempts: [][]stall.Job{{job("build (arm64)", "failure", at), job("build (amd64)", "success", at)}},
+		},
+		{
+			name: "re-run-fails-again",
+			attempts: [][]stall.Job{
+				{
+					job("test (amd64, podman)", "failure", ago(3*time.Hour)), job("test (arm64, podman)", "failure", ago(3*time.Hour)),
+					job("test (amd64, docker)", "success", ago(3*time.Hour)), job("test (arm64, docker)", "success", ago(3*time.Hour)),
+				},
+				{
+					job("test (amd64, podman)", "failure", at), job("test (arm64, podman)", "failure", at),
+					job("test (amd64, docker)", "success", ago(3*time.Hour)), job("test (arm64, docker)", "success", ago(3*time.Hour)),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				src := onRuns(map[int64]map[int][]stall.Job{1: byAttempt(tt.attempts...)},
+					flakyRun(1, built, ago(4*time.Hour), len(tt.attempts), "failure"))
+				checkResult(t, flakyWith(t, src), stall.Result{Headline: notFlaky})
+			})
+		})
+	}
+}
+
+// TestFlakySingleCellStillCounts reads one odd cell failing: each value of
+// it, arm64 and podman, is in a cell that passed, so no one engine or
+// architecture explains it, and it is a flake.
+func TestFlakySingleCellStillCounts(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		at := ago(time.Hour)
+		src := onRuns(map[int64]map[int][]stall.Job{1: byAttempt([]stall.Job{
+			job("test (arm64, podman)", "failure", at),
+			job("test (arm64, docker)", "success", at),
+			job("test (amd64, podman)", "success", at),
+		})}, flakyRun(1, built, ago(2*time.Hour), 1, "failure"))
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: flakyHeadline, Details: []string{
+			"build / test on 3333333: failed in (arm64, podman), passed in (amd64, podman), (arm64, docker)",
+		}})
+	})
+}
+
+// TestFlakyOneValueButRerunPasses reads podman's cells alone failing, then
+// passing when the failed jobs are re-run: the same cells failed and
+// passed, so it is a flake, though the first attempt alone was not.
+func TestFlakyOneValueButRerunPasses(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		first, rerun := ago(3*time.Hour), ago(time.Hour)
+		docker := []stall.Job{job("test (amd64, docker)", "success", first), job("test (arm64, docker)", "success", first)}
+		src := onRuns(map[int64]map[int][]stall.Job{7: byAttempt(
+			append([]stall.Job{job("test (amd64, podman)", "failure", first), job("test (arm64, podman)", "failure", first)}, docker...),
+			append([]stall.Job{job("test (amd64, podman)", "success", rerun), job("test (arm64, podman)", "success", rerun)}, docker...),
+		)}, flakyRun(7, built, ago(4*time.Hour), 2, "success"))
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: flakyHeadline, Details: []string{
+			"build / test on 3333333: failed in (amd64, podman) of attempt 1, (arm64, podman) of attempt 1, " +
+				"passed in (amd64, podman) of attempt 2, (arm64, podman) of attempt 2",
+		}})
+	})
+}
+
+// TestFlakyAcrossEventsNotPaired reads a push run that passed and the daily
+// slot that failed on the same commit: different events are not compared,
+// since the slot's own red run reports what changed upstream.
+func TestFlakyAcrossEventsNotPaired(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		push := flakyRun(1, built, ago(3*time.Hour), 2, "success")
+		push.Event = "push"
+		slot := flakyRun(2, built, ago(2*time.Hour), 1, "failure")
+		slot.Event = "schedule"
+		src := onRuns(map[int64]map[int][]stall.Job{
+			1: byAttempt([]stall.Job{job("build", "success", ago(170*time.Minute))}, []stall.Job{job("build", "success", ago(150*time.Minute))}),
+			2: byAttempt([]stall.Job{job("build", "failure", ago(time.Hour))}),
+		}, slot, push)
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: notFlaky})
+		if got, want := slices.Sorted(slices.Values(src.read)), []string{"1/1", "1/2", "2/1"}; !slices.Equal(got, want) {
+			t.Errorf("read the jobs of %q, want %q", got, want)
+		}
+	})
+}
+
+// slotRun is a daily slot of main, numbered id: a finished scheduled run of
+// the build workflow, created at created, that last changed at updated.
+func slotRun(id int64, created time.Time, attempt int, conclusion string, updated time.Time) stall.Run {
+	r := flakyRun(id, head, created, attempt, conclusion)
+	r.Event, r.Updated = "schedule", updated
+	return r
+}
+
+// dayOne is a source on which the slot of main failed and then passed when
+// re-run, the day before epoch, with the stall run before epoch's a day
+// earlier: the first of two stall runs, at epoch.
+func dayOne() *source {
+	src := onRuns(map[int64]map[int][]stall.Job{
+		1: byAttempt([]stall.Job{job("build", "failure", ago(10*time.Hour))}, []stall.Job{job("build", "success", ago(8*time.Hour))}),
+	}, slotRun(1, ago(11*time.Hour), 2, "success", ago(8*time.Hour)))
+	src.previous, src.current = ago(day), epoch
+	return src
+}
+
+// nextDay moves the bubble's clock and src on to the stall run a day after
+// epoch, with run, the next slot, and its jobs.
+func nextDay(src *source, run *stall.Run, jobs ...stall.Job) {
+	time.Sleep(day)
+	src.attempts[run.ID] = byAttempt(jobs)
+	src.finished = append([]stall.Run{*run}, src.finished...)
+	src.previous, src.current = epoch, epoch.Add(day)
+}
+
+// The headlines of the two stall runs that dayOne and nextDay make.
+const (
+	dayOneFlaky   = "Passed and failed on the same commit since 1999-12-31T00:00:00Z:"
+	nextDayFlaky  = "Passed and failed on the same commit since 2000-01-01T00:00:00Z:"
+	nextDayPassed = "no job passed and failed on the same commit since 2000-01-01T00:00:00Z"
+)
+
+// TestFlakyNextDaySlotNotRepeated reads the slot that failed and passed
+// when re-run, reported by that day's stall run, and then the next day's
+// slot of the same unmoved main, which passed: no new flake, so the next
+// stall run reports nothing.
+func TestFlakyNextDaySlotNotRepeated(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		src := dayOne()
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: dayOneFlaky, Details: []string{
+			"build / build on 2222222: failed in run 1 attempt 1, passed in run 1 attempt 2",
+		}})
+		at := epoch.Add(12 * time.Hour)
+		next := slotRun(2, epoch.Add(11*time.Hour), 1, "success", at)
+		nextDay(src, &next, job("build", "success", at))
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: nextDayPassed})
+	})
+}
+
+// TestFlakyNewFailureSameCommitReports reads the same, but the next day's
+// slot failed again where it had passed: a new flake, which the next stall
+// run reports.
+func TestFlakyNewFailureSameCommitReports(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		src := dayOne()
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: dayOneFlaky, Details: []string{
+			"build / build on 2222222: failed in run 1 attempt 1, passed in run 1 attempt 2",
+		}})
+		at := epoch.Add(12 * time.Hour)
+		next := slotRun(2, epoch.Add(11*time.Hour), 1, "failure", at)
+		nextDay(src, &next, job("build", "failure", at))
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: nextDayFlaky, Details: []string{
+			"build / build on 2222222: failed in run 1 attempt 1, run 2, passed in run 1 attempt 2",
+		}})
+	})
+}
+
+// TestFlakyRunStillGoingAtListing reads a run whose flaky cells finished
+// before a stall run listed the runs, while the run itself, its publish
+// job, was still going, so that stall run did not list it. Its latest
+// attempt's jobs count from when the run finished, so the next stall run
+// reports it.
+func TestFlakyRunStillGoingAtListing(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		finished := epoch.Add(30 * time.Minute)
+		run := flakyRun(3, built, ago(2*time.Hour), 1, "failure")
+		run.Updated = finished
+		src := onRuns(map[int64]map[int][]stall.Job{3: byAttempt([]stall.Job{
+			job("test (amd64, docker)", "failure", ago(90*time.Minute)),
+			job("test (amd64, podman)", "success", ago(80*time.Minute)),
+			job("test (arm64, docker)", "success", ago(80*time.Minute)),
+			job("publish", "skipped", finished),
+		})}, run)
+		src.previous, src.current = ago(day), epoch
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: "no job passed and failed on the same commit since 1999-12-31T00:00:00Z"})
+
+		time.Sleep(day)
+		src.previous, src.current = epoch, epoch.Add(day)
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: nextDayFlaky, Details: []string{
+			"build / test on 3333333: failed in (amd64, docker), passed in (amd64, podman), (arm64, docker)",
+		}})
+	})
+}
+
+// TestFlakyWindowEndsAtThisRun reads a flake that ended after this stall
+// run was created but before it listed the runs: the window ends at its
+// creation, so this run leaves it to the next, which reports it, once.
+func TestFlakyWindowEndsAtThisRun(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		failed := flakyRun(1, built, ago(10*time.Minute), 1, "failure")
+		failed.Updated = ago(4 * time.Minute)
+		passed := flakyRun(2, built, ago(3*time.Minute), 1, "success")
+		passed.Updated = ago(2 * time.Minute)
+		src := onRuns(map[int64]map[int][]stall.Job{
+			1: byAttempt([]stall.Job{job("build", "failure", ago(4*time.Minute))}),
+			2: byAttempt([]stall.Job{job("build", "success", ago(2*time.Minute))}),
+		}, passed, failed)
+		created := ago(5 * time.Minute)
+		src.previous, src.current = ago(day), created
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: "no job passed and failed on the same commit since 1999-12-31T00:00:00Z"})
+
+		time.Sleep(day)
+		src.previous, src.current = created, created.Add(day)
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: "Passed and failed on the same commit since 1999-12-31T23:55:00Z:", Details: []string{
+			"build / build on 3333333: failed in run 1, passed in run 2",
+		}})
+	})
+}
+
+// TestFlakyGapAtWindowEnd reads flakes with one job inside the window and
+// one in the gap between this stall run's creation, where the window ends,
+// and its listing of the runs: a failure inside and a pass in the gap, a
+// pass inside and a failure in the gap, and a re-run whose second attempt
+// passed in the gap. A job in the gap is the next run's, so this run
+// reports nothing, and the next reports each flake, once.
+func TestFlakyGapAtWindowEnd(t *testing.T) {
+	t.Parallel()
+
+	inside, gap := ago(30*time.Minute), ago(2*time.Minute)
+	twoRuns := func(first, second string) ([]stall.Run, map[int64]map[int][]stall.Job) {
+		r1 := flakyRun(1, built, ago(40*time.Minute), 1, first)
+		r1.Updated = inside
+		r2 := flakyRun(2, built, ago(10*time.Minute), 1, second)
+		r2.Updated = gap
+		return []stall.Run{r2, r1}, map[int64]map[int][]stall.Job{
+			1: byAttempt([]stall.Job{job("build", first, inside)}),
+			2: byAttempt([]stall.Job{job("build", second, gap)}),
+		}
+	}
+	rerun := flakyRun(7, built, ago(time.Hour), 2, "success")
+	rerun.Updated = gap
+
+	tests := []struct {
+		name string
+		runs []stall.Run
+		jobs map[int64]map[int][]stall.Job
+		want string
+	}{
+		{name: "failure-inside-pass-in-gap", want: "build / build on 3333333: failed in run 1, passed in run 2"},
+		{name: "pass-inside-failure-in-gap", want: "build / build on 3333333: failed in run 2, passed in run 1"},
+		{
+			name: "rerun-in-gap",
+			runs: []stall.Run{rerun},
+			jobs: map[int64]map[int][]stall.Job{7: byAttempt(
+				[]stall.Job{job("build", "failure", inside)},
+				[]stall.Job{job("build", "success", gap)},
+			)},
+			want: "build / build on 3333333: failed in run 7 attempt 1, passed in run 7 attempt 2",
+		},
+	}
+	tests[0].runs, tests[0].jobs = twoRuns("failure", "success")
+	tests[1].runs, tests[1].jobs = twoRuns("success", "failure")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				src := onRuns(tt.jobs, tt.runs...)
+				created := ago(5 * time.Minute)
+				src.previous, src.current = ago(day), created
+				checkResult(t, flakyWith(t, src), stall.Result{Headline: "no job passed and failed on the same commit since 1999-12-31T00:00:00Z"})
+
+				time.Sleep(day)
+				src.previous, src.current = created, created.Add(day)
+				checkResult(t, flakyWith(t, src), stall.Result{
+					Stalled: true, Headline: "Passed and failed on the same commit since 1999-12-31T23:55:00Z:", Details: []string{tt.want},
+				})
+			})
+		})
+	}
+}
+
+// TestFlakyEarlierAttemptStillGoingAtListing reads a run whose flaky cells
+// finished before one stall run listed the runs, while a long job of the
+// same attempt was still going, so that stall run did not list it; the
+// failed cell was then re-run, and passed, before the next stall run. The
+// first attempt's jobs count from when its last job finished, so the next
+// stall run reports its flake.
+func TestFlakyEarlierAttemptStillGoingAtListing(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		cells, scanned, rerun := ago(90*time.Minute), epoch.Add(30*time.Minute), epoch.Add(2*time.Hour)
+		run := flakyRun(3, built, ago(2*time.Hour), 2, "success")
+		run.Updated = rerun
+		passing := []stall.Job{job("test (amd64, docker)", "success", cells), job("test (arm64, podman)", "success", cells), job("scan", "success", scanned)}
+		src := onRuns(map[int64]map[int][]stall.Job{3: byAttempt(
+			append([]stall.Job{job("test (arm64, docker)", "failure", cells)}, passing...),
+			append([]stall.Job{job("test (arm64, docker)", "success", rerun)}, passing...),
+		)}, run)
+		src.previous, src.current = ago(day), epoch
+		checkResult(t, flakyWith(t, src), stall.Result{Headline: "no job passed and failed on the same commit since 1999-12-31T00:00:00Z"})
+
+		time.Sleep(day)
+		src.previous, src.current = epoch, epoch.Add(day)
+		checkResult(t, flakyWith(t, src), stall.Result{Stalled: true, Headline: nextDayFlaky, Details: []string{
+			"build / test on 3333333: failed in (arm64, docker) of attempt 1, passed in (amd64, docker) of attempt 1, " +
+				"(arm64, podman) of attempt 1, (arm64, docker) of attempt 2",
+		}})
+	})
 }

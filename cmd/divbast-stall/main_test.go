@@ -73,6 +73,10 @@ const (
 		`> [!WARNING]\n> Renovate failed to look up the following dependencies: ` +
 		"`Failed to look up github-tags package anchore/grype: no-result`" + `.\n> \n> Files affected: ` + "`mise.toml`" + `\n"`
 	cleanBody = `"## Open\n\nNothing.\n"`
+	// pendingBody lists stylelint's update as waiting on its status
+	// checks.
+	pendingBody = `"## Pending Status Checks\n\nThe following updates await pending status checks. To force their creation now, click on a checkbox below.\n\n` +
+		` - [ ] <!-- unpend-branch=renovate/stylelint-18.x -->tools: update dependency stylelint to v18.1.0\n\n## Detected Dependencies\n"`
 )
 
 // dashboardOut is the open Dependency Dashboard, #5, with body.
@@ -84,14 +88,55 @@ func dashboardOut(body string) execx.Result {
 // before the bubble's clock with first as its body, and edited at edited
 // to body: its edits newest first, the oldest its creation.
 func historyOut(edited, body, first string) execx.Result {
-	return ok(`{"data":{"repository":{"issue":{"createdAt":"1999-12-30T23:00:00Z","body":` + body + `,"userContentEdits":{"totalCount":2,` +
+	return editsOut("1999-12-30T23:00:00Z", edited, body, first)
+}
+
+// editsOut is historyOut for a Dependency Dashboard made at created.
+func editsOut(created, edited, body, first string) execx.Result {
+	return ok(`{"data":{"repository":{"issue":{"createdAt":"` + created + `","body":` + body + `,"userContentEdits":{"totalCount":2,` +
 		`"pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29yOjI="},` +
-		`"nodes":[{"editedAt":"` + edited + `","diff":` + body + `},{"editedAt":"1999-12-30T23:00:00Z","diff":` + first + `}]}}}}}`)
+		`"nodes":[{"editedAt":"` + edited + `","diff":` + body + `},{"editedAt":"` + created + `","diff":` + first + `}]}}}}}`)
 }
 
 func workflowAPI(workflow string) []string {
 	return []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/actions/workflows/" + workflow}
 }
+
+// workflowID is the read of the ID of the workflow in file, which is id.
+func workflowID(file, id string) execx.Call {
+	return execx.Call{Argv: workflowAPI(file), Result: apiOK(`{"id":` + id + `,"path":".github/workflows/` + file + `"}`)}
+}
+
+func previousRuns(workflow string) []string {
+	return []string{"gh", "run", "list", "--repo", repo, "--workflow", workflow, "--limit", "3", "--json", "databaseId,createdAt"}
+}
+
+func runsSince(since string) []string {
+	return []string{
+		"gh", "run", "list", "--repo", repo, "--created", ">=" + since, "--status", "completed",
+		"--limit", "1000", "--json", "databaseId,headSha,workflowName,event,createdAt,url,workflowDatabaseId,attempt,conclusion,updatedAt",
+	}
+}
+
+func attemptJobs(id, attempt string) []string {
+	return []string{"gh", "run", "view", id, "--repo", repo, "--attempt", attempt, "--json", "jobs"}
+}
+
+// stallRuns are the stall workflow's newest runs: this one, run 900, made
+// at the bubble's clock, and the one before it, 18 hours earlier.
+const stallRuns = `[{"createdAt":"2000-01-01T00:00:00Z","databaseId":900},{"createdAt":"1999-12-31T06:00:00Z","databaseId":899}]`
+
+// runOf is a finished run in gh's form: its ID, attempt, conclusion,
+// creation, when it last changed, event, commit and workflow, whose ID is
+// workflowID.
+func runOf(id, attempt, conclusion, created, updated, event, sha, workflow, workflowID string) string {
+	return `{"attempt":` + attempt + `,"conclusion":"` + conclusion + `","createdAt":"` + created + `","databaseId":` + id +
+		`,"event":"` + event + `","headSha":"` + sha + `","updatedAt":"` + updated + `","url":"https://github.com/divbast/librespeed-oci-image/actions/runs/` + id +
+		`","workflowDatabaseId":` + workflowID + `,"workflowName":"` + workflow + `"}`
+}
+
+// greenRun is a build run that passed at its first attempt.
+var greenRun = runOf("4", "1", "success", "1999-12-31T08:00:00Z", "1999-12-31T08:20:00Z", "push", revision, "build", "13")
 
 // slotsSucceeded is two daily slot runs that built head and succeeded, the
 // newest twenty hours before the bubble's clock.
@@ -111,12 +156,15 @@ func apiOK(body string) execx.Result {
 // changes: a value of "" unsets the variable.
 func env(changes map[string]string) func(string) string {
 	vars := map[string]string{
-		"GH_REPO":     repo,
-		"OPEN_DAYS":   "14",
-		"STUCK_HOURS": "24",
-		"RUN_HOURS":   "24",
-		"LOST_SLOTS":  "2",
-		"PUBLISHED":   image,
+		"GH_REPO":      repo,
+		"OPEN_DAYS":    "14",
+		"STUCK_HOURS":  "24",
+		"RUN_HOURS":    "24",
+		"LOST_SLOTS":   "2",
+		"STARVED_DAYS": "7",
+		"PUBLISHED":    image,
+		// Every run of a workflow has one
+		"GITHUB_RUN_ID": "900",
 	}
 	maps.Copy(vars, changes)
 	return func(k string) string { return vars[k] }
@@ -395,6 +443,145 @@ func TestRun(t *testing.T) {
 				"  no open issue titled \"Dependency Dashboard\"; Renovate last succeeded 1999-12-31T23:00:00Z\n",
 		},
 		{
+			// Nothing waiting, so no history to read
+			name:       "starved",
+			args:       []string{"starved"},
+			calls:      []execx.Call{{Argv: issuesAPI, Result: dashboardOut(cleanBody)}},
+			wantStdout: "no update waiting more than 7 days on the Dependency Dashboard #5\n",
+		},
+		{
+			// Waiting since the dashboard was made, 9 days ago, and still
+			// after its edit 2 hours ago
+			name: "starved-stalled",
+			args: []string{"starved"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: editsOut("1999-12-23T00:00:00Z", "1999-12-31T22:00:00Z", pendingBody, pendingBody)},
+			},
+			wantCode: 1,
+			wantStdout: "Waiting on the Dependency Dashboard for more than 7 days:\n" +
+				"  tools: update dependency stylelint to v18.1.0 (since 1999-12-23T00:00:00Z)\n",
+		},
+		{
+			// Waiting only since an edit 3 days ago
+			name: "starved-young",
+			args: []string{"starved"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: editsOut("1999-12-23T00:00:00Z", "1999-12-29T00:00:00Z", pendingBody, cleanBody)},
+			},
+			wantStdout: "no update waiting more than 7 days on the Dependency Dashboard #5\n",
+		},
+		{
+			// The same 3 days, more than STARVED_DAYS allows
+			name: "starved-days",
+			args: []string{"starved"},
+			env:  map[string]string{"STARVED_DAYS": "2"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: editsOut("1999-12-23T00:00:00Z", "1999-12-29T00:00:00Z", pendingBody, cleanBody)},
+			},
+			wantCode: 1,
+			wantStdout: "Waiting on the Dependency Dashboard for more than 2 days:\n" +
+				"  tools: update dependency stylelint to v18.1.0 (since 1999-12-29T00:00:00Z)\n",
+		},
+		{
+			name: "starved-history-fails",
+			args: []string{"starved"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(pendingBody)},
+				{Argv: historyAPI, Result: execx.Result{Stderr: []byte("HTTP 502: Bad Gateway"), Code: 1}},
+			},
+			wantCode:   2,
+			wantStderr: []string{"gh api graphql", "502"},
+		},
+		{
+			// With no dashboard, whether Renovate ever succeeded decides
+			name: "starved-no-dashboard",
+			args: []string{"starved"},
+			env:  map[string]string{"RENOVATE_WORKFLOW": "self-renovate.yml"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: apiOK("[]")},
+				{Argv: successRuns("self-renovate.yml"), Result: ok(`[{"createdAt":"1999-12-31T23:00:00Z"}]`)},
+			},
+			wantCode: 1,
+			wantStdout: "No open Dependency Dashboard by divbast-renovate, so updates waiting on it cannot be seen:\n" +
+				"  no open issue titled \"Dependency Dashboard\"; Renovate last succeeded 1999-12-31T23:00:00Z\n",
+		},
+		{
+			name:       "starved-no-limit",
+			args:       []string{"starved"},
+			env:        map[string]string{"STARVED_DAYS": ""},
+			wantCode:   2,
+			wantStderr: []string{"STARVED_DAYS is not set"},
+		},
+		{
+			// Every run passed at its first attempt, so no jobs are read
+			name: "flaky",
+			args: []string{"flaky"},
+			calls: []execx.Call{
+				workflowID("stall.yml", "11"),
+				workflowID("renovate.yml", "12"),
+				{Argv: previousRuns("stall.yml"), Result: ok(stallRuns)},
+				{Argv: runsSince("1999-12-30T06:00:00Z"), Result: ok("[" + greenRun + "]")},
+			},
+			wantStdout: "no job passed and failed on the same commit since 1999-12-31T06:00:00Z\n",
+		},
+		{
+			// Run 5 failed its lint at its first attempt and passed when
+			// re-run; stall's and Renovate's runs, red on main, are passed
+			// over
+			name: "flaky-stalled",
+			args: []string{"flaky"},
+			calls: []execx.Call{
+				workflowID("stall.yml", "11"),
+				workflowID("renovate.yml", "12"),
+				{Argv: previousRuns("stall.yml"), Result: ok(stallRuns)},
+				{Argv: runsSince("1999-12-30T06:00:00Z"), Result: ok("[" +
+					runOf("7", "1", "failure", "1999-12-31T12:00:00Z", "1999-12-31T12:05:00Z", "schedule", head, "stall", "11") + "," +
+					runOf("6", "1", "failure", "1999-12-31T11:00:00Z", "1999-12-31T11:10:00Z", "push", head, "renovate", "12") + "," +
+					runOf("5", "2", "success", "1999-12-31T09:00:00Z", "1999-12-31T11:00:00Z", "pull_request", head, "build", "13") + "," +
+					greenRun + "]")},
+				{Argv: attemptJobs("5", "1"), Result: ok(`{"jobs":[{"name":"lint / lint","conclusion":"failure","completedAt":"1999-12-31T10:00:00Z"}]}`)},
+				{Argv: runJobs("5"), Result: ok(`{"jobs":[{"name":"lint / lint","conclusion":"success","completedAt":"1999-12-31T11:00:00Z"}]}`)},
+			},
+			wantCode: 1,
+			wantStdout: "Passed and failed on the same commit since 1999-12-31T06:00:00Z:\n" +
+				"  build / lint / lint on 12db812: failed in run 5 attempt 1, passed in run 5 attempt 2\n",
+		},
+		{
+			// ci's own: with no stall run before this one, the window is
+			// the last 24 hours
+			name: "flaky-self",
+			args: []string{"flaky"},
+			env:  map[string]string{"STALL_WORKFLOW": "self-stall.yml", "RENOVATE_WORKFLOW": "self-renovate.yml"},
+			calls: []execx.Call{
+				workflowID("self-stall.yml", "11"),
+				workflowID("self-renovate.yml", "12"),
+				{Argv: previousRuns("self-stall.yml"), Result: ok(`[{"createdAt":"2000-01-01T00:00:00Z","databaseId":900}]`)},
+				{Argv: runsSince("1999-12-30T00:00:00Z"), Result: ok("[]")},
+			},
+			wantStdout: "no job passed and failed on the same commit since 1999-12-31T00:00:00Z\n",
+		},
+		{
+			name: "flaky-no-workflow",
+			args: []string{"flaky"},
+			calls: []execx.Call{{Argv: workflowAPI("stall.yml"), Result: execx.Result{
+				Stdout: []byte("HTTP/2.0 404 Not Found\n\r\n" + `{"message":"Not Found","status":"404"}`),
+				Stderr: []byte("gh: Not Found (HTTP 404)"),
+				Code:   1,
+			}}},
+			wantCode:   2,
+			wantStderr: []string{"divbast/librespeed-oci-image has no workflow in the file stall.yml"},
+		},
+		{
+			name:       "flaky-run-id",
+			args:       []string{"flaky"},
+			env:        map[string]string{"GITHUB_RUN_ID": "x"},
+			wantCode:   2,
+			wantStderr: []string{`GITHUB_RUN_ID is "x", not a run's ID`},
+		},
+		{
 			name:       "lookups-gh-fails",
 			args:       []string{"lookups"},
 			calls:      []execx.Call{{Argv: issuesAPI, Result: execx.Result{Stderr: []byte("HTTP 401: Bad credentials"), Code: 1}}},
@@ -440,7 +627,7 @@ func TestRun(t *testing.T) {
 			// Only the check's own limit is read.
 			name:       "other-limits-unset",
 			args:       []string{"open"},
-			env:        map[string]string{"STUCK_HOURS": "", "RUN_HOURS": "x", "LOST_SLOTS": "", "PUBLISHED": ""},
+			env:        map[string]string{"STUCK_HOURS": "", "RUN_HOURS": "x", "LOST_SLOTS": "", "STARVED_DAYS": "", "PUBLISHED": ""},
 			calls:      []execx.Call{{Argv: prList, Result: ok("[]")}},
 			wantStdout: "no Renovate pull request open more than 14 days\n",
 		},
@@ -464,7 +651,7 @@ func TestRun(t *testing.T) {
 		{
 			name:       "help",
 			args:       []string{"-h"},
-			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots|lookups"},
+			wantStderr: []string{"usage: divbast-stall open|stuck|renovate|slots|lookups|starved|flaky\n"},
 		},
 	}
 
