@@ -53,6 +53,42 @@ func runJobs(id string) []string {
 // issuesAPI is the read of the Dependency Dashboard.
 var issuesAPI = []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/issues?state=open&creator=divbast-renovate%5Bbot%5D&per_page=100"}
 
+// historyQuery is the query that reads a page of the Dependency
+// Dashboard's edits.
+const historyQuery = `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$cursor:String){repository(owner:$owner,name:$name){issue(number:$number){createdAt body userContentEdits(first:$first,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{editedAt diff}}}}}`
+
+// historyAPI is the read of the edits of the Dependency Dashboard, #5.
+var historyAPI = []string{
+	"gh", "api", "graphql", "-f", "query=" + historyQuery, "-F", "owner=divbast", "-F", "name=librespeed-oci-image",
+	"-F", "number=5", "-F", "first=100",
+}
+
+// Dependency Dashboard bodies, as JSON writes a string: grypeBody lists
+// anchore/grype's lookup as failed, mixedBody puts above that a line with
+// nothing backticked, and cleanBody lists none.
+const (
+	grypeBody = `"> [!WARNING]\n> Renovate failed to look up the following dependencies: ` +
+		"`Failed to look up github-tags package anchore/grype: no-result`" + `.\n> \n> Files affected: ` + "`mise.toml`" + `\n"`
+	mixedBody = `"> [!WARNING]\n> Renovate failed to look up the following dependencies: anchore/grype.\n\n` +
+		`> [!WARNING]\n> Renovate failed to look up the following dependencies: ` +
+		"`Failed to look up github-tags package anchore/grype: no-result`" + `.\n> \n> Files affected: ` + "`mise.toml`" + `\n"`
+	cleanBody = `"## Open\n\nNothing.\n"`
+)
+
+// dashboardOut is the open Dependency Dashboard, #5, with body.
+func dashboardOut(body string) execx.Result {
+	return apiOK(`[{"number":5,"title":"Dependency Dashboard","body":` + body + `,"html_url":"https://github.com/divbast/librespeed-oci-image/issues/5"}]`)
+}
+
+// historyOut is the history of a Dependency Dashboard made 25 hours
+// before the bubble's clock with first as its body, and edited at edited
+// to body: its edits newest first, the oldest its creation.
+func historyOut(edited, body, first string) execx.Result {
+	return ok(`{"data":{"repository":{"issue":{"createdAt":"1999-12-30T23:00:00Z","body":` + body + `,"userContentEdits":{"totalCount":2,` +
+		`"pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29yOjI="},` +
+		`"nodes":[{"editedAt":"` + edited + `","diff":` + body + `},{"editedAt":"1999-12-30T23:00:00Z","diff":` + first + `}]}}}}}`)
+}
+
 func workflowAPI(workflow string) []string {
 	return []string{"gh", "api", "-i", "repos/divbast/librespeed-oci-image/actions/workflows/" + workflow}
 }
@@ -291,22 +327,59 @@ func TestRun(t *testing.T) {
 			wantStderr: []string{"PUBLISHED is not set"},
 		},
 		{
-			name: "lookups",
-			args: []string{"lookups"},
-			calls: []execx.Call{{Argv: issuesAPI, Result: apiOK(`[{"number":5,"title":"Dependency Dashboard",` +
-				`"body":"## Open\n\nNothing.\n","html_url":"https://github.com/divbast/librespeed-oci-image/issues/5"}]`)}},
+			// No failed lookup, so no history to read
+			name:       "lookups",
+			args:       []string{"lookups"},
+			calls:      []execx.Call{{Argv: issuesAPI, Result: dashboardOut(cleanBody)}},
 			wantStdout: "no failed Renovate lookup on the Dependency Dashboard #5\n",
 		},
 		{
+			// Listed since the dashboard was made, 25 hours ago, and
+			// still after its edit 2 hours ago
 			name: "lookups-stalled",
 			args: []string{"lookups"},
-			calls: []execx.Call{{Argv: issuesAPI, Result: apiOK(`[{"number":5,"title":"Dependency Dashboard",` +
-				`"body":"> [!WARNING]\n> Renovate failed to look up the following dependencies: ` +
-				"`Failed to look up github-tags package anchore/grype: no-result`" + `.\n> \n> Files affected: ` + "`mise.toml`" + `\n",` +
-				`"html_url":"https://github.com/divbast/librespeed-oci-image/issues/5"}]`)}},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(grypeBody)},
+				{Argv: historyAPI, Result: historyOut("1999-12-31T22:00:00Z", grypeBody, grypeBody)},
+			},
 			wantCode: 1,
 			wantStdout: "Renovate failed lookups, by the Dependency Dashboard https://github.com/divbast/librespeed-oci-image/issues/5:\n" +
 				"  Failed to look up github-tags package anchore/grype: no-result\n  files affected: mise.toml\n",
+		},
+		{
+			// Listed only since an edit 3 hours ago
+			name: "lookups-transient",
+			args: []string{"lookups"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(grypeBody)},
+				{Argv: historyAPI, Result: historyOut("1999-12-31T21:00:00Z", grypeBody, cleanBody)},
+			},
+			wantStdout: "no failed Renovate lookup listed for 24 hours on the Dependency Dashboard #5; " +
+				"not yet seen listed that long: \"Failed to look up github-tags package anchore/grype: no-result\"\n",
+		},
+		{
+			name: "lookups-history-fails",
+			args: []string{"lookups"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(grypeBody)},
+				{Argv: historyAPI, Result: execx.Result{Stderr: []byte("HTTP 502: Bad Gateway"), Code: 1}},
+			},
+			wantCode:   2,
+			wantStderr: []string{"gh api graphql", "502"},
+		},
+		{
+			// A line that cannot be read stalls whatever the history
+			// does, and the history's error is a detail beside it
+			name: "lookups-unreadable-history-fails",
+			args: []string{"lookups"},
+			calls: []execx.Call{
+				{Argv: issuesAPI, Result: dashboardOut(mixedBody)},
+				{Argv: historyAPI, Result: execx.Result{Stderr: []byte("HTTP 502: Bad Gateway"), Code: 1}},
+			},
+			wantCode: 1,
+			wantStdout: "Renovate failed lookups, by the Dependency Dashboard https://github.com/divbast/librespeed-oci-image/issues/5:\n" +
+				"  unreadable: > Renovate failed to look up the following dependencies: anchore/grype.\n" +
+				"  could not read the history of #5: gh api graphql: exit status 1: HTTP 502: Bad Gateway\n",
 		},
 		{
 			// With no dashboard, whether Renovate ever succeeded decides

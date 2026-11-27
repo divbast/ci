@@ -1255,16 +1255,21 @@ by `divbast-stall`.
 | `slot-job` | string | `''` | With `content-gated`, the job in each slot run that publishes the image, as GitHub names it in the run, whose conclusion counts rather than the whole run's |
 
 `lookups` reads the open issues `divbast-renovate` made, keeps the one
-titled exactly `Dependency Dashboard`, and fails at once while it lists a
-dependency Renovate failed to look up: a datasource that answered
-nothing, or a digest Renovate could not resolve, leaves that dependency
-where it is, and only the dashboard says so. It names each lookup and the
-files it is in. It anchors on the sentence Renovate lists them under,
-which its other warnings never use, and a sentence it cannot read fails
-the check. With no open dashboard it fails once Renovate has succeeded,
-since Renovate remakes the dashboard on every run; before that, the
-`renovate` check owns the case. If Renovate ever rewords the sentence,
-the check goes quietly green.
+titled exactly `Dependency Dashboard`, and fails once the Dependency
+Dashboard has listed the same failed lookup for 24 hours: a datasource
+that answered nothing, or a digest Renovate could not resolve, leaves
+that dependency where it is, and only the dashboard says so. It reads the
+dashboard's edit history to see how long, and names each lookup and the
+files it is in now; a lookup not yet seen listed that long is named when
+the check passes. GitHub keeps only the newest 99 edits of an issue, so
+on a dashboard edited more often than that within a day, the check
+cannot see back 24 hours and stays quiet until it can. It anchors on the
+sentence Renovate lists them under, which its other warnings never use,
+and a sentence it cannot read fails the check at once, even when the
+history cannot be read. With no open dashboard it fails once Renovate
+has succeeded, since Renovate remakes the dashboard on every run; before
+that, the `renovate` check owns the case. If Renovate ever rewords the
+sentence, the check goes quietly green.
 
 `content-gated` is for a repository whose daily slot runs
 `divbast-publish-decision -content-gated`, and so can succeed while it

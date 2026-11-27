@@ -21,9 +21,10 @@
 //	slots     LOST_SLOTS or more daily slots, the scheduled runs of
 //	          SLOT_WORKFLOW on main, that should have published main as
 //	          PUBLISHED and did not; or PUBLISHED private
-//	lookups   a dependency Renovate failed to look up, as its Dependency
-//	          Dashboard lists it, at once; or no open dashboard by
-//	          divbast-renovate once RENOVATE_WORKFLOW has succeeded
+//	lookups   a dependency Renovate failed to look up, once its Dependency
+//	          Dashboard has listed the same failed lookup for 24 hours; or
+//	          no open dashboard by divbast-renovate once RENOVATE_WORKFLOW
+//	          has succeeded
 //
 // slots -content-gated is for a slot workflow that publishes only when the
 // image's content moved, as divbast-publish-decision -content-gated does:
