@@ -12,10 +12,10 @@ name: self-renovate
 on:
   # Every morning. This cron is Renovate's only clock: the preset sets no
   # schedule of its own, so a run GitHub starts late still opens its pull
-  # requests instead of finding itself outside a window. 18:17 UTC is 05:17
-  # in Melbourne under daylight saving, 04:17 outside it.
+  # requests instead of finding itself outside a window. 16:05 UTC is 03:05
+  # in Melbourne under daylight saving, 02:05 outside it.
   schedule:
-    - cron: '17 18 * * *'
+    - cron: '05 16 * * *'
   # A tick on the Dependency Dashboard takes effect now, not tomorrow.
   issues:
     types: [edited]
