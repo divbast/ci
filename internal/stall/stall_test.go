@@ -72,23 +72,35 @@ type source struct {
 	jobs map[int64]map[string]string
 	// dashboards are the open Dependency Dashboards.
 	dashboards []stall.Issue
-	// edits are each dashboard's history, by its number, as
-	// DashboardHistory returns it.
-	edits map[int][]stall.DashboardEdit
-	err   error // returned by every call when set
+	// edits are each dashboard's whole history, by its number, newest
+	// first. DashboardHistory cuts it short as GitHub's does.
+	edits      map[int][]stall.DashboardEdit
+	historyErr error // returned by DashboardHistory when set
+	err        error // returned by every call when set
 }
 
 func (s *source) Dashboards(context.Context) ([]stall.Issue, error) {
 	return s.dashboards, s.err
 }
 
-func (s *source) DashboardHistory(_ context.Context, number int, _ time.Time) ([]stall.DashboardEdit, error) {
+// DashboardHistory returns the dashboard's edits as [stall.GH] does:
+// newest first, down to the newest edit made at or before since, so that a
+// check asking from the wrong time reads the wrong edits.
+func (s *source) DashboardHistory(_ context.Context, number int, since time.Time) ([]stall.DashboardEdit, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if s.historyErr != nil {
+		return nil, s.historyErr
 	}
 	edits, ok := s.edits[number]
 	if !ok {
 		return nil, fmt.Errorf("asked for the history of dashboard #%d, which the test did not script", number)
+	}
+	for i, e := range edits {
+		if !e.EditedAt.After(since) {
+			return edits[:i+1], nil
+		}
 	}
 	return edits, nil
 }
@@ -1201,6 +1213,27 @@ func dashboard(t *testing.T, section string) string {
 
 const dashboardURL = "https://github.com/divbast/baikal-oci-image/issues/94"
 
+// trivy is a lookup Renovate failed, as the dashboard lists it, and
+// trivyFailed is the same as lookups reports it.
+const (
+	trivy       = "`Failed to look up github-tags package aquasecurity/trivy: no-result`"
+	trivyFailed = "Failed to look up github-tags package aquasecurity/trivy: no-result"
+)
+
+// edit is an edit of a dashboard made d before epoch, leaving it with body.
+func edit(d time.Duration, body string) stall.DashboardEdit {
+	return stall.DashboardEdit{EditedAt: ago(d), Body: body}
+}
+
+// onDashboard is a source with one open Dependency Dashboard, #94, whose
+// body is body and whose history is edits, newest first.
+func onDashboard(body string, edits ...stall.DashboardEdit) *source {
+	return &source{
+		dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}},
+		edits:      map[int][]stall.DashboardEdit{94: edits},
+	}
+}
+
 func lookupsWith(t *testing.T, s *source) stall.Result {
 	t.Helper()
 	res, err := stall.Lookups(t.Context(), s, &config)
@@ -1210,87 +1243,362 @@ func lookupsWith(t *testing.T, s *source) stall.Result {
 	return res
 }
 
+// failedHeadline is the headline of a lookups stall on dashboard #94, and
+// youngHeadline the passing one when #94 lists trivy, not yet seen listed
+// for 24 hours.
+const (
+	failedHeadline = "Renovate failed lookups, by the Dependency Dashboard " + dashboardURL + ":"
+	youngHeadline  = `no failed Renovate lookup listed for 24 hours on the Dependency Dashboard #94; not yet seen listed that long: "` + trivyFailed + `"`
+)
+
 func TestLookupsClean(t *testing.T) {
 	t.Parallel()
-	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, ""), URL: dashboardURL}}})
-	if res.Stalled || res.Headline != "no failed Renovate lookup on the Dependency Dashboard #94" {
-		t.Errorf("Lookups() = %+v, want not stalled", res)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		// No history scripted: a dashboard with no failed lookup never
+		// asks for it
+		res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, ""), URL: dashboardURL}}})
+		checkResult(t, res, stall.Result{Headline: "no failed Renovate lookup on the Dependency Dashboard #94"})
+	})
 }
 
-func TestLookupsFailing(t *testing.T) {
+// TestLookupsPersistent reads a lookup the dashboard lists now, 2 hours
+// ago and 25 hours ago: a lookup that stays broken stalls as it always
+// has.
+func TestLookupsPersistent(t *testing.T) {
 	t.Parallel()
-	body := dashboard(t, lookupSection("`Failed to look up github-tags package aquasecurity/trivy: no-result`", "`mise.toml`"))
-	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}}})
-	want := []string{"Failed to look up github-tags package aquasecurity/trivy: no-result", "files affected: mise.toml"}
-	if !res.Stalled || res.Headline != "Renovate failed lookups, by the Dependency Dashboard "+dashboardURL+":" || !slices.Equal(res.Details, want) {
-		t.Errorf("Lookups() = %+v, want stalled with %q", res, want)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, lookupSection(trivy, "`mise.toml`"))
+		res := lookupsWith(t, onDashboard(body, edit(0, body), edit(2*time.Hour, body), edit(25*time.Hour, body)))
+		checkResult(t, res, stall.Result{Stalled: true, Headline: failedHeadline, Details: []string{trivyFailed, "files affected: mise.toml"}})
+	})
+}
+
+// TestLookupsTransient reads a lookup listed now and 3 hours ago, but not
+// 25 hours ago: one that failed once, a registry briefly unreachable say,
+// is named but does not stall.
+func TestLookupsTransient(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, lookupSection(trivy, "`mise.toml`"))
+		res := lookupsWith(t, onDashboard(body, edit(0, body), edit(3*time.Hour, body), edit(25*time.Hour, dashboard(t, ""))))
+		checkResult(t, res, stall.Result{Headline: youngHeadline})
+	})
+}
+
+// TestLookupsFlickered reads a lookup listed now and 25 hours ago, but
+// not 10 hours ago: it cleared in between, so it has not been listed for
+// 24 hours.
+func TestLookupsFlickered(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, lookupSection(trivy, "`mise.toml`"))
+		res := lookupsWith(t, onDashboard(body, edit(0, body), edit(10*time.Hour, dashboard(t, "")), edit(25*time.Hour, body)))
+		checkResult(t, res, stall.Result{Headline: youngHeadline})
+	})
+}
+
+// TestLookupsYoungDashboard reads a dashboard with no edit older than 24
+// hours, made a second short of that with the lookup on it: its history
+// cannot show the lookup listed for 24 hours. Nor can one GitHub kept
+// too few edits of.
+func TestLookupsYoungDashboard(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, lookupSection(trivy, "`mise.toml`"))
+		res := lookupsWith(t, onDashboard(body, edit(0, body), edit(day-time.Second, body)))
+		checkResult(t, res, stall.Result{Headline: youngHeadline})
+	})
+}
+
+// TestLookupsFilesMoved reads a lookup listed for 25 hours whose files
+// changed in that time: it is the same lookup, and the files it is in now
+// are reported.
+func TestLookupsFilesMoved(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		body := dashboard(t, lookupSection(trivy, "`Containerfile`, `mise.toml`"))
+		res := lookupsWith(t, onDashboard(body, edit(0, body), edit(25*time.Hour, dashboard(t, lookupSection(trivy, "`mise.toml`")))))
+		checkResult(t, res, stall.Result{Stalled: true, Headline: failedHeadline, Details: []string{trivyFailed, "files affected: Containerfile, mise.toml"}})
+	})
+}
+
+// TestLookupsOneOfTwo reads two lookups on one line, one listed for 25
+// hours and one for 3: only the first is reported, with the line's
+// files.
+func TestLookupsOneOfTwo(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		grype := "`Failed to look up github-tags package anchore/grype: no-result`"
+		body := dashboard(t, lookupSection(trivy+", "+grype, "`mise.toml`"))
+		old := dashboard(t, lookupSection(trivy, "`mise.toml`"))
+		res := lookupsWith(t, onDashboard(body, edit(0, body), edit(3*time.Hour, body), edit(25*time.Hour, old)))
+		checkResult(t, res, stall.Result{Stalled: true, Headline: failedHeadline, Details: []string{trivyFailed, "files affected: mise.toml"}})
+	})
 }
 
 func TestLookupsTwoItemsCRLF(t *testing.T) {
 	t.Parallel()
-	// A web edit, ticking a box say, saves the body with CRLF until
-	// Renovate's next rewrite
-	body := strings.ReplaceAll(dashboard(t, lookupSection(
-		"`Failed to look up custom.lidarr-nightly package Lidarr/Lidarr: no-result`, "+
-			"`Could not determine new digest for update (docker package dhi.io/aspnetcore)`",
-		"`Containerfile`, `mise.toml`",
-	)), "\n", "\r\n")
-	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}}})
-	want := []string{
-		"Failed to look up custom.lidarr-nightly package Lidarr/Lidarr: no-result",
-		"Could not determine new digest for update (docker package dhi.io/aspnetcore)",
-		"files affected: Containerfile, mise.toml",
-	}
-	if !res.Stalled || !slices.Equal(res.Details, want) {
-		t.Errorf("Lookups() = %+v, want stalled with %q", res, want)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		// A web edit, ticking a box say, saves the body with CRLF until
+		// Renovate's next rewrite: the lookups it lists are the same
+		lf := dashboard(t, lookupSection(
+			"`Failed to look up custom.lidarr-nightly package Lidarr/Lidarr: no-result`, "+
+				"`Could not determine new digest for update (docker package dhi.io/aspnetcore)`",
+			"`Containerfile`, `mise.toml`",
+		))
+		body := strings.ReplaceAll(lf, "\n", "\r\n")
+		res := lookupsWith(t, onDashboard(body, edit(time.Hour, body), edit(25*time.Hour, lf)))
+		checkResult(t, res, stall.Result{Stalled: true, Headline: failedHeadline, Details: []string{
+			"Failed to look up custom.lidarr-nightly package Lidarr/Lidarr: no-result",
+			"Could not determine new digest for update (docker package dhi.io/aspnetcore)",
+			"files affected: Containerfile, mise.toml",
+		}})
+	})
 }
 
 func TestLookupsDeprecationsOnly(t *testing.T) {
 	t.Parallel()
-	// Renovate's other warnings share the [!WARNING] heading, never the
-	// sentence
-	section := "## Deprecations / Replacements\n\n> [!WARNING]\n> The following dependencies are either deprecated " +
-		"or have replacements available:\n\n| Datasource | Name | Replacement PR? |\n|---|---|---|\n| npm | `request` | unavailable |\n\n" +
-		"## Repository Problems\n\nRenovate tried to run on this repository, but found these problems.\n\n" +
-		" - WARN: Fallback to renovate.json file as a preset is deprecated, please use a default.json file instead.\n\n"
-	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, section), URL: dashboardURL}}})
-	if res.Stalled {
-		t.Errorf("Lookups() = %+v, want not stalled: no lookup failed", res)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		// Renovate's other warnings share the [!WARNING] heading, never the
+		// sentence
+		section := "## Deprecations / Replacements\n\n> [!WARNING]\n> The following dependencies are either deprecated " +
+			"or have replacements available:\n\n| Datasource | Name | Replacement PR? |\n|---|---|---|\n| npm | `request` | unavailable |\n\n" +
+			"## Repository Problems\n\nRenovate tried to run on this repository, but found these problems.\n\n" +
+			" - WARN: Fallback to renovate.json file as a preset is deprecated, please use a default.json file instead.\n\n"
+		res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, section), URL: dashboardURL}}})
+		if res.Stalled {
+			t.Errorf("Lookups() = %+v, want not stalled: no lookup failed", res)
+		}
+	})
 }
 
 func TestLookupsUnparsable(t *testing.T) {
 	t.Parallel()
-	// The sentence with nothing backticked: a format that drifted fails
-	// closed, quoting the line
-	line := "> Renovate failed to look up the following dependencies: aquasecurity/trivy."
-	body := dashboard(t, "---\n\n> [!WARNING]\n"+line+"\n\n---\n\n")
-	res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}}})
-	if !res.Stalled || len(res.Details) != 1 || !strings.Contains(res.Details[0], line) {
-		t.Errorf("Lookups() = %+v, want stalled, quoting %q", res, line)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		// The sentence with nothing backticked: a format that drifted fails
+		// closed, quoting the line, at once, with no history to read
+		line := "> Renovate failed to look up the following dependencies: aquasecurity/trivy."
+		body := dashboard(t, "---\n\n> [!WARNING]\n"+line+"\n\n---\n\n")
+		res := lookupsWith(t, &source{dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: body, URL: dashboardURL}}})
+		if !res.Stalled || len(res.Details) != 1 || !strings.Contains(res.Details[0], line) {
+			t.Errorf("Lookups() = %+v, want stalled, quoting %q", res, line)
+		}
+	})
 }
 
 func TestLookupsNoDashboard(t *testing.T) {
 	t.Parallel()
-	last := time.Date(2026, 11, 19, 0, 41, 21, 0, time.UTC)
-	res := lookupsWith(t, &source{success: last})
-	if !res.Stalled || res.Headline != "No open Dependency Dashboard by divbast-renovate, so failed lookups cannot be seen:" ||
-		len(res.Details) != 1 || !strings.Contains(res.Details[0], "2026-11-19T00:41:21Z") {
-		t.Errorf("Lookups() after a success = %+v, want stalled, naming the last success", res)
-	}
-	res = lookupsWith(t, &source{})
-	if res.Stalled {
-		t.Errorf("Lookups() before any success = %+v, want not stalled: the renovate check owns that", res)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		last := time.Date(2026, 11, 19, 0, 41, 21, 0, time.UTC)
+		res := lookupsWith(t, &source{success: last})
+		if !res.Stalled || res.Headline != "No open Dependency Dashboard by divbast-renovate, so failed lookups cannot be seen:" ||
+			len(res.Details) != 1 || !strings.Contains(res.Details[0], "2026-11-19T00:41:21Z") {
+			t.Errorf("Lookups() after a success = %+v, want stalled, naming the last success", res)
+		}
+		res = lookupsWith(t, &source{})
+		if res.Stalled {
+			t.Errorf("Lookups() before any success = %+v, want not stalled: the renovate check owns that", res)
+		}
+	})
 }
 
 func TestLookupsSourceFails(t *testing.T) {
 	t.Parallel()
-	if _, err := stall.Lookups(t.Context(), &source{err: errors.New("gh: HTTP 502")}, &config); err == nil {
-		t.Error("Lookups() error = nil, want gh's")
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		if _, err := stall.Lookups(t.Context(), &source{err: errors.New("gh: HTTP 502")}, &config); err == nil {
+			t.Error("Lookups() error = nil, want gh's")
+		}
+	})
+}
+
+// TestLookupsHistoryFails checks that a dashboard listing a failed lookup
+// whose history cannot be read fails the check, rather than being taken
+// for a lookup listed for 24 hours or for less.
+func TestLookupsHistoryFails(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		atEpoch(t)
+		errHistory := errors.New("gh api graphql: HTTP 502")
+		src := onDashboard(dashboard(t, lookupSection(trivy, "`mise.toml`")))
+		src.historyErr = errHistory
+		got, err := stall.Lookups(t.Context(), src, &config)
+		if !errors.Is(err, errHistory) {
+			t.Fatalf("Lookups() = %+v, %v; want an error wrapping %v", got, err, errHistory)
+		}
+	})
+}
+
+// TestLookupsUnreadableHistoryFails checks that a line that cannot be read
+// stalls at once even when the history another lookup needs cannot be
+// read either: the error is a detail of its own beside the line, not an
+// error that hides it.
+func TestLookupsUnreadableHistoryFails(t *testing.T) {
+	t.Parallel()
+
+	line := "> Renovate failed to look up the following dependencies: aquasecurity/trivy."
+	unreadable := "---\n\n> [!WARNING]\n" + line + "\n\n"
+	grype := lookupSection("`Failed to look up github-tags package anchore/grype: no-result`", "`mise.toml`")
+	errHistory := errors.New("gh api graphql: HTTP 502")
+	const otherURL = "https://github.com/divbast/baikal-oci-image/issues/95"
+
+	tests := []struct {
+		name       string
+		dashboards []stall.Issue
+		want       stall.Result
+	}{
+		{
+			name:       "on-one-dashboard",
+			dashboards: []stall.Issue{{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, unreadable+grype), URL: dashboardURL}},
+			want: stall.Result{Stalled: true, Headline: failedHeadline, Details: []string{
+				"unreadable: " + line, "could not read the history of #94: " + errHistory.Error(),
+			}},
+		},
+		{
+			name: "on-another-dashboard",
+			dashboards: []stall.Issue{
+				{Number: 94, Title: "Dependency Dashboard", Body: dashboard(t, grype), URL: dashboardURL},
+				{Number: 95, Title: "Dependency Dashboard", Body: dashboard(t, unreadable), URL: otherURL},
+			},
+			want: stall.Result{
+				Stalled:  true,
+				Headline: "Renovate failed lookups, by the Dependency Dashboard " + dashboardURL + ", " + otherURL + ":",
+				Details:  []string{"could not read the history of #94: " + errHistory.Error(), "unreadable: " + line},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				atEpoch(t)
+				res := lookupsWith(t, &source{dashboards: tt.dashboards, historyErr: errHistory})
+				checkResult(t, res, tt.want)
+			})
+		})
+	}
+}
+
+// TestPersistent checks, edge by edge, when a lookup counts as listed for
+// a day: in the body now, in every edit of the last day, and in the newest
+// edit made at or before a day ago.
+func TestPersistent(t *testing.T) {
+	t.Parallel()
+
+	grype := "`Failed to look up github-tags package anchore/grype: no-result`"
+	listed := dashboard(t, lookupSection(trivy, "`mise.toml`"))
+	clean := dashboard(t, "")
+
+	tests := []struct {
+		name    string
+		current string
+		edits   []stall.DashboardEdit
+		want    bool
+	}{
+		{
+			name:    "listed-throughout",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(0, listed), edit(2*time.Hour, listed), edit(25*time.Hour, listed)},
+			want:    true,
+		},
+		{
+			// At or before a day ago: an edit made exactly then stood for
+			// the whole day
+			name:    "edited-exactly-a-day-ago",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(day, listed)},
+			want:    true,
+		},
+		{
+			name:    "edited-a-second-short-of-a-day-ago",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(day-time.Second, listed)},
+		},
+		{
+			name:    "gone-now",
+			current: clean,
+			edits:   []stall.DashboardEdit{edit(2*time.Hour, listed), edit(25*time.Hour, listed)},
+		},
+		{
+			name:    "not-listed-a-day-ago",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(3*time.Hour, listed), edit(25*time.Hour, clean)},
+		},
+		{
+			name:    "cleared-within-the-day",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(0, listed), edit(10*time.Hour, clean), edit(25*time.Hour, listed)},
+		},
+		{
+			// Only the newest edit at or before a day ago says what stood
+			// then
+			name:    "cleared-before-the-day",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(25*time.Hour, listed), edit(30*time.Hour, clean)},
+			want:    true,
+		},
+		{
+			name:    "listed-before-but-not-a-day-ago",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(25*time.Hour, clean), edit(30*time.Hour, listed)},
+		},
+		{
+			// Edits in any order: the newest made at or before a day ago
+			// counts, wherever it stands
+			name:    "out-of-order",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(30*time.Hour, clean), edit(0, listed), edit(25*time.Hour, listed)},
+			want:    true,
+		},
+		{
+			name:    "no-history",
+			current: listed,
+		},
+		{
+			// GitHub keeps the newest 99 edits: a history that ends inside
+			// the day does not show what stood a day ago
+			name:    "history-cut-short",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(0, listed), edit(12*time.Hour, listed), edit(23*time.Hour, listed)},
+		},
+		{
+			name:    "files-moved",
+			current: dashboard(t, lookupSection(trivy, "`Containerfile`")),
+			edits:   []stall.DashboardEdit{edit(25*time.Hour, listed)},
+			want:    true,
+		},
+		{
+			name:    "listed-with-another",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(25*time.Hour, dashboard(t, lookupSection(grype+", "+trivy, "`mise.toml`")))},
+			want:    true,
+		},
+		{
+			// The files line names the lookup's files, not lookups
+			name:    "a-file-named-like-it",
+			current: listed,
+			edits:   []stall.DashboardEdit{edit(25*time.Hour, dashboard(t, lookupSection(grype, trivy)))},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := stall.Persistent(trivyFailed, tt.current, tt.edits, epoch, day); got != tt.want {
+				t.Errorf("persistent() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }

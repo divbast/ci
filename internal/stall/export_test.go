@@ -14,3 +14,6 @@ func SetPageSize(t *testing.T, n int) {
 	pageSize = n
 	t.Cleanup(func() { pageSize = old })
 }
+
+// Persistent is persistent, for its tests.
+var Persistent = persistent
