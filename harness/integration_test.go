@@ -1137,6 +1137,56 @@ func TestServingRestart(t *testing.T) {
 	RunRecords(t, s.Probe, "assert-read-only")
 }
 
+// TestServingRestartExited restarts a container whose server has already
+// exited, as an app that stops itself does: one that restores a backup
+// and then exits, say, for its suite to start it again. The server, the
+// fixture's PID 1, exits on a SIGTERM sent from inside the container, and
+// once the engine reports the container stopped, Restart starts that same
+// container again and returns once it serves, with the probe installed
+// again.
+func TestServingRestartExited(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	ctx := t.Context()
+
+	sp := ServeSpec{Run: RunSpec{Image: testfixture.LibreSpeed, Confine: Contract("16m")}, AppPort: 8080, HealthPort: 8081}
+	s, err := e.Serve(ctx, t, &sp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := s.C.ID
+
+	// The exec may end with the container rather than on its own, so what
+	// it returns is only logged: WaitExit is what shows the server exited.
+	res, err := s.C.Exec(ctx, nil, frankenphp, "php-cli", "-r", "exit(posix_kill(1, SIGTERM) ? 0 : 1);")
+	t.Logf("SIGTERM to PID 1 from inside: exit status %d, error %v: %s", res.Code, err, combined(res))
+	code, err := s.C.WaitExit(ctx, ServeWithin)
+	if err != nil {
+		t.Fatalf("waiting for the server to exit on SIGTERM: %v", err)
+	}
+	t.Logf("container %s exited, exit status %d", s.C, code)
+
+	if err = s.Restart(ctx); err != nil {
+		t.Fatalf("Restart() of container %s, which had exited: %v", s.C, err)
+	}
+	if s.C.ID != id {
+		t.Errorf("after Restart(), the container is %s, want the one restarted, %s", s.C.ID, id)
+	}
+	ins, err := s.C.Inspect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ins.State.Running {
+		t.Fatalf("after Restart(), container %s is %s, exit status %d, want it running", s.C, ins.State.Status, ins.State.ExitCode)
+	}
+	StatusIs(t, s, "GET / once the container that had exited is restarted", http.StatusOK, "/")
+	StatusIs(t, s.Health(), "GET /healthz on the health port once it is restarted", http.StatusOK, "/healthz")
+	if s.Probe == nil {
+		t.Fatal("after Restart(), the probe is nil, want one installed again")
+	}
+	RunRecords(t, s.Probe, "assert-read-only")
+}
+
 // TestRefuses runs the exits mutant, which stops before it serves, exit
 // status 3, as a refusal: Refuses passes it when told to want 3, and
 // fails a container that exits 0, one told to want another status, and

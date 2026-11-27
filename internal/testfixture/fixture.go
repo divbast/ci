@@ -4,7 +4,9 @@
 // Package testfixture names the known-good images ci's own tests run real
 // containers from: the harness's integration tests and the contract
 // suite's. They come from here and nowhere else, so moving to a newer
-// image is one edit.
+// image is one edit. PullBeforeTests fetches them, through Pull, before a
+// suite's tests run, and Fetch runs a fetch again when the registry fails
+// it with a server error.
 package testfixture
 
 // LibreSpeed is a published ghcr.io/divbast/librespeed, pinned by its

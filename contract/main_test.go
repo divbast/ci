@@ -11,13 +11,22 @@ import (
 	"time"
 
 	"github.com/divbast/ci/harness"
+	"github.com/divbast/ci/internal/testfixture"
 )
 
-// TestMain removes the probe volumes the tests made once they are done.
-// ci's own suites never sweep, since a sweep would remove what the tests
-// of another package, running beside these under the same label, made.
-// With no test that ran a container, it runs nothing.
+// TestMain pulls the fixtures the tests check before any of them runs,
+// and removes the probe volumes they made once all are done. ci's own
+// suites never sweep, since a sweep would remove what the tests of
+// another package, running beside these under the same label, made. With
+// ENGINE unset it pulls nothing, and with no test that ran a container it
+// removes nothing.
 func TestMain(m *testing.M) {
+	// A CI runner starts with an empty store, where every test that checks
+	// a fixture, or builds a mutant FROM it, would pull it at the same
+	// moment, a dozen and more pulls of one image, and a server error the
+	// registry gives any one of them fails its test. No test guards this
+	// call: only a cold store shows what it saves.
+	testfixture.PullBeforeTests("contract", testfixture.LibreSpeed, testfixture.Baikal)
 	code := m.Run()
 	if err := removeProbeVolumes(); err != nil {
 		fmt.Fprintln(os.Stderr, "contract:", err)
