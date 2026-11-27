@@ -6,6 +6,8 @@ package release_test
 import (
 	"context"
 	"errors"
+	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -147,6 +149,8 @@ func (r inDir) Run(ctx context.Context, name string, args ...string) (execx.Resu
 type repo struct {
 	t           *testing.T
 	dir, origin string
+	// root is the clone's working tree.
+	root *os.Root
 }
 
 func newRepo(t *testing.T) *repo {
@@ -156,6 +160,16 @@ func newRepo(t *testing.T) *repo {
 	gitIn(t, base, "init", "--quiet", "--bare", "--initial-branch=main", r.origin)
 	gitIn(t, base, "init", "--quiet", "--initial-branch=main", r.dir)
 	r.git("remote", "add", "origin", r.origin)
+	root, err := os.OpenRoot(r.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := root.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	r.root = root
 	return r
 }
 
@@ -179,10 +193,37 @@ func (r *repo) git(args ...string) string {
 	return gitIn(r.t, r.dir, args...)
 }
 
-// commit makes an empty commit with message msg and returns its SHA.
-func (r *repo) commit(msg string) string {
+// commit makes a commit with message msg that changes each file named, a
+// slash-separated path that it writes msg into, or, with none named, an
+// empty one, and returns its SHA.
+func (r *repo) commit(msg string, files ...string) string {
 	r.t.Helper()
-	r.git("commit", "--quiet", "--allow-empty", "--message", msg)
+	if len(files) == 0 {
+		r.git("commit", "--quiet", "--allow-empty", "--message", msg)
+		return r.git("rev-parse", "HEAD")
+	}
+	for _, name := range files {
+		if err := r.root.MkdirAll(path.Dir(name), 0o750); err != nil {
+			r.t.Fatal(err)
+		}
+		if err := r.root.WriteFile(name, []byte(msg+"\n"), 0o600); err != nil {
+			r.t.Fatal(err)
+		}
+	}
+	r.git(append([]string{"add", "--"}, files...)...)
+	r.git("commit", "--quiet", "--message", msg)
+	return r.git("rev-parse", "HEAD")
+}
+
+// rename moves the file at from to to, slash-separated paths, in a commit
+// with message msg, and returns its SHA.
+func (r *repo) rename(msg, from, to string) string {
+	r.t.Helper()
+	if err := r.root.MkdirAll(path.Dir(to), 0o750); err != nil {
+		r.t.Fatal(err)
+	}
+	r.git("mv", "--", from, to)
+	r.git("commit", "--quiet", "--message", msg)
 	return r.git("rev-parse", "HEAD")
 }
 
@@ -242,6 +283,11 @@ func TestPrepare(t *testing.T) {
 		wantVersion    string
 		wantSubjects   []string
 		wantBreaking   []string
+		// wantChanged are the paths that differ since the last release.
+		wantChanged []string
+		// wantSelfOnly is whether nothing a caller uses changed since the
+		// last release, so that the plan releases nothing.
+		wantSelfOnly bool
 		// wantTip is whether origin's main is the commit released.
 		wantTip bool
 		// wantSuperseded is whether a later commit on origin's main holds it.
@@ -289,6 +335,108 @@ func TestPrepare(t *testing.T) {
 			wantVersion:  "v2.0.0",
 			wantSubjects: []string{"b: two", "c: three"},
 			wantBreaking: []string{"lint.yml drops its php input"},
+			wantTip:      true,
+		},
+		// Only ci's own files changed since the last release, which no
+		// caller uses: nothing to release.
+		{
+			name: "self-only",
+			setup: func(r *repo) string {
+				r.commit("a: one"+trailers, "harness/x.go")
+				r.git("tag", "v1.0.0")
+				sha := r.commit("docs: say so"+trailers, "README.md", "internal/release/release_test.go")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"docs: say so"},
+			wantChanged:  []string{"README.md", "internal/release/release_test.go"},
+			wantSelfOnly: true,
+			wantTip:      true,
+		},
+		{
+			name: "mixed-paths",
+			setup: func(r *repo) string {
+				r.commit("a: one"+trailers, "harness/x.go")
+				r.git("tag", "v1.0.0")
+				sha := r.commit("harness: say so"+trailers, "README.md", "internal/release/release_test.go", "harness/x.go")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"harness: say so"},
+			wantChanged:  []string{"README.md", "harness/x.go", "internal/release/release_test.go"},
+			wantTip:      true,
+		},
+		// A breaking change is released, as a major, whatever it touched.
+		{
+			name: "self-only-breaking",
+			setup: func(r *repo) string {
+				r.commit("a: one"+trailers, "harness/x.go")
+				r.git("tag", "v1.0.0")
+				sha := r.commit("docs: say so\n\nWhy.\n\nBreaking-change: the docs moved\n"+strings.TrimPrefix(trailers, "\n\n"),
+					"README.md", "internal/release/release_test.go")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v2.0.0",
+			wantSubjects: []string{"docs: say so"},
+			wantBreaking: []string{"the docs moved"},
+			wantChanged:  []string{"README.md", "internal/release/release_test.go"},
+			wantTip:      true,
+		},
+		// Commits that change no file say nothing of what they touch, and
+		// are released.
+		{
+			name: "empty-diff",
+			setup: func(r *repo) string {
+				r.commit("a: one"+trailers, "harness/x.go")
+				r.git("tag", "v1.0.0")
+				sha := r.commit("b: two" + trailers)
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"b: two"},
+			wantTip:      true,
+		},
+		// The whole range since the last release counts, not the commit
+		// alone: one a caller uses, never released, is released with it.
+		{
+			name: "self-only-after-visible",
+			setup: func(r *repo) string {
+				r.commit("a: one"+trailers, "harness/x.go")
+				r.git("tag", "v1.0.0")
+				r.commit("harness: two"+trailers, "harness/x.go")
+				sha := r.commit("docs: say so"+trailers, "README.md")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"harness: two", "docs: say so"},
+			wantChanged:  []string{"README.md", "harness/x.go"},
+			wantTip:      true,
+		},
+		// A file callers use, moved among ci's own, is gone from where
+		// callers found it.
+		{
+			name: "rename-out-of-visible",
+			setup: func(r *repo) string {
+				r.commit("a: one"+trailers, "harness/x.go")
+				r.git("tag", "v1.0.0")
+				sha := r.rename("harness: move x"+trailers, "harness/x.go", "harness/testdata/x.go")
+				r.push("v1.0.0")
+				return sha
+			},
+			wantPrevious: "v1.0.0",
+			wantVersion:  "v1.1.0",
+			wantSubjects: []string{"harness: move x"},
+			wantChanged:  []string{"harness/testdata/x.go", "harness/x.go"},
 			wantTip:      true,
 		},
 		// The words mid-line, which no line starts with, do not count.
@@ -921,7 +1069,39 @@ func TestPrepare(t *testing.T) {
 			if !slices.Equal(breaking, tt.wantBreaking) {
 				t.Errorf("Prepare() breaking = %q, want %q", breaking, tt.wantBreaking)
 			}
+			if !slices.Equal(plan.Changed, tt.wantChanged) {
+				t.Errorf("Prepare().Changed = %q, want %q", plan.Changed, tt.wantChanged)
+			}
+			if plan.CallerVisible == tt.wantSelfOnly {
+				t.Errorf("Prepare().CallerVisible = %t, want %t", plan.CallerVisible, !tt.wantSelfOnly)
+			}
 		})
+	}
+}
+
+// TestPrepareIgnoresDiffRelative checks that a clone's diff.relative,
+// with git run from a subdirectory, hides no changed path: git diff
+// would otherwise name only the paths under that directory, relative to
+// it, and a change callers use outside it would pass for ci's own.
+func TestPrepareIgnoresDiffRelative(t *testing.T) {
+	t.Parallel()
+
+	r := newRepo(t)
+	r.commit("a: one"+trailers, "harness/x.go", "internal/release/release.go")
+	r.git("tag", "v1.0.0")
+	sha := r.commit("harness: two"+trailers, "harness/x.go", "internal/release/release_test.go")
+	r.push("v1.0.0")
+	r.git("config", "diff.relative", "true")
+
+	plan, err := release.Prepare(t.Context(), inDir{filepath.Join(r.dir, "internal", "release")}, sha)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if want := []string{"harness/x.go", "internal/release/release_test.go"}; !slices.Equal(plan.Changed, want) {
+		t.Errorf("Prepare().Changed = %q, want %q", plan.Changed, want)
+	}
+	if !plan.CallerVisible {
+		t.Error("Prepare().CallerVisible = false, want true")
 	}
 }
 
@@ -933,6 +1113,8 @@ func TestPrepareGitFails(t *testing.T) {
 	const (
 		sha = "51b68da129260de083e7c2ca36c4b1440378c527"
 		tip = "9f2c1e0d4b3a29180f6e5d4c3b2a19087f6e5d4c"
+		// v100 is the commit v1.0.0 tags.
+		v100 = "0e5f4d3c2b1a09f8e7d6c5b4a3928170f6e5d4c3"
 	)
 	var (
 		catFile = execx.Call{Argv: []string{"git", "cat-file", "-e", sha + "^{commit}"}}
@@ -980,6 +1162,20 @@ func TestPrepareGitFails(t *testing.T) {
 			},
 			want: "something broke",
 		},
+		// The commits since the last release read, but not the files they
+		// changed
+		{
+			name: "changes-unreadable",
+			calls: []execx.Call{
+				catFile,
+				{Argv: remote, Result: execx.Result{Stdout: []byte(sha + "\trefs/heads/main\n" + v100 + "\trefs/tags/v1.0.0\n")}},
+				{Argv: local, Result: execx.Result{Stdout: []byte("v1.0.0\n")}},
+				{Argv: merged, Result: execx.Result{Stdout: []byte("v1.0.0\n")}},
+				{Argv: []string{"git", "log", "--reverse", release.LogFormat, "v1.0.0.." + sha}},
+				{Argv: []string{"git", "diff", "--name-only", "--no-renames", "--no-relative", "-z", "v1.0.0", sha, "--"}, Result: fatal},
+			},
+			want: "something broke",
+		},
 		{
 			name:  "git-missing",
 			calls: []execx.Call{{Argv: catFile.Argv, Err: errors.New("exec: \"git\": executable file not found in $PATH")}},
@@ -996,6 +1192,100 @@ func TestPrepareGitFails(t *testing.T) {
 			}
 			if errors.Is(err, release.ErrNoCommit) {
 				t.Errorf("Prepare() error = %v; a git that could not answer is not a missing commit", err)
+			}
+		})
+	}
+}
+
+// TestMatch checks path.Match's patterns, segment by segment, with ** as
+// any number of segments, none included.
+func TestMatch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		pattern, name string
+		want          bool
+	}{
+		{pattern: "**/*_test.go", name: "x_test.go", want: true},
+		{pattern: "**/*_test.go", name: "a/b/x_test.go", want: true},
+		{pattern: "**/*_test.go", name: "a/x.go"},
+		{pattern: "**/*_test.go", name: "x_test.go/y.go"},
+		{pattern: "LICENSES/**", name: "LICENSES/BSD-2-Clause.txt", want: true},
+		{pattern: "LICENSES/**", name: "LICENSES/a/b.txt", want: true},
+		{pattern: "LICENSES/**", name: "docs/LICENSES/BSD-2-Clause.txt"},
+		{pattern: "LICENSES/**", name: "LICENSES.txt"},
+		{pattern: "**/testdata/**", name: "testdata/x.txt", want: true},
+		{pattern: "**/testdata/**", name: "internal/workflows/testdata/a/b.txt", want: true},
+		{pattern: "**/testdata/**", name: "internal/testdata.go"},
+		{pattern: "a/**/b", name: "a/b", want: true},
+		{pattern: "a/**/b", name: "a/x/y/b", want: true},
+		{pattern: "a/**/b", name: "a/x/y/c"},
+		{pattern: "**", name: "a/b/c", want: true},
+		{pattern: "internal/testfixture/**", name: "internal/testfixture/testfixture.go", want: true},
+		{pattern: "internal/testfixture/**", name: "internal/testfixtures/x.go"},
+		// One segment's * never crosses a slash.
+		{pattern: "*.md", name: "docs/x.md"},
+		{pattern: "README.md", name: "README.md", want: true},
+		{pattern: "README.md", name: "docs/README.md"},
+		// A malformed pattern matches nothing, not even itself.
+		{pattern: "[", name: "["},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern+" "+tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := release.Match(tt.pattern, tt.name); got != tt.want {
+				t.Errorf("match(%q, %q) = %t, want %t", tt.pattern, tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCallerVisible checks that every kind of ci's own file is one no
+// caller uses, and that a path among them that is not keeps the change
+// visible.
+func TestCallerVisible(t *testing.T) {
+	t.Parallel()
+
+	own := []string{
+		".github/workflows/self-ci.yml", ".github/workflows/self-renovate.yml", ".github/workflows/self-stall.yml",
+		".github/CODEOWNERS", "README.md", "CLAUDE.md", "justfile", ".shellcheckrc",
+		"renovate.json", "renovate.json.license", "LICENSES/BSD-2-Clause.txt",
+		"composer.json", "composer.json.license", "composer.lock", "composer.lock.license",
+		"phpstan.neon", "phpstan.neon.license",
+		"x_test.go", "internal/release/release_test.go",
+		"testdata/x.txt", "internal/workflows/testdata/app-publish-shell.golden.txt",
+		"internal/testfixture/testfixture.go", "contract/internal/minimalgoprobe/main.go",
+	}
+	used := []string{
+		"mise.toml", ".gitignore", "cmd/divbast-release/main.go", "internal/release/release.go",
+		".github/workflows/lint.yml", "harness/harness.go", "go/golangci.yml", "common.just",
+		"docs/README.md", "internal/testdata.go",
+	}
+
+	type row struct {
+		name    string
+		changed []string
+		want    bool
+	}
+	tests := make([]row, 0, 3+len(own)+len(used))
+	tests = append(tests,
+		row{name: "nothing", want: true},
+		row{name: "every-own-file", changed: own},
+		row{name: "one-used-among-own", changed: append(slices.Clone(own), "harness/harness.go"), want: true},
+	)
+	for _, p := range own {
+		tests = append(tests, row{name: p, changed: []string{p}})
+	}
+	for _, p := range used {
+		tests = append(tests, row{name: p, changed: []string{p}, want: true})
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := release.CallerVisible(tt.changed); got != tt.want {
+				t.Errorf("callerVisible(%q) = %t, want %t", tt.changed, got, tt.want)
 			}
 		})
 	}

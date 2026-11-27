@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -60,14 +61,37 @@ func history(t *testing.T) (dir string, h commits) {
 }
 
 // releasedAtC releases c, as v2.0.0, on origin and in the clone.
-func releasedAtC(t *testing.T, dir string, h commits) {
+func releasedAtC(t *testing.T, dir string, h *commits) {
 	t.Helper()
 	gitIn(t, dir, "tag", "v2.0.0", h.c)
 	gitIn(t, dir, "push", "--quiet", "origin", "v2.0.0")
 }
 
-// commits are history's.
-type commits struct{ a, b, c, side string }
+// selfOnlyAfterC releases c, as v2.0.0, then pushes d, which changes
+// only README.md, a file of ci's own that no caller uses.
+func selfOnlyAfterC(t *testing.T, dir string, h *commits) {
+	t.Helper()
+	releasedAtC(t, dir, h)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := root.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := root.WriteFile("README.md", []byte("# ci\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "--", "README.md")
+	gitIn(t, dir, "commit", "--quiet", "--message", "docs: say more\n\nWhy.\n\nDeveloped-by: X <x@x.invalid>")
+	h.d = gitIn(t, dir, "rev-parse", "HEAD")
+	gitIn(t, dir, "push", "--quiet", "origin", "main")
+}
+
+// commits are history's, and d, a commit after c, when a setup makes one.
+type commits struct{ a, b, c, d, side string }
 
 const (
 	notes  = "## Breaking changes\n\n- divbast-scan's -layout is now -oci-layout\n\n## Changes\n\n- scan: rename -layout\n- docs: say so\n"
@@ -117,7 +141,7 @@ func TestRun(t *testing.T) {
 		// wantStderr lists what stderr must contain.
 		wantStderr []string
 		// setup, when set, changes the history before the run.
-		setup func(t *testing.T, dir string, h commits)
+		setup func(t *testing.T, dir string, h *commits)
 		// tagAt, when set, is the commit gh's release finds its tag at.
 		tagAt func(h commits) string
 	}{
@@ -132,7 +156,7 @@ func TestRun(t *testing.T) {
 			name:       "dry-run-superseded",
 			args:       func(h commits) []string { return []string{"-sha", h.b, "-dry-run"} },
 			stdout:     func(commits) string { return "v2.0.0\n\n" + notesB },
-			wantStderr: []string{"no longer main's tip", "would skip it"},
+			wantStderr: []string{"no longer main's tip", "would skip it: the run for ", " decides its release"},
 		},
 		{
 			name:       "dry-run-not-on-main",
@@ -161,13 +185,31 @@ func TestRun(t *testing.T) {
 				return h.a + " is already released as v1.0.0: nothing to do\n"
 			},
 		},
-		// Ruling R29: a later merge landed first, and its run releases
-		// this commit with it.
+		// Ruling R29: a later merge landed first, and its run decides
+		// whether to release this commit with it.
 		{
 			name: "superseded",
 			args: func(h commits) []string { return []string{"-sha", h.b} },
 			stdout: func(h commits) string {
-				return h.b + " is no longer main's tip (" + h.c + "); the run for " + h.c + " releases it\n"
+				return h.b + " is no longer main's tip (" + h.c + "); the run for " + h.c + " decides its release\n"
+			},
+		},
+		// Nothing a caller uses changed since the last release, so neither
+		// run releases it, and gh is never asked.
+		{
+			name:  "self-only",
+			args:  func(h commits) []string { return []string{"-sha", h.d} },
+			setup: selfOnlyAfterC,
+			stdout: func(commits) string {
+				return "nothing a caller uses changed since v2.0.0: no release\n"
+			},
+		},
+		{
+			name:  "self-only-dry-run",
+			args:  func(h commits) []string { return []string{"-sha", h.d, "-dry-run"} },
+			setup: selfOnlyAfterC,
+			stdout: func(commits) string {
+				return "nothing a caller uses changed since v2.0.0: no release\n"
 			},
 		},
 		// CI-36: re-run once the later merge's release is out, which holds
@@ -262,7 +304,7 @@ func TestRun(t *testing.T) {
 
 			dir, h := history(t)
 			if tt.setup != nil {
-				tt.setup(t, dir, h)
+				tt.setup(t, dir, &h)
 			}
 			var calls []execx.Call
 			if tt.gh != nil {
