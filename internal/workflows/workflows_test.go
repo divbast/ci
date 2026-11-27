@@ -1539,6 +1539,37 @@ func passesSlotJob(workflow string) error {
 	return nil
 }
 
+// TestStallDefaults pins the defaults of stall.yml's inputs that callers
+// get without setting them: Renovate may go 48 hours without a successful
+// run, since GitHub starts daily crons hours late, and every check runs.
+func TestStallDefaults(t *testing.T) {
+	t.Parallel()
+	lines := linesOf(readWorkflows(t)["stall.yml"])
+	if got := defaultOf(lines, "run-hours"); got != "48" {
+		t.Errorf("run-hours defaults to %q, want 48", got)
+	}
+	var checks []string
+	raw := defaultOf(lines, "checks")
+	if err := json.Unmarshal([]byte(strings.Trim(raw, "'")), &checks); err != nil {
+		t.Fatalf("checks defaults to %q, not a JSON array: %v", raw, err)
+	}
+	want := []string{"open", "stuck", "renovate", "slots", "lookups"}
+	if !slices.Equal(checks, want) {
+		t.Errorf("checks defaults to %q, want %q", checks, want)
+	}
+}
+
+// defaultOf returns the text after "default: " in a workflow_call input's
+// declaration, or "" when it has none.
+func defaultOf(lines []line, input string) string {
+	for _, d := range declaration(lines, input) {
+		if v, ok := strings.CutPrefix(d, "default: "); ok {
+			return v
+		}
+	}
+	return ""
+}
+
 // declaration returns the lines below a workflow_call input's name, each
 // trimmed: its type, default and the rest.
 func declaration(lines []line, input string) []string {

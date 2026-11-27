@@ -44,7 +44,7 @@ on:
       run-hours:
         description: Hours Renovate may go without a successful run
         type: number
-        default: 24
+        default: 48
       lost-slots:
         description: Lost daily slots that make a stall
         type: number
