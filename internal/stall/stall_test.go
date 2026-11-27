@@ -72,11 +72,25 @@ type source struct {
 	jobs map[int64]map[string]string
 	// dashboards are the open Dependency Dashboards.
 	dashboards []stall.Issue
-	err        error // returned by every call when set
+	// edits are each dashboard's history, by its number, as
+	// DashboardHistory returns it.
+	edits map[int][]stall.DashboardEdit
+	err   error // returned by every call when set
 }
 
 func (s *source) Dashboards(context.Context) ([]stall.Issue, error) {
 	return s.dashboards, s.err
+}
+
+func (s *source) DashboardHistory(_ context.Context, number int, _ time.Time) ([]stall.DashboardEdit, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	edits, ok := s.edits[number]
+	if !ok {
+		return nil, fmt.Errorf("asked for the history of dashboard #%d, which the test did not script", number)
+	}
+	return edits, nil
 }
 
 func (s *source) RenovatePRs(context.Context) ([]stall.PR, error) {

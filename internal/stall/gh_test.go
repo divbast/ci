@@ -5,6 +5,7 @@ package stall_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -58,6 +59,28 @@ const (
 //
 //	gh-api-issues-open-baikal.txt      gh api -i 'repos/divbast/baikal-oci-image/issues?state=open&creator=divbast-renovate%5Bbot%5D&per_page=100'
 //	gh-api-issues-open-sonarr.txt      the same for divbast/sonarr-oci-image
+//
+// and with gh 2.105.0 on 2026-11-27, each through gh api graphql with
+// historyQuery, owner divbast, and the name, number and page size (first)
+// given, the later pages with -f cursor= the page before's endCursor,
+//
+//	gh-api-graphql-edits-sabnzbd-1.json   sabnzbd-oci-image #2, first 8
+//	gh-api-graphql-edits-sabnzbd-2.json   the same, its second and last page
+//	gh-api-graphql-edits-template-1.json  oci-image-template #3, first 5
+//	gh-api-graphql-edits-template-20.json  the same, its twentieth and last page
+//	gh-api-graphql-edits-never-sabnzbd.json  sabnzbd-oci-image #2, first 100, its edits emptied
+//
+// Sabnzbd's dashboard had been edited 12 times, so its two pages hold the
+// whole of its history, ending with its creation. Oci-image-template's had
+// reached 100, as many as GitHub keeps: its original body and the latest
+// 99, with whatever came between gone. Its 20 pages were read in turn, and
+// its tests answer the first page's cursor with the last page, leaving
+// out the 18 between, which hold only more bodies. No issue in divbast's
+// public repositories had never been edited, so the never-edited answer
+// is sabnzbd's, with its edits replaced by what GitHub answered for a pull
+// request never edited, baikal-oci-image #154: no nodes, and a null
+// endCursor. gh api graphql prints only the body, with no headers and no
+// newline at the end; each is as gh printed it.
 //
 // The issue lists hold each repository's Dependency Dashboard, #94 and
 // #4, both clean, among Renovate's open pull requests, which the issues
@@ -980,4 +1003,382 @@ func TestGHDashboards(t *testing.T) {
 			}
 		})
 	}
+}
+
+const (
+	sabnzbd  = "divbast/sabnzbd-oci-image"
+	template = "divbast/oci-image-template"
+)
+
+// historyQuery is the query GH.DashboardHistory sends, with which the
+// recordings were made.
+const historyQuery = `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$cursor:String){repository(owner:$owner,name:$name){issue(number:$number){createdAt body userContentEdits(first:$first,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{editedAt diff}}}}}`
+
+// history is the gh call that reads a page of first edits of issue number
+// in repo: the first page when cursor is empty, else the one after it.
+func history(repo string, number, first int, cursor string) []string {
+	owner, name, _ := strings.Cut(repo, "/")
+	argv := []string{
+		"gh", "api", "graphql", "-f", "query=" + historyQuery, "-F", "owner=" + owner, "-F", "name=" + name,
+		"-F", "number=" + strconv.Itoa(number), "-F", "first=" + strconv.Itoa(first),
+	}
+	if cursor != "" {
+		argv = append(argv, "-f", "cursor="+cursor)
+	}
+	return argv
+}
+
+// recorded reads the recorded pages of an issue's history: each edit's
+// body by when it was made, and the issue's body as it was recorded.
+func recorded(t *testing.T, names ...string) (bodies map[string]string, body string) {
+	t.Helper()
+	bodies = map[string]string{}
+	for _, name := range names {
+		var page struct {
+			Data struct {
+				Repository struct {
+					Issue struct {
+						Body             string
+						UserContentEdits struct {
+							Nodes []struct {
+								EditedAt string
+								Diff     string
+							}
+						}
+					}
+				}
+			}
+		}
+		if err := json.Unmarshal(testdata(t, name), &page); err != nil {
+			t.Fatal(err)
+		}
+		body = page.Data.Repository.Issue.Body
+		for _, n := range page.Data.Repository.Issue.UserContentEdits.Nodes {
+			bodies[n.EditedAt] = n.Diff
+		}
+	}
+	return bodies, body
+}
+
+// checkHistory fails t unless edits were made at want, in that order,
+// each with the body recorded for it.
+func checkHistory(t *testing.T, edits []stall.DashboardEdit, bodies map[string]string, want []string) {
+	t.Helper()
+	got := make([]string, 0, len(edits))
+	for _, e := range edits {
+		got = append(got, e.EditedAt.UTC().Format(time.RFC3339))
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("DashboardHistory() edits made at\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	for i, e := range edits {
+		at := e.EditedAt.UTC().Format(time.RFC3339)
+		if b, ok := bodies[at]; !ok || e.Body != b {
+			t.Errorf("edit %d, made at %s, has a body of %d bytes, not the %d recorded for it", i, at, len(e.Body), len(b))
+		}
+	}
+}
+
+// TestGHDashboardHistory reads one page of sabnzbd's dashboard's history
+// whose oldest edit is before since: the edits come newest first, down to
+// the newest made at or before since, and no second page is asked for.
+//
+//nolint:paralleltest // Not parallel: it lowers the page size every read of a history uses
+func TestGHDashboardHistory(t *testing.T) {
+	stall.SetPageSize(t, 8)
+	bodies, body := recorded(t, "gh-api-graphql-edits-sabnzbd-1.json")
+	newest := []string{
+		"2026-11-27T03:27:37Z", "2026-11-27T03:18:31Z", "2026-11-27T03:17:24Z", "2026-11-27T03:05:47Z",
+		"2026-11-27T02:45:27Z", "2026-11-27T02:13:55Z",
+	}
+	for _, tt := range []struct {
+		name, since string
+		want        []string
+	}{
+		{name: "between-edits", since: "2026-11-27T02:00:00Z", want: append(slices.Clip(newest), "2026-11-27T01:47:47Z")},
+		{name: "at-an-edit", since: "2026-11-27T02:13:55Z", want: newest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{
+				Argv:   history(sabnzbd, 2, 8, ""),
+				Result: stdout(testdata(t, "gh-api-graphql-edits-sabnzbd-1.json")),
+			}), Repo: sabnzbd}
+			edits, err := gh.DashboardHistory(t.Context(), 2, rfc3339(t, tt.since))
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkHistory(t, edits, bodies, tt.want)
+			// The newest edit's body is the issue's body now.
+			if edits[0].Body != body {
+				t.Errorf("the newest edit's body is not the issue's")
+			}
+		})
+	}
+}
+
+// TestGHDashboardHistoryPages reads sabnzbd's dashboard's history over two
+// pages: down to the newest edit at or before since, when there is one,
+// and otherwise down to its creation, which is what there is.
+//
+//nolint:paralleltest // Not parallel: it lowers the page size every read of a history uses
+func TestGHDashboardHistoryPages(t *testing.T) {
+	stall.SetPageSize(t, 8)
+	bodies, _ := recorded(t, "gh-api-graphql-edits-sabnzbd-1.json", "gh-api-graphql-edits-sabnzbd-2.json")
+	first := []string{
+		"2026-11-27T03:27:37Z", "2026-11-27T03:18:31Z", "2026-11-27T03:17:24Z", "2026-11-27T03:05:47Z",
+		"2026-11-27T02:45:27Z", "2026-11-27T02:13:55Z", "2026-11-27T01:47:47Z", "2026-11-26T10:42:55Z",
+	}
+	for _, tt := range []struct {
+		name, since string
+		want        []string
+	}{
+		{
+			name: "stops", since: "2026-11-26T09:30:00Z",
+			want: append(slices.Clip(first), "2026-11-26T09:35:26Z", "2026-11-26T09:25:37Z"),
+		},
+		{
+			// The history ends before since: with its creation, and no error
+			name: "ends-before-since", since: "2026-11-01T00:00:00Z",
+			want: append(slices.Clip(first), "2026-11-26T09:35:26Z", "2026-11-26T09:25:37Z", "2026-11-26T08:56:55Z", "2026-11-26T06:52:53Z"),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gh := stall.GH{Run: execx.NewFake(t,
+				execx.Call{Argv: history(sabnzbd, 2, 8, ""), Result: stdout(testdata(t, "gh-api-graphql-edits-sabnzbd-1.json"))},
+				execx.Call{
+					Argv:   history(sabnzbd, 2, 8, "Y3Vyc29yOnYyOpHPAAAAATnNQEw="),
+					Result: stdout(testdata(t, "gh-api-graphql-edits-sabnzbd-2.json")),
+				},
+			), Repo: sabnzbd}
+			edits, err := gh.DashboardHistory(t.Context(), 2, rfc3339(t, tt.since))
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkHistory(t, edits, bodies, tt.want)
+		})
+	}
+}
+
+// TestGHDashboardHistoryTruncated reads oci-image-template's dashboard,
+// edited 100 times, as many as GitHub keeps: its original body and the
+// latest 99, with what came between gone. The original body, of
+// 2026-11-13T07:45:38Z, is left out, since it did not stand until the
+// oldest edit kept, of 2026-11-16T01:50:09Z. So whether since is before
+// the original or in the days whose edits are gone, the history ends with
+// that oldest edit kept, newer than since, and no error.
+//
+//nolint:paralleltest // Not parallel: it lowers the page size every read of a history uses
+func TestGHDashboardHistoryTruncated(t *testing.T) {
+	stall.SetPageSize(t, 5)
+	bodies, _ := recorded(t, "gh-api-graphql-edits-template-1.json", "gh-api-graphql-edits-template-20.json")
+	want := []string{
+		"2026-11-27T03:23:06Z", "2026-11-27T03:18:03Z", "2026-11-27T03:17:04Z", "2026-11-27T03:05:18Z", "2026-11-27T02:53:59Z",
+		"2026-11-17T01:25:00Z", "2026-11-17T01:20:36Z", "2026-11-17T01:16:34Z", "2026-11-16T01:50:09Z",
+	}
+	for _, tt := range []struct{ name, since string }{
+		{name: "before-the-original", since: "2026-11-01T00:00:00Z"},
+		{name: "in-the-gap", since: "2026-11-15T00:00:00Z"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gh := stall.GH{Run: execx.NewFake(t,
+				execx.Call{Argv: history(template, 3, 5, ""), Result: stdout(testdata(t, "gh-api-graphql-edits-template-1.json"))},
+				execx.Call{
+					Argv:   history(template, 3, 5, "Y3Vyc29yOnYyOpHPAAAAATqso38="),
+					Result: stdout(testdata(t, "gh-api-graphql-edits-template-20.json")),
+				},
+			), Repo: template}
+			edits, err := gh.DashboardHistory(t.Context(), 3, rfc3339(t, tt.since))
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkHistory(t, edits, bodies, want)
+		})
+	}
+}
+
+// TestGHDashboardHistoryEditLimit pins where the original body is left
+// out: at 100 edits, as many as GitHub keeps, and not one fewer, since an
+// issue edited 99 times has lost none of them.
+func TestGHDashboardHistoryEditLimit(t *testing.T) {
+	t.Parallel()
+
+	created := "2026-11-01T00:00:00Z"
+	tests := []struct {
+		total int
+		want  []string
+	}{
+		{total: 99, want: []string{"2026-11-03T00:00:00Z", "2026-11-02T00:00:00Z", created}},
+		{total: 100, want: []string{"2026-11-03T00:00:00Z", "2026-11-02T00:00:00Z"}},
+	}
+	for _, tt := range tests {
+		t.Run(strconv.Itoa(tt.total), func(t *testing.T) {
+			t.Parallel()
+			page := fmt.Sprintf(`{"data":{"repository":{"issue":{"createdAt":%q,"body":"c",`+
+				`"userContentEdits":{"totalCount":%d,"pageInfo":{"hasNextPage":false,"endCursor":"x"},"nodes":[`+
+				`{"editedAt":"2026-11-03T00:00:00Z","diff":"c"},{"editedAt":"2026-11-02T00:00:00Z","diff":"b"},`+
+				`{"editedAt":%q,"diff":"a"}]}}}}}`, created, tt.total, created)
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: history(baikal, 94, 100, ""), Result: stdout([]byte(page))}), Repo: baikal}
+			edits, err := gh.DashboardHistory(t.Context(), 94, rfc3339(t, "2026-10-01T00:00:00Z"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkHistory(t, edits, map[string]string{"2026-11-03T00:00:00Z": "c", "2026-11-02T00:00:00Z": "b", created: "a"}, tt.want)
+		})
+	}
+}
+
+// TestGHDashboardHistoryNeverEdited reads a dashboard GitHub lists no
+// edits of: its history is its creation, with the body it has now.
+func TestGHDashboardHistoryNeverEdited(t *testing.T) {
+	t.Parallel()
+	_, body := recorded(t, "gh-api-graphql-edits-never-sabnzbd.json")
+	gh := stall.GH{Run: execx.NewFake(t, execx.Call{
+		Argv:   history(sabnzbd, 2, 100, ""),
+		Result: stdout(testdata(t, "gh-api-graphql-edits-never-sabnzbd.json")),
+	}), Repo: sabnzbd}
+	edits, err := gh.DashboardHistory(t.Context(), 2, rfc3339(t, "2026-11-27T00:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkHistory(t, edits, map[string]string{"2026-11-26T06:52:53Z": body}, []string{"2026-11-26T06:52:53Z"})
+}
+
+func TestGHDashboardHistoryFails(t *testing.T) {
+	t.Parallel()
+
+	// What gh 2.105.0 printed on 2026-11-27 for an issue
+	// baikal-oci-image does not have.
+	missing := `{"data":{"repository":{"issue":null}},"errors":[{"type":"NOT_FOUND","path":["repository","issue"],` +
+		`"locations":[{"line":1,"column":113}],"message":"Could not resolve to an Issue with the number of 999999."}]}`
+	tests := []struct {
+		name    string
+		repo    string
+		number  int
+		calls   []execx.Call
+		wantErr []string
+	}{
+		{
+			name: "gh-fails", repo: baikal, number: 999999,
+			calls: []execx.Call{{Argv: history(baikal, 999999, 100, ""), Result: execx.Result{
+				Stdout: []byte(missing),
+				Stderr: []byte("gh: Could not resolve to an Issue with the number of 999999.\n"),
+				Code:   1,
+			}}},
+			wantErr: []string{"gh api graphql", "Could not resolve to an Issue with the number of 999999."},
+		},
+		{
+			name: "not-json", repo: baikal, number: 94,
+			calls:   []execx.Call{{Argv: history(baikal, 94, 100, ""), Result: stdout([]byte("<html>"))}},
+			wantErr: []string{"gh api graphql", "decode"},
+		},
+		{
+			name: "no-issue", repo: baikal, number: 94,
+			calls:   []execx.Call{{Argv: history(baikal, 94, 100, ""), Result: stdout([]byte(`{"data":{"repository":{"issue":null}}}`))}},
+			wantErr: []string{"#94", baikal},
+		},
+		{
+			// Not owner/name, which never reaches gh
+			name: "not-a-repository", repo: "baikal-oci-image", number: 94,
+			wantErr: []string{`"baikal-oci-image"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, tt.calls...), Repo: tt.repo}
+			edits, err := gh.DashboardHistory(t.Context(), tt.number, rfc3339(t, "2026-11-27T00:00:00Z"))
+			if err == nil {
+				t.Fatalf("DashboardHistory() = %+v, want an error", edits)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("DashboardHistory() error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestGHDashboardHistoryDeletedRevision checks that an edit whose body
+// someone deleted from the history fails the read when the history
+// reaches it, and only then: whether a line was there is not known.
+func TestGHDashboardHistoryDeletedRevision(t *testing.T) {
+	t.Parallel()
+
+	page := `{"data":{"repository":{"issue":{"createdAt":"2026-11-01T00:00:00Z","body":"c",` +
+		`"userContentEdits":{"totalCount":3,"pageInfo":{"hasNextPage":false,"endCursor":"x"},"nodes":[` +
+		`{"editedAt":"2026-11-03T00:00:00Z","diff":"c"},{"editedAt":"2026-11-02T00:00:00Z","diff":null},` +
+		`{"editedAt":"2026-11-01T00:00:00Z","diff":"a"}]}}}}}`
+	tests := []struct {
+		name, since string
+		wantErr     bool
+	}{
+		{name: "reached", since: "2026-11-01T12:00:00Z", wantErr: true},
+		{name: "at-since", since: "2026-11-02T00:00:00Z", wantErr: true},
+		{name: "beyond-since", since: "2026-11-03T00:00:00Z"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gh := stall.GH{Run: execx.NewFake(t, execx.Call{Argv: history(baikal, 94, 100, ""), Result: stdout([]byte(page))}), Repo: baikal}
+			edits, err := gh.DashboardHistory(t.Context(), 94, rfc3339(t, tt.since))
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "2026-11-02T00:00:00Z") {
+					t.Errorf("DashboardHistory() = %+v, %v; want an error naming the edit of 2026-11-02T00:00:00Z", edits, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkHistory(t, edits, map[string]string{"2026-11-03T00:00:00Z": "c"}, []string{"2026-11-03T00:00:00Z"})
+		})
+	}
+}
+
+// scriptedPages scripts the first n pages of a history, one edit each, all
+// newer than 2026-11-26; the last page says another follows when more.
+func scriptedPages(n int, more bool) []execx.Call {
+	calls := make([]execx.Call, 0, n)
+	for k := 1; k <= n; k++ {
+		cursor := ""
+		if k > 1 {
+			cursor = fmt.Sprintf("c%d", k-1)
+		}
+		next := k < n || more
+		edited := time.Date(2026, 11, 27, 0, 0, 0, 0, time.UTC).Add(-time.Duration(k) * time.Minute)
+		page := fmt.Sprintf(`{"data":{"repository":{"issue":{"createdAt":"2026-11-01T00:00:00Z","body":"b",`+
+			`"userContentEdits":{"totalCount":21,"pageInfo":{"hasNextPage":%t,"endCursor":"c%d"},"nodes":[{"editedAt":%q,"diff":"b%d"}]}}}}}`,
+			next, k, edited.Format(time.RFC3339), k)
+		calls = append(calls, execx.Call{Argv: history(baikal, 94, 100, cursor), Result: stdout([]byte(page))})
+	}
+	return calls
+}
+
+// TestGHDashboardHistoryPageCap checks that a history is read over at
+// most 20 pages: one that goes on past them fails, rather than be read in
+// part, without asking for a 21st.
+func TestGHDashboardHistoryPageCap(t *testing.T) {
+	t.Parallel()
+
+	since := rfc3339(t, "2026-11-26T00:00:00Z")
+	t.Run("20-pages", func(t *testing.T) {
+		t.Parallel()
+		gh := stall.GH{Run: execx.NewFake(t, scriptedPages(20, false)...), Repo: baikal}
+		edits, err := gh.DashboardHistory(t.Context(), 94, since)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(edits) != 20 {
+			t.Errorf("DashboardHistory() returned %d edits, want 20", len(edits))
+		}
+	})
+	t.Run("more", func(t *testing.T) {
+		t.Parallel()
+		gh := stall.GH{Run: execx.NewFake(t, scriptedPages(20, true)...), Repo: baikal}
+		edits, err := gh.DashboardHistory(t.Context(), 94, since)
+		if err == nil || !strings.Contains(err.Error(), "20 pages") {
+			t.Errorf("DashboardHistory() = %d edits, %v; want an error naming 20 pages", len(edits), err)
+		}
+	})
 }
