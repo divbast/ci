@@ -109,7 +109,9 @@ jobs:
 
   # On a pull request, the release its merge would make, in the run's
   # summary, from divbast-release's dry run of GitHub's test merge into
-  # main. required needs it, so a release that would fail stops the merge.
+  # main, or that it makes none, when the pull request changes only ci's
+  # own files. required needs it, so a release that would fail stops the
+  # merge.
   # On any other event, a push to main among them, every step is skipped
   # and the job succeeds: the release job's own log says what main
   # releases, and a preview there could race an earlier merge's release
@@ -150,7 +152,8 @@ jobs:
           {
             echo '## Release preview'
             echo
-            # Anything but a version says a release tag is already here
+            # Anything but a version says merging releases nothing: a
+            # release tag is already here, or nothing a caller uses changed
             if [[ ! ${version} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "${out}"
               exit 0
@@ -192,10 +195,13 @@ jobs:
             fi
           done
 
-  # Every green merge to main is released: the next vX.Y.Z tag at that
-  # commit, as an immutable GitHub Release whose notes are the commits since
-  # the last one (cmd/divbast-release). Callers pin ci at a release's commit
-  # with its tag as the comment, which zizmor and pinact can check.
+  # Every green merge to main that changes something callers use is
+  # released: the next vX.Y.Z tag at that commit, as an immutable GitHub
+  # Release whose notes are the commits since the last one
+  # (cmd/divbast-release). A merge that changes only ci's own files, such as
+  # its own workflows, docs, tests and test data, is not released, and the
+  # next release includes it. Callers pin ci at a release's commit with its
+  # tag as the comment, which zizmor and pinact can check.
   release:
     name: release
     needs: [required]

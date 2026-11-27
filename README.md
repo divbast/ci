@@ -530,17 +530,33 @@ the registry. `renovate.yml` builds none.
 
 ## Releases
 
-Every green merge to ci's main is a release. Once `required` has passed
-on a push to main, `self-ci.yml`'s `release` job runs `divbast-release`,
-which tags the merged commit with the next version and publishes it as a
-GitHub Release, immutable once published, then reads the tag back from
-origin and fails unless it is at that commit. Its notes list the subject
-of every commit since the last release, leaving out merge commits. When
-two merges land close together, the run for the earlier one finds main
-has moved on and leaves the release to the run for the later one, which
-releases both; a re-run of the earlier one once that release is out says
-which release holds it. Only origin's release tags count: a tag in a
-clone alone releases nothing and moves no version.
+Every green merge to ci's main that changes something a caller uses is a
+release. Once `required` has passed on a push to main, `self-ci.yml`'s
+`release` job runs `divbast-release`, which tags the merged commit with
+the next version and publishes it as a GitHub Release, immutable once
+published, then reads the tag back from origin and fails unless it is at
+that commit. Its notes list the subject of every commit since the last
+release, leaving out merge commits. When two merges land close together,
+the run for the earlier one finds main has moved on and leaves the
+release to the run for the later one, which decides for both; a re-run
+of the earlier one once a later release is out says which release holds
+it. Only origin's release tags count: a tag in a clone alone releases
+nothing and moves no version.
+
+A merge that changes only ci's own files is not released: its own
+workflows, README.md, CLAUDE.md and CODEOWNERS, its justfile, the
+configuration of its own Renovate, ShellCheck, Composer and PHPStan, the
+licence texts, and its tests, test data and test fixtures. The release
+job then prints `nothing a caller uses changed since vX.Y.Z: no release`
+and succeeds, and the next release lists those commits with its own.
+`divbast-release` reads what changed with `git diff` from the last
+release's tag to the merged commit, so it judges every commit since that
+release together, and a rename counts as both its paths. A merge is
+released whatever it changed when any commit since the last release
+marks a breaking change, and when together they change no file at all.
+`selfOnly` in `internal/release` lists ci's own files: add one there only
+when no caller can use it, since a wrong entry holds a change back from
+every caller.
 
 - The version is the last release's with its minor number raised:
   v1.4.0 follows v1.3.0. The first release is v1.0.0.
@@ -562,10 +578,11 @@ Every pull request previews the release its merge would make:
 `self-ci.yml`'s `release-preview` job, which `required` needs, dry-runs
 `divbast-release` on GitHub's test merge of the pull request into main
 and writes the version, minor or major, and its notes to the run's
-summary. Re-running an old preview fails once a later release is out: it
-runs on the test merge GitHub made at the time, whose next version is
-taken now. A push to the pull request, or a rebase, makes a new test
-merge.
+summary, or, for a pull request that changes only ci's own files, that
+merging it releases nothing. Re-running an old preview fails once a
+later release is out: it runs on the test merge GitHub made at the time,
+whose next version is taken now. A push to the pull request, or a
+rebase, makes a new test merge.
 
 A repository pins ci at a release, the release's commit with its tag as
 the comment, and zizmor and pinact check that pair as they do any other
@@ -1404,7 +1421,7 @@ the token was found.
 | `go test -json ... \| divbast-testcount` | Fails a go test run in which no test ran, or one skipped; prints each test's output and a count | Every package built and passed with a test of its own passing, and no test failed or skipped | A test failed or skipped; a package failed, did not build, never finished, or ran no test that passed; or a write failed (2: stdin unreadable, not go test -json's, or empty) |
 | `divbast-stall open\|stuck\|renovate\|slots\|lookups`, `divbast-stall slots [-content-gated]` | Fails when updates have stopped flowing | Nothing stalled | Stalled (2: GitHub or the registry could not say) |
 | `divbast-verify-images [-containerfile FILE]` | Refuses a Containerfile that builds from an image not pinned by digest, or from one in its table (FrankenPHP, distroless, `dhi.io`) its publisher did not sign | Every image pinned, and each in the table verified | An image unpinned, or named where it may not be; an unlisted divbast image, or FrankenPHP's named twice; gh too old; a `dhi.io` image with no `DHI_USERNAME` and `DHI_TOKEN`; or a verification failed |
-| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z | Released, already released, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
+| `divbast-release -sha SHA [-dry-run]` | Releases a commit on main as the next vX.Y.Z, unless nothing a caller uses changed since the last release | Released, already released, nothing a caller uses changed, left to a later merge's run or held by its release, or the dry run printed | Refused: not a commit, not on origin's main with something to release, a release tag the clone lacks, or the version's tag taken; the release made on a tag at another commit; or git or gh failed |
 
 ## Shared configuration
 
@@ -1451,7 +1468,8 @@ recipes above, PHPStan, and the tests. It needs `GITHUB_TOKEN` set (see
 containers run only when `ENGINE` is `docker` or `podman`, so
 `ENGINE=docker just ci` runs them all. `self-ci.yml` runs them on amd64 and
 arm64 under Docker and Podman, and calls `lint.yml` from the commit under
-test. A merge to main that passes them is released.
+test. A merge to main that passes them is released, unless it changes
+only ci's own files ([Releases](#releases)).
 
 The contract suite runs against four images. Two are the published
 LibreSpeed and Baikal images `internal/testfixture` pins, Baikal's with

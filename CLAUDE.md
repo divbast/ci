@@ -4,13 +4,13 @@
 # ci
 
 The reusable workflows, Go tools, acceptance harness and lint configuration
-every divbast repository shares. Every green merge to main is released,
-callers pin a release and check out its commit into `.ci/`; `README.md`
-says how. A change here reaches a caller only through the pull request
-that moves its pin, so anything a caller sees is an interface, and
-README.md's "What breaks a caller" is the one list of what that covers:
-change it so that old callers keep working, or mark the commit as
-breaking them (below).
+every divbast repository shares. Every green merge to main that changes
+something callers use is released, callers pin a release and check out
+its commit into `.ci/`; `README.md` says how. A change here reaches a
+caller only through the pull request that moves its pin, so anything a
+caller sees is an interface, and README.md's "What breaks a caller" is
+the one list of what that covers: change it so that old callers keep
+working, or mark the commit as breaking them (below).
 
 ## CRITICAL: Git Commit Message Format
 
@@ -55,11 +55,18 @@ waits for an approval.
 
 ## Releases
 
-Every merge to main that passes `required` is released by `self-ci.yml`'s
+A merge to main that passes `required` is released by `self-ci.yml`'s
 `release` job (`cmd/divbast-release`): the next vX.Y.Z tag at the merged
-commit, as an immutable GitHub Release. Never create, move or delete a
-tag by hand. `bin/divbast-release -sha <commit> -dry-run` shows what a
-commit's release would be.
+commit, as an immutable GitHub Release. A merge that changes only ci's
+own files (its own workflows and docs, its justfile, its tooling
+configuration, the licence texts, and its tests, test data and test
+fixtures) is not released, and the next release includes it; a commit
+that marks a breaking change is released all the same. `selfOnly` in
+`internal/release` lists those files: add one only when no caller can
+use it, since a wrong entry holds a change back from every caller. Never
+create, move or delete a tag by hand.
+`bin/divbast-release -sha <commit> -dry-run` shows what a commit's
+release would be.
 
 ## CRITICAL: No AI Attribution in Pull Requests
 
