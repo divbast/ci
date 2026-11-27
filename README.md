@@ -1249,7 +1249,7 @@ by `divbast-stall`.
 | `renovate-workflow` | string | `renovate.yml` | The workflow that runs Renovate |
 | `open-days` | number | `14` | Days a Renovate pull request may stay open |
 | `stuck-hours` | number | `24` | Hours one may stay red since it opened, or pending since its last push |
-| `run-hours` | number | `24` | Hours Renovate may go without a successful run |
+| `run-hours` | number | `48` | Hours Renovate may go without a successful run |
 | `lost-slots` | number | `2` | Lost daily slots that make a stall |
 | `content-gated` | boolean | `false` | The slot workflow publishes only when the image's content moved, so once the image is published a slot run that succeeded is never lost |
 | `slot-job` | string | `''` | With `content-gated`, the job in each slot run that publishes the image, as GitHub names it in the run, whose conclusion counts rather than the whole run's |
