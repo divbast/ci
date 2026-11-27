@@ -20,9 +20,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 
 	"github.com/divbast/ci/internal/execx"
 	"github.com/divbast/ci/internal/registry"
+	"github.com/divbast/ci/internal/testfixture"
 )
 
 const (
@@ -1033,9 +1035,6 @@ func TestRunUsage(t *testing.T) {
 	}
 }
 
-// fixture is LibreSpeed's published index, public and pinned by digest.
-const fixture = "ghcr.io/divbast/librespeed@sha256:d9ea226a05957bd70876b6b3eb81ca454fefc4365902f061dba82515efb12909"
-
 // TestScanAgainstItself scans the fixture as an OCI layout and compares it
 // with itself as published, with the real trivy, which must find nothing
 // new. It needs the network, skopeo and trivy, so it runs only where the
@@ -1054,11 +1053,8 @@ func TestScanAgainstItself(t *testing.T) {
 
 	dir := t.TempDir()
 	layout := filepath.Join(dir, "layout")
-	// --override-os, for a run on macOS
-	res, err := execx.OS{}.Run(t.Context(), "skopeo", "copy", "--override-os", "linux", "--override-arch", runtime.GOARCH,
-		"docker://"+fixture, "oci:"+layout)
-	if err != nil || res.Code != 0 {
-		t.Fatalf("skopeo copy: %v, exit %d: %s", err, res.Code, res.Stderr)
+	if err := copyFixture(t.Context(), t, execx.OS{}, layout); err != nil {
+		t.Fatal(err)
 	}
 
 	summary := filepath.Join(dir, "summary.md")
@@ -1069,7 +1065,7 @@ func TestScanAgainstItself(t *testing.T) {
 		return ""
 	}
 	args := []string{
-		"-layout", layout, "-report", filepath.Join(dir, "report.json"), "-published", fixture,
+		"-layout", layout, "-report", filepath.Join(dir, "report.json"), "-published", testfixture.LibreSpeed,
 		"-baseline", filepath.Join(dir, "baseline.json"), "-sarif", filepath.Join(dir, "report.sarif"),
 	}
 	var stdout, stderr bytes.Buffer
@@ -1081,8 +1077,8 @@ func TestScanAgainstItself(t *testing.T) {
 	if !strings.Contains(stdout.String(), "nothing new against what is published") {
 		t.Errorf("stdout = %q, want nothing new", stdout.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "compared with "+fixture+"\n") {
-		t.Errorf("stdout = %q, want it compared with %s", stdout.String(), fixture)
+	if !strings.HasPrefix(stdout.String(), "compared with "+testfixture.LibreSpeed+"\n") {
+		t.Errorf("stdout = %q, want it compared with %s", stdout.String(), testfixture.LibreSpeed)
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
@@ -1093,5 +1089,96 @@ func TestScanAgainstItself(t *testing.T) {
 		if info, err := root.Stat(name); err != nil || info.Size() == 0 {
 			t.Errorf("%s: %v, want a file with something in it", name, err)
 		}
+	}
+}
+
+// copyFixture copies the LibreSpeed fixture, for this host's
+// architecture, into the OCI layout at layout, with run's skopeo. The copy
+// is a fetch from ghcr.io, which now and then fails a blob request with a
+// 500, which skopeo does not retry and which once failed this test, so it
+// goes through testfixture.Fetch. Each copy after the first starts from an
+// empty layout, holding nothing of the copy that failed. tb's log says
+// when it copies again.
+func copyFixture(ctx context.Context, tb testing.TB, run execx.Runner, layout string) error {
+	tb.Helper()
+	_, err := testfixture.Fetch(ctx, tbLog{tb}, "skopeo copy "+testfixture.LibreSpeed, func(ctx context.Context, attempt int) (execx.Result, error) {
+		if attempt > 1 {
+			if err := os.RemoveAll(layout); err != nil {
+				return execx.Result{}, err
+			}
+		}
+		// --override-os, for a run on macOS
+		return run.Run(ctx, "skopeo", "copy", "--override-os", "linux", "--override-arch", runtime.GOARCH,
+			"docker://"+testfixture.LibreSpeed, "oci:"+layout)
+	})
+	return err
+}
+
+// tbLog is an io.Writer that writes to tb's log.
+type tbLog struct{ tb testing.TB }
+
+func (l tbLog) Write(p []byte) (int, error) {
+	l.tb.Log(strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
+// TestCopyFixture copies the fixture again after the registry answered
+// with a server error, from an empty layout, and leaves the layout as it
+// is for a first copy and for one that fails for any other reason, which
+// ends the copy at once. testfixture's TestFetch covers when it copies
+// again.
+func TestCopyFixture(t *testing.T) {
+	t.Parallel()
+
+	skopeoCopy := []string{"skopeo", "copy", "--override-os", "linux", "--override-arch", runtime.GOARCH, "docker://" + testfixture.LibreSpeed, "oci:"}
+	// skopeo's words for the blob ghcr.io failed, as ci's own CI logged them
+	serverError := func(status string) execx.Call {
+		return execx.Call{Result: execx.Result{Code: 1, Stderr: []byte(`time="2026-11-25T09:03:07Z" level=fatal msg="copying system image from manifest list: ` +
+			`reading blob sha256:b839dfae01f66e15c6a8b63520557ed315bdfe036342fa7a0c537259f10d7a9a: fetching blob: received unexpected HTTP status: ` + status + `"` + "\n")}}
+	}
+	copied := execx.Call{Result: execx.Result{Code: 0}}
+	refused := execx.Call{Result: execx.Result{Code: 1, Stderr: []byte(`time="2026-11-25T09:03:07Z" level=fatal msg="initializing source docker://` + testfixture.LibreSpeed + `: ` +
+		`reading manifest sha256:d9ea226a05957bd70876b6b3eb81ca454fefc4365902f061dba82515efb12909 in ghcr.io/divbast/librespeed: manifest unknown"` + "\n")}}
+	for _, tt := range []struct {
+		name    string
+		calls   []execx.Call
+		wantErr string
+	}{
+		{name: "at-once", calls: []execx.Call{copied}},
+		{name: "after-a-500", calls: []execx.Call{serverError("500 Internal Server Error"), copied}},
+		{name: "refused", calls: []execx.Call{refused}, wantErr: "skopeo copy " + testfixture.LibreSpeed + ", attempt 1 of 3: exit status 1: "},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				layout := filepath.Join(t.TempDir(), "layout")
+				calls := make([]execx.Call, len(tt.calls))
+				for i, c := range tt.calls {
+					c.Argv = slices.Clone(skopeoCopy)
+					c.Argv[len(c.Argv)-1] += layout
+					calls[i] = c
+				}
+				// A failed copy leaves part of a layout behind, which the next
+				// must not build on
+				if err := os.MkdirAll(filepath.Join(layout, "blobs"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+
+				err := copyFixture(t.Context(), t, execx.NewFake(t, calls...), layout)
+				_, statErr := os.Stat(filepath.Join(layout, "blobs"))
+				if emptied, again := errors.Is(statErr, fs.ErrNotExist), len(calls) > 1; emptied != again {
+					t.Errorf("after %d copies, the layout left before them is gone: %t, want %t", len(calls), emptied, again)
+				}
+				if tt.wantErr == "" {
+					if err != nil {
+						t.Fatalf("copyFixture() error = %v", err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("copyFixture() error = %v, want one holding %q", err, tt.wantErr)
+				}
+			})
+		})
 	}
 }
