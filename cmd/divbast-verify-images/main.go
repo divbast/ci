@@ -22,11 +22,16 @@
 // A registry is read as it serves an image, its host in lower case and
 // without :443. Then each image in its table is verified:
 //
-//	ghcr.io/divbast/frankenphp, by its attestation, once:
-//	  gh attestation verify oci://ghcr.io/divbast/frankenphp@sha256:<digest> \
-//	      --repo divbast/frankenphp \
-//	      --signer-workflow divbast/frankenphp/.github/workflows/build.yml@refs/heads/main \
+//	ghcr.io/divbast/{frankenphp,unrar,ffmpeg,mediainfo}, by their
+//	attestation, each digest once (frankenphp may be named only once):
+//	  gh attestation verify oci://ghcr.io/divbast/<image>@sha256:<digest> \
+//	      --repo <repo> --signer-workflow <workflow> \
 //	      --source-ref refs/heads/main
+//	where <repo> and <workflow> are, by image:
+//	  frankenphp: divbast/frankenphp and
+//	    divbast/frankenphp/.github/workflows/build.yml@refs/heads/main
+//	  unrar, ffmpeg, mediainfo: divbast/native-tools and
+//	    divbast/native-tools/.github/workflows/build.yml@refs/heads/main
 //	gcr.io/distroless/*, by its signature:
 //	  cosign verify gcr.io/distroless/<image>@sha256:<digest> \
 //	      --certificate-identity keyless@distroless.iam.gserviceaccount.com \

@@ -52,13 +52,17 @@ func (rule Rule) matches(name string) bool {
 }
 
 // Table is every image a Containerfile may build from that is verified,
-// and how: divbast's own FrankenPHP by GitHub's attestation of the main
-// build that made it, Google's distroless images by their keyless cosign
-// signature, and Docker Hardened Images by cosign against Docker's public
-// key. A divbast image the table does not name is refused, and any other
-// image passes once it is pinned.
+// and how: divbast's own images, FrankenPHP and native-tools' unrar,
+// ffmpeg and mediainfo, by GitHub's attestation of the main build that
+// made each (see attestedBy), Google's distroless images by their
+// keyless cosign signature, and Docker Hardened Images by cosign against
+// Docker's public key. A divbast image the table does not name is
+// refused, and any other image passes once it is pinned.
 var Table = []Rule{
 	{Prefix: FrankenPHP, Once: true, Check: attested},
+	{Prefix: Unrar, Check: attested},
+	{Prefix: FFmpeg, Check: attested},
+	{Prefix: MediaInfo, Check: attested},
 	{Prefix: Distroless, Check: signed},
 	{Prefix: DHI, Check: dhiSigned},
 }
@@ -66,23 +70,46 @@ var Table = []Rule{
 // The images [Table] names, and the registry divbast publishes under.
 const (
 	FrankenPHP = "ghcr.io/divbast/frankenphp"
+	Unrar      = "ghcr.io/divbast/unrar"
+	FFmpeg     = "ghcr.io/divbast/ffmpeg"
+	MediaInfo  = "ghcr.io/divbast/mediainfo"
 	Distroless = "gcr.io/distroless/"
 	DHI        = "dhi.io/"
 	divbast    = "ghcr.io/divbast/"
 )
 
-// What an attestation must say for a FrankenPHP binary to pass: that
-// divbast/frankenphp's build workflow, run from its main branch, built
-// and signed it.
-const (
-	// SourceRepository is the repository the binary must be built from.
-	SourceRepository = "divbast/frankenphp"
-	// SignerWorkflow is the workflow, at the ref it ran from, that must
-	// have signed the attestation.
-	SignerWorkflow = "divbast/frankenphp/.github/workflows/build.yml@refs/heads/main"
-	// SourceRef is the ref the binary must be built from.
-	SourceRef = "refs/heads/main"
-)
+// attestation is what an attestation must say for a divbast image to
+// pass: that Repository's build workflow, Workflow, run from its main
+// branch, built and signed it.
+type attestation struct {
+	// Repository is the repository the image must be built from.
+	Repository string
+	// Workflow is the workflow, at the ref it ran from, that must have
+	// signed the attestation.
+	Workflow string
+}
+
+// SourceRef is the ref every attested image must be built from.
+const SourceRef = "refs/heads/main"
+
+// nativeTools is the attestation of the three packages divbast/native-tools
+// publishes from one workflow.
+var nativeTools = attestation{
+	Repository: "divbast/native-tools",
+	Workflow:   "divbast/native-tools/.github/workflows/build.yml@refs/heads/main",
+}
+
+// attestedBy names, by image, who must have attested it. Every image
+// [Table] checks with an attestation has an entry.
+var attestedBy = map[string]attestation{
+	FrankenPHP: {
+		Repository: "divbast/frankenphp",
+		Workflow:   "divbast/frankenphp/.github/workflows/build.yml@refs/heads/main",
+	},
+	Unrar:     nativeTools,
+	FFmpeg:    nativeTools,
+	MediaInfo: nativeTools,
+}
 
 // What a distroless image's signature must say: that the distroless
 // project's own keyless signing, as Google's account, made it.
@@ -191,17 +218,22 @@ func Verify(ctx context.Context, t Tools, refs []Ref, log io.Writer) error {
 	return nil
 }
 
-// attested asks gh whether divbast/frankenphp's build workflow, run from
-// its main branch, attested r's digest. gh reads the attestation through
-// the GitHub API, which needs a token that can read attestations.
+// attested asks gh whether r's publisher's build workflow, run from its
+// main branch, attested r's digest, the publisher being the one attestedBy
+// names for r's image. gh reads the attestation through the GitHub API,
+// which needs a token that can read attestations.
 func attested(ctx context.Context, t Tools, r Ref, log io.Writer) error {
+	want, ok := attestedBy[strings.ToLower(r.Name)]
+	if !ok {
+		return fmt.Errorf("%w: no attestation is known for %s", ErrUnlisted, r.Name)
+	}
 	if err := checkGH(ctx, t.GH); err != nil {
 		return err
 	}
-	return report(ctx, t.GH, log, "gh did not verify that divbast/frankenphp's main build attested it",
+	return report(ctx, t.GH, log, "gh did not verify that "+want.Repository+"'s main build attested it",
 		"gh", "attestation", "verify", "oci://"+r.Image(),
-		"--repo", SourceRepository,
-		"--signer-workflow", SignerWorkflow,
+		"--repo", want.Repository,
+		"--signer-workflow", want.Workflow,
 		"--source-ref", SourceRef)
 }
 
