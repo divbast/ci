@@ -148,7 +148,10 @@ jobs:
           # - go run ./cmd/divbast-pins regenerates a repository's Python
           #   locks and its unrar checksum from the pins the pull request
           #   moved. It is run as the module's own command, so the code it
-          #   runs is the code under review.
+          #   runs is the code under review;
+          # - go run ./cmd/modsync keeps pisati's test/acceptance module in
+          #   step with the root after each Go update. It is run as the
+          #   module's own command too.
           # The patterns bound the command line only: a repository's .npmrc
           # or pnpm-workspace.yaml can still change what pnpm does, as the
           # repository's own code runs here anyway.
@@ -161,4 +164,5 @@ jobs:
             "^go tool -modfile=tools/go\\.mod sqlc generate$",
             "^pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile$",
             "^go run \\./cmd/genicons$",
-            "^go run \\./cmd/divbast-pins$"]
+            "^go run \\./cmd/divbast-pins$",
+            "^go run \\./cmd/modsync$"]

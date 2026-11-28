@@ -979,6 +979,7 @@ var allowedCommands = []string{
 	`^pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile$`,
 	`^go run \./cmd/genicons$`,
 	`^go run \./cmd/divbast-pins$`,
+	`^go run \./cmd/modsync$`,
 }
 
 // TestRenovateAllowedCommands checks that renovate.yml's Renovate step
@@ -998,7 +999,7 @@ func TestRenovateAllowedCommands(t *testing.T) {
 	const (
 		key      = "          RENOVATE_ALLOWED_COMMANDS:"
 		genicons = `"^go run \\./cmd/genicons$"`
-		last     = `"^go run \\./cmd/divbast-pins$"`
+		last     = `"^go run \\./cmd/modsync$"`
 	)
 	for name, mutant := range map[string]string{
 		"a dot escaped once":              strings.Replace(renovate, `go\\.mod templ`, `go\.mod templ`, 1),
@@ -1045,6 +1046,7 @@ func TestAllowedCommandsMatchOnlyTheirOwn(t *testing.T) {
 		{name: "pnpm", cmd: "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile", allowed: true},
 		{name: "genicons", cmd: "go run ./cmd/genicons", allowed: true},
 		{name: "divbast-pins", cmd: "go run ./cmd/divbast-pins", allowed: true},
+		{name: "modsync", cmd: "go run ./cmd/modsync", allowed: true},
 		{name: "any character for templ's dot", cmd: "go tool -modfile=tools/goXmod templ generate"},
 		{name: "any character for sqlc's dot", cmd: "go tool -modfile=tools/goXmod sqlc generate"},
 		{name: "any character for genicons' dot", cmd: "go run X/cmd/genicons"},
@@ -1066,6 +1068,10 @@ func TestAllowedCommandsMatchOnlyTheirOwn(t *testing.T) {
 		{name: "divbast-pins elsewhere", cmd: "go run .Xcmd/divbast-pins"},
 		{name: "divbast-pins checking", cmd: "go run ./cmd/divbast-pins -check"},
 		{name: "divbast-pins with a suffix", cmd: "go run ./cmd/divbast-pins2"},
+		{name: "modsync elsewhere", cmd: "go run .Xcmd/modsync"},
+		{name: "modsync with an argument", cmd: "go run ./cmd/modsync -check"},
+		{name: "modsync with a suffix", cmd: "go run ./cmd/modsync2"},
+		{name: "a command before modsync", cmd: "env GOFLAGS=-x go run ./cmd/modsync"},
 		{name: "another program", cmd: "go run ./cmd/pisati"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
