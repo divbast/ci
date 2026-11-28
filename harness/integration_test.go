@@ -95,8 +95,14 @@ func TestSweepOnlyOwnLabel(t *testing.T) {
 	})
 	for i, eng := range engines {
 		network, volume := uniqueName(), uniqueName()
+		// As Network makes one: an engine with no subnet left, while the
+		// tests beside this one hold theirs, gives one once a test ends.
+		// This waits for capacity the harness already waits on elsewhere,
+		// in Network; it is no retry over a race in the code under test.
+		if err := eng.createNetwork(ctx, []string{"network", "create", "--label", eng.label, network}); err != nil {
+			t.Fatal(err)
+		}
 		for _, args := range [][]string{
-			{"network", "create", "--label", eng.label, network},
 			{"volume", "create", "--label", eng.label, volume},
 			eng.Argv(&RunSpec{
 				Image:   images[i],
