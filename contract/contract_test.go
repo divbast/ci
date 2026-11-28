@@ -883,7 +883,7 @@ func TestScenarioPrefix(t *testing.T) {
 		wantLog.WriteString(wantWhat + "\n")
 	}
 
-	reportAll(t, results)
+	reportAll(t, results, nil)
 
 	// A subtest named as one before it gets a #01 suffix, which shows the
 	// name reportAll gave it.

@@ -372,6 +372,14 @@ made it, since every later test of the process mounts it. A suite's
 `TestMain` removes it with `Engine.RemoveProbeVolumes` once `m.Run` has
 returned, or else the next run's `Engine.Sweep` does.
 
+A contract check that fails says what it found, and the harness prints
+the log of the container under the contract, in the test's log, which on
+CI is the job's log. A suite whose container may print a secret, such as
+a password the suite gave it or one the app made, sets
+`contract.Config.Redact`: a function every message passes through before
+the test's log has it, what the harness prints for the contract, the
+container's log among it, included. Nil leaves every message as it is.
+
 The contract's `no-file-capability-xattr` check, `Engine.FileCapabilities`,
 reads each layer of the image as the engine saves it: a gzip layer in Go,
 and a zstd layer, as every layer of a Docker Hardened Image is, through

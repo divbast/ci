@@ -78,6 +78,12 @@
 // that suite had none of those checks. Three more are named for what they
 // show: file-capability's, healthcheck-config's, and engine-healthy's,
 // which has one name on both engines.
+//
+// What the checks print, and what the harness prints for them, such as
+// the log of a container that did not come up, goes to the test's log,
+// and from there to a CI job's. A suite whose container may print a secret,
+// a password it was given or one the app made, sets [Config.Redact], and
+// every message passes through it first.
 package contract
 
 import (
@@ -169,6 +175,19 @@ type Config struct {
 	// them. The records of the confinement checks hold whatever the
 	// configuration, and keep their names.
 	Scenario string
+	// Redact, when set, rewrites every message before the test's log has
+	// it: each that the contract writes there, its records, failures and
+	// skips among them, and each that the harness writes there for it, the
+	// log of the container under the contract included, such as replacing
+	// each password the suite gave the container, or the app made, with
+	// <password>. It is given each message whole, and may be called from
+	// more than one goroutine. A failing record quotes what it found as %q
+	// does, on its own line and in its check's failure, so a secret there
+	// that holds a quote, a backslash or a control character arrives
+	// escaped, as %q writes it; a passing record, and an error a check
+	// stopped on, print it as it is. Redact matches both forms. Nil leaves
+	// every message as it is.
+	Redact func(string) string
 }
 
 // validate refuses a Config that cannot be checked, or whose checks
@@ -321,7 +340,9 @@ func checksFor(cfg *Config) []string {
 // Check runs every check against cfg's image, under the engine $ENGINE
 // names, and returns a Result for each, in order. It never fails tb
 // itself: [Run] reports the results. Everything it starts is removed when
-// tb ends.
+// tb ends. What it, and the harness for it, writes to tb's log passes
+// through cfg.Redact; the Results hold what the checks found, as they
+// found it.
 func Check(ctx context.Context, tb testing.TB, cfg *Config) []Result {
 	tb.Helper()
 	return check(ctx, tb, cfg, nil)
@@ -333,6 +354,7 @@ func Check(ctx context.Context, tb testing.TB, cfg *Config) []Result {
 func check(ctx context.Context, tb testing.TB, given *Config, loosen []string) []Result {
 	tb.Helper()
 	cfg := *given
+	tb = redacting(tb, cfg.Redact)
 	if cfg.Image == "" {
 		cfg.Image = os.Getenv("IMAGE")
 	}
@@ -432,20 +454,21 @@ func resultOf(name string, records []harness.Record, err error) Result {
 
 // Run runs every check against cfg's image, as [Check] does, and reports
 // each as a subtest of t named for it: a record that fails, fails the
-// subtest, and every record's name goes to $DIVBAST_CHECK_LOG.
+// subtest, and every record's name goes to $DIVBAST_CHECK_LOG. What each
+// subtest writes to its log passes through cfg.Redact, as Check's does.
 func Run(t *testing.T, cfg *Config) {
 	t.Helper()
-	reportAll(t, Check(t.Context(), t, cfg))
+	reportAll(t, Check(t.Context(), t, cfg), cfg.Redact)
 }
 
 // reportAll reports each of results as a subtest of t named for its
-// check.
-func reportAll(t *testing.T, results []Result) {
+// check, every message passed through redact when it is not nil.
+func reportAll(t *testing.T, results []Result, redact func(string) string) {
 	t.Helper()
 	for i := range results {
 		t.Run(results[i].Check, func(t *testing.T) {
 			t.Helper()
-			report(t, &results[i])
+			report(redacting(t, redact), &results[i])
 		})
 	}
 }
