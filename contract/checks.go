@@ -41,13 +41,43 @@ type suite struct {
 
 // up starts the container the checks run in: under the contract, on a
 // network with no route out, so every check also shows the image works
-// without one. loosen goes to the engine as raw flags.
+// without one. loosen goes to the engine as raw flags. Why it did not come
+// up, if it did not, is each check's failure that needs it, without the
+// container's log: the harness prints that once, when the test ends
+// failed.
 func (s *suite) up(ctx context.Context, tb testing.TB, loosen []string) {
 	tb.Helper()
 	if err := s.start(ctx, tb, loosen); err != nil {
-		s.ctrErr = fmt.Errorf("the container under the contract did not come up: %w", err)
+		s.ctrErr = fmt.Errorf("the container under the contract did not come up: %w", withoutLog{err})
 	}
 }
+
+// logMarks are where the words harness.WithLog adds for a container's log
+// begin, in each of its forms: the log itself, an empty one, and one that
+// could not be read.
+var logMarks = []string{"; its log:\n", "; its log is empty", "; its log could not be read: "}
+
+// withoutLog is err with the container's log that harness.WithLog added to
+// its message cut out: the harness prints that log once, when the test
+// ends failed, and every check that needed the container would print it
+// again. errors.Is and errors.As see err as it was.
+type withoutLog struct{ err error }
+
+func (w withoutLog) Error() string {
+	msg := w.err.Error()
+	cut := len(msg)
+	for _, mark := range logMarks {
+		if i := strings.Index(msg, mark); i >= 0 && i < cut {
+			cut = i
+		}
+	}
+	if cut == len(msg) {
+		return msg
+	}
+	return msg[:cut] + "; the harness prints its log once, when the test ends failed"
+}
+
+func (w withoutLog) Unwrap() error { return w.err }
 
 // start is up, returning why the container did not come up.
 func (s *suite) start(ctx context.Context, tb testing.TB, loosen []string) error {
@@ -141,21 +171,15 @@ func (s *suite) awaitReady(ctx context.Context, c *harness.Container, p *harness
 	return s.cfg.Ready(ctx, c)
 }
 
-// stopped adds to err how c ended and what it logged, if it is no longer
-// running, which is most often why err happened at all.
+// stopped adds to err how c ended, if it is no longer running, which is
+// most often why err happened at all. What it logged the harness prints
+// once, when the test ends failed.
 func stopped(ctx context.Context, c *harness.Container, err error) error {
 	ins, ierr := c.Inspect(ctx)
 	if ierr != nil || ins.State.Running {
 		return err
 	}
-	logs, lerr := c.Logs(ctx)
-	if lerr != nil {
-		return fmt.Errorf("%w; it had stopped, exit status %d, and its log could not be read: %w", err, ins.State.ExitCode, lerr)
-	}
-	if logs = strings.TrimSpace(logs); logs == "" {
-		logs = "(empty)"
-	}
-	return fmt.Errorf("%w; it had stopped, exit status %d; its log: %s", err, ins.State.ExitCode, logs)
+	return fmt.Errorf("%w; it had stopped, exit status %d; the harness prints its log once, when the test ends failed", err, ins.State.ExitCode)
 }
 
 // container returns the probe, or why the container it runs in did not

@@ -379,6 +379,8 @@ a password the suite gave it or one the app made, sets
 `contract.Config.Redact`: a function every message passes through before
 the test's log has it, what the harness prints for the contract, the
 container's log among it, included. Nil leaves every message as it is.
+The container's log is printed once, when the test ends failed, and each
+check that needed the container says only why it did not come up.
 
 The contract's `no-file-capability-xattr` check, `Engine.FileCapabilities`,
 reads each layer of the image as the engine saves it: a gzip layer in Go,

@@ -151,6 +151,37 @@ func TestReportAllHelper(t *testing.T) {
 	}, redact)
 }
 
+// TestWithoutLog cuts from an error's message the container's log, in
+// each form harness.WithLog adds it, and leaves one without it as it is.
+// What it wraps is still there for errors.Is.
+func TestWithoutLog(t *testing.T) {
+	t.Parallel()
+	stoppedEarly := errors.New("container c stopped, exit status 3, before http://127.0.0.1:8080/ answered")
+	const said = "; the harness prints its log once, when the test ends failed"
+
+	for _, tt := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"a-log", fmt.Errorf("%w; its log:\n%s", stoppedEarly, "token=s3cret\nmarker=m"), stoppedEarly.Error() + said},
+		{"an-empty-log", fmt.Errorf("%w; its log is empty", stoppedEarly), stoppedEarly.Error() + said},
+		{"a-log-not-read", fmt.Errorf("%w; its log could not be read: %w", stoppedEarly, errors.New("no such container")), stoppedEarly.Error() + said},
+		{"no-log", stoppedEarly, stoppedEarly.Error()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := fmt.Errorf("did not come up: %w", withoutLog{tt.err})
+			if got, want := err.Error(), "did not come up: "+tt.want; got != want {
+				t.Errorf("error = %q, want %q", got, want)
+			}
+			if !errors.Is(err, stoppedEarly) {
+				t.Errorf("errors.Is(%v, the error it wraps) = false", err)
+			}
+		})
+	}
+}
+
 // helperEnv names the variable that has TestRunHelper run the contract,
 // redacted or not, and the token and marker its container prints.
 const (
@@ -205,13 +236,33 @@ func TestRunRedacts(t *testing.T) {
 	}
 }
 
-// TestRunHelper is TestRunRedacts' contract run, in a test binary of its
-// own, since a run whose checks fail fails the test that makes it. It
-// skips unless TestRunRedacts runs it.
+// TestRunPrintsLogOnce runs the contract as TestRunRedacts does, with no
+// Redact: the container's log, its marker and its token with it, is in
+// what the run printed exactly once, however many checks needed the
+// container, and each of those says why it did not come up.
+func TestRunPrintsLogOnce(t *testing.T) {
+	t.Parallel()
+	integration(t)
+
+	out, token, marker := helperRun(t, "plain")
+	if markers, tokens := strings.Count(out, marker), strings.Count(out, token); markers != 1 || tokens != 1 {
+		t.Errorf("the run printed its container's marker %d times and its token %d times, want each once; it printed:\n%s",
+			markers, tokens, out)
+	}
+	if n := strings.Count(out, "the container under the contract did not come up"); n < 2 {
+		t.Errorf("the run said %d times that the container did not come up, want it for each check that needed it; it printed:\n%s",
+			n, out)
+	}
+}
+
+// TestRunHelper is the contract run of TestRunRedacts and
+// TestRunPrintsLogOnce, in a test binary of its own, since a run whose
+// checks fail fails the test that makes it. It skips unless one of them
+// runs it.
 func TestRunHelper(t *testing.T) {
 	mode := os.Getenv(helperEnv)
 	if mode == "" {
-		t.Skip("only TestRunRedacts runs this, in a test binary of its own")
+		t.Skip("only TestRunRedacts and TestRunPrintsLogOnce run this, in a test binary of its own")
 	}
 	t.Parallel()
 	e := integration(t)

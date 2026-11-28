@@ -81,9 +81,11 @@
 //
 // What the checks print, and what the harness prints for them, such as
 // the log of a container that did not come up, goes to the test's log,
-// and from there to a CI job's. A suite whose container may print a secret,
-// a password it was given or one the app made, sets [Config.Redact], and
-// every message passes through it first.
+// and from there to a CI job's. That log is printed once, when the test
+// ends failed: each check that needed the container says only why it did
+// not come up. A suite whose container may print a secret, a password it
+// was given or one the app made, sets [Config.Redact], and every message
+// passes through it first.
 package contract
 
 import (
