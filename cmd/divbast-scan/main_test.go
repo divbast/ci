@@ -23,6 +23,7 @@ import (
 	"testing/synctest"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/fetch"
 	"github.com/divbast/ci/internal/registry"
 	"github.com/divbast/ci/internal/testfixture"
 )
@@ -1100,12 +1101,12 @@ func TestScanAgainstItself(t *testing.T) {
 // architecture, into the OCI layout at layout, with run's skopeo. The copy
 // is a fetch from ghcr.io, which now and then fails a blob request with a
 // 500, which skopeo does not retry and which once failed this test, so it
-// goes through testfixture.Fetch. Each copy after the first starts from an
+// goes through fetch.Run. Each copy after the first starts from an
 // empty layout, holding nothing of the copy that failed. tb's log says
 // when it copies again.
 func copyFixture(ctx context.Context, tb testing.TB, run execx.Runner, layout string) error {
 	tb.Helper()
-	_, err := testfixture.Fetch(ctx, tbLog{tb}, "skopeo copy "+testfixture.LibreSpeed, func(ctx context.Context, attempt int) (execx.Result, error) {
+	_, err := fetch.Run(ctx, tbLog{tb}, "skopeo copy "+testfixture.LibreSpeed, func(ctx context.Context, attempt int) (execx.Result, error) {
 		if attempt > 1 {
 			if err := os.RemoveAll(layout); err != nil {
 				return execx.Result{}, err
@@ -1129,7 +1130,7 @@ func (l tbLog) Write(p []byte) (int, error) {
 // TestCopyFixture copies the fixture again after the registry answered
 // with a server error, from an empty layout, and leaves the layout as it
 // is for a first copy and for one that fails for any other reason, which
-// ends the copy at once. testfixture's TestFetch covers when it copies
+// ends the copy at once. internal/fetch's TestRun covers when it copies
 // again.
 func TestCopyFixture(t *testing.T) {
 	t.Parallel()

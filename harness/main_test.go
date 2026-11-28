@@ -14,10 +14,9 @@ import (
 
 // TestMain pulls the fixture the tests run containers of before any of
 // them runs, and removes the probe volumes they made once all are done.
-// ci's own suites never sweep, since a sweep would remove what the tests
-// of another package, running beside these under the same label, made.
-// With ENGINE unset it pulls nothing, and with no test that ran a
-// container it removes nothing.
+// ci's own suites never sweep: each test removes what it made, and a CI
+// runner starts empty. With ENGINE unset it pulls nothing, and with no
+// test that ran a container it removes nothing.
 func TestMain(m *testing.M) {
 	// A CI runner starts with an empty store, where every test that runs
 	// a container of the fixture, or builds FROM it, would pull it at the

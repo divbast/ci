@@ -167,7 +167,7 @@ func (e Engine) Argv(spec *RunSpec) []string {
 
 // argv is [Engine.Argv] with mode, -d or --rm, after "run".
 func (e Engine) argv(spec *RunSpec, mode string) []string {
-	argv := []string{"run", mode, "--label", e.label}
+	argv := slices.Concat([]string{"run", mode}, e.labels())
 	if spec.Name != "" {
 		argv = append(argv, "--name", spec.Name)
 	}

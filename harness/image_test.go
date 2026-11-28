@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
@@ -208,6 +209,83 @@ func TestImageConfigDocker(t *testing.T) {
 			if !sameConfig(got, wantConfig) {
 				t.Errorf("ImageConfig() = %+v, healthcheck %+v; want %+v", got, got.Healthcheck, wantConfig.Healthcheck)
 			}
+		})
+	}
+}
+
+// TestImageConfigPullsAgain pulls an image that is not here again, 5 s
+// later, while the registry answers the pull with a server error, which
+// neither engine retries itself when it is a 500, and says so in the
+// test's log: up to three pulls in all. Any other failure ends it at once.
+func TestImageConfigPullsAgain(t *testing.T) {
+	t.Parallel()
+
+	id := []string{"docker", "image", "inspect", "--format", "{{.Id}}", "img"}
+	inspect := []string{"docker", "image", "inspect", "--format", `{"architecture":{{json .Architecture}},"config":{{json .Config}}}`, "img"}
+	pull := []string{"docker", "pull", "-q", "img"}
+	absent := execx.Result{Code: 1, Stderr: []byte("Error response from daemon: No such image: img\n")}
+	here := execx.Result{Stdout: []byte("sha256:abc\n")}
+	config := execx.Result{Stdout: []byte(`{"architecture":"arm64","config":{"User":"65532:65532"}}` + "\n")}
+	pulled := execx.Result{Stdout: []byte("img\n")}
+	// As Docker's daemon passes on a blob request that ghcr.io failed
+	serverError := func(status string) execx.Result {
+		return execx.Result{Code: 1, Stderr: []byte("Error response from daemon: failed to copy: httpReadSeeker: failed open: unexpected status code " +
+			"https://ghcr.io/v2/divbast/librespeed/blobs/sha256:dd64bf2dd177757451a98fcdc999a339c35dee5d9872d8f4dc69c8f3c4dd0112: " + status + "\n")}
+	}
+	unknown := execx.Result{Code: 1, Stderr: []byte("Error response from daemon: manifest unknown\n")}
+
+	for _, tt := range []struct {
+		name      string
+		pulls     []execx.Result
+		wantErr   string
+		wantAgain int
+	}{
+		{name: "after-a-500", pulls: []execx.Result{serverError("500 Internal Server Error"), pulled}, wantAgain: 1},
+		{name: "after-a-502-and-a-500", pulls: []execx.Result{serverError("502 Bad Gateway"), serverError("500 Internal Server Error"), pulled}, wantAgain: 2},
+		{
+			name:      "server-errors-throughout",
+			pulls:     []execx.Result{serverError("500 Internal Server Error"), serverError("503 Service Unavailable"), serverError("500 Internal Server Error")},
+			wantErr:   "pulling it failed: docker pull -q img, attempt 3 of 3: exit status 1: Error response from daemon: failed to copy",
+			wantAgain: 2,
+		},
+		{name: "manifest-unknown", pulls: []execx.Result{unknown}, wantErr: "pulling it failed: docker pull -q img, attempt 1 of 3: exit status 1: Error response from daemon: manifest unknown"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				calls := []execx.Call{{Argv: id, Result: absent}}
+				for _, res := range tt.pulls {
+					calls = append(calls, execx.Call{Argv: pull, Result: res})
+				}
+				if tt.wantErr == "" {
+					calls = append(calls, execx.Call{Argv: id, Result: here}, execx.Call{Argv: inspect, Result: config})
+				}
+				tb := &fakeTB{TB: t}
+				start := time.Now()
+				got, err := newEngine("docker", execx.NewFake(t, calls...)).ImageConfig(t.Context(), tb, "img")
+
+				if took, want := time.Since(start), time.Duration(tt.wantAgain)*5*time.Second; took != want {
+					t.Errorf("ImageConfig() took %s, want %s: 5 s before each pull again", took, want)
+				}
+				again := 0
+				for _, l := range tb.logs {
+					if strings.Contains(l, "docker pull -q img") && strings.Contains(l, "so fetching again in 5s") {
+						again++
+					}
+				}
+				if again != tt.wantAgain {
+					t.Errorf("ImageConfig() logged %d pulls again, want %d: %q", again, tt.wantAgain, tb.logs)
+				}
+				if tt.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+						t.Errorf("ImageConfig() error = %v, want one holding %q", err, tt.wantErr)
+					}
+					return
+				}
+				if err != nil || got.User != "65532:65532" {
+					t.Errorf("ImageConfig() = %+v, %v; want the user 65532:65532, nil", got, err)
+				}
+			})
 		})
 	}
 }
@@ -450,7 +528,7 @@ func TestBuild(t *testing.T) {
 			t.Cleanup(func() {
 				want := [][]string{
 					slices.Concat(
-						[]string{tt.engine, "build", "-q", "--label", ownLabel, "-t", tag, "-f", "testdata/mutant/Containerfile"},
+						[]string{tt.engine, "build", "-q", "--label", ownLabel, "--label", ownRun, "-t", tag, "-f", "testdata/mutant/Containerfile"},
 						tt.format,
 						[]string{"--build-arg", "A=1", "--build-arg", "B=2", "testdata/mutant"},
 					),

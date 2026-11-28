@@ -32,6 +32,10 @@ import (
 // tests, whose binaries are built in ci's module.
 const ownLabel = "divbast.harness=github.com/divbast/ci"
 
+// ownRun is the run label the harness gives everything it makes in this
+// process.
+var ownRun = processRun().label()
+
 // contractFlags is what every container run under Contract("16m")
 // carries on engine, in this order, and exactly once: on Podman,
 // --read-only-tmpfs=false too, which keeps Podman from adding writable
@@ -157,7 +161,7 @@ func TestArgv(t *testing.T) {
 		Extra:      []string{"--init"},
 	}
 	head := func(engine string) []string {
-		return slices.Concat([]string{"run", "-d", "--label", ownLabel, "--name", "ctr"}, contractFlags(engine), []string{
+		return slices.Concat([]string{"run", "-d", "--label", ownLabel, "--label", ownRun, "--name", "ctr"}, contractFlags(engine), []string{
 			"--network", "net", "--ip", "10.89.66.200",
 			"-e", "A=1 2", "-e", "B=2",
 			"-v", "vol:/data", "-v", "/host/dir:/x:ro",
@@ -450,8 +454,8 @@ func TestZeroConfinementRefused(t *testing.T) {
 
 		spec := &RunSpec{Image: "img", Name: "ctr", Confine: Unconfined()}
 		e := newEngine("docker", execx.NewFake(t,
-			execx.Call{Argv: []string{"docker", "run", "-d", "--label", ownLabel, "--name", "ctr", "img"}, Result: execx.Result{Stdout: []byte("abc123\n")}},
-			execx.Call{Argv: []string{"docker", "run", "--rm", "--label", ownLabel, "--name", "ctr", "img"}},
+			execx.Call{Argv: []string{"docker", "run", "-d", "--label", ownLabel, "--label", ownRun, "--name", "ctr", "img"}, Result: execx.Result{Stdout: []byte("abc123\n")}},
+			execx.Call{Argv: []string{"docker", "run", "--rm", "--label", ownLabel, "--label", ownRun, "--name", "ctr", "img"}},
 			execx.Call{Argv: []string{"docker", "rm", "-f", "-v", "ctr"}},
 			execx.Call{Argv: []string{"docker", "rm", "-f", "-v", "ctr"}},
 		))
@@ -467,7 +471,7 @@ func TestZeroConfinementRefused(t *testing.T) {
 func TestNetwork(t *testing.T) {
 	t.Parallel()
 
-	create := []string{"docker", "network", "create", "--label", ownLabel, "--subnet", "10.89.66.0/24", "--internal", "net"}
+	create := []string{"docker", "network", "create", "--label", ownLabel, "--label", ownRun, "--subnet", "10.89.66.0/24", "--internal", "net"}
 	inspect := []string{"docker", "network", "inspect", "--format", "{{.Internal}}", "net"}
 	remove := []string{"docker", "network", "rm", "net"}
 
@@ -536,7 +540,7 @@ func TestNetwork(t *testing.T) {
 func TestNetworkWaitsForAFreeSubnet(t *testing.T) {
 	t.Parallel()
 
-	create := []string{"docker", "network", "create", "--label", ownLabel, "--internal", "net"}
+	create := []string{"docker", "network", "create", "--label", ownLabel, "--label", ownRun, "--internal", "net"}
 	inspect := []string{"docker", "network", "inspect", "--format", "{{.Internal}}", "net"}
 	full := execx.Result{Code: 1, Stderr: []byte("Error response from daemon: all predefined address pools have been fully subnetted\n")}
 	podmanFull := execx.Result{Code: 125, Stderr: []byte("Error: could not find free subnet from subnet pools\n")}
@@ -588,7 +592,7 @@ func TestVolume(t *testing.T) {
 	t.Parallel()
 
 	e := newEngine("podman", execx.NewFake(t,
-		execx.Call{Argv: []string{"podman", "volume", "create", "--label", ownLabel, "vol"}, Result: execx.Result{Stdout: []byte("vol\n")}},
+		execx.Call{Argv: []string{"podman", "volume", "create", "--label", ownLabel, "--label", ownRun, "vol"}, Result: execx.Result{Stdout: []byte("vol\n")}},
 		execx.Call{Argv: []string{"podman", "volume", "rm", "vol"}},
 	))
 	if got, err := e.Volume(t.Context(), t, "vol"); err != nil || got != "vol" {
@@ -596,34 +600,97 @@ func TestVolume(t *testing.T) {
 	}
 }
 
+// endedPID returns the ID of a process that has ended: one this test
+// started, and waited for.
+func endedPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid
+}
+
+// TestSweepCommands lists what carries the module's label, reads the run
+// label of each, and removes what a run that ended left: none labelled, e's
+// own, or one whose process on this host is gone. What another run that is
+// still going made stays: another of this process's, as a test makes
+// them, one of another host's, and one whose label is no run's.
 func TestSweepCommands(t *testing.T) {
 	t.Parallel()
 
 	// The module's label only: the key alone would match every module's.
 	filter := []string{"--filter", "label=" + ownLabel}
-	ps := slices.Concat([]string{"docker", "ps", "-a", "-q"}, filter)
-	images := slices.Concat([]string{"docker", "image", "ls", "-q"}, filter)
-	nets := slices.Concat([]string{"docker", "network", "ls", "-q"}, filter)
+	ps := slices.Concat([]string{"docker", "ps", "-a", "-q", "--no-trunc"}, filter)
+	images := slices.Concat([]string{"docker", "image", "ls", "-q", "--no-trunc"}, filter)
+	nets := slices.Concat([]string{"docker", "network", "ls", "--format", "{{.Name}}"}, filter)
 	vols := slices.Concat([]string{"docker", "volume", "ls", "-q"}, filter)
+	inspect := func(kind string, ids ...string) []string {
+		format := "{{.Name}} {{json .Labels}}"
+		if kind == "container" || kind == "image" {
+			format = "{{.Id}} {{json .Config.Labels}}"
+		}
+		return slices.Concat([]string{"docker", kind, "inspect", "--format", format}, ids)
+	}
+	// The labels inspect prints for id, made by run
+	labelled := func(id string, run runID) string {
+		if run == (runID{}) {
+			return id + " {\"" + labelKey + "\":\"github.com/divbast/ci\"}\n"
+		}
+		return id + " {\"" + labelKey + "\":\"github.com/divbast/ci\",\"" + runKey + "\":\"" + strings.TrimPrefix(run.label(), runKey+"=") + "\"}\n"
+	}
+	own := processRun()
+	sibling := runID{host: own.host, pid: own.pid, value: "sibling"}
+	var gone, foreign runID
+	if processLookups {
+		gone = runID{host: own.host, pid: endedPID(t), value: "x"}
+		// A process that has ended, so that only its host keeps what it made
+		foreign = runID{host: own.host + ".elsewhere", pid: gone.pid, value: "x"}
+	}
 
 	tests := []struct {
 		name    string
 		calls   []execx.Call
 		wantErr []string
+		lookups bool
 	}{
 		{
 			// An image is listed once for each of its tags, and removed
-			// once, after the containers that may run it.
-			name: "removes-containers-then-images-networks-and-volumes",
+			// once, after the containers that may run it. Docker's list
+			// says sha256: where Podman's inspect does not.
+			name: "removes-what-carries-no-run-label-and-its-own",
 			calls: []execx.Call{
 				{Argv: ps, Result: execx.Result{Stdout: []byte("c1\nc2\n")}},
+				{Argv: inspect("container", "c1", "c2"), Result: execx.Result{Stdout: []byte(labelled("c1", runID{}) + labelled("c2", own))}},
 				{Argv: []string{"docker", "rm", "-f", "-v", "c1", "c2"}},
-				{Argv: images, Result: execx.Result{Stdout: []byte("i1\ni2\ni1\n")}},
-				{Argv: []string{"docker", "image", "rm", "-f", "i1", "i2"}},
+				{Argv: images, Result: execx.Result{Stdout: []byte("sha256:i1\nsha256:i2\nsha256:i1\n")}},
+				{Argv: inspect("image", "sha256:i1", "sha256:i2"), Result: execx.Result{Stdout: []byte(labelled("i1", own) + labelled("sha256:i2", runID{}))}},
+				{Argv: []string{"docker", "image", "rm", "-f", "sha256:i1", "sha256:i2"}},
 				{Argv: nets, Result: execx.Result{Stdout: []byte("n1\n")}},
+				{Argv: inspect("network", "n1"), Result: execx.Result{Stdout: []byte(labelled("n1", runID{}))}},
 				{Argv: []string{"docker", "network", "rm", "n1"}},
 				{Argv: vols, Result: execx.Result{Stdout: []byte("v1\nv2\n")}},
+				{Argv: inspect("volume", "v1", "v2"), Result: execx.Result{Stdout: []byte("v1 null\n" + labelled("v2", own))}},
 				{Argv: []string{"docker", "volume", "rm", "v1", "v2"}},
+			},
+		},
+		{
+			// The process that made c2 and n1 is gone; the others made
+			// theirs in a process that is there, on another host, or
+			// under a label that names no run.
+			name:    "leaves-runs-still-going",
+			lookups: true,
+			calls: []execx.Call{
+				{Argv: ps, Result: execx.Result{Stdout: []byte("c1\nc2\nc3\n")}},
+				{Argv: inspect("container", "c1", "c2", "c3"), Result: execx.Result{Stdout: []byte(labelled("c1", sibling) + labelled("c2", gone) + labelled("c3", foreign))}},
+				{Argv: []string{"docker", "rm", "-f", "-v", "c2"}},
+				{Argv: images, Result: execx.Result{Stdout: []byte("sha256:i1\n")}},
+				{Argv: inspect("image", "sha256:i1"), Result: execx.Result{Stdout: []byte(labelled("sha256:i1", sibling))}},
+				{Argv: nets, Result: execx.Result{Stdout: []byte("n1\nn2\n")}},
+				{Argv: inspect("network", "n1", "n2"), Result: execx.Result{Stdout: []byte(labelled("n1", gone) + "n2 {\"" + runKey + "\":\"host/x/y\"}\n")}},
+				{Argv: []string{"docker", "network", "rm", "n1"}},
+				{Argv: vols, Result: execx.Result{Stdout: []byte("v1\n")}},
+				{Argv: inspect("volume", "v1"), Result: execx.Result{Stdout: []byte(labelled("v1", foreign))}},
 			},
 		},
 		{
@@ -636,22 +703,53 @@ func TestSweepCommands(t *testing.T) {
 			},
 		},
 		{
+			// Another sweep removed c2 between the list and the inspect,
+			// and n1 between the inspect and the removal, which the
+			// engine refuses as one it cannot find: once n1 is no longer
+			// listed, that is no failure. n2 that is still listed is one.
+			name: "removed-by-another-sweep",
+			calls: []execx.Call{
+				{Argv: ps, Result: execx.Result{Stdout: []byte("c1\nc2\n")}},
+				{
+					Argv:   inspect("container", "c1", "c2"),
+					Result: execx.Result{Code: 1, Stdout: []byte(labelled("c1", runID{})), Stderr: []byte("Error response from daemon: No such container: c2\n")},
+				},
+				{Argv: []string{"docker", "rm", "-f", "-v", "c1"}},
+				{Argv: images},
+				{Argv: nets, Result: execx.Result{Stdout: []byte("n1\n")}},
+				{Argv: inspect("network", "n1"), Result: execx.Result{Stdout: []byte(labelled("n1", runID{}))}},
+				{Argv: []string{"docker", "network", "rm", "n1"}, Result: execx.Result{Code: 1, Stderr: []byte("Error response from daemon: network n1 not found\nexit status 1\n")}},
+				{Argv: nets},
+				{Argv: vols, Result: execx.Result{Stdout: []byte("v1\nv2\n")}},
+				{Argv: inspect("volume", "v1", "v2"), Result: execx.Result{Stdout: []byte(labelled("v1", runID{}) + labelled("v2", runID{}))}},
+				{Argv: []string{"docker", "volume", "rm", "v1", "v2"}, Result: execx.Result{Code: 1, Stderr: []byte("Error response from daemon: remove v2: volume is in use\n")}},
+				{Argv: vols, Result: execx.Result{Stdout: []byte("v2\n")}},
+			},
+			wantErr: []string{"volume is in use"},
+		},
+		{
 			// Every failure is reported, and one does not stop the rest.
 			name: "errors-surface",
 			calls: []execx.Call{
 				{Argv: ps, Result: execx.Result{Code: 1, Stderr: []byte("Cannot connect to the Docker daemon")}},
-				{Argv: images},
+				{Argv: images, Result: execx.Result{Stdout: []byte("sha256:i1\n")}},
+				{Argv: inspect("image", "sha256:i1"), Result: execx.Result{Code: 1, Stderr: []byte("Error response from daemon: permission denied\n")}},
 				{Argv: nets, Result: execx.Result{Stdout: []byte("n1\n")}},
+				{Argv: inspect("network", "n1"), Result: execx.Result{Stdout: []byte(labelled("n1", runID{}))}},
 				{Argv: []string{"docker", "network", "rm", "n1"}, Result: execx.Result{Code: 1, Stderr: []byte("network n1 has active endpoints")}},
+				{Argv: nets, Result: execx.Result{Stdout: []byte("n1\n")}},
 				{Argv: vols, Result: execx.Result{Stdout: []byte("v1\n")}},
-				{Argv: []string{"docker", "volume", "rm", "v1"}},
+				{Argv: inspect("volume", "v1"), Result: execx.Result{Stdout: []byte("v1 not-json\n")}},
 			},
-			wantErr: []string{"Cannot connect", "active endpoints"},
+			wantErr: []string{"Cannot connect", "permission denied", "active endpoints", "labels that are not JSON for v1"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			if tt.lookups && !processLookups {
+				t.Skip("this platform cannot tell a process that ended from one that is there")
+			}
 
 			err := newEngine("docker", execx.NewFake(t, tt.calls...)).Sweep(t.Context())
 			if len(tt.wantErr) == 0 {
@@ -666,6 +764,191 @@ func TestSweepCommands(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSweepsTakeTurns runs two sweeps of one engine at once, from one
+// process and from what stands for two: an engine with a sweep lock of its
+// own on the same file. The second lists nothing until the first has
+// ended, so the two never set out to remove the same thing.
+func TestSweepsTakeTurns(t *testing.T) {
+	t.Parallel()
+
+	for _, separate := range []bool{false, true} {
+		t.Run(map[bool]string{false: "same-process", true: "another-process"}[separate], func(t *testing.T) {
+			t.Parallel()
+			if separate && !fileLocks {
+				t.Skip("this platform has no lock on a file that other processes see")
+			}
+			ctx := t.Context()
+			var (
+				mu   sync.Mutex
+				seen []string
+			)
+			started, release := make(chan struct{}), make(chan struct{})
+			sweeping := func(who string) runFunc {
+				return func(argv []string) execx.Result {
+					switch argv[1] {
+					case "ps":
+						mu.Lock()
+						seen = append(seen, who+" starts")
+						mu.Unlock()
+						if who == "first" {
+							close(started)
+							<-release
+						}
+					case "volume":
+						mu.Lock()
+						seen = append(seen, who+" ends")
+						mu.Unlock()
+					}
+					return execx.Result{}
+				}
+			}
+			lock := filepath.Join(t.TempDir(), "sweep.lock")
+			first, second := newEngine("docker", sweeping("first")), newEngine("docker", sweeping("second"))
+			first.own.sweeps = newSweepLock(lock)
+			second.own.sweeps = first.own.sweeps
+			if separate {
+				second.own.sweeps = newSweepLock(lock)
+			}
+
+			done := make(chan error, 2)
+			go func() { done <- first.Sweep(ctx) }()
+			<-started
+			go func() { done <- second.Sweep(ctx) }()
+			due := 2
+			select {
+			case err := <-done:
+				due--
+				t.Errorf("a sweep ended, with %v, while the first was still listing", err)
+			case <-time.After(stillHeld):
+			}
+			close(release)
+			for range due {
+				if err := <-done; err != nil {
+					t.Errorf("Sweep() error = %v", err)
+				}
+			}
+			if want := []string{"first starts", "first ends", "second starts", "second ends"}; !slices.Equal(seen, want) {
+				t.Errorf("the sweeps ran %q, want %q", seen, want)
+			}
+		})
+	}
+}
+
+// TestSweepWaitEndsWithContext gives up its wait for another sweep of the
+// same engine when its context ends, with the context's error, and runs
+// nothing: in one process, and from what stands for another, an engine
+// with a sweep lock of its own on the same file.
+func TestSweepWaitEndsWithContext(t *testing.T) {
+	t.Parallel()
+
+	for _, separate := range []bool{false, true} {
+		t.Run(map[bool]string{false: "same-process", true: "another-process"}[separate], func(t *testing.T) {
+			t.Parallel()
+			if separate && !fileLocks {
+				t.Skip("this platform has no lock on a file that other processes see")
+			}
+			lock := filepath.Join(t.TempDir(), "sweep.lock")
+			held := newSweepLock(lock)
+			unlock, err := held.hold(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := sync.OnceFunc(unlock)
+			defer release()
+
+			waiter := newEngine("docker", runFunc(func(argv []string) execx.Result {
+				t.Errorf("Sweep ran %q while another sweep held the lock", argv)
+				return execx.Result{}
+			}))
+			waiter.own.sweeps = held
+			if separate {
+				waiter.own.sweeps = newSweepLock(lock)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), stillHeld)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- waiter.Sweep(ctx) }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("Sweep() error = %v, want its context's deadline", err)
+				}
+			case <-time.After(20 * stillHeld):
+				t.Errorf("Sweep() was still waiting for the other sweep %s after its context ended", 19*stillHeld)
+				release()
+				if err := <-done; err != nil {
+					t.Logf("and once the other sweep let go, Sweep() returned %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestSweepLockReleasesOnce calls the release of one hold twice, as an
+// early release beside a deferred one does: the second returns at once,
+// and the lock is free once, so the next hold takes it and the one after
+// that waits, in one process and on a file.
+func TestSweepLockReleasesOnce(t *testing.T) {
+	t.Parallel()
+
+	for _, onFile := range []bool{false, true} {
+		t.Run(map[bool]string{false: "in-process", true: "on-a-file"}[onFile], func(t *testing.T) {
+			t.Parallel()
+			if onFile && !fileLocks {
+				t.Skip("this platform has no lock on a file that other processes see")
+			}
+			path := ""
+			if onFile {
+				path = filepath.Join(t.TempDir(), "sweep.lock")
+			}
+			l := newSweepLock(path)
+			release, err := l.hold(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			released := make(chan struct{})
+			go func() {
+				release()
+				release()
+				close(released)
+			}()
+			select {
+			case <-released:
+			case <-time.After(20 * stillHeld):
+				t.Fatalf("the second release() of one hold was still waiting after %s", 20*stillHeld)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 20*stillHeld)
+			defer cancel()
+			again, err := l.hold(ctx)
+			if err != nil {
+				t.Fatalf("hold() after the two releases: %v", err)
+			}
+			defer again()
+			short, cancelShort := context.WithTimeout(t.Context(), stillHeld)
+			defer cancelShort()
+			if third, err := l.hold(short); err == nil {
+				third()
+				t.Error("hold() took the lock while another hold had it")
+			}
+		})
+	}
+}
+
+// TestZeroEngine reads the label of, and the argv for, an Engine made by
+// no constructor, without a panic: it labels nothing.
+func TestZeroEngine(t *testing.T) {
+	t.Parallel()
+
+	var e Engine
+	if got := e.Label(); got != "" {
+		t.Errorf("Label() = %q, want \"\"", got)
+	}
+	if got := e.Argv(&RunSpec{Image: "img", Confine: Unconfined()}); slices.Contains(got, "--label") {
+		t.Errorf("Argv() = %q, want no label", got)
 	}
 }
 
@@ -1252,7 +1535,7 @@ func TestRun(t *testing.T) {
 	e := newEngine("docker", nil)
 	e.run = execx.NewFake(t,
 		execx.Call{
-			Argv: slices.Concat([]string{"docker", "run", "--rm", "--label", ownLabel, "--name", "ctr"}, contractFlags("docker"),
+			Argv: slices.Concat([]string{"docker", "run", "--rm", "--label", ownLabel, "--label", ownRun, "--name", "ctr"}, contractFlags("docker"),
 				[]string{"--network", "none", "--entrypoint", frankenphp, "img", "version"}),
 			Result: refused,
 		},

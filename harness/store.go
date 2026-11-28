@@ -66,6 +66,69 @@ func storeFile(getenv func(string) string) string {
 	return filepath.Join(dir, fmt.Sprintf("divbast-harness-podman-store-%d.lock", os.Getuid()))
 }
 
+// sweepLock keeps two sweeps of an engine from running at once: within
+// a process, a token that one holds at a time, and across processes an
+// exclusive flock of the file at path, on the platforms that have one.
+// A wait for either ends when its context does.
+//
+// The file is in the directory storeFile chooses, from $XDG_RUNTIME_DIR
+// or the temporary directory, and named for the user, so only processes
+// that share that directory take turns. Two runs whose directories differ,
+// as two with different TMPDIRs, can sweep at once: one may then fail to
+// remove what the other is removing already, as "removal already in
+// progress", but neither removes what a run still going made.
+type sweepLock struct {
+	token chan struct{}
+	path  string
+}
+
+// newSweepLock returns a sweep lock on the file at path, or one of this
+// process's alone when path is "".
+func newSweepLock(path string) *sweepLock {
+	return &sweepLock{token: make(chan struct{}, 1), path: path}
+}
+
+// hold takes l and returns what releases it, waiting for a sweep that
+// holds it, in this process or another, until ctx is done. The release
+// releases once, however often it is called: a second call would wait on
+// the token no one holds, or take the next holder's.
+func (l *sweepLock) hold(ctx context.Context) (func(), error) {
+	select {
+	case l.token <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if l.path == "" {
+		return sync.OnceFunc(func() { <-l.token }), nil
+	}
+	f, err := lockFile(ctx, l.path, true)
+	if err != nil {
+		<-l.token
+		return nil, err
+	}
+	return sync.OnceFunc(func() {
+		if f != nil {
+			// Closing the file releases its lock, as for the store's
+			_ = f.Close()
+		}
+		<-l.token
+	}), nil
+}
+
+// sharedSweeps holds the sweep lock of each engine EngineFromEnv returns:
+// one file for every process of this user that shares the directory, so
+// that two runs that sweep as they start sweep one after the other.
+var sharedSweeps = map[string]func() *sweepLock{
+	"docker": sync.OnceValue(func() *sweepLock { return newSweepLock(sweepFile(os.Getenv, "docker")) }),
+	"podman": sync.OnceValue(func() *sweepLock { return newSweepLock(sweepFile(os.Getenv, "podman")) }),
+}
+
+// sweepFile returns the path of the file engine's sweeps lock, in the
+// directory storeFile chooses, reading the environment through getenv.
+func sweepFile(getenv func(string) string, engine string) string {
+	return filepath.Join(filepath.Dir(storeFile(getenv)), fmt.Sprintf("divbast-harness-%s-sweep-%d.lock", engine, os.Getuid()))
+}
+
 // storePoll is how often a wait for another process's hold on the store
 // looks again.
 const storePoll = 50 * time.Millisecond

@@ -372,6 +372,16 @@ made it, since every later test of the process mounts it. A suite's
 `TestMain` removes it with `Engine.RemoveProbeVolumes` once `m.Run` has
 returned, or else the next run's `Engine.Sweep` does.
 
+A contract check that fails says what it found, and the harness prints
+the log of the container under the contract, in the test's log, which on
+CI is the job's log. A suite whose container may print a secret, such as
+a password the suite gave it or one the app made, sets
+`contract.Config.Redact`: a function every message passes through before
+the test's log has it, what the harness prints for the contract, the
+container's log among it, included. Nil leaves every message as it is.
+The container's log is printed once, when the test ends failed, and each
+check that needed the container says only why it did not come up.
+
 The contract's `no-file-capability-xattr` check, `Engine.FileCapabilities`,
 reads each layer of the image as the engine saves it: a gzip layer in Go,
 and a zstd layer, as every layer of a Docker Hardened Image is, through
@@ -387,7 +397,20 @@ The harness labels every container, image, network and volume it makes
 binary running it. A repository's acceptance suite is a test of its own
 module, so `Engine.Sweep` in one repository's suite removes what a dead
 run of that suite left behind, and nothing another repository's suite
-on the same host made.
+on the same host made. A second label, `divbast.harness.run`, names the
+run that made it, as `<host>/<pid>/<value>`, and `Engine.Sweep` leaves
+alone what a run of the same suite whose process on this host is still
+there made: two runs of one suite on one engine, each sweeping as it
+starts, no longer remove each other's containers. What carries no run
+label, as what an older pin made, still goes; what a run on another host
+made goes once a sweep on that host finds its process gone.
+Two sweeps of one engine take turns, through a `flock` of
+`divbast-harness-<engine>-sweep-<uid>.lock` in the directory the store's
+lock below is in, so the two never set out to remove the same thing.
+Only runs that share that directory take turns: two with different ones,
+as two with different `TMPDIR`s, can sweep at once, and then one may fail
+to remove what the other is removing already, though neither removes
+what a run still going made.
 
 On Podman, the harness never removes an image while a build is running.
 `podman image rm -f` also removes each parent image it leaves dangling

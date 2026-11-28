@@ -230,7 +230,7 @@ func TestStartMountsTheProbe(t *testing.T) {
 	t.Parallel()
 
 	run := []string{
-		"docker", "run", "-d", "--label", ownLabel, "--name", "ctr", "--cap-drop", "ALL",
+		"docker", "run", "-d", "--label", ownLabel, "--label", ownRun, "--name", "ctr", "--cap-drop", "ALL",
 		"-v", "data:/data", "-v", "probe-vol:/divbast/probe:ro", "img",
 	}
 	e := newEngine("docker", execx.NewFake(t,

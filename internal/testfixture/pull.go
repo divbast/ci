@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/divbast/ci/internal/execx"
+	"github.com/divbast/ci/internal/fetch"
 )
 
 // pullTimeout bounds PullBeforeTests: a test binary's own -test.timeout
@@ -36,7 +37,7 @@ func PullBeforeTests(suite string, images ...string) {
 }
 
 // Pull makes sure each of images is in the store of engine, docker or
-// podman, run through run, and pulls each that is not, through Fetch,
+// podman, run through run, and pulls each that is not, through fetch.Run,
 // saying on log when it pulls one again. A suite's TestMain calls it
 // before the tests run, so they find the fixtures there and none fetches
 // one itself: into an empty store, as each CI run starts with, every test
@@ -48,7 +49,7 @@ func Pull(ctx context.Context, run execx.Runner, log io.Writer, engine string, i
 		if res, err := run.Run(ctx, engine, "image", "inspect", "--format", "{{.Id}}", image); err == nil && res.Code == 0 {
 			continue
 		}
-		_, err := Fetch(ctx, log, engine+" pull "+image, func(ctx context.Context, _ int) (execx.Result, error) {
+		_, err := fetch.Run(ctx, log, engine+" pull "+image, func(ctx context.Context, _ int) (execx.Result, error) {
 			return run.Run(ctx, engine, "pull", "-q", image)
 		})
 		errs = append(errs, err)

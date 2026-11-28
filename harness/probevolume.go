@@ -139,7 +139,7 @@ func (e Engine) makeProbeVolume(ctx context.Context, tb testing.TB, arch, app st
 	}
 
 	name := "divbast-probe-" + strings.TrimPrefix(uniqueName(), "divbast-")
-	if _, err = e.output(ctx, "volume", "create", "--label", e.label, name); err != nil {
+	if _, err = e.output(ctx, slices.Concat([]string{"volume", "create"}, e.labels(), []string{name})...); err != nil {
 		return "", err
 	}
 	// From here the volume exists: a failure returns its name too, so

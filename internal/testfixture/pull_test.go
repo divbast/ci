@@ -13,7 +13,7 @@ import (
 )
 
 // TestPull leaves a fixture that is here as it is, and pulls one that is
-// not, again through Fetch while the registry answers with a server
+// not, again through fetch.Run while the registry answers with a server
 // error. A fixture that cannot be pulled is an error naming its pull,
 // and the others are pulled all the same.
 func TestPull(t *testing.T) {
@@ -31,6 +31,10 @@ func TestPull(t *testing.T) {
 	pull := func(engine, image string, code int, stderr string) execx.Call {
 		return execx.Call{Argv: []string{engine, "pull", "-q", image}, Result: execx.Result{Code: code, Stderr: []byte(stderr)}}
 	}
+	// Podman's words for a blob request ghcr.io failed, as ci's own CI logged them
+	podman500 := "Error: unable to copy from source docker://" + LibreSpeed + ": copying system image from manifest list: " +
+		"reading blob sha256:dd64bf2dd177757451a98fcdc999a339c35dee5d9872d8f4dc69c8f3c4dd0112: fetching blob: " +
+		"received unexpected HTTP status: 500 Internal Server Error\n"
 	unknown := "Error: initializing source docker://" + Baikal + ": reading manifest in ghcr.io/divbast/baikal: manifest unknown\n"
 
 	for _, tt := range []struct {

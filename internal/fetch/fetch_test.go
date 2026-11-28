@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
 
-package testfixture
+package fetch
 
 import (
 	"bytes"
@@ -30,13 +30,13 @@ const (
 		"https://ghcr.io/v2/divbast/librespeed/blobs/sha256:dd64bf2dd177757451a98fcdc999a339c35dee5d9872d8f4dc69c8f3c4dd0112: 502 Bad Gateway\n"
 )
 
-// TestFetch runs a fetch again while the registry answers it with a
+// TestRun runs a fetch again while the registry answers it with a
 // server error, in any tool's words, on the last line of what the fetch
-// printed, and only then: at most fetchAttempts times in all, fetchPause
-// apart, each again said on the log, and each told its attempt. Any other
+// printed, and only then: at most attempts times in all, pause apart,
+// each again said on the log, and each told its attempt. Any other
 // failure ends it at once, a server error that a tool retried and then
 // failed past among them, as does an error from the fetch itself.
-func TestFetch(t *testing.T) {
+func TestRun(t *testing.T) {
 	t.Parallel()
 
 	failed := func(code int, stderr string) execx.Result { return execx.Result{Code: code, Stderr: []byte(stderr)} }
@@ -96,15 +96,15 @@ func TestFetch(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				var (
-					log      bytes.Buffer
-					attempts []int
-					times    []time.Time
+					log   bytes.Buffer
+					made  []int
+					times []time.Time
 				)
-				got, err := Fetch(t.Context(), &log, "a fetch", func(_ context.Context, attempt int) (execx.Result, error) {
-					attempts = append(attempts, attempt)
+				got, err := Run(t.Context(), &log, "a fetch", func(_ context.Context, attempt int) (execx.Result, error) {
+					made = append(made, attempt)
 					times = append(times, time.Now())
 					if attempt > len(tt.results) {
-						t.Errorf("Fetch() made attempt %d, want at most %d", attempt, len(tt.results))
+						t.Errorf("Run() made attempt %d, want at most %d", attempt, len(tt.results))
 						return execx.Result{Code: 125, Stderr: []byte("Error: nothing scripted for this attempt\n")}, nil
 					}
 					res := tt.results[attempt-1]
@@ -118,48 +118,48 @@ func TestFetch(t *testing.T) {
 				for i := range want {
 					want[i] = i + 1
 				}
-				if !slices.Equal(attempts, want) {
-					t.Errorf("Fetch() made attempts %v, want %v", attempts, want)
+				if !slices.Equal(made, want) {
+					t.Errorf("Run() made attempts %v, want %v", made, want)
 				}
 				for i := 1; i < len(times); i++ {
-					if gap := times[i].Sub(times[i-1]); gap != fetchPause {
-						t.Errorf("attempt %d came %s after the one before, want %s", i+1, gap, fetchPause)
+					if gap := times[i].Sub(times[i-1]); gap != pause {
+						t.Errorf("attempt %d came %s after the one before, want %s", i+1, gap, pause)
 					}
 				}
 				if again := strings.Count(log.String(), "so fetching again in 5s"); again != len(tt.results)-1 {
-					t.Errorf("Fetch() logged %d fetches again, want %d: %q", again, len(tt.results)-1, log.String())
+					t.Errorf("Run() logged %d fetches again, want %d: %q", again, len(tt.results)-1, log.String())
 				}
 				if tt.wantErr == "" {
 					if err != nil || !bytes.Equal(got.Stdout, fetched.Stdout) {
-						t.Fatalf("Fetch() = %q, %v; want %q, nil", got.Stdout, err, fetched.Stdout)
+						t.Fatalf("Run() = %q, %v; want %q, nil", got.Stdout, err, fetched.Stdout)
 					}
 					return
 				}
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Errorf("Fetch() error = %v, want one holding %q", err, tt.wantErr)
+					t.Errorf("Run() error = %v, want one holding %q", err, tt.wantErr)
 				}
 				if tt.err != nil && !errors.Is(err, tt.err) {
-					t.Errorf("Fetch() error = %v, want it to wrap %v", err, tt.err)
+					t.Errorf("Run() error = %v, want it to wrap %v", err, tt.err)
 				}
 			})
 		})
 	}
 }
 
-// TestFetchStopsWithContext ends a wait for the next attempt when the
+// TestRunStopsWithContext ends a wait for the next attempt when the
 // context is done, with the context's error.
-func TestFetchStopsWithContext(t *testing.T) {
+func TestRunStopsWithContext(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(t.Context(), fetchPause/2)
+		ctx, cancel := context.WithTimeout(t.Context(), pause/2)
 		defer cancel()
 		calls := 0
-		_, err := Fetch(ctx, &bytes.Buffer{}, "a fetch", func(context.Context, int) (execx.Result, error) {
+		_, err := Run(ctx, &bytes.Buffer{}, "a fetch", func(context.Context, int) (execx.Result, error) {
 			calls++
 			return execx.Result{Code: 125, Stderr: []byte(podman500)}, nil
 		})
 		if calls != 1 || !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("Fetch() made %d attempts and returned %v, want 1, and the context's deadline", calls, err)
+			t.Errorf("Run() made %d attempts and returned %v, want 1, and the context's deadline", calls, err)
 		}
 	})
 }

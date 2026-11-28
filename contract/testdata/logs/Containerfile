@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Aryan Ameri <github@aryan.ameri.coffee>
+
+# A server that says what it was given and exits before it serves, so that
+# every check that needs its container fails and the harness prints its
+# log: what TestRunRedacts reads. BusyBox's musl build, static, has the
+# shell it says it with.
+FROM docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+
+USER 65532:65532
+CMD ["sh", "-c", "echo \"token=${APP_TOKEN}\"; echo \"marker=${APP_MARKER}\"; exit 3"]

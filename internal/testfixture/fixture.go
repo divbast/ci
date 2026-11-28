@@ -5,8 +5,8 @@
 // containers from: the harness's integration tests and the contract
 // suite's. They come from here and nowhere else, so moving to a newer
 // image is one edit. PullBeforeTests fetches them, through Pull, before a
-// suite's tests run, and Fetch runs a fetch again when the registry fails
-// it with a server error.
+// suite's tests run, and Pull fetches again when the registry fails a
+// pull with a server error, through internal/fetch.
 package testfixture
 
 // LibreSpeed is a published ghcr.io/divbast/librespeed, pinned by its
