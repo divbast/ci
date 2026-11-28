@@ -80,8 +80,23 @@ func TestSweepOnlyOwnLabel(t *testing.T) {
 	engines := []Engine{swept, longer, other}
 
 	// Each an image, and a running container of it that holds a network
-	// and a volume, none of which can go before it does. Only the images
-	// have cleanups of their own; the sweeps below are the rest's.
+	// and a volume, none of which can go before it does.
+	//
+	// The cleanups run the other way round, the last registered first: the
+	// containers go, then each Build's cleanup removes its image, waiting
+	// with no deadline for the builds of the tests running beside this one,
+	// in this process and in the contract suite's, which on Podman can hold
+	// the store for minutes. The sweeps run last and find no image by then,
+	// so their cleanup's deadline is spent on removals alone.
+	t.Cleanup(func() {
+		sweepCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		for _, eng := range engines {
+			if err := eng.Sweep(sweepCtx); err != nil {
+				t.Errorf("sweeping up after the test: %v", err)
+			}
+		}
+	})
 	containerfile := filepath.Join(t.TempDir(), "Containerfile")
 	if err := os.WriteFile(containerfile, []byte("FROM "+testfixture.LibreSpeed+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -94,13 +109,12 @@ func TestSweepOnlyOwnLabel(t *testing.T) {
 		}
 		images[i] = image
 	}
+	containers := make([]string, 0, len(engines))
 	t.Cleanup(func() {
-		sweepCtx, cancel := cleanupContext(ctx)
+		rmCtx, cancel := cleanupContext(ctx)
 		defer cancel()
-		for _, eng := range engines {
-			if err := eng.Sweep(sweepCtx); err != nil {
-				t.Errorf("sweeping up after the test: %v", err)
-			}
+		if len(containers) > 0 {
+			e.remove(rmCtx, t, append([]string{"rm", "-f", "-v"}, containers...)...)
 		}
 	})
 	for i, eng := range engines {
@@ -112,18 +126,20 @@ func TestSweepOnlyOwnLabel(t *testing.T) {
 		if err := eng.createNetwork(ctx, []string{"network", "create", "--label", eng.own.label, network}); err != nil {
 			t.Fatal(err)
 		}
-		for _, args := range [][]string{
-			{"volume", "create", "--label", eng.own.label, volume},
-			eng.Argv(&RunSpec{
-				Image:   images[i],
-				Network: network,
-				Confine: Contract("16m"),
-				Mounts:  []Mount{{Source: volume, Target: "/data", Volume: true}},
-			}),
-		} {
-			if _, err := eng.output(ctx, args...); err != nil {
-				t.Fatal(err)
-			}
+		if _, err := eng.output(ctx, "volume", "create", "--label", eng.own.label, volume); err != nil {
+			t.Fatal(err)
+		}
+		out, err := eng.output(ctx, eng.Argv(&RunSpec{
+			Image:   images[i],
+			Network: network,
+			Confine: Contract("16m"),
+			Mounts:  []Mount{{Source: volume, Target: "/data", Volume: true}},
+		})...)
+		// The ID is the last thing printed, as Start reads it
+		if fields := strings.Fields(string(out)); err != nil || len(fields) == 0 {
+			t.Fatalf("starting a container of %s: %q, %v", images[i], out, err)
+		} else {
+			containers = append(containers, fields[len(fields)-1])
 		}
 	}
 
