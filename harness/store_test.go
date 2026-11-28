@@ -76,6 +76,9 @@ func (b *blockingBuilds) run(argv []string) execx.Result {
 	case slices.Equal(argv[1:3], []string{"image", "ls"}):
 		// What a sweep lists, of images: one
 		return execx.Result{Stdout: []byte("swept\n")}
+	case slices.Equal(argv[1:3], []string{"image", "inspect"}):
+		// Which no run labelled, as an older harness made it
+		return execx.Result{Stdout: []byte("swept {}\n")}
 	case argv[1] == "ps", argv[2] == "ls":
 		// And of containers, networks and volumes: none
 		return execx.Result{}

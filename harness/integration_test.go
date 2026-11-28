@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -48,6 +49,15 @@ func integration(t *testing.T) Engine {
 	return e
 }
 
+// ownedBy returns e, its things labelled label and made by the run r, and
+// its sweeps under the lock sweeps. A test's modules are its own, so it
+// gives them locks of their own too: with the lock the process shares, one
+// test's sweep would wait for another's, under a deadline of its own.
+func ownedBy(e Engine, label string, r runID, sweeps *sweepLock) Engine {
+	e.own = &owner{label: label, run: r, sweeps: sweeps}
+	return e
+}
+
 // TestSweepOnlyOwnLabel leaves behind, as three runs that died would, what
 // each made under its module's label, then sweeps one of them: everything
 // that one made goes, and nothing either of the others made does. One of
@@ -56,17 +66,17 @@ func integration(t *testing.T) Engine {
 //
 // The modules are this test's own, under the harness's key: sweeping by
 // the label of ci's own module would remove the containers of every test
-// running beside it, in this package or the contract suite's.
+// of this package running beside it, which this run made.
 func TestSweepOnlyOwnLabel(t *testing.T) {
 	t.Parallel()
 	e := integration(t)
 	ctx := t.Context()
 
 	module := "example.com/sweep-" + strings.TrimPrefix(uniqueName(), "divbast-")
-	swept, longer, other := e, e, e
-	swept.label = labelFor(&debug.BuildInfo{Main: debug.Module{Path: module}}, true)
-	longer.label = labelFor(&debug.BuildInfo{Main: debug.Module{Path: module + "/more"}}, true)
-	other.label = labelFor(&debug.BuildInfo{Main: debug.Module{Path: "example.com/other-" + strings.TrimPrefix(uniqueName(), "divbast-")}}, true)
+	swept := ownedBy(e, labelFor(&debug.BuildInfo{Main: debug.Module{Path: module}}, true), e.own.run, newSweepLock(""))
+	longer := ownedBy(e, labelFor(&debug.BuildInfo{Main: debug.Module{Path: module + "/more"}}, true), e.own.run, newSweepLock(""))
+	other := ownedBy(e, labelFor(&debug.BuildInfo{Main: debug.Module{Path: "example.com/other-" + strings.TrimPrefix(uniqueName(), "divbast-")}}, true),
+		e.own.run, newSweepLock(""))
 	engines := []Engine{swept, longer, other}
 
 	// Each an image, and a running container of it that holds a network
@@ -99,11 +109,11 @@ func TestSweepOnlyOwnLabel(t *testing.T) {
 		// tests beside this one hold theirs, gives one once a test ends.
 		// This waits for capacity the harness already waits on elsewhere,
 		// in Network; it is no retry over a race in the code under test.
-		if err := eng.createNetwork(ctx, []string{"network", "create", "--label", eng.label, network}); err != nil {
+		if err := eng.createNetwork(ctx, []string{"network", "create", "--label", eng.own.label, network}); err != nil {
 			t.Fatal(err)
 		}
 		for _, args := range [][]string{
-			{"volume", "create", "--label", eng.label, volume},
+			{"volume", "create", "--label", eng.own.label, volume},
 			eng.Argv(&RunSpec{
 				Image:   images[i],
 				Network: network,
@@ -123,17 +133,155 @@ func TestSweepOnlyOwnLabel(t *testing.T) {
 
 	for _, eng := range engines {
 		for _, list := range [][]string{{"ps", "-a", "-q"}, {"image", "ls", "-q"}, {"network", "ls", "-q"}, {"volume", "ls", "-q"}} {
-			out, err := eng.output(ctx, append(list, "--filter", "label="+eng.label)...)
+			out, err := eng.output(ctx, append(list, "--filter", "label="+eng.own.label)...)
 			if err != nil {
 				t.Fatal(err)
 			}
 			left := strings.Fields(string(out))
 			switch {
-			case eng.label == swept.label && len(left) != 0:
-				t.Errorf("after Sweep(), %s %s for %s lists %q, want nothing", e.name, strings.Join(list, " "), eng.label, left)
-			case eng.label != swept.label && len(left) != 1:
-				t.Errorf("after the sweep of %s, %s %s for %s lists %q, want the one it made", swept.label, e.name, strings.Join(list, " "), eng.label, left)
+			case eng.own.label == swept.own.label && len(left) != 0:
+				t.Errorf("after Sweep(), %s %s for %s lists %q, want nothing", e.name, strings.Join(list, " "), eng.own.label, left)
+			case eng.own.label != swept.own.label && len(left) != 1:
+				t.Errorf("after the sweep of %s, %s %s for %s lists %q, want the one it made", swept.own.label, e.name, strings.Join(list, " "), eng.own.label, left)
 			}
+		}
+	}
+}
+
+// TestSweepLeavesRunsStillGoing leaves behind what three runs of one
+// module made, as runs that were killed would: one whose process is still
+// going, as another go test run beside this one is, one whose process has
+// ended, and one from before runs were labelled. Two more runs of the
+// module then sweep at once, as two go test runs that start together do.
+// What the run still going made stays, the rest goes, and neither sweep
+// fails on what the other removed first. Once that process ends, a sweep
+// removes what it made too.
+func TestSweepLeavesRunsStillGoing(t *testing.T) {
+	t.Parallel()
+	e := integration(t)
+	if !processLookups {
+		t.Skip("this platform cannot tell a process that ended from one that is there")
+	}
+	ctx := t.Context()
+
+	// The module is this test's own, as in TestSweepOnlyOwnLabel
+	module := labelFor(&debug.BuildInfo{Main: debug.Module{Path: "example.com/sweep-runs-" + strings.TrimPrefix(uniqueName(), "divbast-")}}, true)
+	host := processRun().host
+	// Killed by the cleanup below, or else when the test's context ends
+	live := exec.CommandContext(ctx, "sleep", "600")
+	if err := live.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stopLive := sync.OnceFunc(func() {
+		_ = live.Process.Kill()
+		_ = live.Wait()
+	})
+	t.Cleanup(stopLive)
+
+	// The two that sweep share a lock of their own, on a file as across
+	// processes; the two that only made things never sweep
+	turns := newSweepLock(filepath.Join(t.TempDir(), "sweep.lock"))
+	going := ownedBy(e, module, runID{host: host, pid: live.Process.Pid, value: "going"}, newSweepLock(""))
+	ended := ownedBy(e, module, runID{host: host, pid: endedPID(t), value: "ended"}, newSweepLock(""))
+	first := ownedBy(e, module, runID{host: host, pid: os.Getpid(), value: "first"}, turns)
+	second := ownedBy(e, module, runID{host: host, pid: os.Getpid(), value: "second"}, turns)
+
+	// Each run's image, and a running container of it that holds a network
+	// and a volume. The run from before runs were labelled has the same,
+	// but for an image, which the harness always labels with its run: its
+	// container runs the fixture itself, which carries no harness label,
+	// since a container carries its image's labels too.
+	containerfile := filepath.Join(t.TempDir(), "Containerfile")
+	if err := os.WriteFile(containerfile, []byte("FROM "+testfixture.LibreSpeed+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	images := make(map[*Engine]string)
+	for _, eng := range []*Engine{&going, &ended} {
+		image, err := eng.Build(ctx, t, containerfile, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		images[eng] = image
+	}
+	// Registered after the builds, so it runs before their cleanups: what
+	// is left once the process still going has ended goes, and the images
+	// first, once their containers have.
+	t.Cleanup(func() {
+		stopLive()
+		sweepCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		if err := first.Sweep(sweepCtx); err != nil {
+			t.Errorf("sweeping up after the test: %v", err)
+		}
+	})
+	leave := func(labels []string, image string) {
+		t.Helper()
+		network, volume := uniqueName(), uniqueName()
+		// As Network makes one, waiting for a subnet to come free: a wait
+		// for capacity the harness already waits on elsewhere, in Network,
+		// and no retry over a race in the code under test
+		if err := e.createNetwork(ctx, slices.Concat([]string{"network", "create"}, labels, []string{network})); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{
+			slices.Concat([]string{"volume", "create"}, labels, []string{volume}),
+			slices.Concat([]string{"run", "-d"}, labels, contractFlags(e.name), []string{
+				"--network", network, "-v", volume + ":/data", image,
+			}),
+		} {
+			if _, err := e.output(ctx, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	leave(going.labels(), images[&going])
+	leave(ended.labels(), images[&ended])
+	leave([]string{"--label", module}, testfixture.LibreSpeed)
+
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i, eng := range []Engine{first, second} {
+		wg.Go(func() { errs[i] = eng.Sweep(ctx) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("sweep %d of the two at once: Sweep() error = %v", i+1, err)
+		}
+	}
+
+	lists := [][]string{{"ps", "-a", "-q"}, {"image", "ls", "-q"}, {"network", "ls", "-q"}, {"volume", "ls", "-q"}}
+	left := func(filter string) map[string][]string {
+		t.Helper()
+		got := make(map[string][]string)
+		for _, list := range lists {
+			out, err := e.output(ctx, slices.Concat(list, []string{"--filter", "label=" + filter})...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got[list[0]] = slices.Compact(slices.Sorted(slices.Values(strings.Fields(string(out)))))
+		}
+		return got
+	}
+	for kind, ids := range left(going.own.run.label()) {
+		if len(ids) != 1 {
+			t.Errorf("after the two sweeps, %s %s lists %q for the run still going, want the one it made", e.name, kind, ids)
+		}
+	}
+	for kind, ids := range left(module) {
+		if want := 1; len(ids) != want {
+			t.Errorf("after the two sweeps, %s %s lists %q for the module, want only what the run still going made", e.name, kind, ids)
+		}
+	}
+
+	// Once its process has ended, what it made goes too
+	stopLive()
+	if err := first.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep() once the process still going had ended: %v", err)
+	}
+	for kind, ids := range left(module) {
+		if len(ids) != 0 {
+			t.Errorf("once its process had ended, %s %s lists %q for the module, want nothing", e.name, kind, ids)
 		}
 	}
 }

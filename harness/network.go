@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,7 +31,7 @@ func (e Engine) Network(ctx context.Context, tb testing.TB, name, subnet string,
 	if name == "" {
 		name = uniqueName()
 	}
-	args := []string{"network", "create", "--label", e.label}
+	args := slices.Concat([]string{"network", "create"}, e.labels())
 	if subnet != "" {
 		args = append(args, "--subnet", subnet)
 	}
@@ -60,7 +61,7 @@ func (e Engine) Volume(ctx context.Context, tb testing.TB, name string) (string,
 	if name == "" {
 		name = uniqueName()
 	}
-	if _, err := e.output(ctx, "volume", "create", "--label", e.label, name); err != nil {
+	if _, err := e.output(ctx, slices.Concat([]string{"volume", "create"}, e.labels(), []string{name})...); err != nil {
 		return "", err
 	}
 	e.removeOnCleanup(ctx, tb, "volume", "rm", name)

@@ -77,8 +77,8 @@ func (m *volumeMaker) run(argv []string) execx.Result {
 		return execx.Result{}
 	case argv[0] == "docker" && argv[1] == "volume" && argv[2] == "create":
 		m.counts["volume create"]++
-		if argv[3] != "--label" || argv[4] != ownLabel {
-			m.t.Errorf("volume create %q carries no label of the module's", argv)
+		if !slices.Equal(argv[3:7], []string{"--label", ownLabel, "--label", ownRun}) {
+			m.t.Errorf("volume create %q carries not the labels of the module and the run", argv)
 		}
 		return execx.Result{}
 	case argv[0] == "docker" && argv[1] == "run":

@@ -528,7 +528,7 @@ func TestBuild(t *testing.T) {
 			t.Cleanup(func() {
 				want := [][]string{
 					slices.Concat(
-						[]string{tt.engine, "build", "-q", "--label", ownLabel, "-t", tag, "-f", "testdata/mutant/Containerfile"},
+						[]string{tt.engine, "build", "-q", "--label", ownLabel, "--label", ownRun, "-t", tag, "-f", "testdata/mutant/Containerfile"},
 						tt.format,
 						[]string{"--build-arg", "A=1", "--build-arg", "B=2", "testdata/mutant"},
 					),

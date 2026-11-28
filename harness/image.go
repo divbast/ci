@@ -498,7 +498,7 @@ func readingIt(how string, err error) error {
 func (e Engine) Build(ctx context.Context, tb testing.TB, containerfile string, args map[string]string) (string, error) {
 	tb.Helper()
 	tag := "localhost/" + uniqueName() + ":latest"
-	argv := []string{"build", "-q", "--label", e.label, "-t", tag, "-f", containerfile}
+	argv := slices.Concat([]string{"build", "-q"}, e.labels(), []string{"-t", tag, "-f", containerfile})
 	if e.name == "podman" {
 		argv = append(argv, "--format", "docker")
 	}
