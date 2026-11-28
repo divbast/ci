@@ -26,6 +26,7 @@ const (
 	static = "gcr.io/distroless/static-debian13:nonroot@" + other
 	golang = "golang:1.27.4-trixie@" + other
 	dhiRef = "dhi.io/aspnetcore:10.0.15-debian13@" + digest
+	ffmpeg = "ghcr.io/divbast/ffmpeg:bazarr@" + digest
 	denied = "\nError: the provided token was denied access to the requested resource\n"
 )
 
@@ -39,6 +40,14 @@ var (
 		"--repo", "divbast/frankenphp",
 		"--signer-workflow", "divbast/frankenphp/.github/workflows/build.yml@refs/heads/main",
 		"--source-ref", "refs/heads/main",
+	}
+	nativeArgv = func(pkg, digest string) []string {
+		return []string{
+			"gh", "attestation", "verify", "oci://ghcr.io/divbast/" + pkg + "@" + digest,
+			"--repo", "divbast/native-tools",
+			"--signer-workflow", "divbast/native-tools/.github/workflows/build.yml@refs/heads/main",
+			"--source-ref", "refs/heads/main",
+		}
 	}
 	// dhiArgv names the key in the temporary directory as {DIR}/dhi-2.pub:
 	// the directory is only known once run has made it.
@@ -135,6 +144,48 @@ func TestRun(t *testing.T) {
 			containerfile: "FROM scratch\nCOPY --from=" + pinned + " --chmod=0755 /frankenphp /usr/local/bin/frankenphp\n",
 			calls:         []execx.Call{version, {Argv: attestArgv}},
 			wantStdout:    "verified: " + pinned + "\n",
+			wantTools:     true,
+		},
+		{
+			name:          "native-tools-attested",
+			containerfile: "FROM scratch\nCOPY --from=" + ffmpeg + " /ffmpeg /usr/local/bin/ffmpeg\n",
+			calls:         []execx.Call{version, {Argv: nativeArgv("ffmpeg", digest)}},
+			wantStdout:    "verified: " + ffmpeg + "\n",
+			wantTools:     true,
+		},
+		{
+			name: "native-tools-each-package",
+			containerfile: "FROM scratch\n" +
+				"COPY --from=ghcr.io/divbast/unrar:v7@" + digest + " /unrar /usr/local/bin/unrar\n" +
+				"COPY --from=ghcr.io/divbast/ffmpeg:bazarr@" + other + " /ffmpeg /usr/local/bin/ffmpeg\n" +
+				"COPY --from=ghcr.io/divbast/mediainfo:v25@" + digest + " /mediainfo /usr/local/bin/mediainfo\n",
+			calls: []execx.Call{
+				version,
+				{Argv: nativeArgv("unrar", digest)},
+				version,
+				{Argv: nativeArgv("ffmpeg", other)},
+				version,
+				{Argv: nativeArgv("mediainfo", digest)},
+			},
+			wantStdout: "verified: ghcr.io/divbast/unrar:v7@" + digest + "\n" +
+				"verified: ghcr.io/divbast/ffmpeg:bazarr@" + other + "\n" +
+				"verified: ghcr.io/divbast/mediainfo:v25@" + digest + "\n",
+			wantTools: true,
+		},
+		{
+			name: "native-tools-same-digest-once",
+			containerfile: "FROM scratch\n" +
+				"COPY --from=" + ffmpeg + " /ffmpeg /usr/local/bin/ffmpeg\n" +
+				"COPY --from=" + ffmpeg + " /ffprobe /usr/local/bin/ffprobe\n",
+			calls:      []execx.Call{version, {Argv: nativeArgv("ffmpeg", digest)}},
+			wantStdout: "verified: " + ffmpeg + "\n",
+			wantTools:  true,
+		},
+		{
+			name:          "divbast-unknown-refused",
+			containerfile: "FROM scratch\nCOPY --from=ghcr.io/divbast/sevenzip:x@" + digest + " /7z /usr/local/bin/7z\n",
+			wantCode:      1,
+			wantStderr:    []string{"not in the table of verified images", "ghcr.io/divbast/sevenzip:x@" + digest},
 			wantTools:     true,
 		},
 		{

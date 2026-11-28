@@ -98,7 +98,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      attestations: read # a listed Containerfile may name divbast/frankenphp, whose attestation it checks
+      attestations: read # a listed Containerfile may name divbast/frankenphp or divbast/native-tools images, whose attestation it checks
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -233,9 +233,9 @@ jobs:
 
       # Before anything is built from them: every image the Containerfile
       # names must be pinned by digest, and each whose publisher signs it
-      # verified as theirs, divbast/frankenphp by its main build's
-      # attestation and distroless by its cosign signature. A local
-      # `just build` skips this.
+      # verified as theirs, divbast/frankenphp and divbast/native-tools by
+      # their main build's attestation and distroless by its cosign
+      # signature. A local `just build` skips this.
       - name: Verify the images the Containerfile builds from
         env:
           GH_TOKEN: ${{ github.token }}

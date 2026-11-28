@@ -632,7 +632,7 @@ func TestAppCheckVerifiesListedContainerfiles(t *testing.T) {
 		input  = "      verify-containerfiles:\n"
 		listed = "      - name: Verify the images the listed Containerfiles build from\n"
 		pins   = "      - name: Check the caller pins this commit of divbast/ci\n"
-		grant  = "      attestations: read # a listed Containerfile may name divbast/frankenphp, whose attestation it checks\n"
+		grant  = "      attestations: read # a listed Containerfile may name divbast/frankenphp or divbast/native-tools images, whose attestation it checks\n"
 	)
 	for name, mutant := range map[string]string{
 		"no input default":                    replaceAfter(check, input, "        default: ''\n", ""),
